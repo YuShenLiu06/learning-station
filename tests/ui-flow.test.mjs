@@ -40,6 +40,7 @@ test('controlled React flow preserves next draft, retries one saved user entry, 
       case 'open_document':return {id:'section_fixture',path:'fixture.md',metadata:{id:'section_fixture',title:'Local fixture',kind:'section',goals:[],tags:[],links:[],version:1},body:'# Local fixture\nReading material.',content:'',version:'v1',modifiedAt:'now'};
       case 'start_session':return {session:clone(session)};
       case 'get_session':return clone(session);
+      case 'list_sessions':return [{id:session.id,title:'fixture session history',kind:'session',path:'fixture.md',version:session.version,modifiedAt:'2026-10-16T00:00:00Z'}];
       case 'load_session_context':if(session.entries.length&&!contextFailed){contextFailed=true;throw {code:'REQUIRED_CONTEXT_UNAVAILABLE',message:'Controlled required material unavailable'};}return clone(context);
       case 'append_entry':{
         await saveGate;
@@ -51,7 +52,7 @@ test('controlled React flow preserves next draft, retries one saved user entry, 
         generationCount++;assert.equal(args.userEntryId,'entry_user_fixture');
         const id='run_'+createHash('sha256').update(args.requestId).digest('hex').slice(0,32);
         runs.set(id,{id,sessionId:session.id,userEntryId:args.userEntryId,status:generationCount===1?'failed':'succeeded',content:'',toolCalls:generationCount===2?[{...toolReceipt,runId:id}]:[],error:generationCount===1?{code:'MODEL_RESPONSE',message:'controlled failure'}:undefined});
-        if(generationCount===2){session.entries.push({id:'entry_assistant',kind:'assistant',content:'Controlled fixture response',createdAt:'now',relatedIds:[]},{id:'entry_tool',kind:'note',content:'internal activity snapshot',createdAt:'now',data:{origin:'pi-tool-activity',toolActivity:{...toolReceipt,runId:id}}});todos.push({id:'todo_fixture',title:'Controlled persisted task',done:false,reminderEnabled:false});}
+        if(generationCount===2){session.entries.push({id:'entry_assistant',kind:'assistant',content:'Controlled fixture response',createdAt:'now',relatedIds:[],data:{runId:id}},{id:'entry_tool',kind:'note',content:'internal activity snapshot',createdAt:'now',data:{origin:'pi-tool-activity',toolActivity:{...toolReceipt,runId:id}}});todos.push({id:'todo_fixture',title:'Controlled persisted task',done:false,reminderEnabled:false});}
         return clone(runs.get(id));
       }
       case 'get_run':if(runs.has(args.runId)){const value=runs.get(args.runId);if(value.content.includes('REFERENCE_MUST_STAY_HIDDEN')&&++practiceReads>1){value.status='failed';value.error={code:'MODEL_RESPONSE',message:'Controlled invalid practice'};}return clone(value);}throw {code:'NOT_FOUND',message:'not found'};
@@ -81,7 +82,7 @@ test('controlled React flow preserves next draft, retries one saved user entry, 
     await React.act(async()=>releaseSave());await waitFor(()=>button('重试生成'));
     assert.equal(composer.value,'next unsent draft');assert.equal(document.querySelectorAll('.message.user').length,1);
     assert.equal(generationCount,0);assert.equal(session.entries.filter(x=>x.kind==='user').length,1);await click(button('重试生成'));await waitFor(()=>generationCount===1&&button('重试生成'));await click(button('重试生成'));await waitFor(()=>document.querySelector('.message.assistant'));
-    assert.equal(document.querySelectorAll('.tool-activity').length,1);assert.match(document.querySelector('.tool-activity').textContent,/创建待办.*成功/);assert.doesNotMatch(document.querySelector('.messages').textContent,/internal activity snapshot/);
+    assert.equal(document.querySelectorAll('.tool-activity').length,1);assert.ok(document.querySelector('.message.assistant .tool-activity'),'receipt must stay adjacent to its real run reply');assert.match(document.querySelector('.tool-activity').textContent,/创建待办.*成功/);assert.doesNotMatch(document.querySelector('.messages').textContent,/internal activity snapshot/);
     await click(button('打开待办'));await waitFor(()=>document.querySelector('[role="dialog"]'));assert.match(document.querySelector('[role="dialog"]').textContent,/Controlled persisted task/);await click(document.querySelector('[aria-label="关闭弹窗"]'));
     const starts=commands.filter(x=>x.command==='start_generation');assert.equal(starts.length,2);assert.notEqual(starts[0].args.requestId,starts[1].args.requestId);assert.equal(starts[0].args.userEntryId,starts[1].args.userEntryId);
     assert.equal(commands.filter(x=>x.command==='append_entry').length,1);assert.equal(composer.value,'next unsent draft');assert.equal(document.querySelectorAll('.message.user').length,1);
@@ -96,6 +97,7 @@ test('controlled React flow preserves next draft, retries one saved user entry, 
     await click(button('发送测试消息'));await waitFor(()=>button('核对上次发送结果'));await click(button('核对上次发送结果'));await waitFor(()=>document.querySelector('.feishu-settings').textContent.includes('测试消息已发送'));
     const tests=commands.filter(x=>x.command==='test_feishu_notification');assert.equal(tests.length,2);assert.equal(tests[0].args.requestId,tests[1].args.requestId);assert.match(tests[0].args.requestId,/^[A-Za-z0-9_-]{8,128}$/);
     assert.equal(commands.some(x=>['test_model','configure_model'].includes(x.command)),false);
+    await click(document.querySelector('[aria-label="历史"]'));await waitFor(()=>button('fixture session history'));await click(button('fixture session history'));await waitFor(()=>document.querySelector('.history-page .tool-activity'));assert.equal(document.querySelectorAll('.history-page .tool-activity').length,1);assert.ok(document.querySelector('.history-page .message.assistant .tool-activity'));assert.match(document.querySelector('.history-page .tool-activity').textContent,/创建待办.*成功/);await click(button('打开待办'));await waitFor(()=>document.querySelector('[role="dialog"]'));assert.match(document.querySelector('[role="dialog"]').textContent,/Controlled persisted task/);assert.equal(commands.filter(x=>x.command==='start_generation').filter(x=>x.args.mode!=='practice').length,2);
   }finally{
     await React.act(async()=>root.unmount());clearMocks();dom.window.close();await unlink(filename).catch(()=>{});
   }
