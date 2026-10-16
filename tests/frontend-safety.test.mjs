@@ -2,7 +2,7 @@ import { sessionMessages } from '../src/sessionMessages.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { JSDOM } from 'jsdom';
-import { isSubmitKey } from '../src/keyboard.ts';
+import { composerKeyAction } from '../src/keyboard.ts';
 import { draftInputsDiffer, questionForSection, needsDraftChoice, unbackedSectionHasInput } from '../src/draftPolicy.ts';
 
 const dom = new JSDOM('');
@@ -27,12 +27,19 @@ test('source URLs and external images cannot make automatic network requests', (
   assert.equal(result.querySelectorAll('[src],[href],[poster],video,source,img').length, 0);
   assert.match(result.textContent, /link/);
 });
-test('plain Enter and Chinese IME composition never submit a question', () => {
-  assert.equal(isSubmitKey({key:'Enter',metaKey:false,ctrlKey:false}), false);
-  assert.equal(isSubmitKey({key:'Enter',metaKey:true,ctrlKey:false,isComposing:true}), false);
-  assert.equal(isSubmitKey({key:'Enter',metaKey:true,ctrlKey:false,keyCode:229}), false);
-  assert.equal(isSubmitKey({key:'Enter',metaKey:true,ctrlKey:false,isComposing:false,keyCode:13}), true);
-  assert.equal(isSubmitKey({key:'Enter',metaKey:false,ctrlKey:true}), true);
+test('Enter sends once while Shift+Enter and Alt+Enter keep native multiline input', () => {
+  assert.equal(composerKeyAction({key:'Enter'}), 'send');
+  assert.equal(composerKeyAction({key:'Enter',repeat:true}), 'block');
+  assert.equal(composerKeyAction({key:'Enter',shiftKey:true}), 'native');
+  assert.equal(composerKeyAction({key:'Enter',shiftKey:true,repeat:true}), 'native');
+  assert.equal(composerKeyAction({key:'Enter',altKey:true}), 'native');
+  assert.equal(composerKeyAction({key:'a'}), 'native');
+});
+test('Chinese IME Enter commits text without sending, including WebKit commit ordering', () => {
+  assert.equal(composerKeyAction({key:'Enter',isComposing:true}), 'native');
+  assert.equal(composerKeyAction({key:'Enter',keyCode:229}), 'native');
+  assert.equal(composerKeyAction({key:'Enter',isComposing:false,keyCode:13},true), 'native');
+  assert.equal(composerKeyAction({key:'Enter',isComposing:false,keyCode:13},false), 'send');
 });
 test('late draft reads require a choice before replacing changed local answer or reason', () => {
   assert.equal(needsDraftChoice({answer:'new',reason:''},{answer:'old',reason:''},true), true);
@@ -109,4 +116,16 @@ test('independent exploration rejects a linked session or source manifest', asyn
 test('historical assistant prose cannot borrow the current session source manifest', () => {
   const messages=sessionMessages([{id:'old',kind:'assistant',content:'old answer',createdAt:'then'}],[{title:'unrelated latest source'}]);
   assert.equal(messages[0].sources,undefined);
+});
+
+ test('local usage policy errors are distinct from connection failures, including plain CoreError objects', async () => {
+  const {modelAccessMessage,modelFailureMessage}=await import('../src/modelPolicy.ts');
+  const settings={configured:true,provider:'custom',baseUrl:'https://example.invalid/coding',model:'test',credentialStored:true,usageGate:'PLAN_USAGE_UNCONFIRMED'};
+  assert.match(modelAccessMessage(settings),/专用通道.*未发送网络请求/);
+  assert.equal(modelAccessMessage({...settings,usageGate:''}),'');
+  const policy=modelFailureMessage({code:'PLAN_USAGE_UNCONFIRMED',message:'old gate wording'},'test');
+  assert.match(policy,/本地用途限制/);
+  assert.doesNotMatch(policy,/连接测试未通过|测试未完成|网络失败/);
+  assert.match(modelFailureMessage({code:'NETWORK',message:'connection refused'},'test'),/^测试未完成：connection refused$/);
+  assert.match(modelFailureMessage(Object.assign(new Error('gate'),{code:'PLAN_USAGE_UNCONFIRMED'}),'generation'),/未发送网络请求/);
 });

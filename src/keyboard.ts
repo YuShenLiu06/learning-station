@@ -1,4 +1,5 @@
-type KeyInput = { key: string; metaKey: boolean; ctrlKey: boolean; isComposing?: boolean; keyCode?: number };
-export function isSubmitKey(event: KeyInput): boolean {
-  return (event.metaKey || event.ctrlKey) && event.key === 'Enter' && !event.isComposing && event.keyCode !== 229;
+type KeyInput = { key: string; shiftKey?: boolean; altKey?: boolean; repeat?: boolean; isComposing?: boolean; keyCode?: number };
+export function composerKeyAction(event: KeyInput, composing = false): 'native' | 'send' | 'block' {
+  if (event.key !== 'Enter' || composing || event.isComposing || event.keyCode === 229 || event.shiftKey || event.altKey) return 'native';
+  return event.repeat ? 'block' : 'send';
 }

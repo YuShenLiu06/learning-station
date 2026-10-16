@@ -3,6 +3,17 @@ export const supportedProtocol = 'openai-completions';
 export function modelAccessReason(model: ModelSettings) {
   return model.usageGate ?? (model.provider === 'glm-pi' ? 'PLAN_USAGE_UNCONFIRMED' : '');
 }
+export const planUsageExplanation = '当前已保存配置使用 Coding Plan 专用通道，本学习应用的用途尚未确认，已在本机停止，未发送网络请求。可保留此配置等待确认，或自行填写具备普通 API 权限的服务地址；费用由所选服务决定。';
+export function modelAccessMessage(model: ModelSettings) {
+  const reason = modelAccessReason(model);
+  return reason === 'PLAN_USAGE_UNCONFIRMED' ? planUsageExplanation : reason ? '当前已保存配置受到本地用途限制，请先核对服务的使用权限。' : '';
+}
+export function modelFailureMessage(error: unknown, operation: 'test' | 'generation') {
+  const value = error && typeof error === 'object' ? error as { code?: unknown; message?: unknown } : null;
+  if (value?.code === 'PLAN_USAGE_UNCONFIRMED') return `本地用途限制：${planUsageExplanation}`;
+  const message = typeof value?.message === 'string' ? value.message : typeof error === 'string' ? error : '本机服务暂时没有响应，请重试。';
+  return operation === 'test' ? `测试未完成：${message}` : message;
+}
 export function modelBindingChanged(model: ModelSettings, input: { provider: string; protocol: string; baseUrl: string }) {
   return model.provider !== input.provider || (model.protocol || supportedProtocol) !== input.protocol || model.baseUrl !== input.baseUrl.trim();
 }

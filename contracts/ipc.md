@@ -32,7 +32,7 @@ Markdown 开头是 ```json 围栏（JSON对象），后面正文。metadata.id�
 - `get_run({runId})` → `{id,status:queued|running|succeeded|failed|cancelled|interrupted,content,error?,sessionId}`
 - `configure_model({provider:"custom"|"glm-pi",protocol?:"openai-completions",baseUrl,model,apiKey})` → ModelSettings；密钥仅本机Keychain，不返回前端/日志
 - `get_model_settings()` → ModelSettings
-- `test_model()` → `{ok,message}`；仅 Coding Plan 专用接入受用途门槛 PLAN_USAGE_UNCONFIRMED；自定义目标按保存配置测试。ModelSettings见[Pi契约](pi-decision.md)。
+- `test_model()` → `{ok,message}`；按已保存的 provider/协议/地址/模型测试。Coding Plan 专用地址（含 provider=custom）在读取凭据前返回 `PLAN_USAGE_UNCONFIRMED`，details 为 `{category:"local_policy",reason:"coding_plan_endpoint",stage:"before_credentials",requestSent:false}`；属于本地用途限制，不能显示为服务器连接失败。普通 custom 地址重新加载后按实际地址重算 gate，不继承旧限制。界面已知 gate 时仅本地解释，编辑和保存仍可用。ModelSettings见[Pi契约](pi-decision.md)。
 - `create_todo({title,dueAt?:string|null,sessionId?,requestId})` → Todo
 - `list_todos()` → Todo[]；`set_todo_done({id,done})` → Todo
 - `list_notifications()` → Notification[]；`mark_notification_read({id})` → Notification

@@ -12,7 +12,7 @@ const OFFICIAL_ENDPOINTS = new Set([
   'https://api.z.ai/api/coding/paas/v4',
 ]);
 export const SAFE_MESSAGES = Object.freeze({
-  PLAN_USAGE_UNCONFIRMED: 'Coding Plan 是否允许本学习应用用途尚未确认，暂不能连接或生成。',
+  PLAN_USAGE_UNCONFIRMED: '本地用途限制：所选 Coding Plan 专用通道的应用用途适用性尚未确认，未发送模型请求；这不是服务器连接失败。',
   AUTH: 'API 认证失败，请检查所选区域的密钥和模型权限。',
   RATE_LIMIT: '模型服务限流或额度不足，请检查额度后重试。',
   TIMEOUT: '模型请求超时；已收到的内容已保留。',

@@ -1090,7 +1090,7 @@ fn ensure_usage_allowed(settings: &ModelSettings) -> Result<()> {
         false,
     )?;
     if usage_blocked(&settings.provider, &settings.base_url) {
-        Err(sidecar_error(USAGE_GATE))
+        Err(sidecar_error(USAGE_GATE).details(json!({"category":"local_policy","reason":"coding_plan_endpoint","stage":"before_credentials","requestSent":false})))
     } else {
         Ok(())
     }
@@ -1099,7 +1099,7 @@ fn sidecar_error(code: &str) -> CoreError {
     let (safe_code, message) = match code {
         "PLAN_USAGE_UNCONFIRMED" => (
             USAGE_GATE,
-            "Coding Plan 是否允许本学习应用用途尚未确认，暂不能连接或生成。",
+            "本地用途限制：当前地址是 Coding Plan 专用通道，应用用途适用性尚未确认，未发送模型请求。这不是服务器连接失败。可保留配置等待确认，或自行配置具有普通 API 权限的地址；程序不会自动更换通道。",
         ),
         "AUTH" => ("AUTH", "API 认证失败，请检查所选区域的密钥和模型权限。"),
         "RATE_LIMIT" => ("RATE_LIMIT", "模型服务限流或额度不足，请检查额度后重试。"),
@@ -1142,6 +1142,11 @@ fn sidecar_error(code: &str) -> CoreError {
     let mut error = CoreError::new(safe_code, message);
     if safe_code == "RATE_LIMIT" {
         error.retryable = true;
+    }
+    if safe_code == USAGE_GATE {
+        error.details = Some(
+            json!({"category":"local_policy","reason":"coding_plan_endpoint","requestSent":false}),
+        );
     }
     error
 }
@@ -1924,5 +1929,58 @@ mod tests {
         let error = sidecar_error("fixture-secret raw provider body");
         assert_eq!(error.code, "PI_RUNTIME");
         assert!(!format!("{error:?}").contains("fixture-secret"));
+    }
+}
+
+#[cfg(test)]
+mod policy_feedback_tests {
+    use super::*;
+    #[test]
+    fn custom_coding_endpoint_reports_local_policy_before_credential_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ModelStore::new(dir.path()).unwrap();
+        store.settings.provider = "custom".into();
+        store.settings.protocol = PROTOCOL.into();
+        store.settings.base_url = DOMESTIC.into();
+        store.settings.model = MODEL_ID.into();
+        store.settings.configured = true;
+        store.settings.active_profile = "custom".into();
+        let error = store.credentials().unwrap_err();
+        assert_eq!(error.code, USAGE_GATE);
+        assert_eq!(error.details.as_ref().unwrap()["category"], "local_policy");
+        assert_eq!(
+            error.details.as_ref().unwrap()["stage"],
+            "before_credentials"
+        );
+        assert_eq!(error.details.as_ref().unwrap()["requestSent"], false);
+        assert!(error.message.contains("本地用途限制"));
+        assert!(!error.retryable);
+    }
+    #[test]
+    fn ordinary_custom_target_does_not_inherit_a_saved_coding_plan_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(dir.path()).unwrap();
+        let mut settings = ModelSettings::default();
+        settings.provider = "custom".into();
+        settings.base_url = "https://api.example.com/v1".into();
+        settings.model = "user-selected-model".into();
+        settings.configured = true;
+        settings.active_profile = "custom".into();
+        settings.usage_gate = USAGE_GATE.into();
+        settings.profiles.push(ModelProfileSettings {
+            profile: "custom".into(),
+            provider: "custom".into(),
+            protocol: PROTOCOL.into(),
+            configured: true,
+            base_url: settings.base_url.clone(),
+            model: settings.model.clone(),
+            verified: false,
+        });
+        store.persist(&settings).unwrap();
+        let reopened = ModelStore::new(dir.path()).unwrap().settings();
+        assert_eq!(reopened.provider, "custom");
+        assert_eq!(reopened.base_url, "https://api.example.com/v1");
+        assert!(reopened.usage_gate.is_empty());
+        assert!(ensure_usage_allowed(&reopened).is_ok());
     }
 }

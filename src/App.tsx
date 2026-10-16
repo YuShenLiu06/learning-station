@@ -2,14 +2,14 @@ import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react'
 import { ArrowDownToLine, ArrowLeft, ArrowRight, ArrowUp, BookOpen, Check, CheckCheck, ChevronDown, ChevronRight, CircleHelp, Clock3, FileText, FolderOpen, Highlighter, Layers2, ListTodo, LoaderCircle, MessageCircle, Maximize2, Minimize2, MoreHorizontal, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, PencilLine, Plus, Search, Settings2, Sparkles, Square, X } from 'lucide-react';
 import { call, emptyBootstrap, isDemo, nativeAvailable, recordMetric, sampleBody } from './api';
 const Editor = lazy(() => import('./Editor').then(module => ({ default: module.Editor })));
-import { modelAccessReason, modelBindingChanged, modelFormError, supportedProtocol } from './modelPolicy';
+import { modelAccessReason, modelAccessMessage, modelBindingChanged, modelFailureMessage, modelFormError, supportedProtocol } from './modelPolicy';
 import { assertExplorationScope } from './explorationPolicy';
 import { useIndependentExploration } from './useIndependentExploration';
 import { RequestContextView } from './RequestContextView';
 import type { ContextViewState } from './RequestContextView';
 import { useFontSize } from './useFontSize';
 import { Markdown } from './Markdown';
-import { isSubmitKey } from './keyboard';
+import { composerKeyAction } from './keyboard';
 import { draftInputsDiffer, questionForSection, unbackedSectionHasInput } from './draftPolicy';
 import { flushExerciseDrafts, hasExerciseInput, useExerciseDraft } from './exerciseDraft';
 import { onGenerationProgress } from './native';
@@ -105,6 +105,8 @@ export function App() {
   const [taskError, setTaskError] = useState('');
   const [notifications, setNotifications] = useState(false);
   const questionRef = useRef<HTMLTextAreaElement>(null);
+  const composerComposing = useRef(false);
+  const composerCommitFrame = useRef(0);
   const questionDrafts = useRef<Record<string, string>>({});
   const activeIdRef = useRef(activeId); activeIdRef.current = activeId;
   const chatEnd = useRef<HTMLDivElement>(null);
@@ -276,7 +278,7 @@ export function App() {
       const result = await call<LearningSession>('session_ask', { sectionId: target.sectionId, sessionId: target.id, mode: panel, question: value, selection: selected, operationId: id });
       updateTargetSession(result, detached);
       if (detached) { if (independentRef.current.question.trim() === value) independentRef.current.setQuestion(''); } else if (activeIdRef.current === target.sectionId) setQuestion(old => old.trim() === value ? '' : old);
-    } catch (error) { if (visibleSessionRef.current === target.id) setAiError(errorText(error)); else notify(`另一会话生成未完成，输入仍保留：${errorText(error)}`); }
+    } catch (error) { if (visibleSessionRef.current === target.id) setAiError(modelFailureMessage(error, 'generation')); else notify(`另一会话生成未完成，输入仍保留：${modelFailureMessage(error, 'generation')}`); }
     finally { await refreshAfterGeneration(target, detached); if (busyRef.current === id) { busyRef.current = ''; setBusyId(''); } }
   }
   async function cancel() {
@@ -291,7 +293,7 @@ export function App() {
     const id = makeId(); busyRef.current = id; setBusyId(id); setPartial(null); setAiError('');
     const sectionId = activeId;
     try { await prepareSource(sectionId); const result = await call<LearningSession>('exercise_generate', { sectionId, sessionId: session.id, selection, operationId: id }); if (busyRef.current === id) setSessions(old => ({ ...old, [sectionId]: result })); }
-    catch (error) { if (busyRef.current === id) setAiError(errorText(error)); }
+    catch (error) { if (busyRef.current === id) setAiError(modelFailureMessage(error, 'generation')); }
     finally { await refreshAfterGeneration(session, false); if (busyRef.current === id) { busyRef.current = ''; setBusyId(''); } }
   }
   async function submitAnswer(exercise: Exercise, answer: string) {
@@ -438,7 +440,7 @@ export function App() {
         {panel === 'practice' && <div className="practice-panel"><span className="card-label">TRY IT YOURSELF</span><h3>用一道题，检查理解。</h3><p className="muted">围绕{selection ? '当前选句' : '当前小节'}与已记录的困惑生成，不必先听完讲解。</p><button className="primary-button full-width" disabled={!!busyId} onClick={() => { void generateExercise(); }}><Sparkles size={14} />生成一道针对练习</button><button className="manual-exercise-link" disabled={!current} onClick={() => setManualExercise(true)}><PencilLine size={12} />或手动添加一道题</button>{session.exercises.map(exercise => <ExerciseCard key={exercise.id} exercise={exercise} onAnswer={answer => submitAnswer(exercise, answer)} onReason={reason => saveReason(exercise, reason)} />)}</div>}
         {partial && partial.sessionId === session.id && busyId && <article className="message assistant partial-message"><div className="message-label"><Sparkles size={12} />正在回复</div><Markdown text={partial.content} /></article>}{busyId && <div className="generating" role="status"><LoaderCircle size={15} className="spin" /><div>正在等待模型回复…<small>{independentMode ? '独立探索 · 未关联当前小节' : '来源以核对后的实际清单为准'}</small></div><button className="quiet-button" onClick={() => { void cancel(); }}><Square size={11} />停止</button></div>}{aiError && <div className="inline-error" role="alert"><strong>这次没有得到回复</strong><p>{aiError}</p><span>输入仍保留，可以修改后重试。</span></div>}<div ref={chatEnd} />
       </div>
-      <div className="composer-area"><form className="composer" onSubmit={event => { event.preventDefault(); void ask(); }}><textarea ref={questionRef} aria-label="向学习助手提问" placeholder={independentMode ? '独立探索，不关联当前小节…' : current ? '写下你的问题…' : '先打开材料，或切换到独立探索'} value={composerQuestion} disabled={!canCompose} rows={3} onChange={event => updateComposer(event.target.value)} onKeyDown={event => { if (isSubmitKey(event.nativeEvent)) { event.preventDefault(); void ask(); } }} /><div className="composer-bottom"><button type="button" className="save-question" disabled={!composerQuestion.trim() || localQuestionSaving} onClick={() => { void saveLocalQuestion(); }}>{localQuestionSaving ? <LoaderCircle size={11} className="spin" /> : <Plus size={11} />}保存困惑</button><button type="submit" className="send-button" aria-label={modelReady ? '发送问题' : '配置模型后提问'} disabled={!composerQuestion.trim() || !!busyId}><ArrowUp size={17} /></button></div></form><p className="composer-note">{modelReady ? `${boot.model.model} · ${independentMode ? '独立探索' : '关联来源可展开核对'}` : '可配置自定义模型 · 本地阅读与练习可独立使用'}</p></div>
+      <div className="composer-area"><form className="composer" onSubmit={event => { event.preventDefault(); void ask(); }}><textarea ref={questionRef} aria-label="向学习助手提问" placeholder={independentMode ? '独立探索，不关联当前小节…' : current ? '写下你的问题…' : '先打开材料，或切换到独立探索'} value={composerQuestion} disabled={!canCompose} rows={3} onChange={event => updateComposer(event.target.value)} onCompositionStart={() => { cancelAnimationFrame(composerCommitFrame.current); composerComposing.current = true; }} onCompositionEnd={() => { composerCommitFrame.current = requestAnimationFrame(() => { composerComposing.current = false; }); }} onBlur={() => { cancelAnimationFrame(composerCommitFrame.current); composerComposing.current = false; }} onKeyDown={event => { const action = composerKeyAction(event.nativeEvent, composerComposing.current); if (action === 'native') return; event.preventDefault(); if (action === 'send') void ask(); }} /><div className="composer-bottom"><button type="button" className="save-question" disabled={!composerQuestion.trim() || localQuestionSaving} onClick={() => { void saveLocalQuestion(); }}>{localQuestionSaving ? <LoaderCircle size={11} className="spin" /> : <Plus size={11} />}保存困惑</button><button type="submit" className="send-button" aria-label={modelReady ? '发送问题' : '配置模型后提问'} disabled={!composerQuestion.trim() || !!busyId}><ArrowUp size={17} /></button></div></form><p className="composer-note">{modelReady ? `${boot.model.model} · ${independentMode ? '独立探索' : '关联来源可展开核对'}` : '可配置自定义模型 · 本地阅读与练习可独立使用'}<br />Enter 发送 · Shift+Enter 换行</p></div>
     </aside>}
 
     {importing && <ImportDialog draft={materialDraft} onDraftLoaded={loaded => { workspaceDraftLoaded.current = loaded; if (loaded) clearDraftError('workspace'); }} onClose={() => setImporting(false)} onImported={async section => { if (section.draftError) reportDraftError(`section:${section.id}`, section.draftError); if (workspaceDraftLoaded.current) { materialDraft.current = { title: '', body: '' }; if (nativeAvailable) void call('draft_save', { key: 'workspace', data: { importTitle: '', importBody: '' } }).catch(error => reportDraftError('workspace', error)); } setImporting(false); setDocs(old => ({ ...old, [section.id]: { section, body: section.body, savedBody: section.body, saving: false, draftLoaded: section.draftReady !== false } })); setSessions(old => ({ ...old, [section.id]: emptySession(section.id) })); setActiveId(section.id); setQuestion(questionForSection(questionDrafts.current, section.id)); setSelection(''); setAiError(''); switchView('lesson'); setEditing(false); try { setBoot(await call<Bootstrap>('bootstrap')); } catch (error) { notify(errorText(error)); } }} />}
@@ -498,31 +500,33 @@ function SettingsDialog({ model, dataPath, onClose, onSaved, font }: { model: Mo
     const validation = modelFormError({ provider, protocol, baseUrl, model: name, apiKey: secret }, model);
     if (validation) { setError(validation); return; }
     setBusy('save'); const apiKey = secret; setSecret('');
-    try { const saved = await call<ModelSettings>('model_save', { provider, protocol, baseUrl: baseUrl.trim(), model: name.trim(), apiKey: apiKey || undefined }); onSaved(saved); setBaseUrl(saved.baseUrl); setName(saved.model); setProtocol(saved.protocol || supportedProtocol); setResult('配置已保存到本机，尚未发送模型请求。可以继续测试已保存的连接。'); }
+    try { const saved = await call<ModelSettings>('model_save', { provider, protocol, baseUrl: baseUrl.trim(), model: name.trim(), apiKey: apiKey || undefined }); onSaved(saved); setBaseUrl(saved.baseUrl); setName(saved.model); setProtocol(saved.protocol || supportedProtocol); setResult(modelAccessMessage(saved) ? `配置已保存到本机。${modelAccessMessage(saved)}` : '配置已保存到本机，尚未发送模型请求。可以继续测试已保存的连接。'); }
     catch (error) { setError(`连接配置尚未保存：${errorText(error)}`); }
     finally { setBusy(''); }
   }
   async function test() {
     if (busy) return; setError(''); setResult('');
     if (!model.configured || settingsChanged) { setError(settingsChanged ? '配置有更改，请先保存，再测试这个目标。' : '请先填写并保存模型连接，再测试。'); return; }
+    if (modelAccessMessage(model)) { setError(`本地用途限制：${modelAccessMessage(model)}`); return; }
     setBusy('test');
     try { const response = await call<{ ok: boolean; message: string }>('model_test'); setResult(response.message); onSaved(await call<ModelSettings>('model_get')); }
-    catch (error) { setError(`连接测试未通过：${errorText(error)}`); }
+    catch (error) { setError(modelFailureMessage(error, 'test')); }
     finally { setBusy(''); }
   }
   return <Dialog title="模型与本机设置" description="填写你自己的模型服务。保存只写入本机，点击测试或发送问题时才请求已保存的地址。" onClose={onClose}>
     <section className="font-settings" aria-label="内容字号设置"><div><strong>内容字号</strong><output aria-live="polite">{font.fontSize}px</output></div><div className="font-controls"><button className="quiet-button" aria-label="减小内容字号" disabled={font.fontSize <= 12} onClick={() => font.setFontSize(font.fontSize - 1)}>A−</button><input aria-label="内容字号" type="range" min="12" max="24" step="1" value={font.fontSize} onChange={event => font.setFontSize(Number(event.target.value))} /><button className="quiet-button" aria-label="增大内容字号" disabled={font.fontSize >= 24} onClick={() => font.setFontSize(font.fontSize + 1)}>A＋</button></div><p>阅读、编辑、对话与复习内容同步调整。{font.status}</p>{font.error && <div className="inline-error" role="alert">字号设置：{font.error}<button onClick={() => { void font.flush().catch(() => undefined); }}>重试保存字号</button><button onClick={() => { void font.retry(); }}>重新读取字号</button></div>}</section>
-    <div className={`settings-status ${model.connected ? 'connected' : ''}`}><span className="connection-dot" />{model.connected ? '已保存目标的真实连接已验证' : model.configured ? '已保存配置 · 连接待验证' : '模型服务尚未配置'}</div>
+    <div className={`settings-status ${model.connected && !modelAccessReason(model) ? 'connected' : ''}`}><span className="connection-dot" />{modelAccessReason(model) ? '已保存配置 · 本地用途限制' : model.connected ? '已保存目标的真实连接已验证' : model.configured ? '已保存配置 · 连接待验证' : '模型服务尚未配置'}</div>
+    {modelAccessMessage(model) && <div className="inline-error model-policy" role="status"><strong>当前保存的地址受本地限制</strong><p>{modelAccessMessage(model)}</p></div>}
     <form noValidate onSubmit={event => { void save(event); }}>
       <label>模型服务类型<select aria-label="模型服务类型" value={provider} onChange={event => { setProvider(event.target.value); setSecret(''); }}><option value="custom">自定义模型服务</option><option value="glm-pi">GLM Pi · Coding Plan 用途受限</option></select></label>
-      {provider === 'glm-pi' && <div className="inline-error model-policy" role="status"><strong>Coding Plan 用途限制仍有效</strong><p>Pi 接入不代表套餐授权。此用途尚未确认，服务端会保留请求门槛；不会自动切换到付费 API。自定义服务请使用你获准调用的接口。</p></div>}
+      {provider === 'glm-pi' && !modelAccessReason(model) && <div className="inline-error model-policy" role="status"><strong>Coding Plan 用途限制仍有效</strong><p>Pi 接入不代表套餐授权。此用途尚未确认，服务端会保留请求门槛；不会自动切换到付费 API。自定义服务请使用你获准调用的接口。</p></div>}
       <label>模型协议<select aria-label="模型协议" value={protocol} onChange={event => { setProtocol(event.target.value); setSecret(''); }}><option value={supportedProtocol}>OpenAI Chat Completions</option></select><span className="label-note">当前支持 openai-completions，由 Pi 适配</span></label>
       <label>服务地址 base_url<input aria-label="模型服务地址" type="url" value={baseUrl} onChange={event => { setBaseUrl(event.target.value); setSecret(''); }} placeholder="填写服务提供方给出的基础 base_url" spellCheck={false} autoComplete="off" /><span className="label-note">填写基础地址，不含 /chat/completions；测试也会调用该地址下的服务，并按服务方规则计费。</span></label>
       <label>模型名称<input aria-label="模型名称" value={name} onChange={event => setName(event.target.value)} placeholder="填写服务端支持的模型 ID" spellCheck={false} autoComplete="off" /></label>
       <label>API 密钥 <span className="label-note">{model.credentialStored && !bindingChanged ? '已由本机安全存储管理；留空保留' : '更改地址或协议后需要新密钥'}</span><input aria-label="API 密钥" type="password" value={secret} onChange={event => setSecret(event.target.value)} placeholder={model.credentialStored && !bindingChanged ? '留空保留已有密钥' : '请在本机输入此服务的密钥'} autoComplete="new-password" spellCheck={false} /></label>
       <p className="muted small">密钥不进入网页存储或日志；提交后立即清空输入框。测试只针对已保存的地址、协议和模型。</p>
       {error && <div className="inline-error" role="alert">{error}</div>}{result && <p className="settings-result" role="status">{result}</p>}
-      <div className="dialog-footer"><button type="button" className="quiet-button" disabled={!!busy} onClick={() => { void test(); }}>{busy === 'test' ? <><LoaderCircle size={14} className="spin" />正在测试已保存连接…</> : '测试已保存连接'}</button><button className="primary-button" disabled={!!busy}>{busy === 'save' ? <><LoaderCircle size={14} className="spin" />正在保存配置…</> : '保存连接设置'}</button></div>
+      <div className="dialog-footer"><button type="button" className="quiet-button" disabled={!!busy} onClick={() => { void test(); }}>{busy === 'test' ? <><LoaderCircle size={14} className="spin" />正在测试已保存连接…</> : modelAccessReason(model) && !settingsChanged ? '查看本地用途限制' : '测试已保存连接'}</button><button className="primary-button" disabled={!!busy}>{busy === 'save' ? <><LoaderCircle size={14} className="spin" />正在保存配置…</> : '保存连接设置'}</button></div>
     </form>
     <div className="settings-local"><p>飞书提醒：未启用 · Anki：仅 CSV 导出，未同步</p><strong><FolderOpen size={14} />本机材料目录</strong><p>{dataPath || '由本机服务管理，连接后显示路径'}</p><p>Markdown 是学习内容的原始文件，保存时会检查版本变化。</p></div>
   </Dialog>;
