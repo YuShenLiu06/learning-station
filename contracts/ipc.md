@@ -96,7 +96,7 @@ Tauri devUrl约定 `http://127.0.0.1:1420`，release嵌入 `dist/`。命令snake
 
 - `ModelSettings.protocol="openai-completions"`；此处为上一轮协议约定；当前两协议以文末v3为准。provider支持custom、glm-pi。新默认custom，baseUrl/model为空，不推测服务或计费。custom模型ID手输；请求地址为baseUrl后接`/chat/completions`。保存不发请求，测试仅使用已保存配置；修改目标地址/协议/provider须新密钥，改模型可保留同通道密钥。
 - URL只允许HTTPS或本机HTTP，拒绝账号密码、查询参数、片段、空白；请求不重定向、不跨域转发认证、不回退其他模型。专用CodingPlan地址即使标为custom也保留用途门槛。密钥只存本应用目标origin+协议+运行目录命名空间的Keychain项。
-- `get_ui_preferences()`与`save_ui_preferences({fontSize})` → `{fontSize:number}`。默认16，12–24整数，独立本机偏好文件，不接收密钥字段。
+- `get_ui_preferences()`与`save_ui_preferences(...)`：独立本机偏好文件，不接收密钥字段；合并字段与范围见后表及 full-loop-v1。
 - `start_exploration({sectionId?:string,associateCurrentSection:boolean,fresh?:boolean})` → `{session,context,lastRunId?:string}`。true复用指定小节会话；false复用单个独立探索会话，`sectionId=""`、links=[]、associateCurrentSection=false、contextManifest=[]。不读取当前小节、选句或其历史，也不改当前阅读位置。
 - `load_session_context({sessionId,selection?:string})` → Context。与生成共用真实上下文计算；独立会话收到非空selection会报错，不静默带入。生成时把实际manifest写回session；UI不能把首次启动的旧清单当作当前来源。
 - `exploration:<sessionId>`草稿key准许，字段仍仅body/question/importTitle/importBody；与其他草稿同样要求先读成功、按version保存。独立提问应放question，不含key。
@@ -111,8 +111,8 @@ Tauri devUrl约定 `http://127.0.0.1:1420`，release嵌入 `dist/`。命令snake
 | `set_model({model})` | 只改当前已保存binding模型ID，0网络、0Keychain读写。地址/协议/provider不变；改名取消verified，未改名no-op。生成queued/running时BUSY；无配置NOT_CONFIGURED；无效模型INVALID_MODEL_SETTINGS。新run捕获独立配置快照。 |
 | `start_generation({...userEntryId?})` | 可复用同会话已保存、kind=user且正文/selection一致的entry，不再次append。Run额外`userEntryId`、`toolCalls`（旧文件默认空）。同requestId+同内容返回原run，变内容CONFLICT；未知结果先get_run，同ID不自动另发。确认终态失败后新重试用新operationId、同userEntryId。 |
 | `append_entry` | 发送原问题data可含`{clientMessageId:sendId,mode}`；同requestId幂等，expectedVersion防覆盖。未配置/gate前置失败不假送达；本地append成功与模型失败分开显示，失败不覆盖后来输入的新草稿。 |
-| `get_ui_preferences` | `{fontSize,assistantWidth}`。字号12–24默认16；宽度280–960整数默认346。 |
-| `save_ui_preferences({fontSize?,assistantWidth?})` | 原子串行合并，缺省字段保持，两个都缺省只读；旧font-only文件补宽度默认值。非法值不写盘。小窗口只夹紧实际渲染宽度，不改存储偏好。 |
+| `get_ui_preferences` | `{fontSize,assistantWidth,sidebarWidth,sidebarCollapsed,expandedNodeIds}`。字号12–24默认16；右宽280–960默认346；左宽180–480默认240；折叠默认false、展开ID默认[]。 |
+| `save_ui_preferences({fontSize?,assistantWidth?,sidebarWidth?,sidebarCollapsed?,expandedNodeIds?})` | 同一锁内原子合并，缺省字段保持，全部缺省只读；旧文件缺字段时补默认。非法值不写盘。小窗口只夹紧实际渲染宽度，折叠不覆盖宽度偏好。 |
 | `check_feishu_status()` | `{ready,reason}`，只读已验证本人通道，不登录、不发送、不返回凭据或收件人参数。 |
 | `test_feishu_notification({requestId})` | `{status:sent|blocked|failed|unknown,messageId:string|null,reason}`。ID为8–128字母数字/下划线/连字符；正文固定测试通知，用户点击才发。发前私有原子Unknown占位；同ID重开/超时均不重发；仅真实成功+messageId才sent。不会启用全部提醒。 |
 

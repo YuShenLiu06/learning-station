@@ -450,6 +450,7 @@ async fn save_ui_preferences(
     assistant_width: Option<u16>,
     sidebar_collapsed: Option<bool>,
     expanded_node_ids: Option<Vec<String>>,
+    sidebar_width: Option<u16>,
 ) -> Result<UiPreferences> {
     work(state.inner().clone(), move |e| {
         e.patch_all_ui_preferences(
@@ -457,6 +458,7 @@ async fn save_ui_preferences(
             assistant_width,
             sidebar_collapsed,
             expanded_node_ids,
+            sidebar_width,
         )
     })
     .await

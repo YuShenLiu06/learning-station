@@ -41,6 +41,8 @@ pub struct UiPreferences {
     pub font_size: u8,
     #[serde(default = "default_assistant_width")]
     pub assistant_width: u16,
+    #[serde(default = "default_sidebar_width")]
+    pub sidebar_width: u16,
     #[serde(default)]
     pub sidebar_collapsed: bool,
     #[serde(default)]
@@ -51,6 +53,7 @@ impl Default for UiPreferences {
         Self {
             font_size: 16,
             assistant_width: default_assistant_width(),
+            sidebar_width: default_sidebar_width(),
             sidebar_collapsed: false,
             expanded_node_ids: vec![],
         }
@@ -58,6 +61,9 @@ impl Default for UiPreferences {
 }
 fn default_assistant_width() -> u16 {
     346
+}
+fn default_sidebar_width() -> u16 {
+    240
 }
 static UI_PREFERENCE_WRITE: Mutex<()> = Mutex::new(());
 impl UiPreferences {
@@ -72,6 +78,12 @@ impl UiPreferences {
             return Err(CoreError::new(
                 "INVALID_INPUT",
                 "助教栏宽度请选择280至960之间的整数。",
+            ));
+        }
+        if !(180..=480).contains(&self.sidebar_width) {
+            return Err(CoreError::new(
+                "INVALID_INPUT",
+                "目录栏宽度请选择180至480之间的整数。",
             ));
         }
         if self.expanded_node_ids.len() > 4096
@@ -209,7 +221,7 @@ impl Engine {
         font_size: Option<u8>,
         assistant_width: Option<u16>,
     ) -> Result<UiPreferences> {
-        self.patch_all_ui_preferences(font_size, assistant_width, None, None)
+        self.patch_all_ui_preferences(font_size, assistant_width, None, None, None)
     }
     pub fn patch_all_ui_preferences(
         &self,
@@ -217,6 +229,7 @@ impl Engine {
         assistant_width: Option<u16>,
         sidebar_collapsed: Option<bool>,
         expanded_node_ids: Option<Vec<String>>,
+        sidebar_width: Option<u16>,
     ) -> Result<UiPreferences> {
         let _guard = UI_PREFERENCE_WRITE
             .lock()
@@ -226,6 +239,7 @@ impl Engine {
             && assistant_width.is_none()
             && sidebar_collapsed.is_none()
             && expanded_node_ids.is_none()
+            && sidebar_width.is_none()
         {
             return Ok(value);
         }
@@ -234,6 +248,9 @@ impl Engine {
         }
         if let Some(width) = assistant_width {
             value.assistant_width = width;
+        }
+        if let Some(width) = sidebar_width {
+            value.sidebar_width = width;
         }
         if let Some(collapsed) = sidebar_collapsed {
             value.sidebar_collapsed = collapsed;
@@ -1011,6 +1028,7 @@ mod navigation_preferences_tests {
                 None,
                 Some(true),
                 Some(vec!["course_a".into(), "folder_b".into()]),
+                None,
             )
             .unwrap();
         engine.patch_ui_preferences(Some(20), None).unwrap();
@@ -1021,9 +1039,55 @@ mod navigation_preferences_tests {
         assert_eq!(saved.expanded_node_ids.len(), 2);
         let before = fs::read(state.join("ui-preferences.json")).unwrap();
         assert!(engine
-            .patch_all_ui_preferences(None, None, None, Some(vec!["../bad".into()]))
+            .patch_all_ui_preferences(None, None, None, Some(vec!["../bad".into()]), None)
             .is_err());
         assert_eq!(before, fs::read(state.join("ui-preferences.json")).unwrap());
+        drop(engine);
+        assert_eq!(
+            Engine::new(library, state)
+                .unwrap()
+                .ui_preferences()
+                .unwrap(),
+            saved
+        );
+    }
+}
+
+#[cfg(test)]
+mod sidebar_width_tests {
+    use super::*;
+    #[test]
+    fn sidebar_width_defaults_and_independent_patches_keep_old_preferences() {
+        let temp = tempfile::tempdir().unwrap();
+        let library = temp.path().join("library");
+        let state = temp.path().join("state");
+        let engine = Engine::new(library.clone(), state.clone()).unwrap();
+        fs::write(state.join("ui-preferences.json"),
+            r#"{"fontSize":18,"assistantWidth":420,"sidebarCollapsed":true,"expandedNodeIds":["folder_a"]}"#).unwrap();
+        assert_eq!(engine.ui_preferences().unwrap().sidebar_width, 240);
+        let a = engine.clone();
+        let b = engine.clone();
+        let font = std::thread::spawn(move || a.patch_ui_preferences(Some(20), None).unwrap());
+        let width = std::thread::spawn(move || {
+            b.patch_all_ui_preferences(None, None, None, None, Some(360))
+                .unwrap()
+        });
+        font.join().unwrap();
+        width.join().unwrap();
+        let saved = engine.ui_preferences().unwrap();
+        assert_eq!(saved.sidebar_width, 360);
+        assert_eq!(saved.font_size, 20);
+        assert_eq!(saved.assistant_width, 420);
+        assert!(saved.sidebar_collapsed);
+        assert_eq!(saved.expanded_node_ids, vec!["folder_a"]);
+        let bytes = fs::read(state.join("ui-preferences.json")).unwrap();
+        for invalid in [179, 481] {
+            let error = engine
+                .patch_all_ui_preferences(None, None, None, None, Some(invalid))
+                .unwrap_err();
+            assert_eq!(error.code, "INVALID_INPUT");
+            assert_eq!(fs::read(state.join("ui-preferences.json")).unwrap(), bytes);
+        }
         drop(engine);
         assert_eq!(
             Engine::new(library, state)

@@ -62,7 +62,7 @@ AI仍只输出严格JSON：`{exercises:[{question,format:"exact"|"self",answers:
 
 ## 界面偏好与设置
 
-`get_ui_preferences`增加`sidebarCollapsed:boolean=false,expandedNodeIds:string[]=[]`；save命令两字段都可选，缺省保持原值，与fontSize/assistantWidth在同一锁下合并。expandedNodeIds最多4096个合法稳定ID。旧偏好自动默认，不重置字号/宽度。
+`get_ui_preferences`返回`fontSize,assistantWidth,sidebarWidth,sidebarCollapsed,expandedNodeIds`。`sidebarWidth`为180–480整数、默认240；`sidebarCollapsed=false,expandedNodeIds=[]`。save命令所有字段可选，缺省保持原值，在同一锁下原子合并；越界返回`INVALID_INPUT`且不写盘。expandedNodeIds最多4096个合法稳定ID。旧文件缺左宽时默认240，不重置其余偏好。折叠时显示64px图标栏且不拖动、不覆盖左宽；小窗口按正文最少350px与右栏实际宽度夹紧渲染，不回写宽度偏好。
 
 设置左分类右内容，仅已有供应商/外观/通知；切换保留未提交配置。主左栏可图标rail/完整树切换，选中/层级保留、tooltip+aria、reduced-motion；右侧拖宽保留，不恢复全展开。
 
