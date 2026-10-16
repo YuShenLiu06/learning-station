@@ -1,5 +1,7 @@
 import {resolveTimeContext,timeSystemContext} from './time-context.mjs';
 import { resolveLearningSkills } from './learning-skills.mjs';
+import {randomUUID} from 'node:crypto';
+import { openNativeSession } from './native-session.mjs';
 import { Agent } from '@earendil-works/pi-agent-core';
 import { streamSimple } from '@earendil-works/pi-ai/api/openai-completions';
 import { streamSimple as streamAnthropic } from '@earendil-works/pi-ai/api/anthropic-messages';
@@ -42,6 +44,9 @@ export const SAFE_MESSAGES = Object.freeze({
   TIME_CONTEXT_INVALID: '请求时间或时区无效，未发送模型请求。',
   SKILL_MISSING: '本次学习指导缺失，未发送模型请求。',
   SKILL_INVALID: '学习指导版本或模式校验失败，未发送模型请求。',
+  NATIVE_SESSION_INVALID: '原生会话缺失或损坏；旧学习记录仍保留，未创建空会话。',
+  NATIVE_SESSION_BUSY: '本学习会话仍有请求在执行，请稍后核对原请求。',
+  NATIVE_TOOL_UNKNOWN: '原工具调用回执尚未核实；未重复执行写入，请保留原请求编号。',
   PI_RUNTIME: 'Pi 运行环境不可用，请检查 Node 24 和学习站组件。',
 });
 export class SafeError extends Error {
@@ -238,15 +243,17 @@ export async function runLearningAgent(request, emit, { signal, streamFn: fixtur
   const history = prepareHistory(request.messages, request.operation, model);
   const glm = request.settings.provider !== 'custom';
   let agent;
+  let native;
+  const manifestWrites=[];
   let failure;
-  const fail = (code) => { failure ??= code; agent?.abort(); };
+  const fail = (code) => { failure ??= code; agent?.abort();native?.session.abortCompaction();void native?.session.abort().catch(()=>{}); };
   const policy = validateToolPolicy(request.toolPolicy, request.learningTools === true, request.operation);
   const skills = resolveLearningSkills(request.learningSkills, policy);
   const intentSystem=explorationSystem(request.explorationContext,policy.mode);
   const toolsEnabled = policy.allowedTools.length > 0 && request.learningTools === true && request.operation === 'generate' && typeof requestTool === 'function';
   if (policy.allowedTools.length > 0 && !toolsEnabled) throw new SafeError('TOOLS_DISABLED');
   const permitted = new Set(policy.allowedTools);
-  const plugin = toolsEnabled ? createLearningPlugin({ requestTool, secret: request.apiKey, fail, allowedTools: policy.allowedTools, maxCalls: policy.maxCalls, exerciseGuidance: skills.exerciseGuidance, timeContext }) : undefined;
+  const plugin = toolsEnabled ? createLearningPlugin({ requestTool:(...args)=>native?native.requestTool(...args):requestTool(...args), secret: request.apiKey, fail, allowedTools: policy.allowedTools, maxCalls: policy.maxCalls, exerciseGuidance: skills.exerciseGuidance, timeContext }) : undefined;
   const filtered = new SecretFilter(request.apiKey);
   let output = '';
   let rawOutput = '';
@@ -269,24 +276,24 @@ export async function runLearningAgent(request, emit, { signal, streamFn: fixtur
   };
   const controlledFetch = createControlledFetch({ endpoint: model.baseUrl, apiKey: request.apiKey, fail, protocol: model.api, diagnostic });
   const productionStream = (selectedModel, context, options) => (model.api === 'anthropic-messages' ? streamAnthropic : streamSimple)(selectedModel, context, {
-    ...options, maxTokens: model.maxTokens, apiKey: request.apiKey, fetch: controlledFetch, ...(glm ? { reasoning: 'max' } : {}),
+    ...options, maxTokens: Math.min(model.maxTokens,options?.maxTokens??model.maxTokens), apiKey: request.apiKey, fetch: controlledFetch, ...(glm ? { reasoning: 'max' } : {}),
     timeoutMs: request.operation === 'test' ? 30_000 : 120_000, maxRetries: 0, maxRetryDelayMs: 1,
-    cacheRetention: 'none', env: {}, toolChoice: toolsEnabled ? 'auto' : 'none', temperature: 1,
+    cacheRetention: 'none', env: {}, toolChoice: toolsEnabled && (!request.nativeSession || options?.sessionId===native?.manager.getSessionId()) ? 'auto' : 'none', temperature: 1,
     ...(glm ? { samplingParams: { top_p: 0.95, thinking: { type: 'enabled', clear_thinking: false }, reasoning_effort: 'max' } } : {}),
     onPayload: (payload) => {
       // Pin invariants after the provider's compat mapping, before any request is sent.
       payload.model = model.id; payload.stream = true;
-      payload.max_tokens = model.maxTokens; delete payload.max_completion_tokens;
+      payload.max_tokens = Math.min(model.maxTokens,options?.maxTokens??model.maxTokens); delete payload.max_completion_tokens;
       diagnostic.begin(model.baseUrl, payload.max_tokens ?? payload.max_completion_tokens ?? model.maxTokens);
       if (glm) { payload.thinking = { type: 'enabled', clear_thinking: false }; payload.reasoning_effort = 'max'; }
       else { delete payload.thinking; delete payload.reasoning_effort; delete payload.tool_stream; }
-      if (!toolsEnabled) { delete payload.tools; delete payload.tool_choice; delete payload.tool_stream; }
+      if (!toolsEnabled || (request.nativeSession && options?.sessionId!==native?.manager.getSessionId())) { delete payload.tools; delete payload.tool_choice; delete payload.tool_stream; }
       else if (payload.tools?.some((tool) => !permitted.has(model.api === 'anthropic-messages' ? tool.name : tool.function?.name))) { fail('TOOLS_DISABLED'); throw new SafeError('TOOLS_DISABLED'); }
       return payload;
     },
     onProviderStreamEvent: chunk => { diagnostic.chunk(chunk); if (diagnostic.snapshot().invalidDelta) { fail('MODEL_FORMAT'); throw new SafeError('MODEL_FORMAT'); } },
   });
-  agent = new Agent({
+  const agentOptions = {
     initialState: { systemPrompt: (request.operation === 'test' ? 'You are a connection test. Reply only with OK. Tools are disabled.' : policy.mode === 'grading' ? GRADING_SYSTEM : policy.mode === 'feedback' ? FEEDBACK_SYSTEM : plugin ? `${FIXED_SYSTEM}\n当前模式：${policy.mode}。已注册工具仅${policy.allowedTools.join('、')}。写入必须依据用户明确请求；AI整理的疑问和错因均待本人确认。` : `${FIXED_SYSTEM}\n本次没有注册工具，禁止请求任何工具。`) + (skills.system ? `\n\n${skills.system}` : '') + `\n\n${timeSystemContext(timeContext)}` + intentSystem,
       model, thinkingLevel: glm ? 'max' : 'off', tools: plugin?.tools ?? [], messages: history.slice(0, -1) },
     streamFn: fixtureStream ?? productionStream,
@@ -298,7 +305,12 @@ export async function runLearningAgent(request, emit, { signal, streamFn: fixtur
       catch (error) { fail(error.code ?? 'TOOL_PROTOCOL'); return { block: true, reason: 'Learning tool request blocked.', terminate: true }; }
     },
     finishTurn: async ({ message }) => policy.mode !== 'feedback' && !failure && message.content.some((part) => part.type === 'toolCall') ? undefined : { action: 'end' },
-  });
+  };
+  if(request.nativeSession && request.operation==='generate'){
+    const systemPrompt=agentOptions.initialState.systemPrompt;
+    native=await openNativeSession(request.nativeSession,{model,systemPrompt,tools:plugin?.tools??[],streamFn:agentOptions.streamFn,apiKey:request.apiKey,thinkingLevel:glm?'max':'off',beforeToolCall:agentOptions.beforeToolCall,finishTurn:agentOptions.finishTurn,requestTool,checkpoint:async()=>{const reply=await requestTool({type:'session_sync',id:'sync_'+randomUUID()});if(reply?.result?.synced!==true)throw new SafeError('NATIVE_SESSION_INVALID');},onManifest:manifest=>{const write=emit({type:'context_manifest',manifest});manifestWrites.push(write);return write;},onLifecycle:event=>{const write=emit({type:'session_lifecycle',event:event.type,reason:event.reason,aborted:event.aborted});manifestWrites.push(write);return write;}});
+    agent=native.agent;
+  }else agent=new Agent(agentOptions);
   const unsubscribe = agent.subscribe(async (event) => {
     if (event.type === 'message_start' && event.message.role === 'assistant') {
       currentText = '';
@@ -339,8 +351,14 @@ export async function runLearningAgent(request, emit, { signal, streamFn: fixtur
   try {
     if (signal?.aborted) throw new SafeError('CANCELLED');
     await onAgent?.(agent);
-    await emit({ type: 'ready', harness: HARNESS, version: PI_VERSION, plugins: plugin ? [{ id: plugin.id, version: plugin.version, tools: policy.allowedTools }] : [], learningSkills: skills.versions, timeContext });
-    await agent.prompt(history.at(-1));
+    await emit({ type: 'ready', ...(native?{nativeSession:{version:PI_VERSION,engine:'pi-coding-agent',persistent:true,learningSessionId:request.nativeSession.learningSessionId}}:{}), harness: HARNESS, version: PI_VERSION, plugins: plugin ? [{ id: plugin.id, version: plugin.version, tools: policy.allowedTools }] : [], learningSkills: skills.versions, timeContext });
+    if(native){
+      let envelope;try{envelope=JSON.parse(history.at(-1).content);}catch{throw new SafeError('INVALID_INPUT');}
+      if(typeof envelope.question!=='string')throw new SafeError('INVALID_INPUT');
+      await native.applyContext(envelope);
+      const outcome=await native.prompt(envelope.question);
+      if(outcome.cached){await sendText(outcome.cached);await Promise.all(manifestWrites);await emit({type:'done',settled:true,stopReason:'stop',outputBytes:Buffer.byteLength(output),finalContent:outcome.cached,toolCalls:0,cached:true,diagnostic:diagnostic.snapshot()});return {output:outcome.cached,partialOutput:output,settled:true};}
+    }else await agent.prompt(history.at(-1));
     await agent.waitForIdle();
     if (signal?.aborted) fail('CANCELLED');
     if (failure) throw new SafeError(failure);
@@ -352,15 +370,18 @@ export async function runLearningAgent(request, emit, { signal, streamFn: fixtur
     if (!output.trim()) throw new SafeError('MODEL_RESPONSE');
     const finalContent = finalText.replaceAll(request.apiKey, '[REDACTED]');
     if (Buffer.byteLength(finalContent) > MAX_OUTPUT) throw new SafeError('OUTPUT_LIMIT');
+    await native?.complete(finalContent);
+    await Promise.all(manifestWrites);
     await emit({ type: 'done', settled: true, stopReason: 'stop', outputBytes: Buffer.byteLength(output), finalContent, toolCalls: plugin?.stats().executed ?? 0, diagnostic: diagnostic.snapshot() });
     return { output: finalContent, partialOutput: output, settled: true };
   } catch (error) {
     agent.abort();
     await agent.waitForIdle();
     await sendText(filtered.abort());
-    throw new SafeError(failure ?? (error instanceof SafeError ? error.code : responseFailureCode(diagnostic.snapshot())), diagnostic.snapshot());
+    throw new SafeError(failure ?? (Object.hasOwn(SAFE_MESSAGES,error?.code)?error.code:responseFailureCode(diagnostic.snapshot())), diagnostic.snapshot());
   } finally {
+    native?.close();
     unsubscribe(); signal?.removeEventListener('abort', abort);
-    request.apiKey = ''; // No filesystem/session persistence; terminate this process after one request.
+    request.apiKey = ''; // Credentials never enter native session storage; process still ends after one run.
   }
 }

@@ -86,6 +86,8 @@ fn validate_stored(data: &Value, manifest: &[ManifestItem], legacy: bool) -> Res
             "sourceDocumentId",
             "requirements",
             "manual",
+            "businessUserEntryId",
+            "toolArgumentsHash",
         ]
     } else {
         &[
@@ -96,6 +98,8 @@ fn validate_stored(data: &Value, manifest: &[ManifestItem], legacy: bool) -> Res
             "runId",
             "sourceDocumentId",
             "requirements",
+            "businessUserEntryId",
+            "toolArgumentsHash",
         ]
     };
     known(data, fields)?;

@@ -92,7 +92,7 @@ impl ContextBridge {
         ctx: &Context,
     ) -> Result<Prepared> {
         automatic_context::verify_snapshot(store, ctx)?;
-        Ok(automatic_context::prepare(state, session, ctx))
+        Ok(automatic_context::prepare_native(state, session, ctx))
     }
     pub fn freeze(
         request: &GenerationRequest,
@@ -103,13 +103,14 @@ impl ContextBridge {
         time: TimeContext,
     ) -> Result<FrozenPrompt> {
         time.validate()?;
-        let legacy = crate::generation::messages_with_intent(request, ctx, session, intent);
+        let legacy = crate::generation::messages_current(request, ctx, session, intent);
         let raw = legacy
             .last()
             .and_then(|m| m["content"].as_str())
             .unwrap_or_default();
         let mut metadata: serde_json::Map<String, Value> = serde_json::from_str(raw)?;
-        let history = metadata.remove("learningHistory").unwrap_or(json!([]));
+        metadata.remove("learningHistory");
+        metadata.remove("historyManifest");
         metadata.remove("context");
         metadata.remove("userGoal");
         let question = metadata.remove("question").unwrap_or(json!(""));
@@ -123,12 +124,6 @@ impl ContextBridge {
                 value: json!({"type":"learning_request","materialRole":"user-reference","projectionVersion":1}),
             },
             PromptPart {
-                key: "learningHistory",
-                lifetime: Lifetime::Turn,
-                position: Position::History,
-                value: history,
-            },
-            PromptPart {
                 key: "materials",
                 lifetime: Lifetime::Versioned,
                 position: Position::Materials,
@@ -138,7 +133,7 @@ impl ContextBridge {
                 key: "references",
                 lifetime: Lifetime::OneShot,
                 position: Position::References,
-                value: json!(references),
+                value: json!(references.clone()),
             },
             PromptPart {
                 key: "turn",
@@ -156,7 +151,6 @@ impl ContextBridge {
             store.add(&part)?;
         }
         let mut entries = projection.manifest_entries(ctx);
-        entries.extend(ctx.history_manifest.iter().map(|m|json!({"id":format!("history:{}",m.id),"kind":"history","status":"retained","sourceId":m.id,"version":m.version,"includedChars":m.included_chars,"reason":"bounded_effective_history"})));
         let auto_ids = ctx
             .automatic_materials
             .iter()
@@ -184,9 +178,11 @@ impl ContextBridge {
             .rfind(",\"question\":")
             .ok_or_else(|| CoreError::new("INVALID_STATE", "本轮问题位置无效。"))?;
         let actual = format!(
-            "{},\"contextBridgeManifest\":{}{}",
+            "{},\"contextBridgeManifest\":{},\"nativeMaterials\":{},\"nativeReferences\":{}{}",
             &content[..at],
             serde_json::to_string(&manifest)?,
+            serde_json::to_string(&projection.native_materials(ctx))?,
+            serde_json::to_string(&references)?,
             &content[at..]
         );
         if actual.len() > 2 * 1024 * 1024 {
@@ -257,9 +253,26 @@ impl ContextBridge {
         }
         let metadata = serde_json::to_string(&metadata)?;
         let inside = &metadata[1..metadata.len() - 1];
-        let text=format!("{{\"learningHistory\":{},\"context\":{},{},\"automaticProjection\":{},\"turnState\":{},\"question\":{}}}",
-            serde_json::to_string(&history)?,serde_json::to_string(&context)?,inside,
-            serde_json::to_string(&self.parts.get("turn").map(|p|p.value["automaticProjection"].clone()).unwrap_or(Value::Null))?,serde_json::to_string(&states)?,serde_json::to_string(&question)?);
+        let history_field = if history.is_empty() {
+            String::new()
+        } else {
+            format!("\"learningHistory\":{},", serde_json::to_string(&history)?)
+        };
+        let text = format!(
+            "{{{}\"context\":{},{},\"automaticProjection\":{},\"turnState\":{},\"question\":{}}}",
+            history_field,
+            serde_json::to_string(&context)?,
+            inside,
+            serde_json::to_string(
+                &self
+                    .parts
+                    .get("turn")
+                    .map(|p| p.value["automaticProjection"].clone())
+                    .unwrap_or(Value::Null)
+            )?,
+            serde_json::to_string(&states)?,
+            serde_json::to_string(&question)?
+        );
         if text.len() > 2 * 1024 * 1024 {
             return Err(CoreError::new("LIMIT_EXCEEDED", "模型上下文超过传输预算。"));
         }

@@ -131,6 +131,19 @@ impl Ledger {
         })
     }
 
+    /// Read-only receipt lookup for an interrupted native tool call. Never creates a todo.
+    pub fn lookup_todo_request(&self, request_id: &str) -> Result<Option<Todo>> {
+        let connection = self.lock()?;
+        let id: Option<String> = connection
+            .query_row(
+                "SELECT todo_id FROM reminder_requests WHERE request_id=?1",
+                [request_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(storage_error)?;
+        id.map(|id| get_todo(&connection, &id)).transpose()
+    }
     pub fn create_todo(
         &self,
         title: &str,

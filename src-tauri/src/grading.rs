@@ -477,6 +477,9 @@ pub async fn start(
                 },
                 vec![],
                 Some(model::RequestContext {
+                    native_session: None,
+                    context_observer: None,
+                    tool_recovery: None,
                     time: time_context,
                     exploration: None,
                 }),

@@ -7,6 +7,8 @@
 修改上下文相关代码前先读 [ContextBridge 文档](docs/context-bridge.md)；行为变更须同步更新该文档、传输契约与必要回归。
 
 - Rust 管业务规则、共享上下文、持久化、权限、幂等回执与失败恢复；保持模块化单体和清晰接口。
+- 模型消息、工具消息、压缩与指定会话重开由 Pi SessionManager/AgentSession 管理；Rust 仅保存业务记录、准确映射、授权及回执，不再把裁剪业务历史拼进 user JSON。
+- 修改原生会话前读 [会话契约](contracts/pi-native-session-v1.md)；不得使用 continueRecent、全局 Pi 凭据或默认资源发现，缺失映射/原会话必须先报错。
 - Pi 按学习模式开放工具白名单；参数和结果由 Rust 校验，模型不能直接获得任意文件或代码执行能力。
 - React 管界面与交互，经明确 IPC 调用业务；不另造业务存储，不在前端持久化密钥。
 

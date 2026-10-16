@@ -173,7 +173,7 @@ async fn context_bridge_real_pi_wire_replays_full_diff_once_per_tool_loop_and_fa
         .unwrap();
         let sent = frozen.messages[0]["content"].as_str().unwrap();
         let json: Value = serde_json::from_str(sent).unwrap();
-        assert!(sent.find("\"learningHistory\"").unwrap() < sent.find("\"context\"").unwrap());
+        assert!(json.get("learningHistory").is_none());
         assert!(sent.find("\"context\"").unwrap() < sent.rfind("\"question\"").unwrap());
         assert_eq!(json["contextBridgeManifest"], frozen.manifest);
         assert_eq!(json["manifest"], json!(ctx.manifest));
@@ -234,6 +234,9 @@ async fn context_bridge_real_pi_wire_replays_full_diff_once_per_tool_loop_and_fa
             crate::learning_skills::capture("question", &["query_related_knowledge".into()])
                 .unwrap(),
             Some(RequestContext {
+                native_session: None,
+                context_observer: None,
+                tool_recovery: None,
                 time: frozen.time,
                 exploration: None,
             }),

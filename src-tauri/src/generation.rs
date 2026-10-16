@@ -294,7 +294,9 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
             &request.assistant_references,
             &request.exercise_references,
         )?;
-        context::attach_history(&mut ctx, &session, request.user_entry_id.as_deref());
+        // Native Pi owns model history. Rust retains business records without clipping them into the prompt.
+        ctx.history_manifest.clear();
+        ctx.warnings.retain(|w| !w.starts_with("TRUNCATED_HISTORY"));
         let projection = crate::context_bridge::ContextBridge::snapshot(
             &core.state_dir,
             &core.content,
@@ -346,6 +348,24 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
         time_context.clone(),
     )?;
     let messages = frozen_prompt.messages;
+    let native_user_id = request
+        .user_entry_id
+        .clone()
+        .unwrap_or_else(|| format!("entry_{}", &hash(&format!("{id}-user"))[..32]));
+    let native_session = {
+        let core = engine.lock()?;
+        let markdown = core.content.read(&session.id)?.content;
+        crate::native_session::prepare(
+            &core.state_dir,
+            &session,
+            &id,
+            &native_user_id,
+            ctx.manifest.iter().map(|m| m.id.clone()).collect(),
+            context::history_is_protected(&ctx),
+            native_legacy_records(&session, Some(&native_user_id)),
+            &markdown,
+        )?
+    };
     let credentials = model_store.credentials()?;
     let stamp = timestamp();
     let run = Run {
@@ -362,7 +382,7 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
         assistant_references: request.assistant_references.clone(),
         injections: request.injections.clone(),
         context_manifest: ctx.manifest.clone(),
-        context_bridge_manifest: Some(frozen_prompt.manifest.clone()),
+        context_bridge_manifest: None, // Filled only after Pi projects the actual native context.
         exercise_reference_manifest: Some(ctx.exercise_reference_manifest.clone()),
         assistant_reference_manifest: Some(ctx.assistant_reference_manifest.clone()),
         history_manifest: ctx.history_manifest.clone(),
@@ -464,6 +484,39 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
             Some(model::RequestContext {
                 time: frozen_prompt.time,
                 exploration: exploration_context,
+                native_session: Some(native_session),
+                tool_recovery: Some({
+                    let engine = engine.clone();
+                    let sid = session.id.clone();
+                    Arc::new(move |original: String, call: model::ToolCall| {
+                        let engine = engine.clone();
+                        let sid = sid.clone();
+                        Box::pin(async move {
+                            tokio::task::spawn_blocking(move || {
+                                crate::native_session::recover(&engine, &sid, &original, &call)
+                            })
+                            .await
+                            .map_err(|_| {
+                                CoreError::new("NATIVE_TOOL_UNKNOWN", "工具回执读取中断。")
+                            })?
+                        })
+                    })
+                }),
+                context_observer: Some({
+                    let engine = engine.clone();
+                    let id = id.clone();
+                    Arc::new(move |manifest: Value| {
+                        let mut runs = engine
+                            .runs
+                            .lock()
+                            .map_err(|_| CoreError::new("BUSY", "来源快照暂不可写。"))?;
+                        let managed = runs
+                            .get_mut(&id)
+                            .ok_or_else(|| CoreError::new("NOT_FOUND", "生成记录不存在。"))?;
+                        managed.run.context_bridge_manifest = Some(manifest);
+                        persist(&engine, &managed.run)
+                    })
+                }),
             }),
         )
         .await;
@@ -487,7 +540,7 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
                     if let Ok(core) = engine.lock() {
                         let anchor = format!("entry_{}", &hash(&format!("{id}-output"))[..32]);
                         // Optimization failure never discards a saved learning answer.
-                        let _ = projection.commit(&core.state_dir, &saved, &anchor);
+                        let _ = projection.commit_native(&core.state_dir, &saved, &anchor);
                     }
                     text
                 })
@@ -524,7 +577,7 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
     Ok(returned)
 }
 
-fn task_tool_policy(mode: &str) -> model::ToolPolicy {
+pub(crate) fn task_tool_policy(mode: &str) -> model::ToolPolicy {
     let (names, max_calls): (&[&str], usize) = match mode {
         "question" => (
             &[
@@ -840,6 +893,7 @@ pub fn history_warnings(session: &Session) -> Vec<String> {
 fn messages(request: &GenerationRequest, ctx: &Context, session: &Session) -> Vec<Value> {
     messages_with_intent(request, ctx, session, None)
 }
+#[cfg(test)]
 pub(crate) fn messages_with_intent(
     request: &GenerationRequest,
     ctx: &Context,
@@ -875,6 +929,21 @@ pub(crate) fn messages_with_intent(
         json!({"role":"system","content":format!("{rules}\n{task}")}),
         json!({"role":"user","content":serde_json::to_string(&json!({"type":"learning_request","explorationContext":intent,"userGoal":request.prompt,"context":ctx.text,"manifest":ctx.manifest,"historyManifest":history_manifest,"assistantReferenceManifest":ctx.assistant_reference_manifest,"exerciseReferenceManifest":ctx.exercise_reference_manifest,"warnings":warnings,"learningHistory":history,"selectedText":request.selection,"question":if request.prompt.trim().is_empty(){default_request(&request.mode)}else{&request.prompt},"mode":request.mode})).unwrap_or_default()}),
     ]
+}
+
+pub(crate) fn messages_current(
+    request: &GenerationRequest,
+    ctx: &Context,
+    session: &Session,
+    intent: Option<&crate::exploration::ExplorationContext>,
+) -> Vec<Value> {
+    let _ = session;
+    vec![
+        json!({"role":"user","content":serde_json::to_string(&json!({"type":"learning_request","explorationContext":intent,"context":ctx.text,"manifest":ctx.manifest,"assistantReferenceManifest":ctx.assistant_reference_manifest,"exerciseReferenceManifest":ctx.exercise_reference_manifest,"warnings":ctx.warnings.iter().filter(|w|!w.starts_with("TRUNCATED_HISTORY")).collect::<Vec<_>>(),"selectedText":request.selection,"question":if request.prompt.trim().is_empty(){default_request(&request.mode)}else{&request.prompt},"mode":request.mode})).unwrap_or_default()}),
+    ]
+}
+fn native_legacy_records(session: &Session, exclude: Option<&str>) -> Vec<Value> {
+    session.entries.iter().filter(|e|included_history(e,exclude)).map(|entry|json!({"id":entry.id,"kind":entry.kind,"origin":history_origin(entry),"content":if entry.kind=="exercise"{exercise_history(entry)}else{entry.content.clone()},"isUserStatement":entry.kind=="user","notice":"旧业务记录引用，未还原缺失工具消息"})).collect()
 }
 
 fn practice(text: &str, manifest: &[ManifestItem], run_id: &str) -> Result<Value> {

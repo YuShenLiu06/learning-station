@@ -83,6 +83,39 @@ enum Operation {
     Exercises(Value),
 }
 
+/// A model can retry a write with a new run/call ID after interruption. Anchor
+/// current writes to the real saved question and exact arguments instead. Old
+/// runs without a user binding retain their original operation IDs.
+pub(crate) fn operation_id(
+    engine: &Engine,
+    scope: &ToolScope,
+    call_id: &str,
+    name: &str,
+    args: &Value,
+) -> Result<(String, Option<String>)> {
+    let user = match crate::generation::get(engine, &scope.run_id) {
+        Ok(run) => {
+            if run.session_id != scope.session_id {
+                return Err(out_of_scope());
+            }
+            run.user_entry_id
+        }
+        Err(error) if error.code == "NOT_FOUND" => None,
+        Err(error) => return Err(error),
+    };
+    let digest = match &user {
+        Some(user) => hash(&serde_json::to_string(&json!([
+            "saved-question-v1",
+            scope.session_id,
+            user,
+            name,
+            args
+        ]))?),
+        None => hash(&serde_json::to_string(&(&scope.run_id, call_id))?),
+    };
+    Ok((format!("pi_tool_{digest}"), user))
+}
+
 /// Synchronous local execution: the caller may put this on spawn_blocking. No
 /// network or model lock is used; the core lock covers only the bounded local IO.
 pub fn execute(
@@ -96,6 +129,8 @@ pub fn execute(
     if serde_json::to_vec(&args)?.len() > MAX_TOOL_INPUT_BYTES {
         return Err(limit());
     }
+    let arguments_hash = hash(&serde_json::to_string(&args)?);
+    let (request_id, business_user) = operation_id(engine, scope, call_id, name, &args)?;
     let operation = match name {
         "generate_exercises" => {
             let object = args.as_object().ok_or_else(invalid)?;
@@ -244,12 +279,48 @@ pub fn execute(
     if let Operation::Query(query) = operation {
         return query_knowledge(&core.content, scope, query);
     }
-    // A model call ID is opaque. Only its hash participates in the deterministic
-    // request ID; it never becomes a filename or a relative path.
-    let request_id = format!(
-        "pi_tool_{}",
-        hash(&serde_json::to_string(&(&scope.run_id, call_id))?)
-    );
+    if let Some(user) = &business_user {
+        if !session
+            .entries
+            .iter()
+            .any(|e| e.id == *user && e.kind == "user")
+        {
+            return Err(out_of_scope());
+        }
+        let entry_id = format!("entry_{}", &hash(&request_id)[..32]);
+        if let Some(previous) = session.entries.iter().find(|e| e.id == entry_id) {
+            let data = previous.data.as_ref().ok_or_else(out_of_scope)?;
+            if data["businessUserEntryId"].as_str() != Some(user.as_str())
+                || data["toolArgumentsHash"].as_str() != Some(arguments_hash.as_str())
+            {
+                return Err(CoreError::new(
+                    "CONFLICT",
+                    "原工具记录与本次参数不一致，未重复写入。",
+                ));
+            }
+            if name == "generate_exercises" {
+                let document = crate::exercises::create(
+                    &mut core.content,
+                    &session.id,
+                    &session.section_id,
+                    data.clone(),
+                    &request_id,
+                )?;
+                return Ok(
+                    json!({"persisted":true,"documentId":document.id,"exerciseEntryId":entry_id,
+                    "sessionId":session.id,"sectionId":session.section_id,"replayed":true}),
+                );
+            }
+            let document = core.content.read(&entry_id)?;
+            let mut receipt = json!({"persisted":true,"entryId":entry_id,"sessionId":session.id,
+                "sectionId":session.section_id,"path":document.path,"needsConfirmation":true,
+                "kind":document.metadata.extra.get("entryKind"),"replayed":true});
+            if let Some(source) = data.get("sourceErrorId") {
+                receipt["existingErrorId"] = source.clone();
+            }
+            return Ok(receipt);
+        }
+    }
     if let Operation::Exercises(args) = &operation {
         if session.section_id.is_empty() {
             return Err(CoreError::new(
@@ -270,6 +341,10 @@ pub fn execute(
         data["runId"] = json!(scope.run_id);
         data["promptVersion"] = json!("learning-v2");
         data["requirements"] = args["requirements"].clone();
+        if let Some(user) = &business_user {
+            data["businessUserEntryId"] = json!(user);
+            data["toolArgumentsHash"] = json!(arguments_hash);
+        }
         let document = crate::exercises::create(
             &mut core.content,
             &session.id,
@@ -306,7 +381,7 @@ pub fn execute(
     };
     let entry_id = format!("entry_{}", &hash(&request_id)[..32]);
     let mut existing_error_id = None;
-    let entry = match operation {
+    let mut entry = match operation {
         Operation::Record(value) => Entry {
             id: String::new(),
             kind: "note".into(),
@@ -437,6 +512,11 @@ pub fn execute(
         }
         Operation::Query(_) | Operation::Todo(_) | Operation::Exercises(_) => unreachable!(),
     };
+    if let Some(user) = &business_user {
+        let data = entry.data.as_mut().ok_or_else(invalid)?;
+        data["businessUserEntryId"] = json!(user);
+        data["toolArgumentsHash"] = json!(arguments_hash);
+    }
     let saved = sessions::append(
         &mut core.content,
         &scope.session_id,

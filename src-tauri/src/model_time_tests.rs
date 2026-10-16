@@ -249,6 +249,9 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
             },
             skills.clone(),
             Some(RequestContext {
+                native_session: None,
+                context_observer: None,
+                tool_recovery: None,
                 time: clock.clone(),
                 exploration: Some(intent),
             }),

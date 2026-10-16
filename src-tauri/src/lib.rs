@@ -12,6 +12,7 @@ pub mod generation;
 pub mod learning_skills;
 pub mod learning_tools;
 pub mod model;
+pub mod native_session;
 pub mod reminders;
 pub mod sessions;
 pub mod time_context;

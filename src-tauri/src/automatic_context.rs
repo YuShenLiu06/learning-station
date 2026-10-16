@@ -175,13 +175,14 @@ fn ledger_path(state: &Path, session: &str, create: bool) -> Option<PathBuf> {
         _ => Some(path),
     }
 }
-fn load(state: &Path, session: &Session, ctx: &Context) -> Option<Ledger> {
+fn load(state: &Path, session: &Session, ctx: &Context, native: bool) -> Option<Ledger> {
     // A clipped/compacted history must not make a local-only baseline appear retained.
     if ctx.excluded_history_source_ids.len() > 0
-        || ctx
-            .warnings
-            .iter()
-            .any(|w| w.starts_with("TRUNCATED_HISTORY"))
+        || (!native
+            && ctx
+                .warnings
+                .iter()
+                .any(|w| w.starts_with("TRUNCATED_HISTORY")))
     {
         return None;
     }
@@ -202,12 +203,13 @@ fn load(state: &Path, session: &Session, ctx: &Context) -> Option<Ledger> {
     let anchor = ctx
         .history_manifest
         .iter()
-        .find(|m| m.id == saved.anchor_id)?;
+        .find(|m| m.id == saved.anchor_id);
     if saved.schema_version != 1
         || saved.session_id != session.id
         || saved.chains.len() > 32
         || prefix_hash(session, &saved.anchor_id)? != saved.prefix_hash
-        || anchor.version != saved.anchor_projection_hash
+        || (!native
+            && anchor.map(|a| a.version.as_str()) != Some(saved.anchor_projection_hash.as_str()))
     {
         return None;
     }
@@ -365,7 +367,13 @@ pub fn verify_snapshot(store: &ContentStore, ctx: &Context) -> Result<()> {
     Ok(())
 }
 pub fn prepare(state: &Path, session: &Session, ctx: &Context) -> Prepared {
-    let previous = load(state, session, ctx);
+    prepare_mode(state, session, ctx, false)
+}
+pub fn prepare_native(state: &Path, session: &Session, ctx: &Context) -> Prepared {
+    prepare_mode(state, session, ctx, true)
+}
+fn prepare_mode(state: &Path, session: &Session, ctx: &Context, native: bool) -> Prepared {
+    let previous = load(state, session, ctx, native);
     let mut bases: BTreeMap<String, Chain> = previous
         .into_iter()
         .flat_map(|l| l.chains)
@@ -447,6 +455,42 @@ pub fn prepare(state: &Path, session: &Session, ctx: &Context) -> Prepared {
 }
 impl Prepared {
     /// Separate versioned automatic documents from the existing one-shot material text.
+    pub fn native_materials(&self, ctx: &Context) -> Vec<Value> {
+        ctx.automatic_materials
+            .iter()
+            .enumerate()
+            .map(|(index, s)| {
+                let mut value: Value = self
+                    .chains
+                    .get(index)
+                    .and_then(|c| serde_json::from_str(&rendered(c)).ok())
+                    .unwrap_or(json!({"frames":[]}));
+                value["id"] = json!(s.id);
+                value["version"] = json!(s.version);
+                value["range"] = json!(s.range());
+                value["text"] = json!(s.text);
+                value["textHash"] = json!(hash(&s.text));
+                value
+            })
+            .collect()
+    }
+    pub fn commit_native(&self, state: &Path, session: &Session, anchor: &str) -> Result<()> {
+        let path = ledger_path(state, &session.id, true)
+            .ok_or_else(|| CoreError::new("IO", "资料投影基准不可保存。"))?;
+        let saved = Ledger {
+            schema_version: 1,
+            session_id: session.id.clone(),
+            anchor_id: anchor.into(),
+            prefix_hash: prefix_hash(session, anchor)
+                .ok_or_else(|| CoreError::new("INVALID_STATE", "资料锚点缺失。"))?,
+            anchor_projection_hash: String::new(),
+            chains: self.chains.clone(),
+        };
+        if serde_json::to_vec(&saved)?.len() as u64 <= MAX_LEDGER_BYTES {
+            atomic_json(&path, &saved)?;
+        }
+        Ok(())
+    }
     pub fn provider_texts(&self, ctx: &Context) -> Result<(String, String)> {
         let mut materials = String::new();
         let mut references = String::new();

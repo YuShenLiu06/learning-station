@@ -1,63 +1,60 @@
 # ContextBridge（上下文桥）
 
-修改上下文相关代码前先读本页；行为变更同步更新。字段形状见[传输契约](../contracts/context-bridge-v1.md)，测试和实际请求示例见[README](../README.md)。
+修改上下文相关代码前先读本页；行为变更同步文档、[清单契约](../contracts/context-bridge-v1.md)与[原生会话契约](../contracts/pi-native-session-v1.md)。
 
-## 职责与入口
+## 职责与实际调用
 
-业务模块核实会话、关联资料、显式引用及公开资格，提供已验证片段。`src-tauri/src/context_bridge.rs` 负责片段去重、位置、已有预算与清单；`automatic_context.rs` 负责自动资料的有界版本投影。薄层不执行工具、不开放路径或网络权限，也不管理第二套会话。
+Rust 核实资料授权、版本与显式引用；桥只冻结、去重、排列和限制片段。Pi 1.3.0 的 `SessionManager`/`AgentSession` 管模型消息、工具循环、压缩和指定文件恢复。Rust 的学习记录继续供界面、复习与回执使用，不再投影最近16条/单项5000/总计20000字符的历史到新 user JSON。
 
 ```mermaid
 flowchart LR
-  A[提交问题] -->|冻结授权状态与资料版本| B[各业务提供器]
-  B -->|已验证片段| C[ContextBridge]
-  C -->|有序 user 投影及同源清单| D[Pi Agent.prompt]
-  D -->|原生工具消息| E[Pi 工具循环]
-  E -->|沿用本轮冻结输入| D
-  D -->|答案结算且保存成功| F[提交资料基准]
+  A[提交问题] --> B[Rust冻结授权与资料版本]
+  B --> C[ContextBridge材料与本轮状态]
+  C --> D[指定原生会话文件]
+  D --> E[Pi实际上下文投影]
+  E --> F[普通用户问题与原生工具循环]
+  F --> G[Rust真实业务回执]
+  G --> F
+  F --> H[Pi持久消息与必要压缩]
 ```
 
-`generation::start` 在模型请求前调用 `ContextBridge::snapshot/freeze`。顺序为有效学习历史 → 自动资料基准/更新 → 一次性引用 → 本次状态 → 问题。桥接数据位于普通 `user` JSON；Pi harness 的固定规则与学习指导仍为 `system`，调用 `Agent.prompt(user)`。现有历史只投影学习记录，没有此前整份资料正文，因此重放链必须把真实正文基准一起送入本次请求。
+`generation::start` 调用 `snapshot/freeze`，私有 stdin 传递 `nativeMaterials`、`nativeReferences`、本轮元数据与问题。适配器把材料/本轮状态写为明确的不可信 custom message，把本次问题写为真实 user 消息。旧模型历史由 Pi 恢复，不在此 JSON 中重建角色。批改、连接测试等原有无历史单轮任务保持隔离。
 
-## 冻结与生命周期
+## 生命周期
 
-| 生命周期 | 当前内容与行为 |
+| 内容 | 行为 |
 |---|---|
-| Stable | 桥协议标签；Pi 固定规则仍在原 harness 组装 |
-| Turn | 可信时间、本次问题与探索目标；新用户回合冻结，工具后继续沿用 |
-| Versioned | 自动课程、关联资料、明确链接的文本附件；按已展示范围与版本判断更新 |
-| OneShot | 手动、AI 回答、练习分区引用；沿既有真实问题保存回执消费，失败重试用原快照 |
+| 固定规则与学习指导 | 应用提供；不加载全局 Pi 配置、外部扩展或默认编码工具 |
+| 时间、问题、探索目标 | 每个用户回合冻结；本轮工具续跑不重新读取用户状态 |
+| 自动课程、关联资料、文本附件 | 版本化材料；实际 Pi 投影仍有完整基准才沿用或追加 diff |
+| 手动、AI回答、练习分区引用 | 沿既有真实问题保存回执消费；模型失败重试使用原快照；旧 turn custom 通过原生 context edit 排除，不自动再注入 |
 
-Core 锁阻止应用内写入交错，并复核捕获的外部文件版本；这不是文件系统级事务快照。冻结后的新编辑只影响下一回合。Pi 工具循环不重新读取用户状态或重复追加资料。原始学习历史仍供界面展示，桥只改变模型投影。
+Core 锁覆盖应用写入并复核外部文件版本，不是多文件系统事务。冻结后新编辑属于下一回合。
 
-## 差异与正文重载
+## 基准与压缩
 
-按稳定 ID 去重，以路径、版本、展示文本哈希和实际范围建立基准。首次提供正文；有效基准仍随当前请求保留时，小改追加有界 unified diff，未变零新增。连续编辑只比较最后冻结版本。
+Rust 生成有界 full/diff 候选，并保留当前已授权的完整范围文本供重载。适配器检查 Pi `buildSessionProjection()` 中真实可见的 full→diff 哈希链：未变不新增；小改只在完整链仍在时追加；链缺失、部分范围、分支或压缩丢失 full 时重载正文。不能仅根据本机缓存存在就宣称模型仍有基准。
 
-只有历史锚点仍在有效历史、原分支前缀未变、基准链可校验且范围完整，才能沿用。历史裁剪、压缩边界、新会话、分支、基准缺失/损坏、diff 过大或链超预算均重载必要资料。部分文件明确标注前缀范围，保守重载；不把未展示部分当成已读。失败/取消不推进基准。基准写入失败不丢答案，下次退回正文。
+Pi 在已配置上下文容量时执行原生阈值压缩，通过同一受控模型/协议/凭据与输出预算产生摘要；摘要请求零工具、无自动换模型或服务。未知容量保持未知，不猜规格，不启用阈值压缩。新摘要完成后重新核验并补齐本轮必要材料。范围不完整时明确只含前缀；从未展示的尾部不算已读。
 
-主动 `query_related_knowledge` 保持原授权及范围内的实际正文片段和截断提示，不使用差异或缓存命中标记。当前没有通用路径 `read`；本版未新增该权限。时间和问题独立注入，不参与文件 diff。
+资料授权集合减少或回收历史保护触发时，使用明确的原生应用权限边界排除先前消息/摘要，再加入本轮授权资料。旧原始记录仍保留，未删除用户数据。主动 `query_related_knowledge` 仍返回授权范围内真实片段，不使用缓存标记代替读取。
 
-## 清单与扩展
+## 同源清单
 
-实际发送 JSON、Run 和每条 assistant 自身保存同一个 `contextBridgeManifest`。界面据此显示新增、沿用、更新、重载及部分范围。预览/旧记录缺字段时明确未记录，不能从最新 Session 补齐，也不表示服务端已读。
+Pi 确定实际材料投影后，把同一个 `contextBridgeManifest` 放进 turn custom message，并经私有管道交 Rust 写入 Run；答案保存时复制到该 assistant 自身。queued 初始值不冒充实际清单。界面不从最新 Session 回填旧回复，不新增路径打开。
 
-新增本轮状态时，业务模块先验证并冻结值，再在 `freeze` 的组装处加入一个提供器片段：
+此清单说明桥提供的资料/引用/状态，不是 Pi 全部原生历史消息目录，也不表示服务端已读或保证总 token 下降。预览或旧记录缺字段明确未记录。
 
-```rust
-store.add(&PromptPart {
-    key: "exam-state",
-    lifetime: Lifetime::Turn,
-    position: Position::State,
-    value: json!({"goal": frozen_goal}),
-})?;
-```
+## 持久化与失败恢复
 
-该扩展路径已有测试。相同 key 的相同值去重，冲突或超预算明确拒绝，不静默裁掉基准。片段内容仍是数据，不能成为工具授权。
+稳定学习会话 ID 映射到私有 `pi-native/<hash>/transcript.jsonl`，只打开该文件，不用 `continueRecent`。首次保留旧 Markdown 与结构化备份；旧记录以明确引用导入，不补造缺失工具调用。
 
-## 验证与限制
+Node 继续使用权限模式，只能读运行组件及读写当前私有会话目录，无 child-process 权限。Node 24 在该模式下禁止 fsync，因此关键检查点经私有 `session_sync` 交 Rust 同步文件和目录，收到确认后才继续模型请求、工具执行或完成回执。
 
-已运行 `automatic_context` 的首次/未变/小改/大改/部分范围/历史边界/分支/并发/去重/失败重试回归；`model_auto_context_tests.rs` 经真实 Rust→Pi→localhost 捕获请求及工具循环；前端用实际清单核对 reader，并测试 Run/历史隔离。不是原生 GUI 或真实在线模型验收。
+工具调用归属先持久化；Rust 业务提交后先保存完整回包日志再回复 Node。中断恢复先读原回包，缺失时只查询真实业务记录；无证据保持 unknown，绝不重做写操作。新业务操作 ID 绑定真实已保存问题、工具名与精确参数，因此同一问题恢复后即使换 run/call 编号，相同写入仍返回原对象；旧无问题绑定的记录保留原编号语义。映射/原生文件缺失、损坏、部分 JSON 行或符号链接均报错，旧 Markdown 不被覆盖。失败或取消不推进 Rust 资料基准。
 
-当前每次新建 Agent，无状态 API 仍需重发保留的基准。本轮新增字节可下降，实际总输入不保证下降；[README](../README.md)同时列出旧单份正文与新投影，token 仅以 UTF-8 bytes/4 示意。未假设 agent-core 自带 coding-agent 压缩生命周期，未新增自动 focus 或宽泛工具权限。
+## 验证边界
 
-设计参考 [pi-readcache](https://github.com/Gurpartap/pi-readcache) 的范围哈希、基准失效与差异回退思想；本项目独立实现有界 Rust 逻辑，未安装插件。保留[MIT 许可](../THIRD_PARTY_NOTICES/pi-readcache.txt)。
+[README](../README.md)区分实际锁版 SDK、Rust→受限 Node→Pi localhost、React/mock IPC 和包资源验证。没有新增原生 GUI、真实在线模型、Anki、飞书或鼠标/IME 验收。
+
+自动 focus、通用网络/文件/Bash 权限、HTML预览仍未新增。原版本投影参考保留 [pi-readcache MIT许可](../THIRD_PARTY_NOTICES/pi-readcache.txt)，未安装插件。

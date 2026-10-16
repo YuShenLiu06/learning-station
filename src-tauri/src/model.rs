@@ -741,16 +741,26 @@ pub async fn generate_with_tools(
     )
     .await
 }
+pub type ToolRecoveryHandler = Arc<
+    dyn Fn(String, ToolCall) -> Pin<Box<dyn Future<Output = Result<Value>> + Send>> + Send + Sync,
+>;
+pub type ContextObserver = Arc<dyn Fn(Value) -> Result<()> + Send + Sync>;
 #[derive(Clone)]
 pub struct RequestContext {
     pub time: crate::time_context::TimeContext,
     pub exploration: Option<crate::exploration::ExplorationContext>,
+    pub native_session: Option<crate::native_session::NativeSession>,
+    pub context_observer: Option<ContextObserver>,
+    pub tool_recovery: Option<ToolRecoveryHandler>,
 }
 impl RequestContext {
     fn capture() -> Self {
         Self {
             time: crate::time_context::TimeContext::capture(),
             exploration: None,
+            native_session: None,
+            context_observer: None,
+            tool_recovery: None,
         }
     }
 }
@@ -829,6 +839,7 @@ async fn run_sidecar(
         learning_skills: &'a [crate::learning_skills::SkillSnapshot],
         time_context: &'a crate::time_context::TimeContext,
         exploration_context: Option<&'a crate::exploration::ExplorationContext>,
+        native_session: Option<&'a crate::native_session::NativeSession>,
     }
     let mut input = serde_json::to_vec(&Input {
         protocol: 1,
@@ -843,6 +854,7 @@ async fn run_sidecar(
         learning_skills: &skills,
         time_context: &request_context.time,
         exploration_context: request_context.exploration.as_ref(),
+        native_session: request_context.native_session.as_ref(),
     })
     .map_err(|_| sidecar_error("INVALID_INPUT"))?;
     if input.len() > 4 * MAX_OUTPUT - 1 {
@@ -851,9 +863,16 @@ async fn run_sidecar(
     }
     input.push(b'\n');
     credentials.api_key.clear();
-    let mut child = Command::new(node_path())
+    let mut command = Command::new(node_path());
+    command
         .arg("--permission")
-        .arg(format!("--allow-fs-read={}", directory.display()))
+        .arg(format!("--allow-fs-read={}", directory.display()));
+    if let Some(native) = &request_context.native_session {
+        command
+            .arg(format!("--allow-fs-read={}", native.directory.display()))
+            .arg(format!("--allow-fs-write={}", native.directory.display()));
+    }
+    let mut child = command
         .arg(directory.join("sidecar.mjs"))
         .current_dir(&directory)
         .env_clear()
@@ -947,6 +966,9 @@ async fn run_sidecar(
                         {
                             return Err(sidecar_error("SKILL_INVALID"));
                         }
+                        if let Some(native)=&request_context.native_session {
+                            if event["nativeSession"]["version"]!="1.3.0"||event["nativeSession"]["engine"]!="pi-coding-agent"||event["nativeSession"]["persistent"]!=true||event["nativeSession"]["learningSessionId"]!=native.learning_session_id {return Err(runtime_error());}
+                        }
                         if event.get("harness").and_then(Value::as_str) != Some(HARNESS)
                             || event.get("version").and_then(Value::as_str) != Some("1.3.0")
                         {
@@ -992,6 +1014,38 @@ async fn run_sidecar(
                         output.push_str(text);
                         on_delta(text);
                     }
+                    Some("session_sync") if !settled => {
+                        let native=request_context.native_session.as_ref().ok_or_else(||sidecar_error("TOOLS_DISABLED"))?;
+                        let id=event["id"].as_str().filter(|s|crate::types::valid_id(s)).ok_or_else(||sidecar_error("TOOL_PROTOCOL"))?;
+                        crate::native_session::sync_directory(&native.directory)?;
+                        let mut bytes=serde_json::to_vec(&json!({"type":"tool_result","id":id,"result":{"synced":true}}))?;bytes.push(b'\n');
+                        await_stage(async{stdin.write_all(&bytes).await.map_err(|_|runtime_error())},&cancel,deadline).await?;
+                        had_response=true;
+                    }
+                    Some("tool_recover") if !settled => {
+                        let native=request_context.native_session.as_ref().ok_or_else(||sidecar_error("TOOLS_DISABLED"))?;
+                        let recovery=request_context.tool_recovery.as_ref().ok_or_else(||sidecar_error("NATIVE_TOOL_UNKNOWN"))?;
+                        tool_attempts+=1;if tool_attempts>MAX_TOOL_CALLS{return Err(sidecar_error("TOOL_LIMIT"));}
+                        let original=event["recoveryRunId"].as_str().ok_or_else(||sidecar_error("TOOL_PROTOCOL"))?;
+                        if !crate::types::valid_id(original){return Err(sidecar_error("TOOL_PROTOCOL"));}
+                        let call=ToolCall{id:event["id"].as_str().unwrap_or_default().into(),name:event["name"].as_str().unwrap_or_default().into(),args:event["args"].clone()};
+                        validate_tool_call(&call)?;
+                        let value=await_stage(recovery(original.into(),call.clone()),&cancel,deadline).await?;
+                        let reply=json!({"type":"tool_result","id":call.id,"result":value});
+                        let path=native.directory.join(format!("tool-{}.json",crate::types::hash(&serde_json::to_string(&json!([original,call.id]))?)));
+                        crate::native_session::atomic(&path,&json!({"version":1,"runId":original,"callId":call.id,"name":call.name,"argsHash":crate::types::hash(&serde_json::to_string(&call.args)?),"reply":reply}))?;
+                        let mut bytes=serde_json::to_vec(&reply)?;bytes.push(b'\n');
+                        await_stage(async{stdin.write_all(&bytes).await.map_err(|_|runtime_error())},&cancel,deadline).await?;
+                        had_response=true;
+                    }
+                    Some("context_manifest") if ready && !settled => {
+                        let manifest=event.get("manifest").cloned().ok_or_else(||sidecar_error("MODEL_RESPONSE"))?;
+                        if manifest["version"]!=1 || manifest["entries"].as_array().is_none_or(|a|a.len()>256) {return Err(sidecar_error("MODEL_RESPONSE"));}
+                        if let Some(observer)=&request_context.context_observer {observer(manifest)?;}
+                    }
+                    Some("session_lifecycle") if ready && !settled => {
+                        if !matches!(event["event"].as_str(),Some("compaction_start"|"compaction_end")){return Err(sidecar_error("MODEL_RESPONSE"));}
+                    }
                     Some("tool_request") if ready && !settled => {
                         let handler = tool_handler
                             .as_ref()
@@ -1020,6 +1074,9 @@ async fn run_sidecar(
                         validate_tool_call(&call)?;
                         let identity = serde_json::to_string(&(&call.name, &call.args))
                             .map_err(|_| sidecar_error("TOOL_PROTOCOL"))?;
+                        let receipt_path=request_context.native_session.as_ref().map(|n|n.directory.join(format!("tool-{}.json",crate::types::hash(&serde_json::to_string(&json!([n.run_id,call.id])).unwrap()))));
+                        let receipt_record=|reply:Value|json!({"version":1,"runId":request_context.native_session.as_ref().map(|n|&n.run_id),"callId":call.id,"name":call.name,"argsHash":crate::types::hash(&serde_json::to_string(&call.args).unwrap()),"reply":reply});
+                        if let Some(path)=&receipt_path {crate::native_session::atomic(path,&receipt_record(Value::Null))?;}
                         let reply = if let Some((saved_identity, reply)) = tool_cache.get(&call.id)
                         {
                             if saved_identity != &identity {
@@ -1051,6 +1108,7 @@ async fn run_sidecar(
                             tool_cache.insert(call.id.clone(), (identity, reply.clone()));
                             reply
                         };
+                        if let Some(path)=&receipt_path {crate::native_session::atomic(path,&receipt_record(reply.clone()))?;}
                         let mut bytes = serde_json::to_vec(&reply)
                             .map_err(|_| sidecar_error("TOOL_PROTOCOL"))?;
                         bytes.push(b'\n');
@@ -1428,6 +1486,9 @@ fn sidecar_error(code: &str) -> CoreError {
         "TIMEOUT" => ("TIMEOUT", "模型请求超时；已收到的内容已保留。"),
         "CANCELLED" => ("CANCELLED", "生成已停止，已收到的内容已保留。"),
         "NETWORK" => ("NETWORK", "模型连接失败或中断；已收到的内容已保留。"),
+        "NATIVE_SESSION_INVALID" => ("NATIVE_SESSION_INVALID","原生学习会话缺失或损坏；旧学习记录仍保留，未静默创建新会话。"),
+        "NATIVE_SESSION_BUSY" => ("NATIVE_SESSION_BUSY","本学习会话仍有请求在执行，请稍后核对原请求。"),
+        "NATIVE_TOOL_UNKNOWN" => ("NATIVE_TOOL_UNKNOWN","原工具调用回执尚未核实；未重复执行写入，请保留原请求编号。"),
         "INVALID_INPUT" => (
             "INVALID_INPUT",
             "模型输入无效或过大，请缩小所选材料后重试。",
@@ -2760,3 +2821,7 @@ mod model_limit_tests {
 #[cfg(test)]
 #[path = "model_auto_context_tests.rs"]
 mod automatic_context_wire_tests;
+
+#[cfg(test)]
+#[path = "model_native_session_tests.rs"]
+mod native_session_tests;
