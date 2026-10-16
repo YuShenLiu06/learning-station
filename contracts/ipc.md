@@ -40,7 +40,7 @@ Markdown 开头是 ```json 围栏（JSON对象），后面正文。metadata.id�
 
 ## 事件（listen）
 
-- `generation` → `{runId,sessionId,status,delta?,content?,error?}`；渲染合并每帧，不在每字流入时重建编辑器。成功产物由Rust持久化到会话。
+- `generation` → `{runId,sessionId,status,delta?,content?,error?,tool?}`；渲染合并每帧，不在每字流入时重建编辑器。成功产物由Rust持久化到会话。
 - `library_changed` → `{documents}`；刷新后发
 - `notification` → Notification；站内提醒，飞书未配置必须显示未连接
 
@@ -94,7 +94,7 @@ Tauri devUrl约定 `http://127.0.0.1:1420`，release嵌入 `dist/`。命令snake
 
 ## 本轮增量契约 v2（2026-10-16）
 
-- `ModelSettings.protocol="openai-completions"`；本轮唯一实际支持的协议为OpenAI Chat Completions。provider支持custom、glm-pi。新默认custom，baseUrl/model为空，不推测服务或计费。custom模型ID手输；请求地址为baseUrl后接`/chat/completions`。保存不发请求，测试仅使用已保存配置；修改目标地址/协议/provider须新密钥，改模型可保留同通道密钥。
+- `ModelSettings.protocol="openai-completions"`；此处为上一轮协议约定；当前两协议以文末v3为准。provider支持custom、glm-pi。新默认custom，baseUrl/model为空，不推测服务或计费。custom模型ID手输；请求地址为baseUrl后接`/chat/completions`。保存不发请求，测试仅使用已保存配置；修改目标地址/协议/provider须新密钥，改模型可保留同通道密钥。
 - URL只允许HTTPS或本机HTTP，拒绝账号密码、查询参数、片段、空白；请求不重定向、不跨域转发认证、不回退其他模型。专用CodingPlan地址即使标为custom也保留用途门槛。密钥只存本应用目标origin+协议+运行目录命名空间的Keychain项。
 - `get_ui_preferences()`与`save_ui_preferences({fontSize})` → `{fontSize:number}`。默认16，12–24整数，独立本机偏好文件，不接收密钥字段。
 - `start_exploration({sectionId?:string,associateCurrentSection:boolean,fresh?:boolean})` → `{session,context,lastRunId?:string}`。true复用指定小节会话；false复用单个独立探索会话，`sectionId=""`、links=[]、associateCurrentSection=false、contextManifest=[]。不读取当前小节、选句或其历史，也不改当前阅读位置。
@@ -102,3 +102,24 @@ Tauri devUrl约定 `http://127.0.0.1:1420`，release嵌入 `dist/`。命令snake
 - `exploration:<sessionId>`草稿key准许，字段仍仅body/question/importTitle/importBody；与其他草稿同样要求先读成功、按version保存。独立提问应放question，不含key。
 - Pi新增`create_todo({title,dueAt?:RFC3339})`。实际session归属由Rust固定，不接收sessionId或reminderEnabled；即使有时间，提醒也为false。成功返回真实persisted/todoId/sessionId/sectionId/todo，同run+call幂等，变参拒绝。question/explain可用，practice/feedback不可用。UI在生成终态从真实list_todos/list_notifications刷新，不解析模型“已保存”。
 - Markdown顶部JSON新增createdAt/updatedAt和timestampSource。新建用真实时间；已有值保留；旧无创建时间为null/unknown，旧修改时间可用明确file-mtime来源；读/无变化保存不写盘，真实正文或用户元数据变化才更新updatedAt。
+
+## 本轮增量契约 v3（以此节为准）
+
+| 接口 | 当前行为 |
+| --- | --- |
+| `configure_model` / `get_model_settings` | custom支持`openai-completions`、`anthropic-messages`；glm-pi仅OpenAI。ModelSettings增加`requestUrl`，按保存配置派生，不表示服务器已验证。OpenAI为base+`/chat/completions`，不会盲加`/v1`；Anthropic为base+`/v1/messages?beta=true`（本版Pi SDK固定query），基础地址不含末尾`/v1`或`/messages`。仅API key、无OAuth或身份伪装；模型与地址不自动替换。 |
+| `set_model({model})` | 只改当前已保存binding模型ID，0网络、0Keychain读写。地址/协议/provider不变；改名取消verified，未改名no-op。生成queued/running时BUSY；无配置NOT_CONFIGURED；无效模型INVALID_MODEL_SETTINGS。新run捕获独立配置快照。 |
+| `start_generation({...userEntryId?})` | 可复用同会话已保存、kind=user且正文/selection一致的entry，不再次append。Run额外`userEntryId`、`toolCalls`（旧文件默认空）。同requestId+同内容返回原run，变内容CONFLICT；未知结果先get_run，同ID不自动另发。确认终态失败后新重试用新operationId、同userEntryId。 |
+| `append_entry` | 发送原问题data可含`{clientMessageId:sendId,mode}`；同requestId幂等，expectedVersion防覆盖。未配置/gate前置失败不假送达；本地append成功与模型失败分开显示，失败不覆盖后来输入的新草稿。 |
+| `get_ui_preferences` | `{fontSize,assistantWidth}`。字号12–24默认16；宽度280–960整数默认346。 |
+| `save_ui_preferences({fontSize?,assistantWidth?})` | 原子串行合并，缺省字段保持，两个都缺省只读；旧font-only文件补宽度默认值。非法值不写盘。小窗口只夹紧实际渲染宽度，不改存储偏好。 |
+| `check_feishu_status()` | `{ready,reason}`，只读已验证本人通道，不登录、不发送、不返回凭据或收件人参数。 |
+| `test_feishu_notification({requestId})` | `{status:sent|blocked|failed|unknown,messageId:string|null,reason}`。ID为8–128字母数字/下划线/连字符；正文固定测试通知，用户点击才发。发前私有原子Unknown占位；同ID重开/超时均不重发；仅真实成功+messageId才sent。不会启用全部提醒。 |
+
+ToolActivity=`{id,toolCallId,runId,sessionId,name,status:running|succeeded|failed,title,summary,startedAt,updatedAt,persisted,object?,errorCode?}`。id/toolCallId由Core对run+模型opaque ID哈希，不返回rawargs或内部路径。object=`{kind:todo|learning-entry|review-card,id,sessionId,sectionId}`；仅真实保存回执提供。查询成功persisted=false，不能显示“已保存”。
+
+工具开始/回执后更新`get_run.toolCalls`并发`generation.tool`事件。历史复用Session.entries：kind=note，data=`{origin:"pi-tool-activity",toolActivity}`；按toolCallId取最新快照，不当普通学习正文、不回灌模型历史。历史只有running而无终态显示结果未确认，不自动重跑；打开仅按稳定ID调用已有待办/学习记录/复习接口。
+
+响应诊断只含固定枚举、状态码、字符/token计数和完成标志，不含正文、reasoning原文、headers或凭据。最近一次在私有状态目录`model-response-diagnostic.json`，生成失败也保留到Run.error.details.response。MODEL_ENDPOINT_PAGE说明返回网页且提示核对/v1；MODEL_FORMAT、MODEL_LENGTH、MODEL_INCOMPLETE、MODEL_THINKING_ONLY、MODEL_EMPTY区分格式、截断和无正文；均不能冒充完整答案。原Pi流解析未替换，预算不自动提高，真实测试由用户在本机触发。
+
+本轮明确取消旧全展开，改边缘拖动调宽。探索左移/作业结构的半截需求、课程资源目录和课件功能只记录后续，不做迁移。

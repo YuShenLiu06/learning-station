@@ -36,6 +36,7 @@ const ALL_TOOLS: &[&str] = &[
 const MODEL_ID: &str = "glm-5.3-flash";
 const HARNESS: &str = "pi-agent-core";
 const PROTOCOL: &str = "openai-completions";
+const ANTHROPIC: &str = "anthropic-messages";
 const USAGE_GATE: &str = "PLAN_USAGE_UNCONFIRMED";
 const KEYCHAIN_SERVICE: &str = "com.yushen.learning-station.pi-api-key";
 const NODE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../runtime/node");
@@ -101,6 +102,8 @@ pub struct ModelSettings {
     pub profiles: Vec<ModelProfileSettings>,
     #[serde(default = "usage_gate")]
     pub usage_gate: String,
+    #[serde(default, skip_deserializing)]
+    pub request_url: String,
 }
 impl Default for ModelSettings {
     fn default() -> Self {
@@ -115,6 +118,7 @@ impl Default for ModelSettings {
             active_profile: String::new(),
             profiles: default_profiles(),
             usage_gate: String::new(),
+            request_url: String::new(),
         }
     }
 }
@@ -134,6 +138,7 @@ pub struct ModelStore {
 pub struct ModelCredentials {
     settings: ModelSettings,
     api_key: String,
+    diagnostic_path: Option<PathBuf>,
 }
 impl fmt::Debug for ModelCredentials {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -287,7 +292,43 @@ impl ModelStore {
         })
     }
     pub fn settings(&self) -> ModelSettings {
-        self.settings.clone()
+        let mut settings = self.settings.clone();
+        settings.request_url = request_url(&settings.protocol, &settings.base_url);
+        settings
+    }
+    /// A local model-name change never reads or writes credentials or calls a server.
+    pub fn set_model(&mut self, model: &str) -> Result<ModelSettings> {
+        if !self.settings.configured {
+            return Err(CoreError::new(
+                "NOT_CONFIGURED",
+                "请先在供应商设置保存地址、协议和密钥。",
+            ));
+        }
+        let model = model.trim();
+        validate_protocol_settings(
+            &self.settings.provider,
+            &self.settings.protocol,
+            &self.settings.base_url,
+            model,
+            false,
+        )?;
+        if self.settings.model == model {
+            return Ok(self.settings());
+        }
+        let mut next = self.settings();
+        next.model = model.into();
+        next.verified = false;
+        if let Some(profile) = next
+            .profiles
+            .iter_mut()
+            .find(|p| p.profile == next.active_profile)
+        {
+            profile.model = model.into();
+            profile.verified = false;
+        }
+        self.persist(&next)?;
+        self.settings = next;
+        Ok(self.settings())
     }
     pub fn configure(
         &mut self,
@@ -313,6 +354,11 @@ impl ModelStore {
         let endpoint =
             validate_protocol_settings(provider, protocol, base_url.trim(), model, false)?;
         let profile = settings_profile(provider, &endpoint)?;
+        if protocol == ANTHROPIC && api_key.contains("sk-ant-oat") {
+            return Err(invalid(
+                "Anthropic 自定义接入仅支持 API key，不使用 OAuth 凭据。",
+            ));
+        }
         if api_key.len() > 16384 || api_key.chars().any(|c| c.is_control() || c.is_whitespace()) {
             return Err(invalid("API 密钥格式无效，请重新输入。"));
         }
@@ -396,7 +442,12 @@ impl ModelStore {
             .keychain_entry(&self.settings.base_url, &self.settings.protocol)?
             .get_password()
             .map_err(|_| CoreError::new("AUTH", "无法读取本应用此通道的密钥，请检查模型设置。"))?;
-        ModelCredentials::new(self.settings(), api_key)
+        let mut credentials = ModelCredentials::new(self.settings(), api_key)?;
+        credentials.diagnostic_path = Some(
+            self.config_path
+                .with_file_name("model-response-diagnostic.json"),
+        );
+        Ok(credentials)
     }
     /// Tests only the saved configuration, via the same real Pi Agent as generation.
     pub async fn test(&mut self) -> Result<ModelTest> {
@@ -487,7 +538,11 @@ impl ModelCredentials {
         {
             return Err(CoreError::new("AUTH", "API 密钥格式无效。"));
         }
-        Ok(Self { settings, api_key })
+        Ok(Self {
+            settings,
+            api_key,
+            diagnostic_path: None,
+        })
     }
 }
 /// No state lock is held while the separate Pi Agent process streams or settles.
@@ -557,6 +612,7 @@ async fn run_sidecar(
     policy: ToolPolicy,
 ) -> Result<String> {
     ensure_usage_allowed(&credentials.settings)?;
+    let diagnostic_path = credentials.diagnostic_path.take();
     validate_tool_policy(&policy, tool_handler.is_some())?;
     if cancel.load(Ordering::Acquire) {
         return Err(cancelled());
@@ -810,15 +866,35 @@ async fn run_sidecar(
                             return Err(sidecar_error("MODEL_RESPONSE"));
                         }
                         final_content = Some(text.to_owned());
+                        if let Some(diagnostic) =
+                            event.get("diagnostic").and_then(safe_response_diagnostic)
+                        {
+                            record_response_diagnostic(
+                                diagnostic_path.as_deref(),
+                                "OK",
+                                &diagnostic,
+                            );
+                        }
                         settled = true;
                     }
                     Some("error") => {
-                        return Err(sidecar_error(
+                        let mut error = sidecar_error(
                             event
                                 .get("code")
                                 .and_then(Value::as_str)
                                 .unwrap_or("PI_RUNTIME"),
-                        ))
+                        );
+                        if let Some(diagnostic) =
+                            event.get("diagnostic").and_then(safe_response_diagnostic)
+                        {
+                            record_response_diagnostic(
+                                diagnostic_path.as_deref(),
+                                &error.code,
+                                &diagnostic,
+                            );
+                            error.details = Some(json!({"response":diagnostic}));
+                        }
+                        return Err(error);
                     }
                     _ => return Err(sidecar_error("MODEL_RESPONSE")),
                 }
@@ -989,10 +1065,9 @@ fn validate_protocol_settings(
     allow_unconfigured: bool,
 ) -> Result<String> {
     let provider = canonical_provider(provider)?;
-    if protocol != PROTOCOL {
-        return Err(invalid(
-            "当前仅支持 OpenAI Chat Completions 协议（openai-completions）。",
-        ));
+    if ![PROTOCOL, ANTHROPIC].contains(&protocol) || (provider == "glm-pi" && protocol != PROTOCOL)
+    {
+        return Err(invalid("自定义服务支持 OpenAI Chat Completions 或 Anthropic Messages；Coding Plan 仅支持 OpenAI 协议。"));
     }
     if allow_unconfigured && base_url.is_empty() && model.is_empty() {
         return Ok(String::new());
@@ -1033,6 +1108,12 @@ fn validate_protocol_settings(
         return Err(invalid("通道地址不能包含账号、查询参数或片段。"));
     }
     let normalized = url.as_str().trim_end_matches('/').to_owned();
+    if protocol == ANTHROPIC
+        && (url.path().trim_end_matches('/').ends_with("/v1")
+            || url.path().trim_end_matches('/').ends_with("/messages"))
+    {
+        return Err(invalid("Anthropic 基础地址请填根地址或代理前缀，不含末尾 /v1 或 /messages；实际会追加 /v1/messages?beta=true。"));
+    }
     if url.host_str().is_none() || (url.scheme() != "https" && !is_fixture(&normalized)) {
         return Err(invalid("API 地址必须使用 HTTPS；仅本机测试可使用 HTTP。"));
     }
@@ -1122,6 +1203,12 @@ fn sidecar_error(code: &str) -> CoreError {
             "MODEL_HTTP",
             "模型服务拒绝请求，请检查所选区域、密钥和模型权限。",
         ),
+        "MODEL_ENDPOINT_PAGE" => ("MODEL_ENDPOINT_PAGE", "服务地址返回了网页，未得到模型 API 响应。请核对基础地址是否需要 /v1，并查看已保存的最终请求 URL；应用未自动改地址。"),
+        "MODEL_FORMAT" => ("MODEL_FORMAT", "服务返回的格式不符合所选流式协议，请核对协议和最终请求 URL；未把它当作完整答案。"),
+        "MODEL_LENGTH" => ("MODEL_LENGTH", "模型因输出 token 上限而结束，正文可能不完整；可用正文已保留，未当作完整答案。"),
+        "MODEL_INCOMPLETE" => ("MODEL_INCOMPLETE", "模型流在有效结束标记前结束；可用正文已保留，未当作完整答案。"),
+        "MODEL_THINKING_ONLY" => ("MODEL_THINKING_ONLY", "模型仅返回思考内容，没有最终正文；思考内容未当作学习答案。"),
+        "MODEL_EMPTY" => ("MODEL_EMPTY", "模型声明结束，但没有返回有效正文。"),
         "OUTPUT_LIMIT" => (
             "OUTPUT_LIMIT",
             "模型输出超过限制，已停止；已收到的内容已保留。",
@@ -1132,7 +1219,7 @@ fn sidecar_error(code: &str) -> CoreError {
         "TOOLS_DISABLED" => ("TOOLS_DISABLED", "模型请求了未启用的工具，已停止本次生成。"),
         "MODEL_RESPONSE" => (
             "MODEL_RESPONSE",
-            "模型未完整返回有效文本；已收到的内容已保留。",
+            "模型响应未通过完整性校验；可用正文已保留，未当作完整答案。",
         ),
         _ => (
             "PI_RUNTIME",
@@ -1328,7 +1415,7 @@ mod tests {
                 validate_protocol_settings("custom", PROTOCOL, url, "my-model", false).unwrap_err();
             assert!(!error.to_string().contains("fixture-secret"));
         }
-        for protocol in ["", "anthropic-messages", "openai-responses"] {
+        for protocol in ["", "unsupported-protocol", "openai-responses"] {
             assert!(validate_protocol_settings(
                 "custom",
                 protocol,
@@ -1428,7 +1515,7 @@ mod tests {
                 assert_eq!(result.unwrap(), "Pi fixture 文本");
                 assert_eq!(partial, "Pi fixture 文本");
             } else {
-                assert_eq!(result.unwrap_err().code, "MODEL_RESPONSE");
+                assert_eq!(result.unwrap_err().code, "MODEL_INCOMPLETE");
             }
         }
     }
@@ -1523,7 +1610,7 @@ mod tests {
         .await
         .unwrap_err();
         server.join().unwrap();
-        assert_eq!(error.code, "MODEL_RESPONSE");
+        assert_eq!(error.code, "MODEL_INCOMPLETE");
     }
     #[tokio::test]
     async fn pi_tool_round_trip_persists_real_markdown_and_reopens_without_a_model() {
@@ -1982,5 +2069,207 @@ mod policy_feedback_tests {
         assert_eq!(reopened.base_url, "https://api.example.com/v1");
         assert!(reopened.usage_gate.is_empty());
         assert!(ensure_usage_allowed(&reopened).is_ok());
+    }
+}
+
+fn request_url(protocol: &str, base_url: &str) -> String {
+    if base_url.is_empty() {
+        return String::new();
+    }
+    format!(
+        "{}{}",
+        base_url.trim_end_matches('/'),
+        if protocol == ANTHROPIC {
+            "/v1/messages?beta=true"
+        } else {
+            "/chat/completions"
+        }
+    )
+}
+/// Only typed, bounded metadata crosses the sidecar boundary; raw response fields never do.
+fn safe_response_diagnostic(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    let mut result = serde_json::Map::new();
+    result.insert("version".into(), json!(1));
+    for (key, allowed) in [
+        ("operation", &["test", "generate"][..]),
+        ("protocol", &[PROTOCOL, ANTHROPIC][..]),
+        (
+            "requestPath",
+            &[
+                "/chat/completions",
+                "/v1/chat/completions",
+                "/v1/messages?beta=true",
+                "custom-base/chat/completions",
+                "custom-base/v1/messages?beta=true",
+            ][..],
+        ),
+        (
+            "contentType",
+            &["sse", "html", "json", "plain", "other", "missing"][..],
+        ),
+        (
+            "finishReason",
+            &[
+                "stop",
+                "end",
+                "length",
+                "tool_calls",
+                "function_call",
+                "content_filter",
+                "network_error",
+                "end_turn",
+                "max_tokens",
+                "stop_sequence",
+                "tool_use",
+                "refusal",
+                "missing",
+                "other",
+            ][..],
+        ),
+    ] {
+        if let Some(text) = object
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|text| allowed.contains(text))
+        {
+            result.insert(key.into(), json!(text));
+        }
+    }
+    for key in [
+        "requests",
+        "httpStatus",
+        "maxTokens",
+        "transportBytes",
+        "providerEvents",
+        "textChars",
+        "thinkingChars",
+        "textEvents",
+        "thinkingEvents",
+        "usageOutputTokens",
+        "usageReasoningTokens",
+    ] {
+        if let Some(number) = object
+            .get(key)
+            .and_then(Value::as_u64)
+            .filter(|number| *number <= 1_000_000_000)
+        {
+            result.insert(key.into(), json!(number));
+        }
+    }
+    for key in ["sawDone", "cleanEof", "messageStop", "invalidDelta"] {
+        if let Some(flag) = object.get(key).and_then(Value::as_bool) {
+            result.insert(key.into(), json!(flag));
+        }
+    }
+    Some(Value::Object(result))
+}
+fn record_response_diagnostic(path: Option<&Path>, code: &str, diagnostic: &Value) {
+    if let Some(path) = path {
+        let _ = crate::app::atomic_json(
+            path,
+            &json!({"schemaVersion":1,"recordedAt":crate::types::timestamp(),"code":code,"response":diagnostic}),
+        );
+    }
+}
+
+#[cfg(test)]
+mod configuration_response_tests {
+    use super::*;
+    #[test]
+    fn protocols_derive_exact_request_targets_without_guessing_v1() {
+        assert_eq!(
+            request_url(PROTOCOL, "https://example.invalid"),
+            "https://example.invalid/chat/completions"
+        );
+        assert_eq!(
+            request_url(PROTOCOL, "https://example.invalid/v1/"),
+            "https://example.invalid/v1/chat/completions"
+        );
+        assert_eq!(
+            request_url(ANTHROPIC, "https://example.invalid/proxy"),
+            "https://example.invalid/proxy/v1/messages?beta=true"
+        );
+        assert!(validate_protocol_settings(
+            "custom",
+            ANTHROPIC,
+            "https://example.invalid",
+            "user-model",
+            false
+        )
+        .is_ok());
+        for path in ["/v1", "/v1/", "/v1/messages", "/messages"] {
+            assert!(validate_protocol_settings(
+                "custom",
+                ANTHROPIC,
+                &format!("https://example.invalid{path}"),
+                "user-model",
+                false
+            )
+            .is_err());
+        }
+        assert!(
+            validate_protocol_settings("glm-pi", ANTHROPIC, DOMESTIC, MODEL_ID, false).is_err()
+        );
+    }
+    #[test]
+    fn model_only_change_preserves_binding_and_never_needs_keychain() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = ModelStore::new(temp.path()).unwrap();
+        let mut settings = ModelSettings::default();
+        settings.configured = true;
+        settings.provider = "custom".into();
+        settings.protocol = ANTHROPIC.into();
+        settings.base_url = "https://example.invalid/proxy".into();
+        settings.model = "old-model".into();
+        settings.active_profile = "custom".into();
+        settings.verified = true;
+        settings.profiles.push(ModelProfileSettings {
+            profile: "custom".into(),
+            provider: "custom".into(),
+            protocol: ANTHROPIC.into(),
+            configured: true,
+            base_url: settings.base_url.clone(),
+            model: settings.model.clone(),
+            verified: true,
+        });
+        store.persist(&settings).unwrap();
+        store.settings = settings.clone();
+        let changed = store.set_model("new-model").unwrap();
+        assert_eq!(changed.base_url, settings.base_url);
+        assert_eq!(changed.protocol, settings.protocol);
+        assert_eq!(changed.active_profile, settings.active_profile);
+        assert!(!changed.verified);
+        let old = std::fs::read(&store.config_path).unwrap();
+        assert!(store.set_model("bad\nmodel").is_err());
+        assert_eq!(std::fs::read(&store.config_path).unwrap(), old);
+        store.set_model("new-model").unwrap();
+        assert_eq!(std::fs::read(&store.config_path).unwrap(), old);
+        assert_eq!(
+            ModelStore::new(temp.path()).unwrap().settings().model,
+            "new-model"
+        );
+    }
+    #[test]
+    fn response_metadata_cannot_persist_headers_content_or_unknown_stop_text() {
+        let value = json!({"httpStatus":200,"contentType":"html","requestPath":"/chat/completions","finishReason":"raw-secret","textChars":0,"thinkingChars":12,"content":"raw-secret","authorization":"raw-secret","headers":{"key":"raw-secret"},"maxTokens":999999999999u64});
+        let diagnostic = safe_response_diagnostic(&value).unwrap();
+        assert_eq!(diagnostic["httpStatus"], 200);
+        assert!(diagnostic.get("maxTokens").is_none());
+        assert!(!diagnostic.to_string().contains("raw-secret"));
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("diagnostic.json");
+        record_response_diagnostic(Some(&path), "MODEL_ENDPOINT_PAGE", &diagnostic);
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("raw-secret"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 }

@@ -133,10 +133,11 @@ async fn get_ui_preferences(state: State<'_, Arc<Engine>>) -> Result<UiPreferenc
 #[tauri::command]
 async fn save_ui_preferences(
     state: State<'_, Arc<Engine>>,
-    font_size: u8,
+    font_size: Option<u8>,
+    assistant_width: Option<u16>,
 ) -> Result<UiPreferences> {
     work(state.inner().clone(), move |e| {
-        e.save_ui_preferences(UiPreferences { font_size })
+        e.patch_ui_preferences(font_size, assistant_width)
     })
     .await
 }
@@ -186,6 +187,7 @@ async fn start_generation(
     selection: String,
     prompt: String,
     request_id: String,
+    user_entry_id: Option<String>,
 ) -> Result<Value> {
     let sink: Sink = Arc::new(move |event| {
         let _ = app.emit("generation", event);
@@ -198,6 +200,7 @@ async fn start_generation(
             selection,
             prompt,
             request_id,
+            user_entry_id,
         },
         sink,
     )
@@ -246,6 +249,10 @@ async fn configure_model(
     Ok(result)
 }
 #[tauri::command]
+async fn set_model(state: State<'_, Arc<Engine>>, model: String) -> Result<ModelSettings> {
+    state.set_model(&model).await
+}
+#[tauri::command]
 async fn test_model(state: State<'_, Arc<Engine>>) -> Result<ModelTest> {
     let mut store = state.model.lock().await;
     let result = store.test().await;
@@ -254,6 +261,18 @@ async fn test_model(state: State<'_, Arc<Engine>>) -> Result<ModelTest> {
         .write()
         .map_err(|_| CoreError::new("BUSY", "模型配置暂不可用。"))? = store.settings();
     result
+}
+#[tauri::command]
+async fn check_feishu_status() -> crate::feishu::IdentityStatus {
+    crate::feishu::check_status().await
+}
+#[tauri::command]
+async fn test_feishu_notification(
+    state: State<'_, Arc<Engine>>,
+    request_id: String,
+) -> Result<crate::feishu::DeliveryOutcome> {
+    let state_dir = state.lock()?.state_dir.clone();
+    crate::feishu::test_notification(&state_dir, &request_id).await
 }
 #[tauri::command]
 async fn create_todo(
@@ -436,6 +455,9 @@ pub fn run() {
             get_model_settings,
             configure_model,
             test_model,
+            check_feishu_status,
+            test_feishu_notification,
+            set_model,
             create_todo,
             list_todos,
             set_todo_done,

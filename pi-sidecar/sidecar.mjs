@@ -1,5 +1,6 @@
 // This entry point emits NDJSON only. No console/SDK diagnostics or raw errors reach stdio.
 import { StringDecoder } from 'node:string_decoder';
+import { safeResponseDiagnostic } from './response-diagnostics.mjs';
 console.log = console.info = console.warn = console.error = console.debug = () => {};
 let running = false;
 let finished = false;
@@ -11,12 +12,12 @@ const abort = new AbortController();
 const emit = (event) => new Promise((resolve, reject) => {
   process.stdout.write(`${JSON.stringify(event)}\n`, (error) => error ? reject(error) : resolve());
 });
-async function exitError(code = 'PI_RUNTIME') {
+async function exitError(code = 'PI_RUNTIME', diagnostic) {
   if (finished) return;
   finished = true;
   abort.abort();
-  const safe = ['PLAN_USAGE_UNCONFIRMED', 'AUTH', 'RATE_LIMIT', 'TIMEOUT', 'CANCELLED', 'NETWORK', 'INVALID_MODEL_SETTINGS', 'INVALID_URL', 'INVALID_INPUT', 'MODEL_HTTP', 'MODEL_RESPONSE', 'OUTPUT_LIMIT', 'TOOL_LIMIT', 'TOOL_PROTOCOL', 'TOOL_FAILED', 'TOOLS_DISABLED', 'PI_RUNTIME'].includes(code) ? code : 'PI_RUNTIME';
-  await emit({ type: 'error', code: safe }).catch(() => {});
+  const safe = ['PLAN_USAGE_UNCONFIRMED', 'AUTH', 'RATE_LIMIT', 'TIMEOUT', 'CANCELLED', 'NETWORK', 'INVALID_MODEL_SETTINGS', 'INVALID_URL', 'INVALID_INPUT', 'MODEL_HTTP', 'MODEL_RESPONSE', 'MODEL_ENDPOINT_PAGE', 'MODEL_FORMAT', 'MODEL_LENGTH', 'MODEL_INCOMPLETE', 'MODEL_THINKING_ONLY', 'MODEL_EMPTY', 'OUTPUT_LIMIT', 'TOOL_LIMIT', 'TOOL_PROTOCOL', 'TOOL_FAILED', 'TOOLS_DISABLED', 'PI_RUNTIME'].includes(code) ? code : 'PI_RUNTIME';
+  await emit({ type: 'error', code: safe, ...(diagnostic ? { diagnostic: safeResponseDiagnostic(diagnostic) } : {}) }).catch(() => {});
   process.exit(1);
 }
 async function start(request) {
@@ -34,7 +35,7 @@ async function start(request) {
     process.exit(0);
   } catch (error) {
     clearTimeout(total);
-    await exitError(typeof error?.code === 'string' ? error.code : 'PI_RUNTIME');
+    await exitError(typeof error?.code === 'string' ? error.code : 'PI_RUNTIME', error?.diagnostic);
   }
 }
 function line(value) {

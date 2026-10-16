@@ -4,9 +4,12 @@
 use crate::types::{CoreError, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use std::time::Duration;
 use tokio::process::Command;
+use tokio::sync::Mutex;
 
 const CLI: &str =
     concat!(env!("CARGO_MANIFEST_DIR"), "/../tools/local/lark-cli");
@@ -22,7 +25,7 @@ pub enum DeliveryState {
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DeliveryOutcome {
     pub status: DeliveryState,
@@ -64,14 +67,13 @@ pub struct FeishuCliChannel {
 
 impl FeishuCliChannel {
     pub fn from_verified_file() -> Result<Self> {
-        let bytes = std::fs::read(VERIFIED_CHANNEL)
-            .map_err(|_| CoreError::new("CHANNEL_DISABLED", "未找到已验证的飞书本人通道。"))?;
-        if bytes.len() > 64 * 1024 {
-            return Err(CoreError::new(
-                "CHANNEL_DISABLED",
-                "已验证的飞书通道配置无效。",
-            ));
-        }
+        let bytes =
+            read_bounded_file(Path::new(VERIFIED_CHANNEL), 64 * 1024, false).map_err(|_| {
+                CoreError::new(
+                    "CHANNEL_DISABLED",
+                    "已验证的飞书本人通道缺失或不可安全读取。",
+                )
+            })?;
         let channel: VerifiedChannel = serde_json::from_slice(&bytes)
             .map_err(|_| CoreError::new("CHANNEL_DISABLED", "已验证的飞书通道配置无效。"))?;
         if !valid_identifier(&channel.app_id, "cli_")
@@ -181,6 +183,242 @@ impl FeishuCliChannel {
             ),
         }
     }
+}
+
+const TEST_MESSAGE: &str = "学习站测试通知：这是一次由你主动触发的本机连接测试。";
+const MAX_OUTBOX_BYTES: usize = 16 * 1024;
+static TEST_NOTIFICATION_LOCK: Mutex<()> = Mutex::const_new(());
+
+/// A read-only identity check for an explicit user action. It never logs in or
+/// sends a message, and unavailable CLI/configuration always reports false.
+pub async fn check_status() -> IdentityStatus {
+    match FeishuCliChannel::from_verified_file() {
+        Ok(channel) => channel.check_identity().await,
+        Err(_) => IdentityStatus {
+            ready: false,
+            reason: "已验证的飞书本人通道不可用；未发送消息。".into(),
+        },
+    }
+}
+
+/// Send only the fixed connection-test text after an explicit user click. The
+/// persisted reservation is Unknown before any CLI invocation. Reusing a request
+/// ID returns that record even after a crash, so ambiguous delivery is never retried.
+pub async fn test_notification(state_dir: &Path, request_id: &str) -> Result<DeliveryOutcome> {
+    test_notification_with(state_dir, request_id, |text, key| async move {
+        match FeishuCliChannel::from_verified_file() {
+            Ok(channel) => channel.send_explicitly_enabled(&text, &key, true).await,
+            Err(_) => DeliveryOutcome::new(
+                DeliveryState::Blocked,
+                "已验证的飞书本人通道不可用；未发送消息。",
+            ),
+        }
+    })
+    .await
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct TestOutboxRecord {
+    version: u8,
+    request_id: String,
+    outcome: DeliveryOutcome,
+}
+
+async fn test_notification_with<F, Fut>(
+    state_dir: &Path,
+    request_id: &str,
+    send: F,
+) -> Result<DeliveryOutcome>
+where
+    F: FnOnce(String, String) -> Fut,
+    Fut: std::future::Future<Output = DeliveryOutcome>,
+{
+    if !(8..=128).contains(&request_id.len())
+        || !request_id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+    {
+        return Err(CoreError::new(
+            "INVALID_INPUT",
+            "测试请求编号须为8至128位字母、数字、短横线或下划线。",
+        ));
+    }
+    let _guard = TEST_NOTIFICATION_LOCK.lock().await;
+    let directory = private_outbox_directory(state_dir)?;
+    let digest = crate::types::hash(request_id);
+    let path = directory.join(format!("{digest}.json"));
+    if let Some(previous) = read_outbox_record(&path, request_id)? {
+        return Ok(previous.outcome);
+    }
+    let mut record = TestOutboxRecord {
+        version: 1,
+        request_id: request_id.into(),
+        outcome: DeliveryOutcome::new(
+            DeliveryState::Unknown,
+            "测试通知已开始，结果尚未确认；请先核实飞书消息，系统不会自动重发。",
+        ),
+    };
+    let reservation = outbox_tempfile(&directory, &record)?;
+    match reservation.persist_noclobber(&path) {
+        Ok(_) => sync_directory(&directory)?,
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return read_outbox_record(&path, request_id)?
+                .map(|previous| previous.outcome)
+                .ok_or_else(outbox_error);
+        }
+        Err(error) => return Err(CoreError::io(error.error)),
+    }
+    let pending = record.outcome.clone();
+    record.outcome = send(TEST_MESSAGE.into(), format!("learning_test_{digest}")).await;
+    // Even an injected/future sender cannot turn an unconfirmed response into Sent.
+    if record.outcome.status == DeliveryState::Sent
+        && record
+            .outcome
+            .message_id
+            .as_deref()
+            .is_none_or(|id| id.trim().is_empty())
+    {
+        record.outcome = pending.clone();
+    }
+    let finish = (|| -> Result<()> {
+        // Reject a replaced symlink/oversized record rather than overwriting it.
+        read_outbox_record(&path, request_id)?.ok_or_else(outbox_error)?;
+        let saved = outbox_tempfile(&directory, &record)?;
+        saved
+            .persist(&path)
+            .map_err(|error| CoreError::io(error.error))?;
+        sync_directory(&directory)
+    })();
+    if finish.is_err() {
+        // The durable pre-send reservation remains authoritative if recording
+        // the final result fails. Never encourage an automatic send retry.
+        return Ok(pending);
+    }
+    Ok(record.outcome)
+}
+
+fn private_outbox_directory(state_dir: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(state_dir).map_err(CoreError::io)?;
+    require_directory(state_dir)?;
+    let path = state_dir.join("feishu-test-outbox");
+    match std::fs::create_dir(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(CoreError::io(error)),
+    }
+    require_directory(&path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .map_err(CoreError::io)?;
+    }
+    Ok(path)
+}
+
+fn require_directory(path: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path).map_err(CoreError::io)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(CoreError::new(
+            "UNSAFE_PATH",
+            "飞书测试记录目录不能是符号链接或普通文件。",
+        ));
+    }
+    Ok(())
+}
+
+fn read_bounded_file(path: &Path, maximum: usize, private: bool) -> Result<Vec<u8>> {
+    let before = std::fs::symlink_metadata(path).map_err(CoreError::io)?;
+    if before.file_type().is_symlink() || !before.is_file() || before.len() > maximum as u64 {
+        return Err(outbox_error());
+    }
+    let file = std::fs::File::open(path).map_err(CoreError::io)?;
+    let opened = file.metadata().map_err(CoreError::io)?;
+    let after = std::fs::symlink_metadata(path).map_err(CoreError::io)?;
+    if after.file_type().is_symlink() || !after.is_file() || opened.len() > maximum as u64 {
+        return Err(outbox_error());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // Compare the opened descriptor before reading any bytes, so swapping
+        // the checked path for a symlink cannot expose another file's contents.
+        if before.dev() != opened.dev()
+            || before.ino() != opened.ino()
+            || after.dev() != opened.dev()
+            || after.ino() != opened.ino()
+            || (private && opened.mode() & 0o077 != 0)
+        {
+            return Err(outbox_error());
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    let mut bytes = Vec::new();
+    file.take((maximum + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(CoreError::io)?;
+    if bytes.len() > maximum {
+        return Err(outbox_error());
+    }
+    Ok(bytes)
+}
+
+fn read_outbox_record(path: &Path, request_id: &str) -> Result<Option<TestOutboxRecord>> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(CoreError::io(error)),
+        Ok(_) => {}
+    }
+    let record: TestOutboxRecord =
+        serde_json::from_slice(&read_bounded_file(path, MAX_OUTBOX_BYTES, true)?)
+            .map_err(|_| outbox_error())?;
+    if record.version != 1
+        || record.request_id != request_id
+        || (record.outcome.status == DeliveryState::Sent
+            && record
+                .outcome
+                .message_id
+                .as_deref()
+                .is_none_or(|id| id.trim().is_empty()))
+    {
+        return Err(outbox_error());
+    }
+    Ok(Some(record))
+}
+
+fn outbox_tempfile(directory: &Path, record: &TestOutboxRecord) -> Result<tempfile::NamedTempFile> {
+    require_directory(directory)?;
+    let bytes = serde_json::to_vec(record).map_err(|_| outbox_error())?;
+    if bytes.len() > MAX_OUTBOX_BYTES {
+        return Err(outbox_error());
+    }
+    let mut file = tempfile::NamedTempFile::new_in(directory).map_err(CoreError::io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(CoreError::io)?;
+    }
+    file.write_all(&bytes).map_err(CoreError::io)?;
+    file.as_file().sync_all().map_err(CoreError::io)?;
+    Ok(file)
+}
+
+fn sync_directory(directory: &Path) -> Result<()> {
+    require_directory(directory)?;
+    std::fs::File::open(directory)
+        .and_then(|file| file.sync_all())
+        .map_err(CoreError::io)
+}
+
+fn outbox_error() -> CoreError {
+    CoreError::new(
+        "INVALID_STATE",
+        "飞书测试记录不可安全读取；为防止重复发送，未重试。",
+    )
 }
 
 enum Invocation {
@@ -299,6 +537,240 @@ fn valid_identifier(value: &str, prefix: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    fn confirmed_fixture() -> DeliveryOutcome {
+        DeliveryOutcome {
+            status: DeliveryState::Sent,
+            message_id: Some("om_fixture_confirmed".into()),
+            reason: "fixture confirmed".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_message_is_fixed_and_duplicate_requests_reopen_without_resending() {
+        let directory = tempfile::tempdir().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let sent_count = count.clone();
+        let first = test_notification_with(
+            directory.path(),
+            "request_sent_01",
+            move |text, key| async move {
+                sent_count.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(text, "学习站测试通知：这是一次由你主动触发的本机连接测试。");
+                assert_eq!(
+                    key,
+                    format!("learning_test_{}", crate::types::hash("request_sent_01"))
+                );
+                confirmed_fixture()
+            },
+        )
+        .await
+        .unwrap();
+        let reopened_path = directory.path().to_path_buf();
+        let second = test_notification_with(&reopened_path, "request_sent_01", |_, _| async {
+            panic!("persisted requests must never invoke the sender again")
+        })
+        .await
+        .unwrap();
+        assert_eq!(first, confirmed_fixture());
+        assert_eq!(second, first);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        let path = directory
+            .path()
+            .join("feishu-test-outbox")
+            .join(format!("{}.json", crate::types::hash("request_sent_01")));
+        assert_eq!(
+            read_outbox_record(&path, "request_sent_01")
+                .unwrap()
+                .unwrap()
+                .outcome,
+            first
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(directory.path().join("feishu-test-outbox"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn simultaneous_double_clicks_send_only_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let count = AtomicUsize::new(0);
+        let send = |_, _| async {
+            count.fetch_add(1, Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            confirmed_fixture()
+        };
+        let (a, b) = tokio::join!(
+            test_notification_with(directory.path(), "request_double_01", send),
+            test_notification_with(directory.path(), "request_double_01", send)
+        );
+        assert_eq!(a.unwrap(), b.unwrap());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_and_unconfirmed_results_are_durable_and_never_retried() {
+        let directory = tempfile::tempdir().unwrap();
+        for (request, outcome) in [
+            (
+                "request_unknown_01",
+                DeliveryOutcome::new(DeliveryState::Unknown, "fixture timeout"),
+            ),
+            (
+                "request_no_id_01",
+                DeliveryOutcome::new(DeliveryState::Sent, "fixture missing receipt"),
+            ),
+        ] {
+            let first =
+                test_notification_with(directory.path(), request, |_, _| async move { outcome })
+                    .await
+                    .unwrap();
+            assert_eq!(first.status, DeliveryState::Unknown);
+            let reopened_path = directory.path().to_path_buf();
+            let replay = test_notification_with(&reopened_path, request, |_, _| async {
+                panic!("ambiguous outcomes must not be retried")
+            })
+            .await
+            .unwrap();
+            assert_eq!(replay, first);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_reservation_reopens_as_unknown_without_resending() {
+        let directory = tempfile::tempdir().unwrap();
+        let owned_path = directory.path().to_path_buf();
+        let (started, wait_started) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            test_notification_with(&owned_path, "request_cancel_01", move |_, _| async move {
+                started.send(()).unwrap();
+                std::future::pending::<DeliveryOutcome>().await
+            })
+            .await
+        });
+        wait_started.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let reopened =
+            test_notification_with(directory.path(), "request_cancel_01", |_, _| async {
+                panic!("an interrupted send must never be automatically retried")
+            })
+            .await
+            .unwrap();
+        assert_eq!(reopened.status, DeliveryState::Unknown);
+        assert!(reopened.message_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn invalid_request_ids_are_rejected_before_storage_or_sending() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("unused");
+        for request in [
+            "".into(),
+            "short".into(),
+            "../outside".into(),
+            "has spaces".into(),
+            "x".repeat(129),
+        ] {
+            let result = test_notification_with(&path, &request, |_, _| async {
+                panic!("invalid requests must never invoke sender")
+            })
+            .await;
+            assert_eq!(result.unwrap_err().code, "INVALID_INPUT");
+        }
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn corrupt_oversized_or_mismatched_history_never_triggers_a_send() {
+        let directory = tempfile::tempdir().unwrap();
+        let outbox = private_outbox_directory(directory.path()).unwrap();
+        for (request, bytes) in [
+            ("request_corrupt_01", b"not-json".to_vec()),
+            ("request_oversize_01", vec![b'x'; MAX_OUTBOX_BYTES + 1]),
+            (
+                "request_mismatch_01",
+                serde_json::to_vec(&TestOutboxRecord {
+                    version: 1,
+                    request_id: "another_request".into(),
+                    outcome: confirmed_fixture(),
+                })
+                .unwrap(),
+            ),
+        ] {
+            let path = outbox.join(format!("{}.json", crate::types::hash(request)));
+            std::fs::write(&path, bytes).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            assert!(
+                test_notification_with(directory.path(), request, |_, _| async {
+                    panic!("unsafe history must not trigger a send")
+                })
+                .await
+                .is_err()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_directories_and_records_are_rejected_without_sending() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), directory.path().join("feishu-test-outbox")).unwrap();
+        assert!(
+            test_notification_with(directory.path(), "request_dirlink_01", |_, _| async {
+                panic!("symlink directories must not trigger sends")
+            })
+            .await
+            .is_err()
+        );
+        std::fs::remove_file(directory.path().join("feishu-test-outbox")).unwrap();
+        let outbox = private_outbox_directory(directory.path()).unwrap();
+        let target = outside.path().join("external.json");
+        std::fs::write(&target, b"must-not-read-or-overwrite").unwrap();
+        symlink(
+            &target,
+            outbox.join(format!(
+                "{}.json",
+                crate::types::hash("request_filelink_01")
+            )),
+        )
+        .unwrap();
+        assert!(
+            test_notification_with(directory.path(), "request_filelink_01", |_, _| async {
+                panic!("symlink records must not trigger sends")
+            })
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read(target).unwrap(),
+            b"must-not-read-or-overwrite"
+        );
+    }
 
     #[test]
     fn confirms_sent_only_with_success_exit_ok_and_message_id() {

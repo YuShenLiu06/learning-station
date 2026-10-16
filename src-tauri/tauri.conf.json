@@ -32,7 +32,8 @@
       "../pi-sidecar/package.json": "pi-sidecar/package.json",
       "../pi-sidecar/package-lock.json": "pi-sidecar/package-lock.json",
       "../pi-sidecar/node_modules/": "pi-sidecar/node_modules/",
-      "../pi-sidecar/learning-plugin.mjs": "pi-sidecar/learning-plugin.mjs"
+      "../pi-sidecar/learning-plugin.mjs": "pi-sidecar/learning-plugin.mjs",
+      "../pi-sidecar/response-diagnostics.mjs": "pi-sidecar/response-diagnostics.mjs"
     }
   }
 }

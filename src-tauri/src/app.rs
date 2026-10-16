@@ -39,18 +39,33 @@ pub struct LibraryState {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct UiPreferences {
     pub font_size: u8,
+    #[serde(default = "default_assistant_width")]
+    pub assistant_width: u16,
 }
 impl Default for UiPreferences {
     fn default() -> Self {
-        Self { font_size: 16 }
+        Self {
+            font_size: 16,
+            assistant_width: default_assistant_width(),
+        }
     }
 }
+fn default_assistant_width() -> u16 {
+    346
+}
+static UI_PREFERENCE_WRITE: Mutex<()> = Mutex::new(());
 impl UiPreferences {
     fn validate(&self) -> Result<()> {
         if !(12..=24).contains(&self.font_size) {
             return Err(CoreError::new(
                 "INVALID_INPUT",
                 "字号请选择12至24之间的整数。",
+            ));
+        }
+        if !(280..=960).contains(&self.assistant_width) {
+            return Err(CoreError::new(
+                "INVALID_INPUT",
+                "助教栏宽度请选择280至960之间的整数。",
             ));
         }
         Ok(())
@@ -67,6 +82,27 @@ pub struct Engine {
 }
 
 impl Engine {
+    pub async fn set_model(&self, model: &str) -> Result<crate::model::ModelSettings> {
+        let mut store = self.model.lock().await;
+        if self
+            .runs
+            .lock()
+            .map_err(|_| CoreError::new("BUSY", "生成状态暂不可用。"))?
+            .values()
+            .any(|run| ["queued", "running"].contains(&run.run.status.as_str()))
+        {
+            return Err(CoreError::new(
+                "BUSY",
+                "生成中不能切换模型，请先停止并等待结束。",
+            ));
+        }
+        let settings = store.set_model(model)?;
+        *self
+            .model_summary
+            .write()
+            .map_err(|_| CoreError::new("BUSY", "模型配置暂不可用。"))? = settings.clone();
+        Ok(settings)
+    }
     pub fn new(library_root: PathBuf, state_dir: PathBuf) -> Result<Arc<Self>> {
         fs::create_dir_all(&state_dir)?;
         #[cfg(unix)]
@@ -144,6 +180,32 @@ impl Engine {
         }
     }
     pub fn save_ui_preferences(&self, value: UiPreferences) -> Result<UiPreferences> {
+        let _guard = UI_PREFERENCE_WRITE
+            .lock()
+            .map_err(|_| CoreError::new("BUSY", "界面设置暂不可用。"))?;
+        value.validate()?;
+        let path = self.lock()?.state_dir.join("ui-preferences.json");
+        atomic_json(&path, &value)?;
+        Ok(value)
+    }
+    pub fn patch_ui_preferences(
+        &self,
+        font_size: Option<u8>,
+        assistant_width: Option<u16>,
+    ) -> Result<UiPreferences> {
+        let _guard = UI_PREFERENCE_WRITE
+            .lock()
+            .map_err(|_| CoreError::new("BUSY", "界面设置暂不可用。"))?;
+        let mut value = self.ui_preferences()?;
+        if font_size.is_none() && assistant_width.is_none() {
+            return Ok(value);
+        }
+        if let Some(size) = font_size {
+            value.font_size = size;
+        }
+        if let Some(width) = assistant_width {
+            value.assistant_width = width;
+        }
         value.validate()?;
         let path = self.lock()?.state_dir.join("ui-preferences.json");
         atomic_json(&path, &value)?;
@@ -601,12 +663,18 @@ mod iteration_tests {
         let engine = Engine::new(lib.clone(), state.clone()).unwrap();
         assert_eq!(engine.ui_preferences().unwrap().font_size, 16);
         engine
-            .save_ui_preferences(UiPreferences { font_size: 20 })
+            .save_ui_preferences(UiPreferences {
+                font_size: 20,
+                ..UiPreferences::default()
+            })
             .unwrap();
         let old = fs::read(state.join("ui-preferences.json")).unwrap();
         assert_eq!(
             engine
-                .save_ui_preferences(UiPreferences { font_size: 11 })
+                .save_ui_preferences(UiPreferences {
+                    font_size: 11,
+                    ..UiPreferences::default()
+                })
                 .unwrap_err()
                 .code,
             "INVALID_INPUT"
@@ -620,6 +688,48 @@ mod iteration_tests {
                 .unwrap()
                 .font_size,
             20
+        );
+    }
+}
+
+#[cfg(test)]
+mod width_preference_tests {
+    use super::*;
+    #[test]
+    fn old_font_settings_and_concurrent_width_patches_preserve_each_other() {
+        let temp = tempfile::tempdir().unwrap();
+        let library = temp.path().join("library");
+        let state = temp.path().join("state");
+        let engine = Engine::new(library.clone(), state.clone()).unwrap();
+        fs::write(state.join("ui-preferences.json"), r#"{"fontSize":18}"#).unwrap();
+        assert_eq!(engine.ui_preferences().unwrap().assistant_width, 346);
+        let a = engine.clone();
+        let b = engine.clone();
+        let t1 = std::thread::spawn(move || a.patch_ui_preferences(Some(20), None).unwrap());
+        let t2 = std::thread::spawn(move || b.patch_ui_preferences(None, Some(600)).unwrap());
+        t1.join().unwrap();
+        t2.join().unwrap();
+        assert_eq!(
+            engine.ui_preferences().unwrap(),
+            UiPreferences {
+                font_size: 20,
+                assistant_width: 600
+            }
+        );
+        let old = fs::read(state.join("ui-preferences.json")).unwrap();
+        assert!(engine.patch_ui_preferences(None, Some(279)).is_err());
+        assert!(engine.patch_ui_preferences(None, Some(961)).is_err());
+        assert_eq!(fs::read(state.join("ui-preferences.json")).unwrap(), old);
+        drop(engine);
+        assert_eq!(
+            Engine::new(library, state)
+                .unwrap()
+                .ui_preferences()
+                .unwrap(),
+            UiPreferences {
+                font_size: 20,
+                assistant_width: 600
+            }
         );
     }
 }

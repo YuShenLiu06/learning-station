@@ -166,7 +166,7 @@ test('real Pi provider sends exact GLM model, thinking enabled, no tools, and st
 test('truncated provider stream cannot produce settled success', async () => {
   await withServer(async (req, res) => { await readPayload(req); sendSse(res, 'partial', false); }, async (endpoint) => {
     const events = [];
-    await assert.rejects(runLearningAgent(request(endpoint), (event) => events.push(event)), (error) => error.code === 'MODEL_RESPONSE');
+    await assert.rejects(runLearningAgent(request(endpoint), (event) => events.push(event)), (error) => error.code === 'MODEL_INCOMPLETE');
     assert(!events.some((event) => event.type === 'done'));
   });
 });
@@ -211,7 +211,7 @@ test('CLI cancel exits promptly, without done or secret output', async () => {
 const customRequest = (endpoint) => ({ ...request(endpoint), settings: { provider: 'custom', protocol: 'openai-completions', baseUrl: endpoint, model: 'user-selected/model-2026' } });
 test('custom transport requires an explicit supported protocol, valid URL and user model', () => {
   assert.equal(createModel(customRequest('https://api.example.com/custom/v1/').settings).baseUrl, 'https://api.example.com/custom/v1');
-  for (const protocol of ['', 'anthropic-messages', 'openai-responses']) assert.throws(() => createModel({ ...customRequest('https://example.com/v1').settings, protocol }));
+  for (const protocol of ['', 'unsupported-protocol', 'openai-responses']) assert.throws(() => createModel({ ...customRequest('https://example.com/v1').settings, protocol }));
   for (const model of ['', 'x'.repeat(257), 'bad\nmodel']) assert.throws(() => createModel({ ...customRequest('https://example.com/v1').settings, model }));
   for (const endpoint of ['http://example.com/v1', 'file:///tmp/fixture-secret', 'https://user:fixture-secret@example.com/v1', 'https://@example.com/v1', 'https://example.com/v1?', 'https://example.com/v1#']) assert.throws(() => createModel(customRequest(endpoint).settings), (error) => !error.message.includes(SECRET));
 });
@@ -238,7 +238,7 @@ test('custom connection test uses same transport and failures never emit done or
       if (failure === 'auth') { res.writeHead(401); res.end(SECRET); } else sendSse(res, 'partial fixture', false);
     }, async (endpoint) => {
       const input = customRequest(endpoint); input.operation = 'test'; const events = [];
-      await assert.rejects(runLearningAgent(input, (event) => events.push(event)), (error) => error.code === (failure === 'auth' ? 'AUTH' : 'MODEL_RESPONSE') && !error.message.includes(SECRET));
+      await assert.rejects(runLearningAgent(input, (event) => events.push(event)), (error) => error.code === (failure === 'auth' ? 'AUTH' : 'MODEL_INCOMPLETE') && !error.message.includes(SECRET));
       assert(!events.some((event) => event.type === 'done')); assert(!JSON.stringify(events).includes(SECRET));
     });
     assert.equal(calls, 1);

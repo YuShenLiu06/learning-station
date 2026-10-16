@@ -1,5 +1,7 @@
 import { Agent } from '@earendil-works/pi-agent-core';
 import { streamSimple } from '@earendil-works/pi-ai/api/openai-completions';
+import { streamSimple as streamAnthropic } from '@earendil-works/pi-ai/api/anthropic-messages';
+import { createResponseDiagnostic, responseFailureCode, safeResponseDiagnostic } from './response-diagnostics.mjs';
 import { createLearningPlugin, LEARNING_PLUGIN, validateToolPolicy } from './learning-plugin.mjs';
 
 export const HARNESS = 'pi-agent-core';
@@ -22,7 +24,13 @@ export const SAFE_MESSAGES = Object.freeze({
   INVALID_URL: 'API 地址无效或返回重定向，请检查所填地址。',
   INVALID_INPUT: '模型输入无效或过大，请缩小所选材料后重试。',
   MODEL_HTTP: '模型服务拒绝请求，请检查所选区域、密钥和模型权限。',
-  MODEL_RESPONSE: '模型未完整返回有效文本；已收到的内容已保留。',
+  MODEL_RESPONSE: '模型响应未通过完整性校验；可用正文已保留，未当作完整答案。',
+  MODEL_ENDPOINT_PAGE: '服务地址返回了网页，未得到模型 API 响应。请核对基础地址是否需要 /v1，并查看已保存的最终请求 URL；应用未自动改地址。',
+  MODEL_FORMAT: '服务返回的格式不符合所选流式协议，请核对协议和最终请求 URL；未把它当作完整答案。',
+  MODEL_LENGTH: '模型因输出 token 上限而结束，正文可能不完整；可用正文已保留，未当作完整答案。',
+  MODEL_INCOMPLETE: '模型流在有效结束标记前结束；可用正文已保留，未当作完整答案。',
+  MODEL_THINKING_ONLY: '模型仅返回思考内容，没有最终正文；思考内容未当作学习答案。',
+  MODEL_EMPTY: '模型声明结束，但没有返回有效正文。',
   OUTPUT_LIMIT: '模型输出超过限制，已停止；已收到的内容已保留。',
   TOOL_LIMIT: '学习工具调用超过本次预算，已停止。',
   TOOL_PROTOCOL: '学习工具协议或参数无效，已停止。',
@@ -31,11 +39,12 @@ export const SAFE_MESSAGES = Object.freeze({
   PI_RUNTIME: 'Pi 运行环境不可用，请检查 Node 24 和学习站组件。',
 });
 export class SafeError extends Error {
-  constructor(code) {
+  constructor(code, diagnostic) {
     const safe = Object.hasOwn(SAFE_MESSAGES, code) ? code : 'PI_RUNTIME';
     super(SAFE_MESSAGES[safe]);
     this.name = 'SafeError';
     this.code = safe;
+    if (diagnostic) this.diagnostic = safeResponseDiagnostic(diagnostic);
   }
 }
 export function safeErrorEvent(code) {
@@ -55,13 +64,13 @@ export function normalizeEndpoint(value, provider = 'glm-pi') {
   return normalized;
 }
 export function createModel(settings, operation = 'generate') {
-  if (!['custom', 'glm-pi', 'openai-compatible'].includes(settings?.provider) || (settings.protocol ?? (settings.provider === 'custom' ? '' : 'openai-completions')) !== 'openai-completions' || typeof settings.model !== 'string' || !settings.model.trim() || Buffer.byteLength(settings.model) > 256 || /[\u0000-\u001f\u007f]/u.test(settings.model)) throw new SafeError('INVALID_MODEL_SETTINGS');
+  if (!['custom', 'glm-pi', 'openai-compatible'].includes(settings?.provider) || !['openai-completions', ...(settings.provider === 'custom' ? ['anthropic-messages'] : [])].includes(settings.protocol ?? (settings.provider === 'custom' ? '' : 'openai-completions')) || typeof settings.model !== 'string' || !settings.model.trim() || Buffer.byteLength(settings.model) > 256 || /[\u0000-\u001f\u007f]/u.test(settings.model)) throw new SafeError('INVALID_MODEL_SETTINGS');
   if (settings.provider === 'custom') return {
-    id: settings.model, name: settings.model, provider: 'learning-custom', api: 'openai-completions',
+    id: settings.model, name: settings.model, provider: 'learning-custom', api: settings.protocol,
     baseUrl: normalizeEndpoint(settings.baseUrl, 'custom'), reasoning: false, input: ['text'],
     contextWindow: 32768, maxTokens: operation === 'test' ? 256 : 4096,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    compat: { supportsReasoningEffort: false, maxTokensField: 'max_tokens', supportsDeveloperRole: false, supportsStore: false, supportsUsageInStreaming: false, zaiToolStream: false },
+    compat: settings.protocol === 'anthropic-messages' ? { supportsStrictTools: false, supportsEagerToolInputStreaming: false, supportsLongCacheRetention: false, supportsCacheControlOnTools: false, sendSessionAffinityHeaders: false } : { supportsReasoningEffort: false, maxTokensField: 'max_tokens', supportsDeveloperRole: false, supportsStore: false, supportsUsageInStreaming: false, zaiToolStream: false },
   };
   if (settings.model !== MODEL_ID) throw new SafeError('INVALID_MODEL_SETTINGS');
   return {
@@ -110,11 +119,11 @@ function statusCode(status) {
 }
 
 /** Explicit fetch, no ambient credentials, no retry, and no redirects to any host. */
-export function createControlledFetch({ endpoint, apiKey, fail, baseFetch = globalThis.fetch }) {
-  const target = `${normalizeEndpoint(endpoint, 'custom')}/chat/completions`;
+export function createControlledFetch({ endpoint, apiKey, fail, protocol = 'openai-completions', diagnostic, baseFetch = globalThis.fetch }) {
+  const target = `${normalizeEndpoint(endpoint, 'custom')}${protocol === 'anthropic-messages' ? '/v1/messages?beta=true' : '/chat/completions'}`;
   return async (input, init) => {
     const request = new Request(input, init);
-    if (request.url !== target || request.method !== 'POST' || request.headers.get('authorization') !== `Bearer ${apiKey}`) {
+    if (request.url !== target || request.method !== 'POST' || (protocol === 'anthropic-messages' ? request.headers.get('x-api-key') !== apiKey || request.headers.has('authorization') : request.headers.get('authorization') !== `Bearer ${apiKey}`)) {
       fail('INVALID_URL'); throw new SafeError('INVALID_URL');
     }
     const headersController = new AbortController();
@@ -125,11 +134,17 @@ export function createControlledFetch({ endpoint, apiKey, fail, baseFetch = glob
     try { response = await baseFetch(request, { redirect: 'error', signal }); }
     catch { if (!signal.aborted) fail('NETWORK'); throw new SafeError('NETWORK'); }
     finally { clearTimeout(timer); }
+    diagnostic?.headers(response);
     if (!response.ok) {
       const code = statusCode(response.status);
       fail(code);
       await response.body?.cancel().catch(() => {});
       throw new SafeError(code);
+    }
+    const responseKind = diagnostic?.snapshot().contentType;
+    if (responseKind === 'html' || responseKind === 'json') {
+      const code = responseKind === 'html' ? 'MODEL_ENDPOINT_PAGE' : 'MODEL_FORMAT';
+      fail(code); await response.body?.cancel().catch(() => {}); throw new SafeError(code);
     }
     if (!response.body) { fail('MODEL_RESPONSE'); throw new SafeError('MODEL_RESPONSE'); }
     const reader = response.body.getReader();
@@ -139,11 +154,12 @@ export function createControlledFetch({ endpoint, apiKey, fail, baseFetch = glob
       async pull(controller) {
         try {
           const next = await reader.read();
-          if (next.done) { controller.close(); return; }
+          if (next.done) { diagnostic?.end(); controller.close(); return; }
           received += next.value.byteLength;
           if (received > MAX_TRANSPORT) {
             fail('OUTPUT_LIMIT'); await reader.cancel(); controller.error(new SafeError('OUTPUT_LIMIT')); return;
           }
+          diagnostic?.bytes(next.value);
           controller.enqueue(next.value);
         } catch {
           // The OpenAI SSE reader aborts its request after [DONE]; that intentional
@@ -178,6 +194,13 @@ class SecretFilter {
     this.pending = this.pending.slice(length);
     return safe;
   }
+  abort() {
+    let text = this.pending.replaceAll(this.secret, '[REDACTED]'); this.pending = '';
+    for (let length = this.secret.length - 1; length > 0; length--) {
+      if (text.endsWith(this.secret.slice(0, length))) { text = `${text.slice(0, -length)}[REDACTED]`; break; }
+    }
+    return text;
+  }
 }
 
 /** Test dependencies accept functions only; JSON input cannot replace the real Agent or provider. */
@@ -185,6 +208,8 @@ export async function runLearningAgent(request, emit, { signal, streamFn: fixtur
   if (!request || request.protocol !== 1 || !['generate', 'test'].includes(request.operation)) throw new SafeError('INVALID_INPUT');
   if (typeof request.apiKey !== 'string' || !request.apiKey || Buffer.byteLength(request.apiKey) > 16384 || /[\u0000-\u0020\u007f]/u.test(request.apiKey)) throw new SafeError('AUTH');
   const model = createModel(request.settings, request.operation);
+  if (model.api === 'anthropic-messages' && (request.apiKey.includes('sk-ant-oat') || /\/(?:v1|messages)$/u.test(new URL(model.baseUrl).pathname))) throw new SafeError('INVALID_MODEL_SETTINGS');
+  const diagnostic = createResponseDiagnostic(request.operation, model.api);
   const targetUrl = new URL(model.baseUrl);
   const fixture = targetUrl.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(targetUrl.hostname);
   const codingTarget = ['open.bigmodel.cn', 'api.z.ai'].includes(targetUrl.hostname) && targetUrl.pathname.startsWith('/api/coding/');
@@ -219,8 +244,8 @@ export async function runLearningAgent(request, emit, { signal, streamFn: fixtur
       offset = end;
     }
   };
-  const controlledFetch = createControlledFetch({ endpoint: model.baseUrl, apiKey: request.apiKey, fail });
-  const productionStream = (selectedModel, context, options) => streamSimple(selectedModel, context, {
+  const controlledFetch = createControlledFetch({ endpoint: model.baseUrl, apiKey: request.apiKey, fail, protocol: model.api, diagnostic });
+  const productionStream = (selectedModel, context, options) => (model.api === 'anthropic-messages' ? streamAnthropic : streamSimple)(selectedModel, context, {
     ...options, apiKey: request.apiKey, fetch: controlledFetch, ...(glm ? { reasoning: 'max' } : {}),
     timeoutMs: request.operation === 'test' ? 30_000 : 120_000, maxRetries: 0, maxRetryDelayMs: 1,
     cacheRetention: 'none', env: {}, toolChoice: toolsEnabled ? 'auto' : 'none', temperature: 1,
@@ -228,12 +253,14 @@ export async function runLearningAgent(request, emit, { signal, streamFn: fixtur
     onPayload: (payload) => {
       // Pin invariants after the provider's compat mapping, before any request is sent.
       payload.model = model.id; payload.stream = true;
+      diagnostic.begin(model.baseUrl, payload.max_tokens ?? payload.max_completion_tokens ?? model.maxTokens);
       if (glm) { payload.thinking = { type: 'enabled', clear_thinking: false }; payload.reasoning_effort = 'max'; }
       else { delete payload.thinking; delete payload.reasoning_effort; delete payload.tool_stream; }
       if (!toolsEnabled) { delete payload.tools; delete payload.tool_choice; delete payload.tool_stream; }
-      else if (payload.tools?.some((tool) => !permitted.has(tool.function?.name))) { fail('TOOLS_DISABLED'); throw new SafeError('TOOLS_DISABLED'); }
+      else if (payload.tools?.some((tool) => !permitted.has(model.api === 'anthropic-messages' ? tool.name : tool.function?.name))) { fail('TOOLS_DISABLED'); throw new SafeError('TOOLS_DISABLED'); }
       return payload;
     },
+    onProviderStreamEvent: chunk => { diagnostic.chunk(chunk); if (diagnostic.snapshot().invalidDelta) { fail('MODEL_FORMAT'); throw new SafeError('MODEL_FORMAT'); } },
   });
   agent = new Agent({
     initialState: { systemPrompt: request.operation === 'test' ? 'You are a connection test. Reply only with OK. Tools are disabled.' : policy.mode === 'feedback' ? FEEDBACK_SYSTEM : plugin ? `${FIXED_SYSTEM}\n当前模式：${policy.mode}。已注册工具仅${policy.allowedTools.join('、')}。写入必须依据用户明确请求；AI整理的疑问和错因均待本人确认。` : `${FIXED_SYSTEM}\n本次没有注册工具，禁止请求任何工具。`,
@@ -293,19 +320,21 @@ export async function runLearningAgent(request, emit, { signal, streamFn: fixtur
     await agent.waitForIdle();
     if (signal?.aborted) fail('CANCELLED');
     if (failure) throw new SafeError(failure);
-    if (!sawAgentEnd || agent.state.isStreaming || agent.state.pendingToolCalls.size > 0 || completedAssistant?.stopReason !== 'stop') throw new SafeError('MODEL_RESPONSE');
-    if (!finalText.trim()) throw new SafeError('MODEL_RESPONSE');
+    if (!sawAgentEnd || agent.state.isStreaming || agent.state.pendingToolCalls.size > 0 || completedAssistant?.stopReason !== 'stop') throw new SafeError(responseFailureCode(diagnostic.snapshot()));
+    if (model.api === 'anthropic-messages' && !diagnostic.snapshot().messageStop) throw new SafeError('MODEL_INCOMPLETE');
+    if (!finalText.trim()) throw new SafeError(responseFailureCode(diagnostic.snapshot()));
     await sendText(filtered.push('', true));
     if (failure) throw new SafeError(failure);
     if (!output.trim()) throw new SafeError('MODEL_RESPONSE');
     const finalContent = finalText.replaceAll(request.apiKey, '[REDACTED]');
     if (Buffer.byteLength(finalContent) > MAX_OUTPUT) throw new SafeError('OUTPUT_LIMIT');
-    await emit({ type: 'done', settled: true, stopReason: 'stop', outputBytes: Buffer.byteLength(output), finalContent, toolCalls: plugin?.stats().executed ?? 0 });
+    await emit({ type: 'done', settled: true, stopReason: 'stop', outputBytes: Buffer.byteLength(output), finalContent, toolCalls: plugin?.stats().executed ?? 0, diagnostic: diagnostic.snapshot() });
     return { output: finalContent, partialOutput: output, settled: true };
   } catch (error) {
     agent.abort();
     await agent.waitForIdle();
-    throw new SafeError(failure ?? (error instanceof SafeError ? error.code : 'MODEL_RESPONSE'));
+    await sendText(filtered.abort());
+    throw new SafeError(failure ?? (error instanceof SafeError ? error.code : responseFailureCode(diagnostic.snapshot())), diagnostic.snapshot());
   } finally {
     unsubscribe(); signal?.removeEventListener('abort', abort);
     request.apiKey = ''; // No filesystem/session persistence; terminate this process after one request.

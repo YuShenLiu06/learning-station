@@ -22,6 +22,8 @@ pub struct GenerationRequest {
     pub selection: String,
     pub prompt: String,
     pub request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_entry_id: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,6 +38,37 @@ pub struct Run {
     pub updated_at: String,
     pub request_digest: String,
     pub context_manifest: Vec<ManifestItem>,
+    #[serde(default)]
+    pub user_entry_id: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Vec<ToolActivity>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolObject {
+    pub kind: String,
+    pub id: String,
+    pub session_id: String,
+    pub section_id: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolActivity {
+    pub id: String,
+    pub tool_call_id: String,
+    pub run_id: String,
+    pub session_id: String,
+    pub name: String,
+    pub status: String,
+    pub title: String,
+    pub summary: String,
+    pub started_at: String,
+    pub updated_at: String,
+    pub persisted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object: Option<ToolObject>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
 }
 pub struct ManagedRun {
     pub run: Run,
@@ -53,6 +86,8 @@ pub struct GenerationEvent {
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<CoreError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<ToolActivity>,
 }
 pub type Sink = Arc<dyn Fn(GenerationEvent) + Send + Sync>;
 
@@ -81,6 +116,7 @@ fn event(run: &Run, delta: Option<String>) -> GenerationEvent {
             Some(run.content.clone())
         },
         error: run.error.clone(),
+        tool: None,
     }
 }
 
@@ -144,10 +180,20 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
         };
     }
     // credentials() touches only the Keychain item this app created; no existing account is reused.
-    let credentials = engine.model.lock().await.credentials()?;
+    let model_store = engine.model.lock().await;
+    let credentials = model_store.credentials()?;
     let (ctx, session) = {
         let mut core = engine.lock()?;
         let (session, ctx) = core.session_context(&request.session_id, Some(&request.selection))?;
+        if let Some(entry_id) = &request.user_entry_id {
+            validate_reused_user(
+                &session,
+                entry_id,
+                &request.prompt,
+                &request.mode,
+                &request.selection,
+            )?;
+        }
         let session =
             sessions::set_context_manifest(&mut core.content, &session.id, &ctx.manifest)?;
         (ctx, session)
@@ -164,6 +210,13 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
         updated_at: stamp,
         request_digest: digest,
         context_manifest: ctx.manifest.clone(),
+        user_entry_id: Some(
+            request
+                .user_entry_id
+                .clone()
+                .unwrap_or_else(|| format!("entry_{}", &hash(&format!("{id}-user"))[..32])),
+        ),
+        tool_calls: vec![],
     };
     {
         let mut runs = engine
@@ -195,6 +248,7 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
             },
         );
     }
+    drop(model_store); // Model selection cannot race credential capture and queued-run insertion.
     let user_entry = Entry {
         id: String::new(),
         kind: "user".into(),
@@ -208,7 +262,13 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
         related_ids: vec![],
         data: Some(json!({"mode":request.mode,"runId":id})),
     };
-    record_user_and_resume(&engine, &session.id, user_entry, &id)?;
+    record_user_and_resume(
+        &engine,
+        &session.id,
+        user_entry,
+        &id,
+        request.user_entry_id.as_deref(),
+    )?;
     let messages = messages(&request, &ctx, &session);
     let tool_scope = crate::learning_tools::ToolScope {
         session_id: session.id.clone(),
@@ -229,7 +289,7 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
         let mut last_persist = std::time::Instant::now();
         let policy = task_tool_policy(&request.mode);
         let tool_handler = (!policy.allowed_tools.is_empty())
-            .then(|| learning_tool_handler(engine.clone(), tool_scope));
+            .then(|| learning_tool_handler(engine.clone(), tool_scope, sink.clone()));
         let result = model::generate_scoped(
             credentials,
             messages,
@@ -324,14 +384,29 @@ fn task_tool_policy(mode: &str) -> model::ToolPolicy {
 fn learning_tool_handler(
     engine: Arc<Engine>,
     scope: crate::learning_tools::ToolScope,
+    sink: Sink,
 ) -> model::ToolHandler {
     let scope = Arc::new(scope);
     Arc::new(move |call| {
         let engine = engine.clone();
         let scope = scope.clone();
+        let sink = sink.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
-                crate::learning_tools::execute(&engine, &scope, &call.id, &call.name, call.args)
+                let mut activity = new_tool_activity(&scope, &call.id, &call.name)?;
+                publish_tool_activity(&engine, &activity, &sink)?;
+                let result = crate::learning_tools::execute(
+                    &engine, &scope, &call.id, &call.name, call.args,
+                );
+                finish_tool_activity(&mut activity, &scope, &result);
+                let _ = publish_tool_activity(&engine, &activity, &sink);
+                if activity.status == "failed" && result.is_ok() {
+                    return Err(CoreError::new(
+                        "TOOL_PROTOCOL",
+                        "工具结果没有有效保存回执。",
+                    ));
+                }
+                result
             })
             .await
             .map_err(|_| CoreError::new("INTERNAL", "学习工具执行中断，已提交记录仍保留。"))?
@@ -344,16 +419,28 @@ fn record_user_and_resume(
     session_id: &str,
     user_entry: Entry,
     id: &str,
+    user_entry_id: Option<&str>,
 ) -> Result<()> {
     let result = (|| {
         let mut core = engine.lock()?;
-        sessions::append(
-            &mut core.content,
-            session_id,
-            user_entry,
-            None,
-            &format!("{id}-user"),
-        )?;
+        if let Some(entry_id) = user_entry_id {
+            let session = sessions::get(&mut core.content, session_id)?;
+            validate_reused_user(
+                &session,
+                entry_id,
+                &user_entry.content,
+                "",
+                user_entry.selection.as_deref().unwrap_or_default(),
+            )?;
+        } else {
+            sessions::append(
+                &mut core.content,
+                session_id,
+                user_entry,
+                None,
+                &format!("{id}-user"),
+            )?;
+        }
         core.preferences
             .last_run_by_session
             .insert(session_id.into(), id.into());
@@ -391,6 +478,16 @@ fn messages(request: &GenerationRequest, ctx: &Context, session: &Session) -> Ve
     let mut budget = 20000usize;
     let mut history = Vec::new();
     for entry in session.entries.iter().rev().take(16) {
+        if request.user_entry_id.as_deref() == Some(entry.id.as_str())
+            || entry
+                .data
+                .as_ref()
+                .and_then(|data| data.get("origin"))
+                .and_then(Value::as_str)
+                == Some("pi-tool-activity")
+        {
+            continue;
+        }
         if budget == 0 {
             break;
         }
@@ -553,6 +650,7 @@ mod tests {
             selection: String::new(),
             prompt: "why?".into(),
             request_id: "request1".into(),
+            user_entry_id: None,
         };
         let s = Session {
             id: "s".into(),
@@ -604,6 +702,8 @@ mod prestart_tests {
             updated_at: stamp,
             request_digest: "fixture".into(),
             context_manifest: vec![],
+            user_entry_id: None,
+            tool_calls: vec![],
         };
         engine.runs.lock().unwrap().insert(
             id.into(),
@@ -624,7 +724,7 @@ mod prestart_tests {
             related_ids: vec![],
             data: None,
         };
-        assert!(record_user_and_resume(&engine, &session.id, input, id).is_err());
+        assert!(record_user_and_resume(&engine, &session.id, input, id, None).is_err());
         assert_eq!(get(&engine, id).unwrap().status, "failed");
         assert_eq!(
             sessions::get(&mut engine.lock().unwrap().content, &session.id)
@@ -673,11 +773,370 @@ mod exploration_tests {
             selection: String::new(),
             prompt: "How does memory work?".into(),
             request_id: "independent-question".into(),
+            user_entry_id: None,
         };
         let serialized = serde_json::to_string(&messages(&request, &context, &free)).unwrap();
         assert!(!serialized.contains("SECRET_COURSE"));
         assert!(!serialized.contains("SECRET_LINKED_HISTORY"));
         assert!(serialized.contains("How does memory work?"));
         assert!(context.manifest.is_empty());
+    }
+}
+
+fn validate_reused_user(
+    session: &Session,
+    entry_id: &str,
+    prompt: &str,
+    mode: &str,
+    selection: &str,
+) -> Result<()> {
+    let content = if prompt.trim().is_empty() && !mode.is_empty() {
+        default_request(mode)
+    } else {
+        prompt
+    };
+    if !valid_id(entry_id)
+        || !session.entries.iter().any(|entry| {
+            entry.id == entry_id
+                && entry.kind == "user"
+                && entry.content == content
+                && entry.selection.as_deref().unwrap_or_default() == selection
+        })
+    {
+        return Err(CoreError::new(
+            "CONFLICT",
+            "已保存的问题与本次请求不一致，请重新核对；未重复保存或发送。",
+        ));
+    }
+    Ok(())
+}
+fn new_tool_activity(
+    scope: &crate::learning_tools::ToolScope,
+    call_id: &str,
+    name: &str,
+) -> Result<ToolActivity> {
+    let title = match name {
+        "record_question" => "记录困惑",
+        "create_error" => "整理错因建议",
+        "create_review_card" => "创建复习卡",
+        "create_note" => "保存学习笔记",
+        "create_todo" => "创建待办",
+        "query_related_knowledge" => "查找相关材料",
+        _ => return Err(CoreError::new("TOOL_NOT_ALLOWED", "未启用此学习工具。")),
+    };
+    let id = format!(
+        "tool_{}",
+        &hash(&format!("{}\n{}", scope.run_id, call_id))[..32]
+    );
+    let stamp = timestamp();
+    Ok(ToolActivity {
+        id: id.clone(),
+        tool_call_id: id,
+        run_id: scope.run_id.clone(),
+        session_id: scope.session_id.clone(),
+        name: name.into(),
+        status: "running".into(),
+        title: title.into(),
+        summary: "正在本机执行，尚未确认结果。".into(),
+        started_at: stamp.clone(),
+        updated_at: stamp,
+        persisted: false,
+        object: None,
+        error_code: None,
+    })
+}
+fn finish_tool_activity(
+    activity: &mut ToolActivity,
+    scope: &crate::learning_tools::ToolScope,
+    result: &Result<Value>,
+) {
+    activity.updated_at = timestamp();
+    if let Ok(value) = result {
+        if activity.name == "query_related_knowledge" {
+            activity.status = "succeeded".into();
+            activity.summary = "已完成授权材料查询，未创建新内容。".into();
+            return;
+        }
+        let (field, kind) = if activity.name == "create_todo" {
+            ("todoId", "todo")
+        } else if ["create_error", "create_review_card"].contains(&activity.name.as_str()) {
+            ("entryId", "review-card")
+        } else {
+            ("entryId", "learning-entry")
+        };
+        if value.get("persisted").and_then(Value::as_bool) == Some(true)
+            && value.get("sessionId").and_then(Value::as_str) == Some(scope.session_id.as_str())
+        {
+            if let Some(id) = value
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|id| valid_id(id))
+            {
+                activity.status = "succeeded".into();
+                activity.persisted = true;
+                activity.summary = if kind == "todo" {
+                    "已保存待办，提醒默认关闭。"
+                } else {
+                    "已保存学习内容，AI整理待本人确认。"
+                }
+                .into();
+                activity.object = Some(ToolObject {
+                    kind: kind.into(),
+                    id: id.into(),
+                    session_id: scope.session_id.clone(),
+                    section_id: scope.section_id.clone(),
+                });
+                return;
+            }
+        }
+    }
+    activity.status = "failed".into();
+    activity.summary = "工具未确认完成；不会将模型文字当作保存成功。".into();
+    activity.error_code = Some("TOOL_FAILED".into());
+}
+fn publish_tool_activity(engine: &Engine, activity: &ToolActivity, sink: &Sink) -> Result<()> {
+    {
+        let mut core = engine.lock()?;
+        sessions::append(
+            &mut core.content,
+            &activity.session_id,
+            Entry {
+                id: String::new(),
+                kind: "note".into(),
+                content: format!("{}：{}", activity.title, activity.summary),
+                created_at: String::new(),
+                selection: None,
+                related_ids: vec![],
+                data: Some(json!({"origin":"pi-tool-activity","toolActivity":activity})),
+            },
+            None,
+            &format!("{}-{}", activity.id, activity.status),
+        )?;
+    }
+    let mut runs = engine
+        .runs
+        .lock()
+        .map_err(|_| CoreError::new("BUSY", "工具状态暂不可用。"))?;
+    if let Some(managed) = runs.get_mut(&activity.run_id) {
+        if let Some(previous) = managed
+            .run
+            .tool_calls
+            .iter_mut()
+            .find(|item| item.tool_call_id == activity.tool_call_id)
+        {
+            *previous = activity.clone();
+        } else {
+            managed.run.tool_calls.push(activity.clone());
+        }
+        managed.run.updated_at = timestamp();
+        persist(engine, &managed.run)?;
+        let mut update = event(&managed.run, None);
+        update.tool = Some(activity.clone());
+        (sink)(update);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    fn run(session_id: &str) -> Run {
+        Run {
+            id: "run_lifecycle".into(),
+            session_id: session_id.into(),
+            mode: "question".into(),
+            status: "running".into(),
+            content: String::new(),
+            error: None,
+            created_at: timestamp(),
+            updated_at: timestamp(),
+            request_digest: "fixture".into(),
+            context_manifest: vec![],
+            user_entry_id: None,
+            tool_calls: vec![],
+        }
+    }
+    fn setup() -> (tempfile::TempDir, Arc<Engine>, Session) {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = Engine::new(temp.path().join("library"), temp.path().join("state")).unwrap();
+        let session = {
+            let mut core = engine.lock().unwrap();
+            let section = core
+                .create_section("English fixture", "for a period", vec![], vec![])
+                .unwrap();
+            core.start_session(&section.id, false).unwrap().0
+        };
+        (temp, engine, session)
+    }
+    #[test]
+    fn appended_question_is_reused_for_retries_without_duplicate_history() {
+        let (_temp, engine, session) = setup();
+        let entry = Entry {
+            id: String::new(),
+            kind: "user".into(),
+            content: "Why for?".into(),
+            created_at: String::new(),
+            selection: Some("for a period".into()),
+            related_ids: vec![],
+            data: Some(json!({"clientMessageId":"send_stable","mode":"explain"})),
+        };
+        let saved = {
+            let mut core = engine.lock().unwrap();
+            sessions::append(
+                &mut core.content,
+                &session.id,
+                entry.clone(),
+                Some(&session.version),
+                "send_stable",
+            )
+            .unwrap()
+        };
+        let entry_id = saved.entries[0].id.clone();
+        assert!(
+            validate_reused_user(&saved, &entry_id, "Why for?", "explain", "for a period").is_ok()
+        );
+        assert!(
+            validate_reused_user(&saved, &entry_id, "different", "explain", "for a period")
+                .is_err()
+        );
+        assert!(validate_reused_user(
+            &saved,
+            &entry_id,
+            "Why for?",
+            "explain",
+            "foreign selection"
+        )
+        .is_err());
+        for run_id in ["run_retry_one", "run_retry_two"] {
+            record_user_and_resume(&engine, &session.id, entry.clone(), run_id, Some(&entry_id))
+                .unwrap();
+        }
+        let current = sessions::get(&mut engine.lock().unwrap().content, &session.id).unwrap();
+        assert_eq!(current.entries.len(), 1);
+        let request = GenerationRequest {
+            session_id: session.id.clone(),
+            mode: "explain".into(),
+            selection: "for a period".into(),
+            prompt: "Why for?".into(),
+            request_id: "request_retry".into(),
+            user_entry_id: Some(entry_id),
+        };
+        let payload = messages(
+            &request,
+            &Context {
+                text: String::new(),
+                manifest: vec![],
+                warnings: vec![],
+                truncated: false,
+            },
+            &current,
+        );
+        let quoted: Value = serde_json::from_str(payload[1]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(quoted["learningHistory"], json!([]));
+    }
+    #[tokio::test]
+    async fn model_selection_is_blocked_for_active_run_without_touching_credentials() {
+        let (_temp, engine, session) = setup();
+        engine.runs.lock().unwrap().insert(
+            "run_lifecycle".into(),
+            ManagedRun {
+                run: run(&session.id),
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        assert_eq!(
+            engine.set_model("new-model").await.unwrap_err().code,
+            "BUSY"
+        );
+        engine
+            .runs
+            .lock()
+            .unwrap()
+            .get_mut("run_lifecycle")
+            .unwrap()
+            .run
+            .status = "failed".into();
+        assert_eq!(
+            engine.set_model("new-model").await.unwrap_err().code,
+            "NOT_CONFIGURED"
+        );
+    }
+    #[test]
+    fn real_todo_receipt_drives_safe_durable_tool_card_and_reopens_without_duplicates() {
+        let (temp, engine, session) = setup();
+        let mut current = run(&session.id);
+        current.id = "run_lifecycle".into();
+        engine.runs.lock().unwrap().insert(
+            current.id.clone(),
+            ManagedRun {
+                run: current,
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        let scope = crate::learning_tools::ToolScope {
+            session_id: session.id.clone(),
+            section_id: session.section_id.clone(),
+            run_id: "run_lifecycle".into(),
+            allowed_ids: vec![],
+        };
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let saved = events.clone();
+        let sink: Sink = Arc::new(move |event| saved.lock().unwrap().push(event));
+        let mut activity = new_tool_activity(&scope, "opaque-secret-id", "create_todo").unwrap();
+        publish_tool_activity(&engine, &activity, &sink).unwrap();
+        let result = crate::learning_tools::execute(
+            &engine,
+            &scope,
+            "opaque-secret-id",
+            "create_todo",
+            json!({"title":"synthetic private title"}),
+        );
+        finish_tool_activity(&mut activity, &scope, &result);
+        assert_eq!(activity.status, "succeeded");
+        assert!(activity.persisted);
+        assert_eq!(activity.object.as_ref().unwrap().kind, "todo");
+        publish_tool_activity(&engine, &activity, &sink).unwrap();
+        publish_tool_activity(&engine, &activity, &sink).unwrap();
+        assert_eq!(
+            engine.runs.lock().unwrap()["run_lifecycle"]
+                .run
+                .tool_calls
+                .len(),
+            1
+        );
+        let serialized = serde_json::to_string(&*events.lock().unwrap()).unwrap();
+        assert!(!serialized.contains("opaque-secret-id"));
+        assert!(!serialized.contains("synthetic private title"));
+        let todo = engine.reminders.list_todos().unwrap();
+        assert_eq!(todo.len(), 1);
+        assert!(!todo[0].reminder_enabled);
+        drop(engine);
+        let reopened = Engine::new(temp.path().join("library"), temp.path().join("state")).unwrap();
+        let restored = sessions::get(&mut reopened.lock().unwrap().content, &session.id).unwrap();
+        let cards = restored
+            .entries
+            .iter()
+            .filter(|e| {
+                e.data
+                    .as_ref()
+                    .and_then(|d| d.get("origin"))
+                    .and_then(Value::as_str)
+                    == Some("pi-tool-activity")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cards.len(), 2);
+        assert_eq!(
+            cards.last().unwrap().data.as_ref().unwrap()["toolActivity"]["status"],
+            "succeeded"
+        );
+        let mut failed = new_tool_activity(&scope, "invalid-receipt", "create_note").unwrap();
+        finish_tool_activity(
+            &mut failed,
+            &scope,
+            &Ok(json!({"persisted":true,"sessionId":"foreign","entryId":"entry_fake"})),
+        );
+        assert_eq!(failed.status, "failed");
+        assert!(!failed.persisted);
+        assert!(failed.object.is_none());
     }
 }
