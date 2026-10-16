@@ -20,7 +20,7 @@ export class StationError extends Error {
   constructor(message: string, code = 'UNKNOWN', details?: unknown) { super(message); this.code = code; this.details = details; }
 }
 
-export type UiDraft = { key: string; data: { body?: string; question?: string; importTitle?: string; importBody?: string }; version: string; updatedAt: string };
+export type UiDraft = { key: string; data: { body?: string; question?: string; importTitle?: string; importBody?: string; requestId?: string }; version: string; updatedAt: string };
 
 export type LibraryNodeKind = 'course' | 'folder' | 'section' | 'knowledge' | 'exploration' | 'exercise';
 export type LibraryNode = { id: string; title: string; kind: LibraryNodeKind; parentId?: string | null; order?: number; courseId?: string; path: string; version: string; modifiedAt?: string };
@@ -28,3 +28,8 @@ export type LibraryNode = { id: string; title: string; kind: LibraryNodeKind; pa
 export type LibraryTreeSnapshot = { nodes: LibraryNode[]; warnings: string[] };
 export type CourseAsset = { id: string; courseId: string; fileName: string; mime: string; size: number; sha256: string; reference: string };
 export type CourseAssetPreview = { asset: CourseAsset; text?: string; dataUrl?: string; truncated: boolean };
+
+export type SessionSummary = { id: string; title: string; modifiedAt?: string; path?: string; version?: string };
+export type TrashPreview = { id: string; title: string; kind: LibraryNodeKind; nodeCount: number; sessionCount: number; version: string };
+export type TrashReceipt = { trashId: string; id: string; title: string; kind: LibraryNodeKind; nodeCount: number; sessionCount: number; createdAt: string; restoredAt: string | null; status: 'trashed' | 'restored' };
+export type ExplorationNote = { document: Section; session: LearningSession; userEntryId: string; folderId: string };

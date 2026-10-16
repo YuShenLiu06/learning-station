@@ -73,7 +73,7 @@ test('controlled React flow preserves next draft, retries one saved user entry, 
   const button=text=>[...document.querySelectorAll('button')].find(item=>item.textContent.includes(text));
   try{
     await React.act(async()=>root.render(React.createElement(App)));await waitFor(()=>document.querySelector('[aria-label="向学习助手提问"]')?.disabled===false&&document.querySelector('.reading-content'));
-    const composer=document.querySelector('[aria-label="向学习助手提问"]');
+    const composer=document.querySelector('[aria-label="向学习助手提问"]');assert.ok(document.querySelector('.composer-bottom .chat-model-current'));assert.equal(document.querySelectorAll('[aria-label="收起学习助手"]').length,1);
     await input(composer,'first saved question');await key(composer,'Enter');
     assert.equal(composer.value,'');assert.match(document.querySelector('.messages').textContent,/first saved question/);assert.match(document.querySelector('.messages').textContent,/正在保存问题/);
     await input(composer,'next unsent draft');await key(composer,'Enter');await key(composer,'Enter');

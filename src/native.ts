@@ -32,7 +32,7 @@ const cancelled = new Set<string>();
 export type GenerationProgress = { operationId: string; sectionId: string; sessionId: string; content: string; mode?: string; runId?: string; toolCalls?: ToolActivity[]; manifest?: RequestContext['manifest']; context?: RequestContext; contextError?: string };
 const progressListeners = new Set<(progress: GenerationProgress) => void>();
 export function onGenerationProgress(listener: (progress: GenerationProgress) => void) { progressListeners.add(listener); return () => { progressListeners.delete(listener); }; }
-const nativeCommands = new Set(['get_app_state', 'refresh_library', 'create_section', 'import_markdown', 'open_document', 'save_document', 'start_session', 'get_session', 'append_entry', 'load_context', 'start_generation', 'cancel_generation', 'get_run', 'configure_model', 'get_model_settings', 'set_model', 'test_model', 'create_todo', 'list_todos', 'set_todo_done', 'list_notifications', 'mark_notification_read', 'export_anki_csv', 'list_review_items', 'get_ui_draft', 'save_ui_draft', 'set_todo_reminder', 'record_ui_metric', 'get_ui_preferences', 'save_ui_preferences', 'start_exploration', 'load_session_context', 'check_feishu_status', 'test_feishu_notification', 'get_library_tree', 'create_library_node', 'move_library_node', 'get_exercise_document', 'create_manual_exercise', 'materialize_legacy_exercise', 'import_course_asset', 'list_course_assets', 'read_course_asset', 'set_review_state', 'export_review_items', 'set_document_links']);
+const nativeCommands = new Set(['get_app_state', 'refresh_library', 'create_section', 'import_markdown', 'open_document', 'save_document', 'start_session', 'get_session', 'append_entry', 'load_context', 'start_generation', 'cancel_generation', 'get_run', 'configure_model', 'get_model_settings', 'set_model', 'test_model', 'create_todo', 'list_todos', 'set_todo_done', 'list_notifications', 'mark_notification_read', 'export_anki_csv', 'list_review_items', 'get_ui_draft', 'save_ui_draft', 'set_todo_reminder', 'record_ui_metric', 'get_ui_preferences', 'save_ui_preferences', 'start_exploration', 'load_session_context', 'check_feishu_status', 'test_feishu_notification', 'get_library_tree', 'create_library_node', 'move_library_node', 'get_exercise_document', 'create_manual_exercise', 'materialize_legacy_exercise', 'import_course_asset', 'list_course_assets', 'read_course_asset', 'set_review_state', 'export_review_items', 'set_document_links', 'create_exploration_note', 'preview_library_trash', 'trash_library_node', 'list_library_trash', 'restore_library_node', 'list_sessions']);
 async function ipc<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
   if (!nativeCommands.has(command)) throw new StationError('不支持的本机命令。', 'INVALID_COMMAND');
   return invoke<T>(command, args);
@@ -157,6 +157,12 @@ export async function nativeCall(command: string, payload: Record<string, unknow
     }
     case 'library_refresh': return courses(await ipc<Summary[]>('refresh_library'));
     case 'library_tree': { const tree = await ipc<LibraryTreeSnapshot>('get_library_tree'); libraryNodes = tree.nodes; return tree; }
+    case 'exploration_note_create': { const result = await ipc<{ document: NativeDoc; session: NativeSession; userEntryId: string; folderId: string }>('create_exploration_note', payload); return { ...result, document: section(result.document), session: learning(result.session) }; }
+    case 'history_list': return ipc('list_sessions');
+    case 'trash_preview': return ipc('preview_library_trash', { id: payload.id });
+    case 'trash_create': return ipc('trash_library_node', payload);
+    case 'trash_list': return ipc('list_library_trash');
+    case 'trash_restore': return ipc('restore_library_node', payload);
     case 'node_create': return section(await ipc<NativeDoc>('create_library_node', payload));
     case 'document_links': return section(await ipc<NativeDoc>('set_document_links', payload));
     case 'node_move': return section(await ipc<NativeDoc>('move_library_node', payload));
