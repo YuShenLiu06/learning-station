@@ -24,6 +24,7 @@ import { TrashConfirmation, TrashPanel } from './TrashPanel';
 import { SessionHistory } from './SessionHistory';
 import { useNavigationPreferences } from './useNavigationPreferences';
 import { ancestorIds, containingCourse } from './treePolicy';
+import { isExplorationDocument } from './explorationPolicy';
 import { CreateNodeForm, MoveNodeForm, isContainerKind } from './NodeDialogs';
 import type { CreatableKind } from './NodeDialogs';
 import { CourseAssets, AssetPreviewContent } from './CourseAssets';
@@ -58,11 +59,14 @@ export function App() {
   const editorRefs = useRef(new Map<string, EditorHandle>());
   const [creatingNode, setCreatingNode] = useState<CreatableKind | null>(null);
   const [movingNode, setMovingNode] = useState(false);
-  const [explorationForm, setExplorationForm] = useState(false);
+  const [explorationEntryId, setExplorationEntryId] = useState(makeId);
+  const explorationEntryRef = useRef(explorationEntryId);
+  const explorationBackups = useRef(new Set<ExplorationStartHandle>());
   const explorationStart = useRef<ExplorationStartHandle>(null);
-  const [explorationFolderId, setExplorationFolderId] = useState('');
+  const explorationFolderId = useRef('');
+  const treeSequence = useRef(0);
   const [trashNode, setTrashNode] = useState<LibraryNode | null>(null);
-  useEffect(()=>{void stableRunId('learning-station-exploration-folder-v1').then(id=>setExplorationFolderId(id.replace(/^run_/, 'node_')));},[]);
+
   const [linkingMaterials, setLinkingMaterials] = useState(false);
   const linkWrites = useRef(new Set<string>());
   const [assetsOpen, setAssetsOpen] = useState(false);
@@ -71,6 +75,7 @@ export function App() {
   const assetSequence = useRef(0);
   const [practiceFailure, setPracticeFailure] = useState<{ operationId: string; sourceId: string; selection: string; prompt: string; injections: ContextInjection[]; unknown: boolean; recovery?: boolean } | null>(null);
   const [historySession, setHistorySession] = useState<LearningSession | null>(null);
+  const [historyError, setHistoryError] = useState('');
   const font = useFontSize();
   const sidebarWidth = useSidebarWidth();
   const sidebarWidthRef = useRef(sidebarWidth); sidebarWidthRef.current = sidebarWidth;
@@ -91,7 +96,9 @@ export function App() {
   const [openError, setOpenError] = useState('');
   const [view, setView] = useState<View>('lesson');
   const editorStartedAt = useRef<Record<string, number>>({});
-  function switchView(next: View) { const started = performance.now(); setView(next); requestAnimationFrame(() => recordMetric('page-switch', performance.now() - started)); }
+  const navigationIntent = useRef(0);
+  const viewRef = useRef<View>('lesson');
+  function switchView(next: View) { const started = performance.now(); navigationIntent.current++; viewRef.current = next; setView(next); setOpening(false); requestAnimationFrame(() => recordMetric('page-switch', performance.now() - started)); }
   useEffect(() => { const frame = requestAnimationFrame(() => recordMetric('shell-interactive', performance.now())); return () => cancelAnimationFrame(frame); }, []);
   const [editing, setEditing] = useState(false);
   const [editedIds, setEditedIds] = useState<Set<string>>(new Set());
@@ -185,16 +192,18 @@ export function App() {
     const started = performance.now();
     const sequence = ++openSequence.current;
     navigationRef.current.ensureExpanded(ancestorIds(nodesRef.current, id));
-    setActiveId(id); setAssetsOpen(false); setQuestion(questionForSection(questionDrafts.current, id)); switchView('lesson'); setEditing(false); setSelection(''); setAiError(''); setOpenError('');
+    activeIdRef.current = id; setActiveId(id); setAssetsOpen(false); setQuestion(questionForSection(questionDrafts.current, id)); switchView('lesson'); setEditing(false); setSelection(''); setAiError(''); setOpenError('');
+    const intent = navigationIntent.current;
+    const stillCurrent = () => intent === navigationIntent.current && sequence === openSequence.current;
     if (docsRef.current[id]) {
-      if (!isContainerKind(docsRef.current[id].section.kind)) void call<LearningSession>('session_open', { sectionId: id }).then(value => setSessions(old => ({ ...old, [id]: value }))).catch(error => setAiError(`学习记录尚未读到：${errorText(error)}`));
+      if (!isContainerKind(docsRef.current[id].section.kind)) void call<LearningSession>('session_open', { sectionId: id }).then(value => setSessions(old => ({ ...old, [id]: value }))).catch(error => { if (stillCurrent()) setAiError(`学习记录尚未读到：${errorText(error)}`); });
       if (nativeAvailable) void call<Section>('section_open', { id }).then(section => {
         const local = docsRef.current[id];
         if (!local || local.saving || section.version === local.section.version) return;
         if (local.body !== local.savedBody) { setDocs(old => ({ ...old, [id]: { ...old[id], conflict: true, error: '原文件已在外部更新。当前编辑保留，请先对照新版本。' } })); return; }
         setDocs(old => ({ ...old, [id]: { section, body: section.body, savedBody: section.body, saving: false, draftLoaded: local.draftLoaded } }));
         setEditedIds(old => { const next = new Set(old); next.delete(id); return next; });
-      }).catch(error => setOpenError(errorText(error)));
+      }).catch(error => { if (stillCurrent()) setOpenError(errorText(error)); });
       return;
     }
     setOpening(true);
@@ -204,20 +213,35 @@ export function App() {
       // Immediate follow-up actions use the same committed document before React paints.
       docsRef.current = { ...docsRef.current, [id]: opened };
       setDocs(previous => ({ ...previous, [id]: opened }));
-      if (!isContainerKind(section.kind)) void call<LearningSession>('session_open', { sectionId: id }).then(learning => setSessions(previous => ({ ...previous, [id]: learning }))).catch(error => { if (activeIdRef.current === id) setAiError(`小节已打开，学习记录暂未载入：${errorText(error)}`); });
+      if (stillCurrent() && !isContainerKind(section.kind)) void call<LearningSession>('session_open', { sectionId: id }).then(learning => setSessions(previous => ({ ...previous, [id]: learning }))).catch(error => { if (activeIdRef.current === id) setAiError(`小节已打开，学习记录暂未载入：${errorText(error)}`); });
       requestAnimationFrame(() => recordMetric('section-ready', performance.now() - started));
-      if (draft.value?.data.question) { questionDrafts.current[id] = draft.value.data.question; if (sequence === openSequence.current) setQuestion(draft.value.data.question); }
-    } catch (error) { if (sequence === openSequence.current) setOpenError(errorText(error)); }
-    finally { if (sequence === openSequence.current) setOpening(false); }
+      if (draft.value?.data.question) { questionDrafts.current[id] = draft.value.data.question; if (stillCurrent()) setQuestion(draft.value.data.question); }
+    } catch (error) { if (stillCurrent()) setOpenError(errorText(error)); }
+    finally { if (stillCurrent()) setOpening(false); }
   }, []);
   const load = useCallback(async () => {
+    const intent = navigationIntent.current;
+    const treeRequest = ++treeSequence.current;
     setLoading(true); setBootError('');
     try {
       const result = await call<Bootstrap>('bootstrap');
       setBoot(result);
+      // Wait for the real ancestry before restoring: new exploration notes are sections.
+      const [tree, folderRunId] = await Promise.all([
+        !isDemo ? call<LibraryTreeSnapshot>('library_tree') : Promise.resolve({ nodes: result.nodes || result.courses.flatMap(course => course.sections.map(section => ({ ...section, kind: 'section' as const, parentId: null, path: '', version: '' }))), warnings: [] }),
+        stableRunId('learning-station-exploration-folder-v1'),
+      ]);
+      explorationFolderId.current = folderRunId.replace(/^run_/, 'node_');
+      if (treeRequest !== treeSequence.current) return;
+      nodesRef.current = tree.nodes;
+      setBoot(old => ({ ...old, nodes: tree.nodes, treeWarnings: tree.warnings }));
+      if (intent !== navigationIntent.current || intent !== 0) return;
       const id = result.lastSectionId || result.courses[0]?.sections[0]?.id;
-      if (id) void openSection(id);
-      if (!isDemo) void call<LibraryTreeSnapshot>('library_tree').then(tree => { nodesRef.current = tree.nodes; setBoot(old => ({ ...old, nodes: tree.nodes, treeWarnings: tree.warnings })); navigationRef.current.ensureExpanded(ancestorIds(tree.nodes, id || '')); if (id && !docsRef.current[id]) void openSection(id); }).catch(error => setBootError(errorText(error)));
+      if (id && isExplorationDocument(tree.nodes, id, explorationFolderId.current)) {
+        switchView('explorations');
+      } else if (id && tree.nodes.some(node => node.id === id)) {
+        void openSection(id);
+      }
     } catch (error) { setBootError(errorText(error)); }
     finally { setLoading(false); }
   }, [openSection]);
@@ -259,7 +283,7 @@ export function App() {
       try { await widthRef.current.flush(); } catch (error) { event.preventDefault(); notify(`面板宽度尚未保存，窗口已保留：${errorText(error)}`); return; }
       try { await fontRef.current.flush(); } catch (error) { event.preventDefault(); notify(`字号尚未保存，窗口已保留：${errorText(error)}`); return; }
       try { await navigationRef.current.flush(); } catch (error) { event.preventDefault(); notify(`导航状态尚未保存，窗口已保留：${errorText(error)}`); return; }
-      try { await explorationStart.current?.flush(); } catch (error) { event.preventDefault(); notify(`探索问题尚未备份，窗口已保留：${errorText(error)}`); return; }
+      try { await Promise.all([...explorationBackups.current, ...(explorationStart.current ? [explorationStart.current] : [])].map(draft => draft.flush())); } catch (error) { event.preventDefault(); notify(`探索问题尚未备份，窗口已保留：${errorText(error)}`); return; }
       if (!hasInput) return;
       try {
         await Promise.all(Object.entries(docsRef.current).filter(([, doc]) => doc.draftLoaded !== false).map(([id, doc]) => call('draft_save', { key: `section:${id}`, data: { body: doc.body, question: questionDrafts.current[id] || '' } })));
@@ -404,13 +428,12 @@ export function App() {
     const result = await call<LearningSession>('mistake_save', { sectionId: activeId, sessionId: session.id, exerciseId: exercise.id, question: exercise.prompt, reason });
     updateTargetSession(result); notify('错因已保存，下次可按情境找回。');
   }
-  async function openLegacyHistory() { try { setHistorySession(await call<LearningSession>('legacy_history_open')); switchView('history'); } catch(error) { notify(`旧会话尚未读到：${errorText(error)}`); } }
+  async function openLegacyHistory() { await readHistory('legacy_history_open'); }
   async function openSourceDocument(id:string){try{await call<Section>('section_open',{id});await openSection(id);}catch(error){notify(`来源暂不可用（${id}）：${errorText(error)}。原卡保留，未跳转到其他材料。`);}}
   async function openReviewSource(card: ReviewCard) {
     if (card.sourceDocumentId || card.sectionId) { await openSourceDocument(card.sourceDocumentId || card.sectionId); return; }
     if (!card.sessionId) { notify('这条历史记录缺少可打开的会话编号。'); return; }
-    try { setHistorySession(await call<LearningSession>('history_open', { sessionId: card.sessionId })); switchView('history'); }
-    catch (error) { notify(errorText(error)); }
+    await openHistorySession(card.sessionId);
   }
   async function createTask(event: React.FormEvent) {
     event.preventDefault(); if (!taskTitle.trim() || taskBusy) return;
@@ -466,14 +489,38 @@ export function App() {
     if (key === 'workspace' && useSaved) setImporting(true);
   }
   async function refreshTree() {
-    try { const tree = await call<LibraryTreeSnapshot>('library_tree'); nodesRef.current = tree.nodes; setBoot(old => ({ ...old, nodes: tree.nodes, treeWarnings: tree.warnings })); return tree; }
+    const sequence = ++treeSequence.current;
+    try { const tree = await call<LibraryTreeSnapshot>('library_tree'); if (sequence === treeSequence.current) { nodesRef.current = tree.nodes; setBoot(old => ({ ...old, nodes: tree.nodes, treeWarnings: tree.warnings })); } return tree; }
     catch (error) { notify(`学习目录暂未刷新，已有内容仍保留：${errorText(error)}`); return undefined; }
   }
-  async function startExploration(question: string, requestId: string) {
+  function enterExplorations() {
+    const previous = explorationStart.current;
+    if (previous) {
+      explorationBackups.current.add(previous);
+      void previous.flush().then(() => explorationBackups.current.delete(previous)).catch(error => notify(`原探索草稿仍保留，关闭时将再次备份：${errorText(error)}`));
+    }
+    const id = makeId(); explorationEntryRef.current = id; setExplorationEntryId(id);
+    if (isExplorationDocument(nodesRef.current, activeIdRef.current, explorationFolderId.current)) {
+      activeIdRef.current = ''; setActiveId(''); setQuestion(''); setSelection('');
+    }
+    switchView('explorations');
+  }
+  async function startExploration(question: string, requestId: string, entryId: string) {
+    const intent = navigationIntent.current;
+    const stillAtEntry = () => intent === navigationIntent.current && viewRef.current === 'explorations' && explorationEntryRef.current === entryId;
+    // Draft saving may finish after the user has already left this input.
+    if (!stillAtEntry()) return { created: false, complete: false };
     if (busyRef.current || modelChangingRef.current) throw new Error('请先停止当前生成，再开始探索。');
     const result = await call<ExplorationNote>('exploration_note_create', { question, requestId });
-    setExplorationFolderId(result.folderId); await refreshTree(); await openSection(result.document.id);
-    setSessions(old=>({...old,[result.document.id]:result.session})); setRightbar(true);
+    explorationFolderId.current = result.folderId;
+    setSessions(old => ({ ...old, [result.document.id]: result.session }));
+    await refreshTree();
+    if (!stillAtEntry()) return { created: true, complete: false };
+    const opened = openSection(result.document.id);
+    const openedIntent = navigationIntent.current;
+    await opened;
+    if (openedIntent !== navigationIntent.current || activeIdRef.current !== result.document.id) return { created: true, complete: false };
+    setRightbar(true);
     const existing=outgoingRef.current.find(item=>item.sendId===requestId);
     if(existing?.stage==='done')return {created:true,complete:true};
     const operationId=existing?retryOperation(existing,makeId()):`${requestId}-generation`;
@@ -498,7 +545,13 @@ export function App() {
     await flushExerciseDrafts();
   }
   async function afterTrash(receipt:TrashReceipt){setTrashNode(null);if(receipt.status!=='trashed'){notify('此操作记录已恢复，内容未再次收纳。');return;}const ids=subtreeIds(receipt.id);setDocs(old=>Object.fromEntries(Object.entries(old).filter(([id])=>!ids.has(id))));setSessions(old=>Object.fromEntries(Object.entries(old).filter(([id])=>!ids.has(id))));const tree=await refreshTree();if(ids.has(activeIdRef.current)){const next=tree?.nodes[0]?.id;if(next)await openSection(next);else{setActiveId('');setQuestion('');setSelection('');switchView('lesson');}}notify('已移至回收区，可按原编号恢复。');}
-  async function openHistorySession(id:string){try{setHistorySession(await call<LearningSession>('history_open',{sessionId:id}));switchView('history');}catch(error){notify(`学习历史暂未打开：${errorText(error)}`);}}
+  async function readHistory(command: 'history_open' | 'legacy_history_open', args?: { sessionId: string }) {
+    switchView('history'); setHistorySession(null); setHistoryError('');
+    const intent = navigationIntent.current;
+    try { const value = await call<LearningSession>(command, args); if (intent === navigationIntent.current) setHistorySession(value); }
+    catch (error) { if (intent === navigationIntent.current) setHistoryError(`学习历史暂未打开：${errorText(error)}`); }
+  }
+  async function openHistorySession(id:string){await readHistory('history_open',{sessionId:id});}
   async function saveLinks(id: string, links: string[]) {
     if (busyRef.current) throw new Error('请先停止生成，再更改关联资料。');
     await prepareSource(id);
@@ -538,7 +591,7 @@ export function App() {
         <div className="topbar-navigation"><button className="icon-button navigation-toggle" aria-label={navigation.collapsed ? '展开侧边栏' : '折叠为图标栏'} title={navigation.collapsed ? '展开左侧目录' : '收起左侧目录'} aria-expanded={!navigation.collapsed} onClick={()=>navigation.setCollapsed(!navigation.collapsed)}>{navigation.collapsed ? <PanelLeftOpen size={19}/> : <PanelLeftClose size={19}/>}</button><div className="breadcrumbs"><span>{view === 'lesson' ? (activeCourse?.title || '我的学习空间') : view === 'review' ? '复习与历史' : view === 'settings' ? '设置' : view === 'explorations' ? '探索' : view === 'history-index' ? '学习历史' : view === 'trash' ? '回收区' : view === 'history' ? '历史会话' : '学习待办'}</span><ChevronRight size={12} /><span className="breadcrumb-current">{view === 'lesson' ? '阅读与理解' : view === 'review' ? '把学过的串起来' : view === 'settings' ? '本机偏好' : view === 'explorations' ? '从问题开始' : view === 'history-index' ? '真实学习记录' : view === 'trash' ? '可恢复的学习内容' : view === 'history' ? '只读记录' : '接着完成下一步'}</span></div></div>
         <div className="topbar-actions"><button className={`icon-button navigation-toggle notice-button ${boot.notices.some(notice => !notice.read) ? 'has-notices' : ''}`} aria-label="通知" title="通知" onClick={() => setNotifications(!notifications)}><Clock3 size={19} /></button>{view === 'lesson' && <button className="icon-button navigation-toggle" aria-label={rightbar ? '收起学习助手' : '打开学习助手'} title={rightbar ? '收起右侧学习助手' : '打开右侧学习助手'} aria-expanded={rightbar} onClick={() => setRightbar(!rightbar)}>{rightbar ? <PanelRightClose size={19} /> : <PanelRightOpen size={19} />}</button>}</div>
       </header>
-    <WorkspaceSidebar sidebarWidth={sidebarWidth.width} onSidebarWidth={sidebarWidth.setWidth} collapsed={navigation.collapsed} nodes={nodes} activeId={activeId} expandedIds={navigation.expandedIds} onExpanded={navigation.setExpandedIds} onOpen={id => { void openSection(id); }} onNew={setCreatingNode} onImport={() => setImporting(true)} onLearning={()=>switchView('lesson')} onExplorations={() => {setExplorationForm(false);switchView('explorations');}} onHistory={()=>switchView('history-index')} onTrash={()=>switchView('trash')} onTrashNode={node=>{if(busyRef.current){notify('请先停止生成，再将内容移至回收区。');return;}setTrashNode(node);}} blocked={!!busyId} onInject={id=>{void injectDocument(id);}} injectedIds={injections.map(item=>item.documentId)} onRemoveInjection={removeInjection} canInject={!!session.id} onReview={() => switchView('review')} onTasks={() => switchView('tasks')} onSettings={openSettings} view={view} loading={loading} dirtyIds={Object.entries(docs).filter(([,doc])=>doc.body!==doc.savedBody).map(([id])=>id)} taskCount={boot.tasks.filter(task=>!task.completed).length} modelReady={modelReady}/>
+    <WorkspaceSidebar sidebarWidth={sidebarWidth.width} onSidebarWidth={sidebarWidth.setWidth} collapsed={navigation.collapsed} nodes={nodes} activeId={activeId} expandedIds={navigation.expandedIds} onExpanded={navigation.setExpandedIds} onOpen={id => { void openSection(id); }} onNew={setCreatingNode} onImport={() => setImporting(true)} onLearning={()=>switchView('lesson')} onExplorations={enterExplorations} onHistory={()=>switchView('history-index')} onTrash={()=>switchView('trash')} onTrashNode={node=>{if(busyRef.current){notify('请先停止生成，再将内容移至回收区。');return;}setTrashNode(node);}} blocked={!!busyId} onInject={id=>{void injectDocument(id);}} injectedIds={injections.map(item=>item.documentId)} onRemoveInjection={removeInjection} canInject={!!session.id} onReview={() => switchView('review')} onTasks={() => switchView('tasks')} onSettings={openSettings} view={view} loading={loading} dirtyIds={Object.entries(docs).filter(([,doc])=>doc.body!==doc.savedBody).map(([id])=>id)} taskCount={boot.tasks.filter(task=>!task.completed).length} modelReady={modelReady}/>
 
     <main className="main-area">
 
@@ -573,10 +626,10 @@ export function App() {
 
       {view === 'review' && <ReviewPage nodes={nodes} onBack={()=>switchView('lesson')} onOpenSource={openReviewSource} onOpenDocument={openSourceDocument} notify={notify}/>}
       {view === 'tasks' && <div className="utility-page"><button className="text-back" onClick={() => switchView('lesson')}><ArrowLeft size={14} />回到小节</button><span className="eyebrow">ONE SMALL NEXT STEP</span><h1>给下次学习，留一步。</h1><p className="page-description">记下一个具体动作，让开始变得容易。到期状态由本机服务管理。</p><form className="task-form" onSubmit={event => { void createTask(event); }}><label>下一步做什么<input value={taskTitle} onChange={event => setTaskTitle(event.target.value)} placeholder="例如：再读一遍今天的转折句" required maxLength={200} /></label><div className="task-form-bottom"><div className="task-reminder-fields"><label className="checkbox-label"><input type="checkbox" checked={taskReminder} onChange={event => setTaskReminder(event.target.checked)} />到时间提醒我</label>{taskReminder && <label>提醒时间<input type="datetime-local" value={taskDue} onChange={event => setTaskDue(event.target.value)} required /></label>}</div><button className="primary-button" disabled={taskBusy || !taskTitle.trim()}>{taskBusy ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />}添加待办</button></div>{taskReminder && <p className="muted small">应用退出或电脑休眠时无法准点提醒；重开后会补入通知。飞书提醒未启用。</p>}</form>{taskError && <div className="inline-error" role="alert">{taskError}</div>}<div className="section-heading"><h2>学习待办 <span>{boot.tasks.filter(task => !task.completed).length}</span></h2></div>{!boot.tasks.length && <div className="empty-state"><ListTodo size={30} strokeWidth={1.2} /><h3>现在没有待办</h3><p>今天不必安排很多。一个能完成的小动作就够了。</p></div>}<div className="task-list">{boot.tasks.map(task => <div className={`task-item ${task.completed ? 'completed' : ''}`} key={task.id}><button className="task-check" aria-label={task.completed ? '标为未完成' : '完成待办'} onClick={() => { void toggleTask(task); }}>{task.completed && <Check size={14} />}</button><div><span>{task.title}</span>{task.dueAt && <small><Clock3 size={11} />{new Date(task.dueAt).toLocaleString('zh-CN', { month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' })} · {task.reminderEnabled ? '提醒已开启' : '提醒未开启'}</small>}</div>{task.dueAt && !task.completed && <button className="task-reminder-toggle" onClick={() => { void toggleReminder(task); }}>{task.reminderEnabled ? '关闭提醒' : '开启提醒'}</button>}</div>)}</div></div>}
-      <section className="utility-page exploration-records" hidden={view!=='explorations'}>{!explorationForm?<><span className="eyebrow">QUESTIONS BECOME UNDERSTANDING</span><div className="section-heading"><h1>探索记录</h1><button className="primary-button" onClick={()=>setExplorationForm(true)}><Plus size={15}/>开始探索</button></div><p className="page-description">从一个问题开始，学习内容自动保存在“探索”文件夹，是可编辑的普通 Markdown 笔记。</p><div className="folder-contents">{nodes.filter(node=>node.parentId===explorationFolderId||node.kind==='exploration').reverse().map(node=><button className="folder-child" key={node.id} onClick={()=>{void openSection(node.id);}}><FileText size={17}/><span>{node.title}</span><ArrowRight size={14}/></button>)}{!nodes.some(node=>node.parentId===explorationFolderId||node.kind==='exploration')&&<p className="muted">还没有探索记录。用上方“开始探索”提出第一个问题。</p>}</div></>:<button className="text-back" onClick={()=>setExplorationForm(false)}><ArrowLeft size={14}/>返回探索记录</button>}<div hidden={!explorationForm}><ExplorationStart ref={explorationStart} onStart={startExploration}/></div></section>
+      <section className="utility-page exploration-records" hidden={view!=='explorations'}><button className="text-back" onClick={()=>switchView('lesson')}><ArrowLeft size={14}/>返回学习</button><ExplorationStart key={explorationEntryId} entryId={explorationEntryId} ref={explorationStart} onStart={startExploration}/></section>
       {view==='history-index'&&<SessionHistory onOpen={id=>{void openHistorySession(id);}} onLegacy={()=>{void openLegacyHistory();}}/>}
       {view==='trash'&&<TrashPanel onRestored={()=>{void refreshTree();notify('已恢复原文件、目录关联和学习记录。');}}/>}
-      {view === 'history' && historySession && <section className="utility-page history-page"><button className="text-back" onClick={()=>switchView('history-index')}><ArrowLeft size={14}/>回到历史</button><h1>{historySession.sectionId ? '学习会话记录' : '旧版探索会话'}</h1><p className="muted">这里只读展示该真实会话，不会带入当前阅读文档。</p>{historySession.sectionId&&<button className="quiet-button" onClick={()=>{void openSection(historySession.sectionId);}}>打开来源文档</button>}{!historySession.messages.length && <p className="muted">这里还没有旧版会话记录。</p>}{historySession.messages.map(message=><article className={`message ${message.role}`} key={message.id}><div className="message-label">{message.role==='user'?'我的问题':message.role==='assistant'?'学习助手':'学习记录'}</div>{message.role==='assistant'&&message.runId&&<ToolActivityCards items={(historySession.toolCalls || []).filter(item=>item.runId===message.runId)} onOpen={object=>{void openToolObject(object);}}/>}<Markdown text={message.content}/></article>)}<ToolActivityCards items={(historySession.toolCalls || []).filter(item=>!historySession.messages.some(message=>message.role==='assistant'&&message.runId===item.runId))} onOpen={object=>{void openToolObject(object);}}/></section>}
+      {view === 'history' && <section className="utility-page history-page"><button className="text-back" onClick={()=>switchView('history-index')}><ArrowLeft size={14}/>回到历史</button>{!historySession ? <p className={historyError ? 'inline-error' : 'context-loading'}>{historyError || '正在读取学习历史…'}</p> : <><h1>{historySession.sectionId ? '学习会话记录' : '旧版探索会话'}</h1><p className="muted">这里只读展示该真实会话，不会带入当前阅读文档。</p>{historySession.sectionId&&<button className="quiet-button" onClick={()=>{void openSection(historySession.sectionId);}}>打开来源文档</button>}{!historySession.messages.length && <p className="muted">这里还没有旧版会话记录。</p>}{historySession.messages.map(message=><article className={`message ${message.role}`} key={message.id}><div className="message-label">{message.role==='user'?'我的问题':message.role==='assistant'?'学习助手':'学习记录'}</div>{message.role==='assistant'&&message.runId&&<ToolActivityCards items={(historySession.toolCalls || []).filter(item=>item.runId===message.runId)} onOpen={object=>{void openToolObject(object);}}/>}<Markdown text={message.content}/></article>)}<ToolActivityCards items={(historySession.toolCalls || []).filter(item=>!historySession.messages.some(message=>message.role==='assistant'&&message.runId===item.runId))} onOpen={object=>{void openToolObject(object);}}/></>}</section>}
       {view === 'settings' && <SettingsPage font={font} model={boot.model} dataPath={boot.dataPath} blocked={!!busyId || modelChanging} onClose={() => switchView(settingsReturnView.current)} onSaved={model => setBoot(old => ({ ...old, model }))} />}
       <footer className="statusbar"><span><span className={`tiny-dot ${nativeAvailable ? '' : 'offline'}`} />{isDemo ? '开发预览' : nativeAvailable ? '本机工作空间' : '等待本机连接'}</span><span>{dirtyCount ? `${dirtyCount} 份草稿待保存` : '每一点理解，都值得留下'}</span><span>⌘ S 保存</span></footer>
     </main>
