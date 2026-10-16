@@ -30,7 +30,7 @@ export const Editor = forwardRef<EditorHandle, Props>(function Editor(props, ref
             if (update.docChanged) callbacks.current.onChange(update.state.doc.toString());
             if (update.selectionSet) { const selection = update.state.selection.main; if (!selection.empty) callbacks.current.onSelection(update.state.sliceDoc(selection.from, selection.to)); }
           }),
-          EditorView.theme({ '&': { minHeight: '100%', fontSize: '16px', background: 'transparent' }, '.cm-content': { fontFamily: 'var(--font-reading)', lineHeight: '1.95', padding: '28px 0 120px', caretColor: '#315d4a' }, '.cm-line': { padding: '0' }, '.cm-focused': { outline: 'none' }, '&.cm-focused': { outline: 'none' }, '.cm-selectionBackground, &.cm-focused .cm-selectionBackground': { background: '#d9e7dc' }, '.cm-scroller': { overflow: 'visible' }, '.cm-gutters': { display: 'none' } }),
+          EditorView.theme({ '&': { minHeight: '100%', fontSize: 'var(--content-font-size, 16px)', background: 'transparent' }, '.cm-content': { fontFamily: 'var(--font-reading)', lineHeight: '1.95', padding: '28px 0 120px', caretColor: '#315d4a' }, '.cm-line': { padding: '0' }, '.cm-focused': { outline: 'none' }, '&.cm-focused': { outline: 'none' }, '.cm-selectionBackground, &.cm-focused .cm-selectionBackground': { background: '#d9e7dc' }, '.cm-scroller': { overflow: 'visible' }, '.cm-gutters': { display: 'none' } }),
         ],
       }),
     });

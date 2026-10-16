@@ -81,3 +81,32 @@ test('Pi tool notes are persisted learning records awaiting confirmation, never 
   assert.equal(sessionMessages([entries[1]],[]).length,1);
   assert.equal(sessionMessages([entries[1]],[])[0].role,'assistant');
 });
+
+test('custom model configuration is editable while Coding Plan gate remains provider-specific', async () => {
+  const {modelAccessReason,modelFormError,modelBindingChanged}=await import('../src/modelPolicy.ts');
+  const base={configured:false,provider:'custom',protocol:'openai-completions',baseUrl:'',model:'',credentialStored:false,usageGate:''};
+  assert.equal(modelAccessReason(base),'');
+  assert.equal(modelAccessReason({...base,provider:'glm-pi',usageGate:undefined}),'PLAN_USAGE_UNCONFIRMED');
+  const input={provider:'custom',protocol:'openai-completions',baseUrl:'http://127.0.0.1:53990/v1',model:'qa-custom-model',apiKey:'local-fixture-not-a-real-key'};
+  assert.equal(modelFormError(input,base),'');
+  assert.match(modelFormError({...input,baseUrl:'not-a-url'},base),/地址/);
+  assert.match(modelFormError({...input,protocol:'unsupported'},base),/仅支持/);
+  assert.match(modelFormError({...input,baseUrl:'http://127.0.0.1/v1/chat/completions'},base),/基础地址/);
+  const saved={...base,configured:true,credentialStored:true,baseUrl:input.baseUrl,model:input.model};
+  assert.equal(modelFormError({...input,apiKey:''},saved),'');
+  assert.equal(modelBindingChanged(saved,{...input,baseUrl:'http://127.0.0.1:9999/v1'}),true);
+  assert.match(modelFormError({...input,baseUrl:'http://127.0.0.1:9999/v1',apiKey:''},saved),/新密钥/);
+});
+test('independent exploration rejects a linked session or source manifest', async () => {
+  const {assertExplorationScope,validFontSize}=await import('../src/explorationPolicy.ts');
+  assert.doesNotThrow(()=>assertExplorationScope({session:{sectionId:''},context:{manifest:[]}},false));
+  assert.throws(()=>assertExplorationScope({session:{sectionId:'course'},context:{manifest:[]}},false));
+  assert.throws(()=>assertExplorationScope({session:{sectionId:''},context:{manifest:[{id:'course'}]}},false));
+  assert.throws(()=>assertExplorationScope({session:{sectionId:'different'},context:{manifest:[]}},true,'current'));
+  assert.doesNotThrow(()=>assertExplorationScope({session:{sectionId:'current'},context:{manifest:[]}},true,'current'));
+  assert.equal(validFontSize(12),true);assert.equal(validFontSize(24),true);assert.equal(validFontSize(25),false);assert.equal(validFontSize(16.5),false);
+});
+test('historical assistant prose cannot borrow the current session source manifest', () => {
+  const messages=sessionMessages([{id:'old',kind:'assistant',content:'old answer',createdAt:'then'}],[{title:'unrelated latest source'}]);
+  assert.equal(messages[0].sources,undefined);
+});

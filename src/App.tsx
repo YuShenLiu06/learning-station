@@ -1,7 +1,13 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowDownToLine, ArrowLeft, ArrowRight, ArrowUp, BookOpen, Check, CheckCheck, ChevronDown, ChevronRight, CircleHelp, Clock3, FileText, FolderOpen, Highlighter, Layers2, ListTodo, LoaderCircle, MessageCircle, Maximize2, Minimize2, MoreHorizontal, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, PencilLine, Plus, Search, Settings2, Sparkles, Square, X } from 'lucide-react';
-import { call, emptyBootstrap, isDemo, nativeAvailable, recordMetric, modelAccessPending, sampleBody } from './api';
+import { call, emptyBootstrap, isDemo, nativeAvailable, recordMetric, sampleBody } from './api';
 const Editor = lazy(() => import('./Editor').then(module => ({ default: module.Editor })));
+import { modelAccessReason, modelBindingChanged, modelFormError, supportedProtocol } from './modelPolicy';
+import { assertExplorationScope } from './explorationPolicy';
+import { useIndependentExploration } from './useIndependentExploration';
+import { RequestContextView } from './RequestContextView';
+import type { ContextViewState } from './RequestContextView';
+import { useFontSize } from './useFontSize';
 import { Markdown } from './Markdown';
 import { isSubmitKey } from './keyboard';
 import { draftInputsDiffer, questionForSection, unbackedSectionHasInput } from './draftPolicy';
@@ -10,7 +16,7 @@ import { onGenerationProgress } from './native';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import type { GenerationProgress } from './native';
-import type { Bootstrap, Course, Exercise, LearningSession, ModelSettings, ReviewCard, Section, Source, Task, UiDraft } from './types';
+import type { Bootstrap, Course, Exercise, LearningSession, ModelSettings, ReviewCard, Section, Source, Task, UiDraft, RequestContext } from './types';
 import { StationError } from './types';
 
 type View = 'lesson' | 'review' | 'tasks';
@@ -22,6 +28,8 @@ const errorText = (error: unknown) => error instanceof Error ? error.message : S
 const makeId = () => crypto.randomUUID();
 
 export function App() {
+  const font = useFontSize();
+  const fontRef = useRef(font); fontRef.current = font;
   const [boot, setBoot] = useState<Bootstrap>(emptyBootstrap);
   const [loading, setLoading] = useState(true);
   const [bootError, setBootError] = useState('');
@@ -41,6 +49,16 @@ export function App() {
   const [editing, setEditing] = useState(false);
   const [editedIds, setEditedIds] = useState<Set<string>>(new Set());
   const [panel, setPanel] = useState<Panel>('explain');
+  const [associateSection, setAssociateSection] = useState(true);
+  const independentMode = panel === 'explore' && !associateSection;
+  const independent = useIndependentExploration(independentMode);
+  const independentRef = useRef(independent); independentRef.current = independent;
+  const [linkedOpening, setLinkedOpening] = useState(false);
+  const [linkedError, setLinkedError] = useState('');
+  const linkedSequence = useRef(0);
+  const [contextView, setContextView] = useState<ContextViewState>({ status: 'idle' });
+  const [contextRetry, setContextRetry] = useState(0);
+  const contextSequence = useRef(0);
   const [sidebar, setSidebar] = useState(true);
   const [rightbar, setRightbar] = useState(true);
   const [immersive, setImmersive] = useState(false);
@@ -57,7 +75,7 @@ export function App() {
   const [localQuestionSaving, setLocalQuestionSaving] = useState(false);
   const [busyId, setBusyId] = useState('');
   const [partial, setPartial] = useState<GenerationProgress | null>(null);
-  useEffect(() => onGenerationProgress(progress => { if (progress.operationId === busyRef.current) setPartial(progress); }), []);
+  useEffect(() => onGenerationProgress(progress => { if (progress.operationId !== busyRef.current) return; if (progress.content) setPartial(progress); if (progress.manifest) setContextView({ status: 'ready', actual: true, sessionId: progress.sessionId, context: { text: '', manifest: progress.manifest, warnings: [], truncated: false } }); if (progress.contextError) setContextView({ status: 'error', sessionId: progress.sessionId, error: progress.contextError }); }), []);
   const busyRef = useRef('');
   const [aiError, setAiError] = useState('');
   const [importing, setImporting] = useState(false);
@@ -92,8 +110,13 @@ export function App() {
   const chatEnd = useRef<HTMLDivElement>(null);
   const openSequence = useRef(0);
   const current = docs[activeId];
-  const session = sessions[activeId] ?? emptySession(activeId);
-  const modelReady = boot.model.configured && !modelAccessPending;
+  const session = independentMode ? independent.session ?? emptySession('') : sessions[activeId] ?? emptySession(activeId);
+  const composerQuestion = independentMode ? independent.question : question;
+  const requestSelection = independentMode ? '' : selection;
+  const canCompose = independentMode ? !!independent.session : !!current;
+  const visibleSessionRef = useRef(session.id); visibleSessionRef.current = session.id;
+  const modelBlocked = !!modelAccessReason(boot.model);
+  const modelReady = boot.model.configured && !modelBlocked;
   const dirtyCount = Object.values(docs).filter(doc => doc.body !== doc.savedBody).length;
   const activeCourse = boot.courses.find(course => course.sections.some(section => section.id === activeId));
 
@@ -168,6 +191,8 @@ export function App() {
     const subscription = getCurrentWindow().onCloseRequested(async event => {
       const drafts = Object.entries(docsRef.current).filter(([, doc]) => doc.body !== doc.savedBody);
       const hasInput = drafts.length || Object.values(questionDrafts.current).some(Boolean) || materialDraft.current.body || materialDraft.current.title || hasExerciseInput();
+      try { await fontRef.current.flush(); } catch (error) { event.preventDefault(); notify(`字号尚未保存，窗口已保留：${errorText(error)}`); return; }
+      try { await independentRef.current.flush(); } catch (error) { event.preventDefault(); notify(`独立探索草稿尚未保存，窗口已保留：${errorText(error)}`); return; }
       if (!hasInput) return;
       try {
         await Promise.all(Object.entries(docsRef.current).filter(([, doc]) => doc.draftLoaded !== false).map(([id, doc]) => call('draft_save', { key: `section:${id}`, data: { body: doc.body, question: questionDrafts.current[id] || '' } })));
@@ -205,29 +230,54 @@ export function App() {
   }, [activeId, save]);
   useEffect(() => { const area = chatEnd.current?.parentElement; if (area) area.scrollTop = area.scrollHeight; }, [session.messages.length, busyId]);
 
+  async function openLinkedExploration() {
+    if (!activeId) { setLinkedError('先打开一个小节，或关闭关联开始独立探索。'); return; }
+    const sequence = ++linkedSequence.current; setLinkedOpening(true); setLinkedError('');
+    try { const result = await call<{ session: LearningSession; context: RequestContext }>('exploration_open', { sectionId: activeId, associateCurrentSection: true }); assertExplorationScope(result, true, activeId); if (sequence === linkedSequence.current) setSessions(old => ({ ...old, [result.session.sectionId]: result.session })); }
+    catch (error) { if (sequence === linkedSequence.current) setLinkedError(errorText(error)); }
+    finally { if (sequence === linkedSequence.current) setLinkedOpening(false); }
+  }
+  useEffect(() => { if (panel === 'explore' && associateSection) void openLinkedExploration(); }, [panel, associateSection, activeId]);
+  useEffect(() => {
+    const sequence = ++contextSequence.current;
+    if (!session.id) { setContextView({ status: 'idle' }); return; }
+    if (busyId) { setContextView(old => old.sessionId === session.id && old.actual ? old : { status: 'loading', sessionId: session.id }); return; }
+    if (!independentMode && current && current.body !== current.savedBody) { setContextView({ status: 'error', sessionId: session.id, error: '正文有未保存改动，保存后会重新核对来源。' }); return; }
+    setContextView({ status: 'loading', sessionId: session.id });
+    const timer = setTimeout(() => { void call<RequestContext>('context_load', { sessionId: session.id, sectionId: session.sectionId, selection: requestSelection }).then(context => { if (sequence === contextSequence.current) setContextView({ status: 'ready', sessionId: session.id, context }); }).catch(error => { if (sequence === contextSequence.current) setContextView({ status: 'error', sessionId: session.id, error: errorText(error) }); }); }, 150);
+    return () => clearTimeout(timer);
+  }, [session.id, requestSelection, current?.body, current?.savedBody, current?.section.version, independentMode, busyId, contextRetry]);
+  function updateComposer(value: string) { if (independentMode) independent.setQuestion(value); else setQuestion(value); }
+  function updateTargetSession(result: LearningSession, independentTarget: boolean) { if (independentTarget) independentRef.current.setSession(result); else setSessions(old => ({ ...old, [result.sectionId]: result })); }
+  async function refreshAfterGeneration(target: LearningSession, independentTarget: boolean) {
+    const results = await Promise.allSettled([call<LearningSession>('session_refresh', { sectionId: target.sectionId, sessionId: target.id }), call<Pick<Bootstrap, 'tasks' | 'notices'>>('activity_refresh')]);
+    if (results[0].status === 'fulfilled') updateTargetSession(results[0].value, independentTarget); else notify(`学习记录刷新失败，已有内容仍保留：${errorText(results[0].reason)}`);
+    if (results[1].status === 'fulfilled') { const activity = results[1].value; setBoot(old => ({ ...old, ...activity })); } else notify(`待办与通知尚未刷新：${errorText(results[1].reason)}`);
+  }
   async function saveLocalQuestion() {
-    const value = question.trim(); if (!value || !current || localQuestionSaving) return;
-    const sectionId = activeId; setLocalQuestionSaving(true);
-    try { const result = await call<LearningSession>('question_save', { sectionId, question: value, selection }); setSessions(old => ({ ...old, [sectionId]: result })); if (activeIdRef.current === sectionId) setQuestion(old => old.trim() === value ? '' : old); notify('困惑已保存在学习记录中，未请求AI。'); }
-    catch (error) { notify(`困惑尚未保存，输入仍保留：${errorText(error)}`); }
+    const value = composerQuestion.trim(); if (!value || localQuestionSaving) return;
+    if (!canCompose || !session.id) { setAiError('学习会话尚未就绪，请稍候或重试打开。'); return; }
+    const target = session; const detached = independentMode; setLocalQuestionSaving(true);
+    try { const result = await call<LearningSession>('question_save', { sectionId: target.sectionId, sessionId: target.id, question: value, selection: requestSelection }); updateTargetSession(result, detached); if (detached) { if (independentRef.current.question.trim() === value) independentRef.current.setQuestion(''); } else if (activeIdRef.current === target.sectionId) setQuestion(old => old.trim() === value ? '' : old); notify('困惑已保存在学习记录中，未请求AI。'); }
+    catch (error) { setAiError(`困惑尚未保存，输入仍保留：${errorText(error)}`); }
     finally { setLocalQuestionSaving(false); }
   }
   async function ask(preset?: string) {
-    const value = (preset ?? question).trim();
-    if (!value || !current || busyRef.current) return;
-    if (!modelReady) { setSettings(true); return; }
+    const value = (preset ?? composerQuestion).trim();
+    if (!value || busyRef.current) return;
+    if (!canCompose || !session.id) { setAiError('学习会话尚未就绪，请重试打开，问题仍保留。'); return; }
+    if (!modelReady) { notify(modelBlocked ? '此模型用途受限，请查看设置中的说明或配置获准使用的自定义服务。' : '请先保存你自己的模型连接配置。'); setSettings(true); return; }
+    const target = session; const detached = independentMode; const selected = requestSelection;
     const id = makeId(); busyRef.current = id; setBusyId(id); setPartial(null); setAiError('');
-    const sectionId = activeId;
-    const previous = sessions[sectionId] ?? emptySession(sectionId);
-    const userMessage = { id: makeId(), role: 'user' as const, content: value, createdAt: new Date().toISOString() };
-    setSessions(old => ({ ...old, [sectionId]: { ...previous, messages: [...previous.messages, userMessage] } }));
-    setQuestion('');
     try {
-      await prepareSource(sectionId);
-      const result = await call<LearningSession>('session_ask', { sectionId, sessionId: previous.id, mode: panel, question: value, selection, operationId: id });
-      if (busyRef.current === id) setSessions(old => ({ ...old, [sectionId]: result }));
-    } catch (error) { if (busyRef.current === id) { if (activeIdRef.current === sectionId) { setAiError(errorText(error)); setQuestion(previous => previous || value); } else questionDrafts.current[sectionId] = questionDrafts.current[sectionId] || value; } }
-    finally { try { const latest = await call<LearningSession>('session_refresh', { sectionId }); setSessions(old => ({ ...old, [sectionId]: latest })); } catch { /* Preserve the displayed records when the local reread fails. */ } if (busyRef.current === id) { busyRef.current = ''; setBusyId(''); } }
+      if (!detached) await prepareSource(target.sectionId);
+      const context = await call<RequestContext>('context_load', { sessionId: target.id, sectionId: target.sectionId, selection: selected });
+      setContextView({ status: 'loading', sessionId: target.id, context });
+      const result = await call<LearningSession>('session_ask', { sectionId: target.sectionId, sessionId: target.id, mode: panel, question: value, selection: selected, operationId: id });
+      updateTargetSession(result, detached);
+      if (detached) { if (independentRef.current.question.trim() === value) independentRef.current.setQuestion(''); } else if (activeIdRef.current === target.sectionId) setQuestion(old => old.trim() === value ? '' : old);
+    } catch (error) { if (visibleSessionRef.current === target.id) setAiError(errorText(error)); else notify(`另一会话生成未完成，输入仍保留：${errorText(error)}`); }
+    finally { await refreshAfterGeneration(target, detached); if (busyRef.current === id) { busyRef.current = ''; setBusyId(''); } }
   }
   async function cancel() {
     const id = busyRef.current; if (!id) return;
@@ -237,12 +287,12 @@ export function App() {
   }
   async function generateExercise() {
     if (!current || busyRef.current) return;
-    if (!modelReady) { setSettings(true); return; }
+    if (!modelReady) { notify(modelBlocked ? '该模型用途受限，请查看设置说明。' : '请先保存模型连接配置。'); setSettings(true); return; }
     const id = makeId(); busyRef.current = id; setBusyId(id); setPartial(null); setAiError('');
     const sectionId = activeId;
     try { await prepareSource(sectionId); const result = await call<LearningSession>('exercise_generate', { sectionId, sessionId: session.id, selection, operationId: id }); if (busyRef.current === id) setSessions(old => ({ ...old, [sectionId]: result })); }
     catch (error) { if (busyRef.current === id) setAiError(errorText(error)); }
-    finally { try { const latest = await call<LearningSession>('session_refresh', { sectionId }); setSessions(old => ({ ...old, [sectionId]: latest })); } catch { /* Preserve the displayed records when the local reread fails. */ } if (busyRef.current === id) { busyRef.current = ''; setBusyId(''); } }
+    finally { await refreshAfterGeneration(session, false); if (busyRef.current === id) { busyRef.current = ''; setBusyId(''); } }
   }
   async function submitAnswer(exercise: Exercise, answer: string) {
     const result = await call<LearningSession>('exercise_answer', { sectionId: activeId, sessionId: session.id, exerciseId: exercise.id, entryId: exercise.entryId, answer });
@@ -315,9 +365,9 @@ export function App() {
     if (!useSaved) { try { await call('draft_save', { key, data: currentDraftData(key) }); } catch (error) { reportDraftError(key, error); } }
     if (key === 'workspace' && useSaved) setImporting(true);
   }
-  function openPanel(mode: Panel, preset?: string) { setPanel(mode); setRightbar(true); if (preset) setQuestion(preset); setTimeout(() => questionRef.current?.focus(), 0); }
+  function openPanel(mode: Panel, preset?: string) { setPanel(mode); setRightbar(true); if (preset) { if (mode === 'explore' && !associateSection) independent.setQuestion(preset); else setQuestion(preset); } setTimeout(() => questionRef.current?.focus(), 0); }
 
-  return <div className={`app-shell ${!sidebar ? 'sidebar-collapsed' : ''} ${!rightbar || view !== 'lesson' ? 'rightbar-collapsed' : ''} ${immersive && rightbar && view === 'lesson' ? 'immersive' : ''}`}>
+  return <div style={{ '--content-font-size': `${font.fontSize}px`, '--ui-font-scale': font.fontSize / 16 } as React.CSSProperties} className={`app-shell ${!sidebar ? 'sidebar-collapsed' : ''} ${!rightbar || view !== 'lesson' ? 'rightbar-collapsed' : ''} ${immersive && rightbar && view === 'lesson' ? 'immersive' : ''}`}>
     {isDemo && <div className="demo-banner">开发预览 · 示例材料，数据仅保留在内存 · 未连接本机服务或 AI</div>}
     <aside className="sidebar">
       <div className="brand"><span className="brand-mark"><BookOpen size={18} /></span><div>学习站<span>LEARNING STATION</span></div><button className="icon-button sidebar-collapse" title="收起课程栏" aria-label="收起课程栏" onClick={() => setSidebar(false)}><PanelLeftClose size={17} /></button></div>
@@ -360,10 +410,10 @@ export function App() {
             {current.error && <div className="inline-error"><strong>{current.conflict ? '外部文件已更新，你的编辑仍在这里。' : '这次编辑还没有写入文件。'}</strong><p>{current.error}</p><div className="button-row">{current.conflict && <button onClick={async () => { try { setComparison(await call<Section>('section_open', { id: activeId })); } catch (error) { notify(errorText(error)); } }}>查看外部新版本</button>}{!current.conflict && <button onClick={() => { void save(activeId); }}>重新保存</button>}<button onClick={async () => { try { const result = await call<Section>('section_import', { title: `${current.section.title}（我的草稿）`, body: current.body }); notify('已另存一份草稿，原文件保留。'); setBoot(old => ({ ...old, courses: old.courses.map(course => course.id === result.courseId ? { ...course, sections: [...course.sections, { id: result.id, title: result.title }] } : course) })); setDocs(old => ({ ...old, [result.id]: { section: result, body: result.body, savedBody: result.body, saving: false, draftLoaded: result.draftReady !== false } })); setActiveId(result.id); } catch (error) { notify(errorText(error)); } }}>另存为新小节</button></div></div>}
           </div>
           <div className="document-scroll" onMouseUp={selectText} onKeyUp={selectText}>
-            {!editing && <div className="reading-content" tabIndex={0}><Markdown text={current.body} className={current.body.split('\n')[0].replace(/^#\s+/, '').trim().toLowerCase() === current.section.title.replace(/^\d+\s*[·.、-]\s*/, '').trim().toLowerCase() ? 'hide-redundant-title' : ''} /><div className="reading-end"><span /><BookOpen size={15} /><span /></div><p className="reading-footnote">不必一次全部读懂。把真正卡住你的那一句留下来。</p></div>}
+            {!editing && <div className="reading-content" tabIndex={0}><Markdown text={current.body} className={current.body.split('\n')[0].replace(/^#\s+/, '').trim().toLowerCase() === current.section.title.replace(/^\d+\s*[·.、-]\s*/, '').trim().toLowerCase() ? 'hide-redundant-title' : ''} /><div className="reading-end"><span /><BookOpen size={15} /><span /></div></div>}
             {Object.entries(docs).filter(([id]) => editedIds.has(id)).map(([id, doc]) => <div key={id} className="document-editor" hidden={!editing || activeId !== id}><Suspense fallback={<div className="muted small">正在打开编辑器…</div>}><Editor initial={doc.body} onReady={() => { const started = editorStartedAt.current[id]; if (started !== undefined) { recordMetric('editor-ready', performance.now() - started); delete editorStartedAt.current[id]; } }} onChange={body => changeBody(id, body)} onSelection={setSelection} onSave={() => { void save(id); }} /></Suspense></div>)}
           </div>
-          {selection && <div className="selection-tray"><div className="selected-quote"><Highlighter size={14} /><span>{selection}</span><button className="icon-button" aria-label="清除选句" onClick={() => setSelection('')}><X size={13} /></button></div><div className="selection-actions"><button onClick={() => openPanel('explain', '请帮我理解这句话的含义和表达。')}><MessageCircle size={14} />问一句</button><button onClick={() => { openPanel('practice'); }}><Sparkles size={14} />考考我</button><button onClick={() => setCardDraft({ front: selection, back: '' })}><Layers2 size={14} />留作复习</button></div></div>}
+
         </> : <div className="welcome"><div className="welcome-symbol"><BookOpen size={32} strokeWidth={1.4} /></div><span className="eyebrow">YOUR OWN LEARNING SPACE</span><h1>从一小节开始，<br />把一个问题读明白。</h1><p>打开你的英语材料，边读边问。<br />小节、讲解和学过的错因，会自然留在一起。</p><button className="primary-button" onClick={() => setImporting(true)}><Plus size={16} />打开或粘贴我的材料</button><span className="welcome-support">支持 Markdown 与纯文本 · 原文保存在本机</span><button className="template-button" onClick={() => { if (!materialDraft.current.body) materialDraft.current = { title: "英语学习 · 每天的一小步（原创示例）", body: sampleBody }; else notify("已保留你未完成的导入草稿，请先保存它。"); setImporting(true); }}><BookOpen size={14} />使用英语学习模板<span>原创示例 · 可编辑 · 非 AI 生成</span></button>{openError && <div className="inline-error">{openError}<button onClick={() => { void openSection(activeId); }}>重试打开</button></div>}<div className="welcome-steps"><span><b>01</b> 读自己的材料</span><span><b>02</b> 随时问与练</span><span><b>03</b> 留下值得复习的</span></div></div>}
       </div>
 
@@ -374,21 +424,25 @@ export function App() {
 
     {view === 'lesson' && <aside className="assistant-panel"><div className="assistant-heading"><span className="assistant-mark"><Sparkles size={17} /></span><div><h2>一起读明白</h2><p>顺着你的问题，往前一步</p></div><button className="expand-assistant" aria-label={immersive ? '恢复三栏阅读' : '全展开学习助手'} aria-pressed={immersive} onClick={toggleImmersive}>{immersive ? <Minimize2 size={15} /> : <Maximize2 size={15} />}<span>{immersive ? '恢复阅读' : '全展开'}</span></button><button className="icon-button" aria-label="收起学习助手" onClick={() => { setImmersive(false); setRightbar(false); }}><PanelRightClose size={17} /></button></div><div className="assistant-tabs" role="tablist" aria-label="学习方式">{(['explain', 'explore', 'practice'] as Panel[]).map(mode => <button role="tab" aria-selected={panel === mode} key={mode} className={panel === mode ? 'selected' : ''} onClick={() => setPanel(mode)}>{mode === 'explain' ? '讲解' : mode === 'explore' ? '探索' : '练习'}</button>)}</div>
       <div className="assistant-scroll" ref={assistantScroll}>
-        <ContextSources section={current?.section} selection={selection} sources={session.sources} />
-        {boot.recovery && <details className="recovery-message"><summary>上次生成未完成 · 查看保留内容<ChevronDown size={12} /></summary><p>{boot.recovery.message || '应用关闭时生成尚未完成，已保存内容仍保留。'}</p>{boot.recovery.content ? <Markdown text={boot.recovery.content} /> : <p>尚未收到正文。可以重新发送问题。</p>}</details>}
-        {!modelReady && <div className="model-prompt"><span className="model-prompt-icon"><Sparkles size={16} /></span><div><strong>{modelAccessPending ? '模型接入适用性待确认' : '连接你的模型，开始对话'}</strong><p>{modelAccessPending ? '本地阅读、手动练习和复习可以先使用。' : '材料与选句会自动带入，无需复制上下文。'}</p><button onClick={() => setSettings(true)}>设置模型连接 <ArrowRight size={13} /></button></div></div>}
+        {panel === 'explore' && <div className="exploration-scope"><label className="checkbox-label"><input type="checkbox" checked={associateSection} disabled={!!busyId} onChange={event => { setAssociateSection(event.target.checked); setAiError(''); setPartial(null); }} />关联当前小节</label><p>{associateSection ? '关联探索：仅使用服务端核对的来源。' : '独立探索：不带入当前小节、选句或其他小节历史。'}</p>{busyId && <p>生成中；请先停止，再切换关联方式。</p>}{(independentMode ? independent.loading : linkedOpening) && <p role="status">正在打开探索会话…</p>}{(independentMode ? independent.error : linkedError) && <div className="inline-error" role="alert">{independentMode ? independent.error : linkedError}<button onClick={() => { if (independentMode) void independent.retry(); else void openLinkedExploration(); }}>重试打开探索</button></div>}</div>}
+        <RequestContextView value={contextView.sessionId && contextView.sessionId !== session.id ? { status: 'loading' } : contextView} independent={independentMode} onRetry={() => setContextRetry(old => old + 1)} />
+        {!independentMode && selection && <div className="selection-tray"><div className="selected-quote"><Highlighter size={13} /><span>当前选句 · 发送前会核对上下文</span><button className="icon-button" aria-label="取消选句" onClick={() => setSelection('')}><X size={13} /></button></div><blockquote>{selection}</blockquote><div className="selection-actions"><button onClick={() => openPanel('explain', '请帮我理解这句话的含义和表达。')}><MessageCircle size={12} />问一句</button><button onClick={() => openPanel('practice')}><Sparkles size={12} />考考我</button><button onClick={() => setCardDraft({ front: selection, back: '' })}><Layers2 size={12} />留作复习</button></div></div>}
+        {independentMode && independent.draftError && <div className="inline-error" role="alert">独立探索草稿尚未备份：{independent.draftError}{independent.conflict !== null ? <><p>旧问题：{independent.conflict || '（空）'}</p><button onClick={() => independent.resolveDraft(true)}>恢复旧问题</button><button onClick={() => independent.resolveDraft(false)}>保留当前问题并备份</button></> : <button onClick={() => { void independent.retryDraft(); }}>重试读取探索草稿</button>}</div>}
+        {independentMode && independent.recovery && <details className="recovery-message"><summary>独立探索上次生成未完成</summary><p>{independent.recovery.message || '已有记录仍保留。'}</p><Markdown text={independent.recovery.content} /></details>}
+        {!independentMode && boot.recovery && <details className="recovery-message"><summary>上次生成未完成 · 查看保留内容<ChevronDown size={12} /></summary><p>{boot.recovery.message || '应用关闭时生成尚未完成，已保存内容仍保留。'}</p>{boot.recovery.content ? <Markdown text={boot.recovery.content} /> : <p>尚未收到正文。可以重新发送问题。</p>}</details>}
+        {!modelReady && <div className="model-prompt"><span className="model-prompt-icon"><Sparkles size={16} /></span><div><strong>{modelBlocked ? '当前模型用途受限' : '连接自己的模型，开始对话'}</strong><p>{modelBlocked ? '可在设置中查看限制或配置获准使用的自定义服务。' : '可手动填写服务地址、协议和模型名称。'}</p><button onClick={() => setSettings(true)}>设置模型连接 <ArrowRight size={13} /></button></div></div>}
         {panel !== 'practice' && <>
-          {!session.messages.length && <div className="assistant-empty"><div className="little-line" /><h3>{panel === 'explore' ? '好问题，可以从这里展开。' : '哪里卡住了？'}</h3><p>{panel === 'explore' ? '从一个想法出发，比较、追问，再回到自己的理解。' : '词义、句子关系，或一整段的意思，都可以慢慢问。'}</p><div className="starter-questions"><button disabled={!current} onClick={() => { setQuestion('请带我梳理这一小节的核心意思，先从一个问题开始。'); questionRef.current?.focus(); }}>带我梳理这一小节 <ArrowRight size={13} /></button><button disabled={!current} onClick={() => { setQuestion('这篇材料里，有哪些容易理解错的表达？'); questionRef.current?.focus(); }}>找找容易理解错的表达 <ArrowRight size={13} /></button></div></div>}
+          {!session.messages.length && <div className="assistant-empty"><div className="little-line" /><h3>{panel === 'explore' ? '好问题，可以从这里展开。' : '哪里卡住了？'}</h3><p>{panel === 'explore' ? '从一个想法出发，比较、追问，再回到自己的理解。' : '词义、句子关系，或一整段的意思，都可以慢慢问。'}</p><div className="starter-questions"><button disabled={!canCompose} onClick={() => { updateComposer(independentMode ? '我想独立探索一个问题，请先帮我澄清。' : '请带我梳理这一小节的核心意思，先从一个问题开始。'); questionRef.current?.focus(); }}>{independentMode ? '澄清一个独立问题' : '带我梳理这一小节'} <ArrowRight size={13} /></button><button disabled={!canCompose} onClick={() => { updateComposer(independentMode ? '请从不同角度分析我接下来提出的问题。' : '这篇材料里，有哪些容易理解错的表达？'); questionRef.current?.focus(); }}>{independentMode ? '从不同角度展开' : '找找容易理解错的表达'} <ArrowRight size={13} /></button></div></div>}
           <div className="messages">{session.messages.slice(-30).map(message => <article className={`message ${message.role}`} key={message.id}><div className="message-label">{message.role === 'user' ? '我的问题' : message.role === 'note' ? <><FileText size={12} />学习记录 · AI整理{message.needsConfirmation && <span className="pending-label">待确认</span>}</> : <><Sparkles size={12} />学习助手</>}</div><Markdown text={message.content} />{message.sources?.length ? <SourceList sources={message.sources} /> : null}{message.role === 'assistant' && <button className="message-save" onClick={() => setCardDraft({ front: selection || '这一小节中值得回忆的问题', back: message.content })}><Plus size={12} />留作复习</button>}</article>)}</div>{session.messages.length > 30 && <p className="muted small">显示最近 30 条。完整记录保存在学习文件中。</p>}
         </>}
-        {panel === 'practice' && <div className="practice-panel"><span className="card-label">TRY IT YOURSELF</span><h3>用一道题，检查理解。</h3><p className="muted">围绕{selection ? '当前选句' : '当前小节'}与已记录的困惑生成，不必先听完讲解。</p><button className="primary-button full-width" disabled={!current || !!busyId || modelAccessPending} onClick={() => { void generateExercise(); }}><Sparkles size={14} />生成一道针对练习</button><button className="manual-exercise-link" disabled={!current} onClick={() => setManualExercise(true)}><PencilLine size={12} />或手动添加一道题</button>{session.exercises.map(exercise => <ExerciseCard key={exercise.id} exercise={exercise} onAnswer={answer => submitAnswer(exercise, answer)} onReason={reason => saveReason(exercise, reason)} />)}</div>}
-        {partial && partial.sectionId === activeId && busyId && <article className="message assistant partial-message"><div className="message-label"><Sparkles size={12} />正在回复</div><Markdown text={partial.content} /></article>}{busyId && <div className="generating" role="status"><LoaderCircle size={15} className="spin" /><div>正在等待模型回复…<small>当前小节与选句已自动带入</small></div><button className="quiet-button" onClick={() => { void cancel(); }}><Square size={11} />停止</button></div>}{aiError && <div className="inline-error" role="alert"><strong>这次没有得到回复</strong><p>{aiError}</p><span>问题已放回输入框，可以修改后重试。</span></div>}<div ref={chatEnd} />
+        {panel === 'practice' && <div className="practice-panel"><span className="card-label">TRY IT YOURSELF</span><h3>用一道题，检查理解。</h3><p className="muted">围绕{selection ? '当前选句' : '当前小节'}与已记录的困惑生成，不必先听完讲解。</p><button className="primary-button full-width" disabled={!!busyId} onClick={() => { void generateExercise(); }}><Sparkles size={14} />生成一道针对练习</button><button className="manual-exercise-link" disabled={!current} onClick={() => setManualExercise(true)}><PencilLine size={12} />或手动添加一道题</button>{session.exercises.map(exercise => <ExerciseCard key={exercise.id} exercise={exercise} onAnswer={answer => submitAnswer(exercise, answer)} onReason={reason => saveReason(exercise, reason)} />)}</div>}
+        {partial && partial.sessionId === session.id && busyId && <article className="message assistant partial-message"><div className="message-label"><Sparkles size={12} />正在回复</div><Markdown text={partial.content} /></article>}{busyId && <div className="generating" role="status"><LoaderCircle size={15} className="spin" /><div>正在等待模型回复…<small>{independentMode ? '独立探索 · 未关联当前小节' : '来源以核对后的实际清单为准'}</small></div><button className="quiet-button" onClick={() => { void cancel(); }}><Square size={11} />停止</button></div>}{aiError && <div className="inline-error" role="alert"><strong>这次没有得到回复</strong><p>{aiError}</p><span>输入仍保留，可以修改后重试。</span></div>}<div ref={chatEnd} />
       </div>
-      <div className="composer-area">{selection && <div className="composer-selection"><Highlighter size={12} /><span>已带入选句</span><button className="icon-button" aria-label="移除提问选句" onClick={() => setSelection('')}><X size={12} /></button></div>}<form className="composer" onSubmit={event => { event.preventDefault(); void ask(); }}><textarea ref={questionRef} aria-label="向学习助手提问" placeholder={current ? '写下你的问题…' : '先打开一份学习材料'} value={question} disabled={!current} rows={3} onChange={event => setQuestion(event.target.value)} onKeyDown={event => { if (isSubmitKey(event.nativeEvent)) { event.preventDefault(); void ask(); } }} /><div className="composer-bottom"><button type="button" className="save-question" disabled={!current || !question.trim() || localQuestionSaving} onClick={() => { void saveLocalQuestion(); }}>{localQuestionSaving ? <LoaderCircle size={11} className="spin" /> : <Plus size={11} />}保存困惑</button><button type="submit" className="send-button" aria-label={modelReady ? '发送问题' : '设置模型后提问'} disabled={!current || !question.trim() || !!busyId || modelAccessPending}><ArrowUp size={17} /></button></div></form><p className="composer-note">{modelReady ? `${boot.model.model} · 来源可展开查看` : '模型接入待确认 · 原文阅读与编辑可独立使用'}</p></div>
+      <div className="composer-area"><form className="composer" onSubmit={event => { event.preventDefault(); void ask(); }}><textarea ref={questionRef} aria-label="向学习助手提问" placeholder={independentMode ? '独立探索，不关联当前小节…' : current ? '写下你的问题…' : '先打开材料，或切换到独立探索'} value={composerQuestion} disabled={!canCompose} rows={3} onChange={event => updateComposer(event.target.value)} onKeyDown={event => { if (isSubmitKey(event.nativeEvent)) { event.preventDefault(); void ask(); } }} /><div className="composer-bottom"><button type="button" className="save-question" disabled={!composerQuestion.trim() || localQuestionSaving} onClick={() => { void saveLocalQuestion(); }}>{localQuestionSaving ? <LoaderCircle size={11} className="spin" /> : <Plus size={11} />}保存困惑</button><button type="submit" className="send-button" aria-label={modelReady ? '发送问题' : '配置模型后提问'} disabled={!composerQuestion.trim() || !!busyId}><ArrowUp size={17} /></button></div></form><p className="composer-note">{modelReady ? `${boot.model.model} · ${independentMode ? '独立探索' : '关联来源可展开核对'}` : '可配置自定义模型 · 本地阅读与练习可独立使用'}</p></div>
     </aside>}
 
     {importing && <ImportDialog draft={materialDraft} onDraftLoaded={loaded => { workspaceDraftLoaded.current = loaded; if (loaded) clearDraftError('workspace'); }} onClose={() => setImporting(false)} onImported={async section => { if (section.draftError) reportDraftError(`section:${section.id}`, section.draftError); if (workspaceDraftLoaded.current) { materialDraft.current = { title: '', body: '' }; if (nativeAvailable) void call('draft_save', { key: 'workspace', data: { importTitle: '', importBody: '' } }).catch(error => reportDraftError('workspace', error)); } setImporting(false); setDocs(old => ({ ...old, [section.id]: { section, body: section.body, savedBody: section.body, saving: false, draftLoaded: section.draftReady !== false } })); setSessions(old => ({ ...old, [section.id]: emptySession(section.id) })); setActiveId(section.id); setQuestion(questionForSection(questionDrafts.current, section.id)); setSelection(''); setAiError(''); switchView('lesson'); setEditing(false); try { setBoot(await call<Bootstrap>('bootstrap')); } catch (error) { notify(errorText(error)); } }} />}
-    {settings && <SettingsDialog model={boot.model} dataPath={boot.dataPath} onClose={() => setSettings(false)} onSaved={model => setBoot(old => ({ ...old, model }))} />}
+    {settings && <SettingsDialog font={font} model={boot.model} dataPath={boot.dataPath} onClose={() => setSettings(false)} onSaved={model => setBoot(old => ({ ...old, model }))} />}
     {backupConflict && <Dialog title="找回了之前的草稿" description="旧草稿还没有被覆盖。请对照正文与未发送的问题，再选择保留哪份输入。" onClose={() => setBackupConflict(null)}><div className="conflict-compare">{[{ label: '当前窗口输入', data: currentDraftData(backupConflict.key) }, { label: '找回的旧草稿', data: backupConflict.data }].map(item => <div key={item.label}><h3>{item.label}</h3>{backupConflict.key === 'workspace' ? <><h4>小节名称</h4><p>{item.data.importTitle || '（空）'}</p><h4>正文</h4><Markdown text={item.data.importBody || '（空）'} /></> : <><h4>正文</h4><Markdown text={item.data.body || '（空）'} /><h4>未发送的问题</h4><p className="draft-question">{item.data.question || '（空）'}</p></>}</div>)}</div><div className="dialog-footer"><button className="quiet-button" onClick={() => { void resolveBackup(true); }}>使用找回的草稿</button><button className="primary-button" onClick={() => { void resolveBackup(false); }}>保留当前输入并备份</button></div></Dialog>}
     {manualExercise && <ManualExerciseDialog sectionId={activeId} onClose={() => setManualExercise(false)} onSaved={result => { setSessions(old => ({ ...old, [activeId]: result })); setManualExercise(false); notify('手动题目已保存，可以开始作答。'); }} />}
     {comparison && <Dialog title="对照外部的新版本" description="左侧是仍保留的本地编辑，右侧是当前文件。关闭对照后可以继续整理，或将草稿另存为新小节。" onClose={() => setComparison(null)}><div className="conflict-compare"><div><h3>我的编辑</h3><Markdown text={current?.body || ''} /></div><div><h3>外部文件</h3><Markdown text={comparison.body} /></div></div></Dialog>}
@@ -397,9 +451,6 @@ export function App() {
   </div>;
 }
 
-function ContextSources({ section, selection, sources }: { section?: Section; selection: string; sources?: Source[] }) {
-  return <details className="context-sources"><summary><span className="context-dot" /><span>{section ? `已关联${sources?.length ? ` ${sources.length} 个来源` : '当前小节'}` : '等待打开学习材料'}</span><ChevronDown size={13} /></summary>{section && <div className="source-details"><strong>{section.title}</strong><p>{section.sourcePath}</p>{selection && <blockquote>{selection.slice(0, 300)}{selection.length > 300 ? '…' : ''}</blockquote>}{sources && sources.length > 1 && sources.map((source, index) => <p key={index}>· {source.title} — {source.path}</p>)}<p>发送问题时自动提供这些来源。提问前会先保存当前正文，保证来源与你正在读的内容一致。</p></div>}</details>;
-}
 function SourceList({ sources }: { sources: Source[] }) { return <details className="source-list"><summary><FileText size={12} />查看 {sources.length} 个上下文来源 <ChevronDown size={12} /></summary>{sources.map((source, index) => <div className="source-details" key={index}><strong>{source.title}</strong><p>{source.path}</p>{source.excerpt && <blockquote>{source.excerpt}</blockquote>}</div>)}</details>; }
 function ExerciseCard({ exercise, onAnswer, onReason }: { exercise: Exercise; onAnswer: (answer: string) => Promise<void>; onReason: (reason: string) => Promise<void> }) {
   const { answer, setAnswer, reason, setReason, error: draftError, retry: retryDraft, conflict: draftConflict, resolveConflict } = useExerciseDraft(exercise.id, exercise.answer || '');
@@ -430,30 +481,53 @@ function ImportDialog({ onClose, onImported, draft, onDraftLoaded }: { onClose: 
   async function submit(event: React.FormEvent) { event.preventDefault(); if (!body.trim() || busy) return; setBusy(true); setError(''); try { onImported(await call<Section>('section_import', { title: title.trim() || '未命名小节', body })); } catch (error) { setError(errorText(error)); } finally { setBusy(false); } }
   return <Dialog title="打开一份自己的材料" description="一篇短文、一页笔记，或今天要读的小节。系统会自动保存为课程材料。" onClose={onClose}><form onSubmit={event => { void submit(event); }}><input ref={file} type="file" accept=".md,.markdown,.txt,text/plain,text/markdown" hidden onChange={async event => { const selected = event.target.files?.[0]; if (!selected) return; edited.current = true; if (selected.size > 1_500_000) { setError('这份文件超过 1.5MB，请先按小节拆分。'); return; } try { setBody(await selected.text()); if (!title) setTitle(selected.name.replace(/\.(md|markdown|txt)$/i, '')); } catch { setError('无法读取这份文件，请确认文件可用后重试，也可以粘贴正文。'); } }} /><button type="button" className="file-picker" onClick={() => file.current?.click()}><FolderOpen size={20} /><span>选择 Markdown 或文本文件<small>也可以直接粘贴在下方</small></span><Plus size={17} /></button><label>小节名称<input value={title} onChange={event => { edited.current = true; setTitle(event.target.value); }} placeholder="例如：阅读 · Daily habits" maxLength={200} /></label><label>小节正文<textarea className="import-body" value={body} onChange={event => { edited.current = true; setBody(event.target.value); }} placeholder="把自己的学习材料粘贴在这里…" required rows={8} /></label>{error && <div className="inline-error" role="alert">{error}{savedImport ? <><p>旧名称：{savedImport.data.importTitle || '（空）'}</p><details><summary>查看旧正文</summary><Markdown text={savedImport.data.importBody || '（空）'} /></details><div className="button-row"><button type="button" onClick={() => { setTitle(savedImport.data.importTitle || ''); setBody(savedImport.data.importBody || ''); loadedRef.current = true; setDraftLoaded(true); onDraftLoaded(true); setSavedImport(null); setError(''); }}>恢复旧导入草稿</button><button type="button" onClick={() => { loadedRef.current = true; setDraftLoaded(true); onDraftLoaded(true); setSavedImport(null); setError(''); }}>保留当前输入并备份</button></div></> : !draftLoaded && <button type="button" onClick={() => { void restoreDraft(); }}>重试读取导入草稿</button>}</div>}<div className="dialog-footer"><span>正文可随时编辑</span><button className="primary-button" disabled={busy || !body.trim()}>{busy ? <LoaderCircle className="spin" size={15} /> : <ArrowRight size={15} />}{busy ? '正在保存到本机…' : '保存并开始阅读'}</button></div></form></Dialog>;
 }
-function SettingsDialog({ model, dataPath, onClose, onSaved }: { model: ModelSettings; dataPath?: string; onClose: () => void; onSaved: (model: ModelSettings) => void }) {
-  const [baseUrl, setBaseUrl] = useState(model.baseUrl || ''); const name = 'glm-5.3-flash'; const [secret, setSecret] = useState(''); const [busy, setBusy] = useState(false); const [error, setError] = useState(''); const [result, setResult] = useState('');
-  async function save(event: React.FormEvent) { event.preventDefault(); if (busy || modelAccessPending) return; setBusy(true); setError(''); setResult(''); const apiKey = secret; setSecret(''); try { const saved = await call<ModelSettings>('model_save', { provider: 'glm-pi', baseUrl, model: name, apiKey: apiKey || undefined }); onSaved(saved); setResult('连接设置已保存；请测试真实连接。'); } catch (error) { setError(errorText(error)); } finally { setBusy(false); } }
-  const settingsChanged = baseUrl !== model.baseUrl || name !== model.model || !!secret;
-  async function test() { if (modelAccessPending) return; setBusy(true); setError(''); setResult(''); try { const result = await call<{ ok: boolean; message: string }>('model_test'); setResult(result.message); if (result.ok) onSaved({ ...model, baseUrl, model: name, configured: true, connected: true }); } catch (error) { setError(errorText(error)); } finally { setBusy(false); } }
-  return <Dialog title="模型与本机设置" description="GLM-5.3-flash · Pi。请选择密钥所属的平台；只有发起提问或练习时，才发送相关学习上下文。" onClose={onClose}>
-    <div className={`settings-status ${model.connected ? 'connected' : ''}`}><span className="connection-dot" />{model.connected ? '真实连接已验证' : model.configured ? '已保存配置 · 连接待验证' : 'AI 尚未连接'}</div>
-    <form onSubmit={event => { void save(event); }}>
-      {modelAccessPending && <div className="inline-error model-policy" role="status"><strong>当前模型接入适用性待确认</strong><p>Coding Plan 不允许自建应用直接使用套餐。Pi 接入不代表获得套餐授权，目前不会发送模型请求，也不会自动改用付费 API。</p><p>先使用本地阅读、编辑、手动练习、复习与待办。确认支持的接入方式后再输入密钥。</p></div>}
-      <label>密钥所属的平台<select aria-label="模型平台" disabled={modelAccessPending} value={baseUrl} onChange={event => setBaseUrl(event.target.value)} required>
-        <option value="" disabled>请选择你的 API 密钥来自哪个平台</option>
-        <option value="https://open.bigmodel.cn/api/paas/v4">智谱 BigModel · 中国大陆</option>
-        <option value="https://api.z.ai/api/paas/v4">Z.AI · 国际</option>
-      </select></label>
-      <p className="endpoint-note">{baseUrl || '选择后显示服务地址'} · 不跨平台重试</p>
-      <label>默认模型<input value="GLM-5.3-flash" readOnly aria-label="默认模型" /><span className="label-note">Pi Agent · 模型固定为你选择的这一款</span></label>
-      <label>API 密钥 <span className="label-note">{model.credentialStored ? '已由本机安全存储管理；同一平台可留空继续使用' : '只交给本机安全存储'}</span><input type="password" disabled={modelAccessPending} value={secret} onChange={event => setSecret(event.target.value)} placeholder={model.credentialStored && baseUrl === model.baseUrl ? '留空保留已有密钥' : '在此输入此平台的新密钥'} autoComplete="new-password" spellCheck={false} required={!model.credentialStored || baseUrl !== model.baseUrl} /></label>
-      <p className="muted small">密钥不会保存在网页存储中，提交后立即从输入框清空。请先保存更改，再测试连接。更换平台需要重新输入对应密钥。</p>
+function SettingsDialog({ model, dataPath, onClose, onSaved, font }: { model: ModelSettings; dataPath?: string; onClose: () => void; onSaved: (model: ModelSettings) => void; font: ReturnType<typeof useFontSize> }) {
+  const [provider, setProvider] = useState(model.provider === 'glm-pi' ? 'glm-pi' : 'custom');
+  const [protocol, setProtocol] = useState(model.protocol || supportedProtocol);
+  const [baseUrl, setBaseUrl] = useState(model.baseUrl || '');
+  const [name, setName] = useState(model.model || '');
+  const [secret, setSecret] = useState('');
+  const [busy, setBusy] = useState<'save' | 'test' | ''>('');
+  const [error, setError] = useState('');
+  const [result, setResult] = useState('');
+  const bindingChanged = modelBindingChanged(model, { provider, protocol, baseUrl });
+  const settingsChanged = bindingChanged || name.trim() !== model.model;
+  async function save(event: React.FormEvent) {
+    event.preventDefault(); if (busy) return;
+    setError(''); setResult('');
+    const validation = modelFormError({ provider, protocol, baseUrl, model: name, apiKey: secret }, model);
+    if (validation) { setError(validation); return; }
+    setBusy('save'); const apiKey = secret; setSecret('');
+    try { const saved = await call<ModelSettings>('model_save', { provider, protocol, baseUrl: baseUrl.trim(), model: name.trim(), apiKey: apiKey || undefined }); onSaved(saved); setBaseUrl(saved.baseUrl); setName(saved.model); setProtocol(saved.protocol || supportedProtocol); setResult('配置已保存到本机，尚未发送模型请求。可以继续测试已保存的连接。'); }
+    catch (error) { setError(`连接配置尚未保存：${errorText(error)}`); }
+    finally { setBusy(''); }
+  }
+  async function test() {
+    if (busy) return; setError(''); setResult('');
+    if (!model.configured || settingsChanged) { setError(settingsChanged ? '配置有更改，请先保存，再测试这个目标。' : '请先填写并保存模型连接，再测试。'); return; }
+    setBusy('test');
+    try { const response = await call<{ ok: boolean; message: string }>('model_test'); setResult(response.message); onSaved(await call<ModelSettings>('model_get')); }
+    catch (error) { setError(`连接测试未通过：${errorText(error)}`); }
+    finally { setBusy(''); }
+  }
+  return <Dialog title="模型与本机设置" description="填写你自己的模型服务。保存只写入本机，点击测试或发送问题时才请求已保存的地址。" onClose={onClose}>
+    <section className="font-settings" aria-label="内容字号设置"><div><strong>内容字号</strong><output aria-live="polite">{font.fontSize}px</output></div><div className="font-controls"><button className="quiet-button" aria-label="减小内容字号" disabled={font.fontSize <= 12} onClick={() => font.setFontSize(font.fontSize - 1)}>A−</button><input aria-label="内容字号" type="range" min="12" max="24" step="1" value={font.fontSize} onChange={event => font.setFontSize(Number(event.target.value))} /><button className="quiet-button" aria-label="增大内容字号" disabled={font.fontSize >= 24} onClick={() => font.setFontSize(font.fontSize + 1)}>A＋</button></div><p>阅读、编辑、对话与复习内容同步调整。{font.status}</p>{font.error && <div className="inline-error" role="alert">字号设置：{font.error}<button onClick={() => { void font.flush().catch(() => undefined); }}>重试保存字号</button><button onClick={() => { void font.retry(); }}>重新读取字号</button></div>}</section>
+    <div className={`settings-status ${model.connected ? 'connected' : ''}`}><span className="connection-dot" />{model.connected ? '已保存目标的真实连接已验证' : model.configured ? '已保存配置 · 连接待验证' : '模型服务尚未配置'}</div>
+    <form noValidate onSubmit={event => { void save(event); }}>
+      <label>模型服务类型<select aria-label="模型服务类型" value={provider} onChange={event => { setProvider(event.target.value); setSecret(''); }}><option value="custom">自定义模型服务</option><option value="glm-pi">GLM Pi · Coding Plan 用途受限</option></select></label>
+      {provider === 'glm-pi' && <div className="inline-error model-policy" role="status"><strong>Coding Plan 用途限制仍有效</strong><p>Pi 接入不代表套餐授权。此用途尚未确认，服务端会保留请求门槛；不会自动切换到付费 API。自定义服务请使用你获准调用的接口。</p></div>}
+      <label>模型协议<select aria-label="模型协议" value={protocol} onChange={event => { setProtocol(event.target.value); setSecret(''); }}><option value={supportedProtocol}>OpenAI Chat Completions</option></select><span className="label-note">当前支持 openai-completions，由 Pi 适配</span></label>
+      <label>服务地址 base_url<input aria-label="模型服务地址" type="url" value={baseUrl} onChange={event => { setBaseUrl(event.target.value); setSecret(''); }} placeholder="填写服务提供方给出的基础 base_url" spellCheck={false} autoComplete="off" /><span className="label-note">填写基础地址，不含 /chat/completions；测试也会调用该地址下的服务，并按服务方规则计费。</span></label>
+      <label>模型名称<input aria-label="模型名称" value={name} onChange={event => setName(event.target.value)} placeholder="填写服务端支持的模型 ID" spellCheck={false} autoComplete="off" /></label>
+      <label>API 密钥 <span className="label-note">{model.credentialStored && !bindingChanged ? '已由本机安全存储管理；留空保留' : '更改地址或协议后需要新密钥'}</span><input aria-label="API 密钥" type="password" value={secret} onChange={event => setSecret(event.target.value)} placeholder={model.credentialStored && !bindingChanged ? '留空保留已有密钥' : '请在本机输入此服务的密钥'} autoComplete="new-password" spellCheck={false} /></label>
+      <p className="muted small">密钥不进入网页存储或日志；提交后立即清空输入框。测试只针对已保存的地址、协议和模型。</p>
       {error && <div className="inline-error" role="alert">{error}</div>}{result && <p className="settings-result" role="status">{result}</p>}
-      <div className="dialog-footer"><button type="button" className="quiet-button" disabled={busy || !model.configured || settingsChanged || modelAccessPending} title={settingsChanged ? '请先保存更改再测试' : undefined} onClick={() => { void test(); }}>测试真实连接</button><button className="primary-button" disabled={busy || !baseUrl || modelAccessPending}>{busy && <LoaderCircle className="spin" size={14} />}保存连接设置</button></div>
+      <div className="dialog-footer"><button type="button" className="quiet-button" disabled={!!busy} onClick={() => { void test(); }}>{busy === 'test' ? <><LoaderCircle size={14} className="spin" />正在测试已保存连接…</> : '测试已保存连接'}</button><button className="primary-button" disabled={!!busy}>{busy === 'save' ? <><LoaderCircle size={14} className="spin" />正在保存配置…</> : '保存连接设置'}</button></div>
     </form>
-    <div className="settings-local"><p>飞书提醒：未启用 · Anki：仅 CSV 导出，未同步</p><strong><FolderOpen size={14} />本机材料目录</strong><p>{dataPath || '由本机服务管理，连接后显示路径'}</p><p>Markdown 是学习内容的原始文件。可以用自己的编辑器打开，保存时会检查版本变化。</p></div>
+    <div className="settings-local"><p>飞书提醒：未启用 · Anki：仅 CSV 导出，未同步</p><strong><FolderOpen size={14} />本机材料目录</strong><p>{dataPath || '由本机服务管理，连接后显示路径'}</p><p>Markdown 是学习内容的原始文件，保存时会检查版本变化。</p></div>
   </Dialog>;
 }
+
 function CardDialog({ draft, sectionId, onClose, onSaved }: { draft: CardDraft; sectionId: string; onClose: () => void; onSaved: (card: ReviewCard) => void }) {
   const [front, setFront] = useState(draft.front); const [back, setBack] = useState(draft.back); const [busy, setBusy] = useState(false); const [error, setError] = useState('');
   async function submit(event: React.FormEvent) { event.preventDefault(); setBusy(true); setError(''); try { onSaved(await call<ReviewCard>('card_create', { sectionId, front, back })); } catch (error) { setError(errorText(error)); } finally { setBusy(false); } }
