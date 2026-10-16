@@ -1,7 +1,9 @@
+import { sessionMessages } from '../src/sessionMessages.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { JSDOM } from 'jsdom';
 import { isSubmitKey } from '../src/keyboard.ts';
+import { draftInputsDiffer, questionForSection, needsDraftChoice, unbackedSectionHasInput } from '../src/draftPolicy.ts';
 
 const dom = new JSDOM('');
 globalThis.window = dom.window;
@@ -31,4 +33,51 @@ test('plain Enter and Chinese IME composition never submit a question', () => {
   assert.equal(isSubmitKey({key:'Enter',metaKey:true,ctrlKey:false,keyCode:229}), false);
   assert.equal(isSubmitKey({key:'Enter',metaKey:true,ctrlKey:false,isComposing:false,keyCode:13}), true);
   assert.equal(isSubmitKey({key:'Enter',metaKey:false,ctrlKey:true}), true);
+});
+test('late draft reads require a choice before replacing changed local answer or reason', () => {
+  assert.equal(needsDraftChoice({answer:'new',reason:''},{answer:'old',reason:''},true), true);
+  assert.equal(needsDraftChoice({answer:'same',reason:'new cause'},{answer:'same',reason:'old cause'},true), true);
+  assert.equal(needsDraftChoice({answer:'same',reason:''},{answer:'same',reason:''},true), false);
+  assert.equal(needsDraftChoice({answer:'',reason:''},{answer:'saved',reason:'saved'},false), false);
+});
+test('a question alone prevents closing after its draft read failed', () => {
+  assert.equal(unbackedSectionHasInput(false,'saved','saved','unsent question'),true);
+  assert.equal(unbackedSectionHasInput(false,'edited','saved',''),true);
+  assert.equal(unbackedSectionHasInput(false,'saved','saved',''),false);
+  assert.equal(unbackedSectionHasInput(true,'saved','saved','unsent question'),false);
+});
+
+test('section recovery compares unsent questions even when the body is unchanged', () => {
+  assert.equal(draftInputsDiffer('section:a', {body:'same',question:'new question'}, {body:'same',question:'old question'}),true);
+  assert.equal(draftInputsDiffer('section:a', {body:'same',question:''}, {body:'same',question:'old question'}),true);
+  assert.equal(draftInputsDiffer('section:a', {body:'same',question:'same'}, {body:'same',question:'same'}),false);
+});
+test('workspace recovery compares its own title/body independently of section fields', () => {
+  assert.equal(draftInputsDiffer('workspace', {importTitle:'new',importBody:'same',question:'ignored'}, {importTitle:'old',importBody:'same',question:'different'}),true);
+  assert.equal(draftInputsDiffer('workspace', {importTitle:'same',importBody:'new'}, {importTitle:'same',importBody:'old'}),true);
+  assert.equal(draftInputsDiffer('workspace', {importTitle:'same',importBody:'same',body:'a'}, {importTitle:'same',importBody:'same',body:'b'}),false);
+});
+
+test('importing or switching sections restores only that section question, never the previous composer', () => {
+  const drafts = {'old-section':'old unsent question','existing-section':'its own question'};
+  assert.equal(questionForSection(drafts,'new-imported-section'),'');
+  assert.equal(questionForSection(drafts,'existing-section'),'its own question');
+  assert.equal(questionForSection(drafts,'old-section'),'old unsent question');
+  assert.deepEqual(drafts,{'old-section':'old unsent question','existing-section':'its own question'});
+});
+
+test('Pi tool notes are persisted learning records awaiting confirmation, never user quotations or inferred saves', () => {
+  const entries = [
+    {id:'u',kind:'user',content:'my wording',createdAt:'now'},
+    {id:'a',kind:'assistant',content:'已为你保存',createdAt:'now'},
+    {id:'q',kind:'note',content:'AI整理的待解问题',createdAt:'now',data:{origin:'pi-tool',question:true,needsConfirmation:true}},
+    {id:'c',kind:'note',content:'card',createdAt:'now',data:{reviewCard:true}},
+    {id:'s',kind:'note',content:'AI cause suggestion',createdAt:'now',data:{origin:'pi-tool',errorSuggestion:true,needsConfirmation:true}},
+  ];
+  const mapped = sessionMessages(entries, [{title:'source'}]);
+  assert.deepEqual(mapped.map(x=>[x.id,x.role,x.needsConfirmation]),[['u','user',false],['a','assistant',false],['q','note',true],['s','note',true]]);
+  assert.equal(mapped[2].content,'AI整理的待解问题');
+  assert.equal(mapped[2].sources,undefined);
+  assert.equal(sessionMessages([entries[1]],[]).length,1);
+  assert.equal(sessionMessages([entries[1]],[])[0].role,'assistant');
 });

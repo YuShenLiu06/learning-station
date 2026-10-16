@@ -96,7 +96,7 @@ impl DraftStore {
         Ok(Some(draft))
     }
 
-    /// None permits an upsert. With a version, the saved record must still match.
+    /// None creates only. Updating any existing draft requires its exact version.
     pub fn save(
         &self,
         key: &str,
@@ -110,6 +110,12 @@ impl DraftStore {
             .lock()
             .map_err(|_| CoreError::new("BUSY", "草稿保存暂不可用，输入仍保留。"))?;
         let current = self.get(key)?;
+        if current.is_some() && expected_version.is_none() {
+            return Err(CoreError::new(
+                "CONFLICT",
+                "本机已有草稿。请先读取并核对，当前输入仍保留，不会覆盖原草稿。",
+            ));
+        }
         if let Some(expected) = expected_version {
             if current.as_ref().map(|draft| draft.version.as_str()) != Some(expected) {
                 return Err(CoreError::new(
@@ -335,5 +341,40 @@ mod tests {
             "CONFLICT"
         );
         assert!(store.get("absent").unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod read_failure_tests {
+    use super::*;
+    #[test]
+    fn unknown_version_cannot_overwrite_existing_draft_after_a_failed_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DraftStore::new(dir.path()).unwrap();
+        let original = store
+            .save(
+                "section:reading",
+                DraftData {
+                    body: "尚未提交的真实草稿".into(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let attempted = store
+            .save(
+                "section:reading",
+                DraftData {
+                    body: "磁盘旧正文".into(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(attempted.code, "CONFLICT");
+        assert_eq!(
+            store.get("section:reading").unwrap().unwrap().version,
+            original.version
+        );
     }
 }

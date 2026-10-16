@@ -246,6 +246,29 @@ impl Core {
     }
 }
 
+static METRIC_APPEND_LOCK: Mutex<()> = Mutex::new(());
+
+/// Keep concurrent startup metrics as whole JSONL records, never formatter fragments.
+pub fn append_metric(path: &std::path::Path, value: &Value) -> Result<bool> {
+    let mut bytes = serde_json::to_vec(value)?;
+    bytes.push(b'\n');
+    let _guard = METRIC_APPEND_LOCK
+        .lock()
+        .map_err(|_| CoreError::new("BUSY", "性能记录暂不可用。"))?;
+    if fs::metadata(path).is_ok_and(|meta| meta.len() > 1_000_000) {
+        return Ok(false);
+    }
+    let mut options = fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(&bytes)?;
+    Ok(true)
+}
+
 pub fn atomic_json(path: &std::path::Path, value: &impl Serialize) -> Result<()> {
     let parent = path
         .parent()
@@ -267,6 +290,41 @@ pub fn atomic_json(path: &std::path::Path, value: &impl Serialize) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn concurrent_metrics_append_complete_json_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("performance.jsonl");
+        let threads: Vec<_> = (0..8)
+            .map(|worker| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for sequence in 0..25 {
+                        assert!(append_metric(
+                            &path,
+                            &json!({"worker":worker,"sequence":sequence})
+                        )
+                        .unwrap());
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let bytes = fs::read_to_string(path).unwrap();
+        let records: std::collections::BTreeSet<_> = bytes
+            .lines()
+            .map(|line| {
+                let value: Value = serde_json::from_str(line).unwrap();
+                (
+                    value["worker"].as_u64().unwrap(),
+                    value["sequence"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(bytes.lines().count(), 200);
+        assert_eq!(records.len(), 200);
+    }
     #[test]
     fn open_session_recovers_after_engine_restart_and_course_is_unchanged() {
         let dir = tempfile::tempdir().unwrap();

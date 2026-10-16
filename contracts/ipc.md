@@ -8,7 +8,7 @@ Rust命令均为异步IPC；失败返回 `{code,message,retryable,details?}`。�
 
 Markdown 开头是 ```json 围栏（JSON对象），后面正文。metadata.id稳定，links为稳定ID，不是文件路径。kind: section|knowledge|session；tags由AI建议可编辑。
 
-`LibraryState = {root:string, documents:DocumentSummary[], activeDocumentId?:string, activeSessionId?:string, model:{configured:boolean,provider:string,baseUrl:string,model:string,verified:boolean}, indexing:boolean}`；摘要不含正文。
+`LibraryState = {root:string, documents:DocumentSummary[], activeDocumentId?:string, activeSessionId?:string, model:ModelSettings, indexing:boolean}`；摘要不含正文。
 
 `Session = {id,sectionId,title,path,version,createdAt,updatedAt,entries:Entry[],contextManifest:ManifestItem[]}`。
 `Entry = {id,kind:user|assistant|exercise|attempt|feedback|error|note,content:string,createdAt,selection?:string,relatedIds?:string[],data?:object}`。
@@ -30,9 +30,9 @@ Markdown 开头是 ```json 围栏（JSON对象），后面正文。metadata.id�
 - `start_generation({sessionId,mode:explain|question|practice|feedback,selection,prompt,requestId})` → `{runId}`（立即返回）
 - `cancel_generation({runId})` → `{status}`；停止未完成生成，不删除记录/不撤回外部发送
 - `get_run({runId})` → `{id,status:queued|running|succeeded|failed|cancelled|interrupted,content,error?,sessionId}`
-- `configure_model({provider:openai-compatible,baseUrl,model,apiKey})` → `{configured,provider,model}`；密钥仅本机Keychain，不返回前端/日志
-- `get_model_settings()` → `{configured,provider,baseUrl,model}`
-- `test_model()` → `{ok,message}`（真实请求，有超时）
+- `configure_model({provider:"glm-pi",baseUrl,model,apiKey})` → ModelSettings；密钥仅本机Keychain，不返回前端/日志
+- `get_model_settings()` → ModelSettings
+- `test_model()` → `{ok,message}`；当前 Coding Plan 用途门槛返回 PLAN_USAGE_UNCONFIRMED，不发真实请求。ModelSettings见[Pi契约](pi-decision.md)。
 - `create_todo({title,dueAt?:string|null,sessionId?,requestId})` → Todo
 - `list_todos()` → Todo[]；`set_todo_done({id,done})` → Todo
 - `list_notifications()` → Notification[]；`mark_notification_read({id})` → Notification
@@ -44,7 +44,7 @@ Markdown 开头是 ```json 围栏（JSON对象），后面正文。metadata.id�
 - `library_changed` → `{documents}`；刷新后发
 - `notification` → Notification；站内提醒，飞书未配置必须显示未连接
 
-空库由UI提供“新建小节”和“使用示例”（示例标注）；无API时禁用AI执行并引导配置。聊天未发送草稿由UI保存；输入失败不清空。新建学习记录不要污染课程正文。
+空库由UI提供“新建小节”和“使用示例”（示例标注）；Coding Plan 用途未确认时禁用AI执行与密钥配置。聊天未发送草稿由UI保存；输入失败不清空。新建学习记录不要污染课程正文。
 
 实现过程中如字段变动在本文件更新并通知对方；前端mock必须最终切换真实IPC。
 
@@ -76,7 +76,7 @@ Tauri devUrl约定 `http://127.0.0.1:1420`，release嵌入 `dist/`。命令snake
 - 无时间允许纯待办；有时间但未启用不提醒；启用却无有效时间报INVALID_INPUT。仅启用+到期+未完成才入提醒箱。
 - `set_todo_reminder({id,reminderEnabled:boolean})` → Todo；关闭未来排队，不能撤回已发送消息。
 
-## 原生草稿与关闭窗口（Core正接入）
+## 原生草稿与关闭窗口
 
 - `get_ui_draft({key})` → UiDraft|null。
 - `save_ui_draft({key,data:{body?:string,question?:string,importTitle?:string,importBody?:string},expectedVersion?:string})` → UiDraft={key,data,version,updatedAt}。
@@ -89,3 +89,5 @@ Tauri devUrl约定 `http://127.0.0.1:1420`，release嵌入 `dist/`。命令snake
 `record_ui_metric({name,valueMs})` → `{recorded:boolean}`，name白名单：shell-interactive/section-ready/editor-ready/page-switch/ime-commit/stream-input。Rust在私有运行目录performance.jsonl加上mainToMetricMs（从Rust main进入Tauri到上报），用于release实测，不是冷启动完整OS耗时保证。
 
 请前端在首次可操作布局后requestAnimationFrame上报shell-interactive=performance.now()；CodeMirror构建并requestAnimationFrame可输入时editor-ready记该次加载耗时；切页可见后page-switch记动作到下一帧。只每次动作一条，禁止逐键IPC。可用实际中文IME提交测ime-commit；无真实模型时stream-input保持未测，不用fake证明在线性能。
+
+草稿保存加强：expectedVersion省略仅允许新建；已有草稿必须先get_ui_draft取得版本，否则CONFLICT，保护读取失败后的旧草稿。

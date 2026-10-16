@@ -314,13 +314,10 @@ async fn record_ui_metric(
         .get()
         .map(|t| t.elapsed().as_secs_f64() * 1000.0)
         .unwrap_or_default();
-    work(state.inner().clone(),move|e|{
-        let path=e.lock()?.state_dir.join("performance.jsonl");
-        if std::fs::metadata(&path).is_ok_and(|m|m.len()>1_000_000){return Ok(json!({"recorded":false}));}
-        use std::io::Write;
-        let mut file=std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-        writeln!(file,"{}",json!({"name":name,"valueMs":value_ms,"mainToMetricMs":elapsed,"timestamp":timestamp(),"version":env!("CARGO_PKG_VERSION"),"arch":std::env::consts::ARCH}))?;
-        Ok(json!({"recorded":true}))
+    work(state.inner().clone(), move |e| {
+        let path = e.lock()?.state_dir.join("performance.jsonl");
+        let recorded = crate::app::append_metric(&path, &json!({"name":name,"valueMs":value_ms,"mainToMetricMs":elapsed,"timestamp":timestamp(),"version":env!("CARGO_PKG_VERSION"),"arch":std::env::consts::ARCH}))?;
+        Ok(json!({"recorded":recorded}))
     }).await
 }
 
@@ -328,6 +325,8 @@ pub fn run() {
     let _ = RUN_START.set(std::time::Instant::now());
     tauri::Builder::default()
         .setup(|app| {
+            #[cfg(not(debug_assertions))]
+            crate::model::set_sidecar_dir(app.path().resource_dir()?.join("pi-sidecar"))?;
             let home = std::env::var_os("HOME")
                 .map(std::path::PathBuf::from)
                 .ok_or("无法定位本机用户目录")?;
@@ -341,9 +340,8 @@ pub fn run() {
             app.manage(engine.clone());
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                if let Ok(documents) = work(engine.clone(), |e| e.lock()?.refresh()).await {
-                    let _ = handle.emit("library_changed", json!({"documents":documents}));
-                }
+                // The UI explicitly refreshes after rendering its cached bootstrap.
+                // Do not race that first read by holding the core lock for a startup scan.
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
                 loop {
                     interval.tick().await;

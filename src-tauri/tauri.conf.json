@@ -25,6 +25,14 @@
     }
   },
   "bundle": {
-    "active": false
+    "active": false,
+    "resources": {
+      "../pi-sidecar/sidecar.mjs": "pi-sidecar/sidecar.mjs",
+      "../pi-sidecar/harness.mjs": "pi-sidecar/harness.mjs",
+      "../pi-sidecar/package.json": "pi-sidecar/package.json",
+      "../pi-sidecar/package-lock.json": "pi-sidecar/package-lock.json",
+      "../pi-sidecar/node_modules/": "pi-sidecar/node_modules/",
+      "../pi-sidecar/learning-plugin.mjs": "pi-sidecar/learning-plugin.mjs"
+    }
   }
 }

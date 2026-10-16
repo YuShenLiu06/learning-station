@@ -4,7 +4,7 @@
 | --- | --- |
 | content/context | 课程与知识点 Markdown；稳定 ID 关联、受限上下文和来源版本清单 |
 | sessions | 每会话 Markdown 及每条学习记录；作答反馈、可修正错因与复习导出 |
-| model/generation | 仅用户配置的兼容 API；提示版本、真实流、取消和生成状态 |
+| model/generation/learning_tools | Pi sidecar与按模式工具白名单；Rust复用学习记录/复习服务；用途门槛、流、取消和生成状态 |
 | reminders/feishu | 独立运行目录的 SQLite 通知 ledger；去重与固定本人通道适配 |
 | drafts | 仅允许正文／问题／导入内容的本机草稿，不接收模型密钥 |
 | desktop | Tauri IPC 和窗口事件，异步执行磁盘工作 |
