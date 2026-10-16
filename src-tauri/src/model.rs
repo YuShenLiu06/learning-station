@@ -2756,3 +2756,7 @@ mod model_limit_tests {
         assert!(!dir.path().join("state/model-settings.json").exists());
     }
 }
+
+#[cfg(test)]
+#[path = "model_auto_context_tests.rs"]
+mod automatic_context_wire_tests;

@@ -347,6 +347,7 @@ pub fn set_context_manifest(
 ) -> Result<Session> {
     let session = get(store, session_id)?;
     let mut context = Context {
+        automatic_materials: vec![],
         text: String::new(),
         manifest: manifest.to_vec(),
         exercise_reference_manifest: vec![],

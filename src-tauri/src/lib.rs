@@ -1,7 +1,9 @@
 pub mod app;
 pub mod assistant_references;
+pub mod automatic_context;
 pub mod content;
 pub mod context;
+pub mod context_bridge;
 #[cfg(feature = "desktop")]
 mod desktop;
 pub mod drafts;

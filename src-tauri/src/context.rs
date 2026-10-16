@@ -237,6 +237,7 @@ pub fn inject(store: &ContentStore, ctx: &mut Context, inputs: &[ContextInjectio
         }
     }
     let mut builder = Builder {
+        collect_auto: false,
         store,
         remaining: MAX_CONTEXT_CHARS.saturating_sub(ctx.text.chars().count()),
         visited: ctx.manifest.iter().map(|m| m.id.clone()).collect(),
@@ -284,8 +285,10 @@ pub fn load(store: &ContentStore, section_id: &str, selection: Option<&str>) -> 
         ));
     }
     let mut builder = Builder {
+        collect_auto: true,
         store,
         result: Context {
+            automatic_materials: vec![],
             exercise_reference_manifest: vec![],
             assistant_reference_manifest: vec![],
             history_manifest: vec![],
@@ -314,6 +317,7 @@ pub fn load(store: &ContentStore, section_id: &str, selection: Option<&str>) -> 
 }
 
 struct Builder<'a> {
+    collect_auto: bool,
     store: &'a ContentStore,
     result: Context,
     remaining: usize,
@@ -375,9 +379,25 @@ impl Builder<'_> {
         }
         let (included, truncated) = take_chars(&document.content, self.remaining - overhead);
         let included_chars = included.chars().count();
+        let block_start = self.result.text.len();
         self.append(&header);
         self.append(&included);
         self.append(footer);
+        if self.collect_auto {
+            self.result
+                .automatic_materials
+                .push(crate::automatic_context::MaterialSnapshot {
+                    id: id.clone(),
+                    path: document.path.clone(),
+                    version: document.version.clone(),
+                    text: included.to_string(),
+                    complete: !truncated,
+                    total_bytes: document.content.len(),
+                    start: block_start,
+                    end: self.result.text.len(),
+                    asset_course: None,
+                });
+        }
         self.result.manifest.push(ManifestItem {
             id: id.clone(),
             path: document.path,
@@ -541,9 +561,25 @@ impl Builder<'_> {
                         .saturating_sub(header.chars().count() + footer.chars().count());
                     let (included, truncated) = take_chars(&text, available);
                     let chars = included.chars().count();
+                    let block_start = self.result.text.len();
                     self.append(&header);
                     self.append(&included);
                     self.append(footer);
+                    if self.collect_auto {
+                        self.result.automatic_materials.push(
+                            crate::automatic_context::MaterialSnapshot {
+                                id: asset.id.clone(),
+                                path: format!("assets/{}/{}", asset.course_id, asset.id),
+                                version: asset.sha256.clone(),
+                                text: included.to_string(),
+                                complete: !truncated && included.len() == asset.size as usize,
+                                total_bytes: asset.size as usize,
+                                start: block_start,
+                                end: self.result.text.len(),
+                                asset_course: Some(asset.course_id.clone()),
+                            },
+                        );
+                    }
                     self.result.manifest.push(ManifestItem {
                         id: asset.id.clone(),
                         path: format!("assets/{}/{}", asset.course_id, asset.id),
@@ -1156,6 +1192,7 @@ mod trash_history_tests {
     }
     fn empty_context() -> Context {
         Context {
+            automatic_materials: vec![],
             text: "Current retained material".into(),
             manifest: vec![],
             exercise_reference_manifest: vec![],

@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import type { Bootstrap, Course, Exercise, LearningSession, ModelSettings, ReviewCard, Section, Source, UiDraft, RequestContext, LibraryNode, LibraryTreeSnapshot, GradeResult, Rubric } from './types';
 import { StationError } from './types';
 import { sessionMessages } from './sessionMessages';
+import { readContextBridgeManifest } from './contextBridge';
 import { historicalTools, foldToolActivities } from './toolActivities';
 import { noticeBody } from './noticePolicy';
 import { freezeRequestedContext } from './requestedContext';
@@ -18,7 +19,7 @@ type NativeModel = { maxOutputTokens?: number; contextWindow?: number | null; co
 type NativeState = { root: string; documents: Summary[]; activeDocumentId?: string; model: NativeModel; lastRunId?: string };
 type NativeTodo = { id: string; title: string; dueAt?: string; reminderEnabled?: boolean; done: boolean };
 type NativeNotice = { id: string; title: string; dueAt?: string; read: boolean; deliveryStatus?: string };
-type Run = { id: string; status: string; content: string; error?: { code: string; message: string; details?: Record<string, unknown> } | string; sessionId: string; userEntryId?: string; toolCalls?: ToolActivity[]; contextSnapshotVersion?: number; contextManifest?: Manifest[]; historyManifest?: Manifest[]; assistantReferenceManifest?: Manifest[]; exerciseReferenceManifest?: Manifest[]; contextWarnings?: string[]; contextTruncated?: boolean };
+type Run = { contextBridgeManifest?: unknown; id: string; status: string; content: string; error?: { code: string; message: string; details?: Record<string, unknown> } | string; sessionId: string; userEntryId?: string; toolCalls?: ToolActivity[]; contextSnapshotVersion?: number; contextManifest?: Manifest[]; historyManifest?: Manifest[]; assistantReferenceManifest?: Manifest[]; exerciseReferenceManifest?: Manifest[]; contextWarnings?: string[]; contextTruncated?: boolean };
 const draftVersions = new Map<string, string>();
 const draftReadKeys = new Set<string>();
 const appendRequests = new Map<string, string>();
@@ -126,7 +127,7 @@ async function generation(payload: Record<string, unknown>, mode: string, prompt
         userSnapshot = await ipc<NativeSession>('get_session', { id: value.id }).then(cacheSession).catch(() => undefined);
       }
       const userEntryConfirmed = mode === 'practice' && matchesUser();
-      progressListeners.forEach(listener => listener({ operationId, mode, sectionId, sessionId: value.id, runId, userEntryId: run.userEntryId, userEntryConfirmed, content: run.content || '', ...(run.contextSnapshotVersion === 1 && Array.isArray(run.contextManifest) ? { context: { text: '', manifest: run.contextManifest, historyManifest: run.historyManifest || [], assistantReferenceManifest: run.assistantReferenceManifest, exerciseReferenceManifest: run.exerciseReferenceManifest, warnings: run.contextWarnings || [], truncated: run.contextTruncated === true } } : { contextError: '此历史运行未记录实际来源快照，不能用当前会话或空清单代替核实。' }), toolCalls: foldToolActivities(run.toolCalls || [], value.id) }));
+      progressListeners.forEach(listener => listener({ operationId, mode, sectionId, sessionId: value.id, runId, userEntryId: run.userEntryId, userEntryConfirmed, content: run.content || '', ...(run.contextSnapshotVersion === 1 && Array.isArray(run.contextManifest) ? { context: { text: '', contextBridgeManifest: readContextBridgeManifest(run.contextBridgeManifest), manifest: run.contextManifest, historyManifest: run.historyManifest || [], assistantReferenceManifest: run.assistantReferenceManifest, exerciseReferenceManifest: run.exerciseReferenceManifest, warnings: run.contextWarnings || [], truncated: run.contextTruncated === true } } : { contextError: '此历史运行未记录实际来源快照，不能用当前会话或空清单代替核实。' }), toolCalls: foldToolActivities(run.toolCalls || [], value.id) }));
       if (run.status === 'succeeded') return learning(await ipc<NativeSession>('get_session', { id: value.id }));
       if (['failed', 'cancelled', 'interrupted'].includes(run.status)) throw new StationError(typeof run.error === 'string' ? run.error : run.error?.message || '生成未完成，已收到的内容仍保留。', typeof run.error === 'object' ? run.error.code : run.status.toUpperCase(), { ...(typeof run.error === 'object' ? run.error.details : {}), sendStage: 'generation', runId, runStatus: run.status });
       await new Promise(resolve => setTimeout(resolve, 350));

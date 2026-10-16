@@ -112,6 +112,8 @@ pub struct ManifestItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Context {
+    #[serde(skip)]
+    pub automatic_materials: Vec<crate::automatic_context::MaterialSnapshot>,
     pub text: String,
     pub manifest: Vec<ManifestItem>,
     #[serde(default)]

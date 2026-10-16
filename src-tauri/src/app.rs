@@ -688,6 +688,7 @@ impl Core {
         Ok((
             session,
             Context {
+                automatic_materials: vec![],
                 exercise_reference_manifest: vec![],
                 assistant_reference_manifest: vec![],
                 history_manifest: vec![],
@@ -713,6 +714,7 @@ impl Core {
                 ));
             }
             Context {
+                automatic_materials: vec![],
                 exercise_reference_manifest: vec![],
                 assistant_reference_manifest: vec![],
                 history_manifest: vec![],
