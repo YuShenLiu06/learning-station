@@ -57,6 +57,13 @@ struct CreateNote {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct CreateTodo {
+    title: String,
+    #[serde(default)]
+    due_at: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct QueryKnowledge {
     #[serde(default)]
     query: Option<String>,
@@ -69,6 +76,7 @@ enum Operation {
     Error(CreateError),
     Card(CreateReviewCard),
     Note(CreateNote),
+    Todo(CreateTodo),
     Query(QueryKnowledge),
 }
 
@@ -122,6 +130,15 @@ pub fn execute(
             }
             Operation::Note(value)
         }
+        "create_todo" => {
+            let value: CreateTodo = decode(args)?;
+            bounded(&value.title, 1, 2000)?;
+            if let Some(due_at) = &value.due_at {
+                bounded(due_at, 1, 64)?;
+                chrono::DateTime::parse_from_rfc3339(due_at).map_err(|_| invalid())?;
+            }
+            Operation::Todo(value)
+        }
         "query_related_knowledge" => {
             let value: QueryKnowledge = decode(args)?;
             if let Some(query) = &value.query {
@@ -142,9 +159,30 @@ pub fn execute(
     if session.section_id != scope.section_id {
         return Err(out_of_scope());
     }
-    let source = core.content.read(&scope.section_id)?;
-    if !matches!(source.metadata.kind.as_str(), "section" | "knowledge") {
-        return Err(out_of_scope());
+    if scope.section_id.is_empty() {
+        // Independent exploration must be explicit in the persisted session;
+        // an empty or forged scope cannot silently detach an associated session.
+        let document = core.content.read(&scope.session_id)?;
+        if document
+            .metadata
+            .extra
+            .get("sectionId")
+            .and_then(Value::as_str)
+            != Some("")
+            || document
+                .metadata
+                .extra
+                .get("associateCurrentSection")
+                .and_then(Value::as_bool)
+                != Some(false)
+        {
+            return Err(out_of_scope());
+        }
+    } else {
+        let source = core.content.read(&scope.section_id)?;
+        if !matches!(source.metadata.kind.as_str(), "section" | "knowledge") {
+            return Err(out_of_scope());
+        }
     }
     if let Operation::Query(query) = operation {
         return query_knowledge(&core.content, scope, query);
@@ -155,6 +193,24 @@ pub fn execute(
         "pi_tool_{}",
         hash(&serde_json::to_string(&(&scope.run_id, call_id))?)
     );
+    if let Operation::Todo(value) = operation {
+        let todo = engine.reminders.create_todo(
+            &value.title,
+            value.due_at.as_deref(),
+            false,
+            Some(&session.id),
+            &request_id,
+        )?;
+        return Ok(
+            json!({"persisted":true,"todoId":todo.id,"sessionId":session.id,
+            "sectionId":session.section_id,"todo":todo}),
+        );
+    }
+    let section_related_ids = if scope.section_id.is_empty() {
+        vec![]
+    } else {
+        vec![scope.section_id.clone()]
+    };
     let entry_id = format!("entry_{}", &hash(&request_id)[..32]);
     let mut existing_error_id = None;
     let entry = match operation {
@@ -164,7 +220,7 @@ pub fn execute(
             content: format!("{AI_NOTICE} · 待解问题\n\n{}", value.question),
             created_at: String::new(),
             selection: value.selection,
-            related_ids: vec![scope.section_id.clone()],
+            related_ids: section_related_ids.clone(),
             data: Some(
                 json!({"question":true,"origin":"pi-tool","needsConfirmation":true,"runId":scope.run_id}),
             ),
@@ -177,7 +233,7 @@ pub fn execute(
                 content: format!("{AI_NOTICE} · 复习卡\n\n{}\n\n{}", value.front, back),
                 created_at: String::new(),
                 selection: None,
-                related_ids: vec![scope.section_id.clone()],
+                related_ids: section_related_ids.clone(),
                 data: Some(
                     json!({"reviewCard":true,"front":value.front,"back":back,"tags":value.tags,
                     "origin":"pi-tool","needsConfirmation":true,"runId":scope.run_id}),
@@ -190,7 +246,7 @@ pub fn execute(
             content: format!("{AI_NOTICE} · 学习笔记\n\n{}", value.content),
             created_at: String::new(),
             selection: value.selection,
-            related_ids: vec![scope.section_id.clone()],
+            related_ids: section_related_ids.clone(),
             data: Some(json!({"origin":"pi-tool","needsConfirmation":true,"runId":scope.run_id})),
         },
         Operation::Error(value) => {
@@ -260,11 +316,13 @@ pub fn execute(
             if let Some(exercise_id) = value.exercise_id {
                 data["exerciseId"] = json!(exercise_id);
             }
-            let mut related_ids = vec![scope.section_id.clone()];
+            let mut related_ids = section_related_ids.clone();
             if let Some(source_id) = &existing_error_id {
                 data["errorSuggestion"] = json!(true);
                 data["sourceErrorId"] = json!(source_id);
-                related_ids.push(source_id.clone());
+                if !scope.section_id.is_empty() {
+                    related_ids.push(source_id.clone());
+                }
             }
             Entry {
                 id: String::new(),
@@ -284,7 +342,7 @@ pub fn execute(
                 data: Some(data),
             }
         }
-        Operation::Query(_) => unreachable!(),
+        Operation::Query(_) | Operation::Todo(_) => unreachable!(),
     };
     let saved = sessions::append(
         &mut core.content,
@@ -315,6 +373,12 @@ fn query_knowledge(
     scope: &ToolScope,
     query: QueryKnowledge,
 ) -> Result<Value> {
+    if scope.section_id.is_empty() {
+        return Ok(
+            json!({"sectionId":"","sessionId":scope.session_id,"results":[],"manifest":[],
+            "truncated":false,"materialRole":"user-reference"}),
+        );
+    }
     let mut allowed: BTreeSet<&str> = scope.allowed_ids.iter().map(String::as_str).collect();
     allowed.insert(&scope.section_id);
     if query
@@ -393,7 +457,7 @@ fn query_knowledge(
 
 fn validate_scope(scope: &ToolScope, call_id: &str) -> Result<()> {
     if !valid_id(&scope.session_id)
-        || !valid_id(&scope.section_id)
+        || (!scope.section_id.is_empty() && !valid_id(&scope.section_id))
         || !valid_id(&scope.run_id)
         || scope.allowed_ids.len() > 32
         || scope.allowed_ids.iter().any(|id| !valid_id(id))
@@ -402,6 +466,9 @@ fn validate_scope(scope: &ToolScope, call_id: &str) -> Result<()> {
         || call_id.chars().any(char::is_control)
     {
         return Err(invalid());
+    }
+    if scope.section_id.is_empty() && !scope.allowed_ids.is_empty() {
+        return Err(out_of_scope());
     }
     Ok(())
 }
@@ -513,6 +580,384 @@ mod tests {
             (scope, updated.content)
         };
         (directory, engine, scope, original)
+    }
+
+    fn independent_fixture() -> (tempfile::TempDir, Arc<Engine>, ToolScope, String, String) {
+        let (directory, engine, associated, original) = fixture();
+        let independent_id = "independent_session_fixture";
+        {
+            let mut core = engine.lock().unwrap();
+            let mut extra = BTreeMap::new();
+            extra.insert("sectionId".into(), json!(""));
+            extra.insert("associateCurrentSection".into(), json!(false));
+            extra.insert("createdAt".into(), json!(timestamp()));
+            extra.insert("contextManifest".into(), json!([]));
+            core.content
+                .create(
+                    Metadata {
+                        id: independent_id.into(),
+                        title: "独立探索".into(),
+                        kind: "session".into(),
+                        goals: vec![],
+                        tags: vec![],
+                        links: vec![],
+                        version: 1,
+                        extra,
+                    },
+                    "独立探索记录。",
+                    &format!("sessions/{independent_id}/session.md"),
+                )
+                .unwrap();
+            sessions::get(&mut core.content, independent_id).unwrap();
+        }
+        let scope = ToolScope {
+            session_id: independent_id.into(),
+            section_id: String::new(),
+            run_id: "run_independent_fixture".into(),
+            allowed_ids: vec![],
+        };
+        (directory, engine, scope, associated.section_id, original)
+    }
+
+    #[test]
+    fn pi_todos_really_persist_reopen_deduplicate_and_never_enable_reminders() {
+        let (directory, engine, scope, original) = fixture();
+        let plain_args = json!({"title":"稍后复习 since 与 for"});
+        let timed_args = json!({"title":"明天再比较用法","dueAt":"2000-01-01T08:00:00+08:00"});
+        let plain = execute(
+            &engine,
+            &scope,
+            "plain-todo",
+            "create_todo",
+            plain_args.clone(),
+        )
+        .unwrap();
+        let timed = execute(
+            &engine,
+            &scope,
+            "timed-todo",
+            "create_todo",
+            timed_args.clone(),
+        )
+        .unwrap();
+        assert_eq!(plain["persisted"], true);
+        assert_eq!(plain["todoId"], plain["todo"]["id"]);
+        assert_eq!(plain["sessionId"], scope.session_id);
+        assert_eq!(plain["sectionId"], scope.section_id);
+        assert_eq!(plain["todo"]["sessionId"], scope.session_id);
+        assert!(plain["todo"]["dueAt"].is_null());
+        assert_eq!(timed["todo"]["dueAt"], "2000-01-01T00:00:00.000000000Z");
+        for receipt in [&plain, &timed] {
+            assert_eq!(receipt["todo"]["reminderEnabled"], false);
+        }
+        assert_eq!(
+            execute(
+                &engine,
+                &scope,
+                "plain-todo",
+                "create_todo",
+                plain_args.clone()
+            )
+            .unwrap(),
+            plain
+        );
+        for changed in [
+            json!({"title":"另一待办"}),
+            json!({"title":"稍后复习 since 与 for","dueAt":"2000-01-02T00:00:00Z"}),
+        ] {
+            assert_eq!(
+                execute(&engine, &scope, "plain-todo", "create_todo", changed)
+                    .unwrap_err()
+                    .code,
+                "CONFLICT"
+            );
+        }
+        assert_eq!(engine.reminders.list_todos().unwrap().len(), 2);
+        assert!(engine.reminders.tick().unwrap().is_empty());
+        assert!(engine.reminders.list_notifications().unwrap().is_empty());
+        {
+            let mut core = engine.lock().unwrap();
+            assert!(sessions::get(&mut core.content, &scope.session_id)
+                .unwrap()
+                .entries
+                .is_empty());
+            assert_eq!(
+                core.content.read(&scope.section_id).unwrap().content,
+                original
+            );
+        }
+        drop(engine);
+        let reopened = Engine::new(
+            directory.path().join("library"),
+            directory.path().join("runtime"),
+        )
+        .unwrap();
+        assert_eq!(
+            execute(&reopened, &scope, "plain-todo", "create_todo", plain_args).unwrap(),
+            plain
+        );
+        assert_eq!(
+            execute(&reopened, &scope, "timed-todo", "create_todo", timed_args).unwrap(),
+            timed
+        );
+        assert_eq!(reopened.reminders.list_todos().unwrap().len(), 2);
+        assert!(reopened.reminders.tick().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_todo_storage_is_an_error_without_a_success_receipt() {
+        let (directory, engine, scope, _) = fixture();
+        let connection =
+            rusqlite::Connection::open(directory.path().join("runtime/notifications.sqlite3"))
+                .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_tool_todo BEFORE INSERT ON reminder_todos
+             BEGIN SELECT RAISE(ABORT,'test-storage-failure'); END;",
+            )
+            .unwrap();
+        assert!(execute(
+            &engine,
+            &scope,
+            "failed-todo",
+            "create_todo",
+            json!({"title":"不能假称保存"})
+        )
+        .is_err());
+        assert!(engine.reminders.list_todos().unwrap().is_empty());
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM reminder_requests", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let mut core = engine.lock().unwrap();
+        assert!(sessions::get(&mut core.content, &scope.session_id)
+            .unwrap()
+            .entries
+            .is_empty());
+    }
+
+    #[test]
+    fn todo_arguments_cannot_override_reminders_ownership_or_scope() {
+        let (_directory, engine, scope, _) = fixture();
+        for args in [
+            json!({"title":"T","reminderEnabled":true}),
+            json!({"title":"T","reminderEnabled":false}),
+            json!({"title":"T","sessionId":"another_session"}),
+            json!({"title":"T","sectionId":"another_section"}),
+            json!({"title":"T","path":"../../outside.md"}),
+            json!({"title":"T","dueAt":""}),
+            json!({"title":"T","dueAt":"2000-01-01T00:00:00"}),
+            json!({"title":"T","dueAt":"not-a-date"}),
+            json!({"title":" "}),
+        ] {
+            assert_eq!(
+                execute(&engine, &scope, "invalid-todo", "create_todo", args)
+                    .unwrap_err()
+                    .code,
+                "INVALID_TOOL_INPUT"
+            );
+        }
+        let mut foreign = scope.clone();
+        foreign.section_id = "unrelated".into();
+        assert_eq!(
+            execute(
+                &engine,
+                &foreign,
+                "cross-section-todo",
+                "create_todo",
+                json!({"title":"T"})
+            )
+            .unwrap_err()
+            .code,
+            "TOOL_SCOPE"
+        );
+        foreign = scope.clone();
+        foreign.session_id = "missing_session".into();
+        assert!(execute(
+            &engine,
+            &foreign,
+            "missing-session-todo",
+            "create_todo",
+            json!({"title":"T"})
+        )
+        .is_err());
+        assert!(engine.reminders.list_todos().unwrap().is_empty());
+    }
+
+    #[test]
+    fn todo_idempotency_cannot_reuse_another_real_sessions_receipt() {
+        let (_directory, engine, scope, _) = fixture();
+        let args = json!({"title":"复习"});
+        let first = execute(&engine, &scope, "same-call", "create_todo", args.clone()).unwrap();
+        let other_session = {
+            let mut core = engine.lock().unwrap();
+            sessions::create(&mut core.content, &scope.section_id, &[]).unwrap()
+        };
+        let mut other = scope.clone();
+        other.session_id = other_session.id;
+        assert_eq!(
+            execute(&engine, &other, "same-call", "create_todo", args.clone())
+                .unwrap_err()
+                .code,
+            "CONFLICT"
+        );
+        other.run_id = "another_run".into();
+        let second = execute(&engine, &other, "same-call", "create_todo", args).unwrap();
+        assert_ne!(first["todoId"], second["todoId"]);
+        assert_eq!(second["todo"]["sessionId"], other.session_id);
+        assert_eq!(engine.reminders.list_todos().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn independent_exploration_tools_do_not_inherit_current_section_sources() {
+        let (_directory, engine, scope, current_section, original) = independent_fixture();
+        for (call_id, name, args) in [
+            (
+                "independent-note",
+                "create_note",
+                json!({"content":"我想单独探索一个问题"}),
+            ),
+            (
+                "independent-question",
+                "record_question",
+                json!({"question":"这个概念是什么？"}),
+            ),
+            (
+                "independent-card",
+                "create_review_card",
+                json!({"front":"F","back":"B"}),
+            ),
+            (
+                "independent-error",
+                "create_error",
+                json!({"front":"Q","back":"A"}),
+            ),
+        ] {
+            let receipt = execute(&engine, &scope, call_id, name, args).unwrap();
+            assert_eq!(receipt["persisted"], true);
+            assert_eq!(receipt["sectionId"], "");
+        }
+        for args in [
+            json!({"query":"since"}),
+            json!({"knowledgeId":"unrelated"}),
+            json!({"knowledgeId":current_section}),
+        ] {
+            let result = execute(
+                &engine,
+                &scope,
+                "independent-query",
+                "query_related_knowledge",
+                args,
+            )
+            .unwrap();
+            assert_eq!(result["results"], json!([]));
+            assert_eq!(result["manifest"], json!([]));
+            assert_eq!(result["truncated"], false);
+            assert!(!result.to_string().contains("OUTSIDE_SCOPE_PRIVATE_TEXT"));
+            assert!(!result.to_string().contains("current lesson"));
+        }
+        let todo = execute(
+            &engine,
+            &scope,
+            "independent-todo",
+            "create_todo",
+            json!({"title":"整理独立探索结论"}),
+        )
+        .unwrap();
+        assert_eq!(todo["sectionId"], "");
+        assert_eq!(todo["todo"]["sessionId"], scope.session_id);
+        assert_eq!(todo["todo"]["reminderEnabled"], false);
+        let mut core = engine.lock().unwrap();
+        let session = sessions::get(&mut core.content, &scope.session_id).unwrap();
+        assert!(session.section_id.is_empty());
+        assert!(session.context_manifest.is_empty());
+        assert_eq!(session.entries.len(), 4);
+        for entry in &session.entries {
+            assert!(entry.related_ids.is_empty());
+            assert!(core
+                .content
+                .read(&entry.id)
+                .unwrap()
+                .metadata
+                .links
+                .is_empty());
+        }
+        assert_eq!(
+            core.content.read(&current_section).unwrap().content,
+            original
+        );
+    }
+
+    #[test]
+    fn independent_scope_requires_explicit_persisted_optout_and_empty_allowed_ids() {
+        let (_directory, engine, scope, current_section, _) = independent_fixture();
+        let mut contaminated = scope.clone();
+        contaminated.allowed_ids.push(current_section.clone());
+        for (name, args) in [
+            ("query_related_knowledge", json!({"query":"since"})),
+            ("create_todo", json!({"title":"T"})),
+            ("create_note", json!({"content":"N"})),
+        ] {
+            assert_eq!(
+                execute(&engine, &contaminated, "contaminated-scope", name, args)
+                    .unwrap_err()
+                    .code,
+                "TOOL_SCOPE"
+            );
+        }
+        for associate in [None, Some(json!(true))] {
+            {
+                let core = engine.lock().unwrap();
+                let doc = core.content.read(&scope.session_id).unwrap();
+                let mut meta = doc.metadata;
+                if let Some(value) = associate {
+                    meta.extra.insert("associateCurrentSection".into(), value);
+                } else {
+                    meta.extra.remove("associateCurrentSection");
+                }
+                let content = crate::content::serialize(&meta, &doc.body).unwrap();
+                // Simulate an external edit: the normal save API deliberately
+                // preserves omitted extension keys from older clients.
+                std::fs::write(core.content.root().join(&doc.path), content).unwrap();
+            }
+            assert!(execute(
+                &engine,
+                &scope,
+                "implicit-independent",
+                "create_todo",
+                json!({"title":"T"})
+            )
+            .is_err());
+        }
+        assert!(engine.reminders.list_todos().unwrap().is_empty());
+        {
+            let mut core = engine.lock().unwrap();
+            let doc = core.content.read(&scope.session_id).unwrap();
+            let mut meta = doc.metadata;
+            meta.extra
+                .insert("associateCurrentSection".into(), json!(false));
+            let content = crate::content::serialize(&meta, &doc.body).unwrap();
+            core.content
+                .save(&scope.session_id, &content, &doc.version)
+                .unwrap();
+        }
+        let mut associated_scope = scope.clone();
+        associated_scope.section_id = current_section;
+        assert_eq!(
+            execute(
+                &engine,
+                &associated_scope,
+                "forged-associated",
+                "create_note",
+                json!({"content":"N"})
+            )
+            .unwrap_err()
+            .code,
+            "TOOL_SCOPE"
+        );
     }
 
     #[test]

@@ -207,3 +207,45 @@ test('CLI cancel exits promptly, without done or secret output', async () => {
     assert.equal(result.events.at(-1).code, 'CANCELLED'); assert(!result.stdout.includes(SECRET));
   });
 });
+
+const customRequest = (endpoint) => ({ ...request(endpoint), settings: { provider: 'custom', protocol: 'openai-completions', baseUrl: endpoint, model: 'user-selected/model-2026' } });
+test('custom transport requires an explicit supported protocol, valid URL and user model', () => {
+  assert.equal(createModel(customRequest('https://api.example.com/custom/v1/').settings).baseUrl, 'https://api.example.com/custom/v1');
+  for (const protocol of ['', 'anthropic-messages', 'openai-responses']) assert.throws(() => createModel({ ...customRequest('https://example.com/v1').settings, protocol }));
+  for (const model of ['', 'x'.repeat(257), 'bad\nmodel']) assert.throws(() => createModel({ ...customRequest('https://example.com/v1').settings, model }));
+  for (const endpoint of ['http://example.com/v1', 'file:///tmp/fixture-secret', 'https://user:fixture-secret@example.com/v1', 'https://@example.com/v1', 'https://example.com/v1?', 'https://example.com/v1#']) assert.throws(() => createModel(customRequest(endpoint).settings), (error) => !error.message.includes(SECRET));
+});
+test('custom real Pi transport preserves model/path without GLM thinking or fallback', async () => {
+  let calls = 0;
+  await withServer(async (req, res) => {
+    calls++; assert.equal(req.url, '/custom/v2/chat/completions'); assert.equal(req.headers.authorization, `Bearer ${SECRET}`);
+    const body = await readPayload(req);
+    assert.equal(body.model, 'user-selected/model-2026'); assert.equal(body.stream, true);
+    for (const name of ['thinking', 'reasoning_effort', 'tool_stream', 'tools']) assert.equal(body[name], undefined);
+    sendSse(res, 'Custom Pi fixture 文本');
+  }, async (endpoint) => {
+    const input = customRequest(endpoint.replace('/v1', '/custom/v2'));
+    const events = []; const result = await runLearningAgent(input, (event) => events.push(event));
+    assert.equal(result.output, 'Custom Pi fixture 文本'); assert.equal(events.at(-1).settled, true);
+  });
+  assert.equal(calls, 1);
+});
+test('custom connection test uses same transport and failures never emit done or raw secrets', async () => {
+  for (const failure of ['auth', 'truncated']) {
+    let calls = 0;
+    await withServer(async (req, res) => {
+      calls++; const body = await readPayload(req); assert.equal(body.model, 'user-selected/model-2026'); assert.equal(body.tools, undefined);
+      if (failure === 'auth') { res.writeHead(401); res.end(SECRET); } else sendSse(res, 'partial fixture', false);
+    }, async (endpoint) => {
+      const input = customRequest(endpoint); input.operation = 'test'; const events = [];
+      await assert.rejects(runLearningAgent(input, (event) => events.push(event)), (error) => error.code === (failure === 'auth' ? 'AUTH' : 'MODEL_RESPONSE') && !error.message.includes(SECRET));
+      assert(!events.some((event) => event.type === 'done')); assert(!JSON.stringify(events).includes(SECRET));
+    });
+    assert.equal(calls, 1);
+  }
+});
+test('custom provider cannot bypass a known Coding Plan endpoint gate', async () => {
+  let calls = 0;
+  await assert.rejects(runLearningAgent(customRequest('https://open.bigmodel.cn/api/coding/paas/v4'), () => {}, { streamFn: () => { calls++; } }), (error) => error.code === 'PLAN_USAGE_UNCONFIRMED');
+  assert.equal(calls, 0);
+});

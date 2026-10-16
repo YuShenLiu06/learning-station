@@ -30,9 +30,9 @@ Markdown 开头是 ```json 围栏（JSON对象），后面正文。metadata.id�
 - `start_generation({sessionId,mode:explain|question|practice|feedback,selection,prompt,requestId})` → `{runId}`（立即返回）
 - `cancel_generation({runId})` → `{status}`；停止未完成生成，不删除记录/不撤回外部发送
 - `get_run({runId})` → `{id,status:queued|running|succeeded|failed|cancelled|interrupted,content,error?,sessionId}`
-- `configure_model({provider:"glm-pi",baseUrl,model,apiKey})` → ModelSettings；密钥仅本机Keychain，不返回前端/日志
+- `configure_model({provider:"custom"|"glm-pi",protocol?:"openai-completions",baseUrl,model,apiKey})` → ModelSettings；密钥仅本机Keychain，不返回前端/日志
 - `get_model_settings()` → ModelSettings
-- `test_model()` → `{ok,message}`；当前 Coding Plan 用途门槛返回 PLAN_USAGE_UNCONFIRMED，不发真实请求。ModelSettings见[Pi契约](pi-decision.md)。
+- `test_model()` → `{ok,message}`；仅 Coding Plan 专用接入受用途门槛 PLAN_USAGE_UNCONFIRMED；自定义目标按保存配置测试。ModelSettings见[Pi契约](pi-decision.md)。
 - `create_todo({title,dueAt?:string|null,sessionId?,requestId})` → Todo
 - `list_todos()` → Todo[]；`set_todo_done({id,done})` → Todo
 - `list_notifications()` → Notification[]；`mark_notification_read({id})` → Notification
@@ -44,7 +44,7 @@ Markdown 开头是 ```json 围栏（JSON对象），后面正文。metadata.id�
 - `library_changed` → `{documents}`；刷新后发
 - `notification` → Notification；站内提醒，飞书未配置必须显示未连接
 
-空库由UI提供“新建小节”和“使用示例”（示例标注）；Coding Plan 用途未确认时禁用AI执行与密钥配置。聊天未发送草稿由UI保存；输入失败不清空。新建学习记录不要污染课程正文。
+空库由UI提供“新建小节”和“使用示例”（示例标注）；Coding Plan 用途未确认时保留该专用接入限制；自定义协议/地址配置不被此门槛禁用。聊天未发送草稿由UI保存；输入失败不清空。新建学习记录不要污染课程正文。
 
 实现过程中如字段变动在本文件更新并通知对方；前端mock必须最终切换真实IPC。
 
@@ -91,3 +91,14 @@ Tauri devUrl约定 `http://127.0.0.1:1420`，release嵌入 `dist/`。命令snake
 请前端在首次可操作布局后requestAnimationFrame上报shell-interactive=performance.now()；CodeMirror构建并requestAnimationFrame可输入时editor-ready记该次加载耗时；切页可见后page-switch记动作到下一帧。只每次动作一条，禁止逐键IPC。可用实际中文IME提交测ime-commit；无真实模型时stream-input保持未测，不用fake证明在线性能。
 
 草稿保存加强：expectedVersion省略仅允许新建；已有草稿必须先get_ui_draft取得版本，否则CONFLICT，保护读取失败后的旧草稿。
+
+## 本轮增量契约 v2（2026-10-16）
+
+- `ModelSettings.protocol="openai-completions"`；本轮唯一实际支持的协议为OpenAI Chat Completions。provider支持custom、glm-pi。新默认custom，baseUrl/model为空，不推测服务或计费。custom模型ID手输；请求地址为baseUrl后接`/chat/completions`。保存不发请求，测试仅使用已保存配置；修改目标地址/协议/provider须新密钥，改模型可保留同通道密钥。
+- URL只允许HTTPS或本机HTTP，拒绝账号密码、查询参数、片段、空白；请求不重定向、不跨域转发认证、不回退其他模型。专用CodingPlan地址即使标为custom也保留用途门槛。密钥只存本应用目标origin+协议+运行目录命名空间的Keychain项。
+- `get_ui_preferences()`与`save_ui_preferences({fontSize})` → `{fontSize:number}`。默认16，12–24整数，独立本机偏好文件，不接收密钥字段。
+- `start_exploration({sectionId?:string,associateCurrentSection:boolean,fresh?:boolean})` → `{session,context,lastRunId?:string}`。true复用指定小节会话；false复用单个独立探索会话，`sectionId=""`、links=[]、associateCurrentSection=false、contextManifest=[]。不读取当前小节、选句或其历史，也不改当前阅读位置。
+- `load_session_context({sessionId,selection?:string})` → Context。与生成共用真实上下文计算；独立会话收到非空selection会报错，不静默带入。生成时把实际manifest写回session；UI不能把首次启动的旧清单当作当前来源。
+- `exploration:<sessionId>`草稿key准许，字段仍仅body/question/importTitle/importBody；与其他草稿同样要求先读成功、按version保存。独立提问应放question，不含key。
+- Pi新增`create_todo({title,dueAt?:RFC3339})`。实际session归属由Rust固定，不接收sessionId或reminderEnabled；即使有时间，提醒也为false。成功返回真实persisted/todoId/sessionId/sectionId/todo，同run+call幂等，变参拒绝。question/explain可用，practice/feedback不可用。UI在生成终态从真实list_todos/list_notifications刷新，不解析模型“已保存”。
+- Markdown顶部JSON新增createdAt/updatedAt和timestampSource。新建用真实时间；已有值保留；旧无创建时间为null/unknown，旧修改时间可用明确file-mtime来源；读/无变化保存不写盘，真实正文或用户元数据变化才更新updatedAt。

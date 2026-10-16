@@ -31,11 +31,13 @@ const ALL_TOOLS: &[&str] = &[
     "query_related_knowledge",
     "create_review_card",
     "create_note",
+    "create_todo",
 ];
 const MODEL_ID: &str = "glm-5.3-flash";
 const HARNESS: &str = "pi-agent-core";
+const PROTOCOL: &str = "openai-completions";
 const USAGE_GATE: &str = "PLAN_USAGE_UNCONFIRMED";
-const KEYCHAIN_SERVICE: &str = "com.yushen.learning-station.pi-coding-plan-key";
+const KEYCHAIN_SERVICE: &str = "com.yushen.learning-station.pi-api-key";
 const NODE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../runtime/node");
 const DOMESTIC: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
 const INTERNATIONAL: &str = "https://api.z.ai/api/coding/paas/v4";
@@ -44,8 +46,11 @@ static SIDECAR_DIR: OnceLock<PathBuf> = OnceLock::new();
 fn harness_name() -> String {
     HARNESS.into()
 }
-fn model_id() -> String {
-    MODEL_ID.into()
+fn protocol_name() -> String {
+    PROTOCOL.into()
+}
+fn coding_provider() -> String {
+    "glm-pi".into()
 }
 fn usage_gate() -> String {
     USAGE_GATE.into()
@@ -54,6 +59,10 @@ fn usage_gate() -> String {
 #[serde(rename_all = "camelCase")]
 pub struct ModelProfileSettings {
     pub profile: String,
+    #[serde(default = "coding_provider")]
+    pub provider: String,
+    #[serde(default = "protocol_name")]
+    pub protocol: String,
     pub configured: bool,
     pub base_url: String,
     pub model: String,
@@ -64,6 +73,8 @@ fn default_profiles() -> Vec<ModelProfileSettings> {
         .into_iter()
         .map(|(profile, url)| ModelProfileSettings {
             profile: profile.into(),
+            provider: coding_provider(),
+            protocol: protocol_name(),
             configured: false,
             base_url: url.into(),
             model: MODEL_ID.into(),
@@ -76,6 +87,8 @@ fn default_profiles() -> Vec<ModelProfileSettings> {
 pub struct ModelSettings {
     pub configured: bool,
     pub provider: String,
+    #[serde(default = "protocol_name")]
+    pub protocol: String,
     pub base_url: String,
     pub model: String,
     #[serde(default)]
@@ -93,14 +106,15 @@ impl Default for ModelSettings {
     fn default() -> Self {
         Self {
             configured: false,
-            provider: "glm-pi".into(),
+            provider: "custom".into(),
+            protocol: protocol_name(),
             base_url: String::new(),
-            model: model_id(),
+            model: String::new(),
             verified: false,
             harness: harness_name(),
             active_profile: String::new(),
             profiles: default_profiles(),
-            usage_gate: usage_gate(),
+            usage_gate: String::new(),
         }
     }
 }
@@ -162,7 +176,12 @@ impl ToolPolicy {
 fn validate_tool_policy(policy: &ToolPolicy, has_handler: bool) -> Result<()> {
     let (allowed, maximum): (&[&str], usize) = match policy.mode.as_str() {
         "question" => (
-            &["query_related_knowledge", "record_question", "create_note"],
+            &[
+                "query_related_knowledge",
+                "record_question",
+                "create_note",
+                "create_todo",
+            ],
             4,
         ),
         "explain" => (ALL_TOOLS, 6),
@@ -208,14 +227,19 @@ impl ModelStore {
                 } else {
                     let mut saved: ModelSettings = serde_json::from_value(value)
                         .map_err(|_| invalid("模型配置文件无效，请重新配置。"))?;
-                    if saved.profiles.len() > 3 {
+                    if saved.profiles.len() > 4 {
                         return Err(invalid("模型通道配置无效。"));
                     }
                     let mut ids = std::collections::BTreeSet::new();
                     for profile in &saved.profiles {
-                        let endpoint =
-                            validate_settings("glm-pi", &profile.base_url, &profile.model, false)?;
-                        if profile_id(&endpoint)? != profile.profile
+                        let endpoint = validate_protocol_settings(
+                            &profile.provider,
+                            &profile.protocol,
+                            &profile.base_url,
+                            &profile.model,
+                            false,
+                        )?;
+                        if settings_profile(&profile.provider, &endpoint)? != profile.profile
                             || !ids.insert(profile.profile.clone())
                         {
                             return Err(invalid("模型通道配置无效。"));
@@ -225,22 +249,30 @@ impl ModelStore {
                         saved.configured = false;
                         saved.verified = false;
                         saved.base_url.clear();
-                        saved.model = model_id();
+                        saved.model.clear();
+                        saved.provider = "custom".into();
+                        saved.protocol = protocol_name();
                     } else {
                         let profile = saved
                             .profiles
                             .iter()
                             .find(|p| p.profile == saved.active_profile)
                             .ok_or_else(|| invalid("模型通道配置无效。"))?;
+                        saved.provider = canonical_provider(&profile.provider)?.into();
+                        saved.protocol = profile.protocol.clone();
                         saved.base_url = profile.base_url.clone();
                         saved.model = profile.model.clone();
                         saved.configured = profile.configured;
                         // External usage remains blocked independently of any saved verification flag.
-                        saved.verified = profile.verified && is_fixture(&profile.base_url);
+                        saved.verified =
+                            profile.verified && !usage_blocked(&saved.provider, &profile.base_url);
                     }
-                    saved.provider = "glm-pi".into();
                     saved.harness = harness_name();
-                    saved.usage_gate = usage_gate();
+                    saved.usage_gate = if usage_blocked(&saved.provider, &saved.base_url) {
+                        usage_gate()
+                    } else {
+                        String::new()
+                    };
                     saved
                 }
             }
@@ -264,51 +296,79 @@ impl ModelStore {
         model: &str,
         api_key: &str,
     ) -> Result<ModelSettings> {
-        let endpoint = validate_settings(provider.trim(), base_url.trim(), model.trim(), false)?;
-        let profile = profile_id(&endpoint)?;
+        self.configure_protocol(provider, PROTOCOL, base_url, model, api_key)
+    }
+    /// Save only explicit user settings and an app-owned Keychain secret; never sends a request.
+    pub fn configure_protocol(
+        &mut self,
+        provider: &str,
+        protocol: &str,
+        base_url: &str,
+        model: &str,
+        api_key: &str,
+    ) -> Result<ModelSettings> {
+        let provider = canonical_provider(provider.trim())?;
+        let protocol = protocol.trim();
+        let model = model.trim();
+        let endpoint =
+            validate_protocol_settings(provider, protocol, base_url.trim(), model, false)?;
+        let profile = settings_profile(provider, &endpoint)?;
         if api_key.len() > 16384 || api_key.chars().any(|c| c.is_control() || c.is_whitespace()) {
             return Err(invalid("API 密钥格式无效，请重新输入。"));
         }
         if api_key.is_empty() {
             if !self.settings.configured {
-                return Err(CoreError::new(
-                    "AUTH",
-                    "请先输入所选 Coding Plan 通道的 API 密钥。",
-                ));
+                return Err(CoreError::new("AUTH", "请先输入此通道的 API 密钥。"));
             }
-            let saved_endpoint = validate_settings(
+            let saved_endpoint = validate_protocol_settings(
                 &self.settings.provider,
+                &self.settings.protocol,
                 &self.settings.base_url,
                 &self.settings.model,
                 false,
             )?;
-            if saved_endpoint != endpoint || self.settings.active_profile != profile {
+            if saved_endpoint != endpoint
+                || self.settings.protocol != protocol
+                || canonical_provider(&self.settings.provider)? != provider
+                || self.settings.active_profile != profile
+            {
                 return Err(CoreError::new(
                     "AUTH",
-                    "通道地址已更改，请输入该区域 Coding Plan 的 API 密钥后保存。",
+                    "通道地址或协议已更改，请输入新通道的 API 密钥后保存。",
                 ));
             }
         }
         if !api_key.is_empty() {
-            self.keychain_entry(&profile)?
+            self.keychain_entry(&endpoint, protocol)?
                 .set_password(api_key)
                 .map_err(|_| keychain_error())?;
         }
-        let changed = self.settings.base_url != endpoint || !api_key.is_empty();
+        let changed = self.settings.base_url != endpoint
+            || self.settings.model != model
+            || self.settings.protocol != protocol
+            || self.settings.provider != provider
+            || !api_key.is_empty();
         let mut next = self.settings();
         next.configured = true;
-        next.provider = "glm-pi".into();
+        next.provider = provider.into();
+        next.protocol = protocol.into();
         next.base_url = endpoint.clone();
-        next.model = model_id();
+        next.model = model.into();
         next.harness = harness_name();
         next.active_profile = profile.clone();
-        next.verified = next.verified && !changed && is_fixture(&endpoint);
-        next.usage_gate = usage_gate();
+        next.verified = next.verified && !changed && !usage_blocked(provider, &endpoint);
+        next.usage_gate = if usage_blocked(provider, &endpoint) {
+            usage_gate()
+        } else {
+            String::new()
+        };
         let item = ModelProfileSettings {
             profile: profile.clone(),
+            provider: provider.into(),
+            protocol: protocol.into(),
             configured: true,
             base_url: endpoint,
-            model: model_id(),
+            model: model.into(),
             verified: next.verified,
         };
         if let Some(saved) = next.profiles.iter_mut().find(|p| p.profile == profile) {
@@ -324,23 +384,23 @@ impl ModelStore {
         if !self.settings.configured {
             return Err(CoreError::new(
                 "NOT_CONFIGURED",
-                "请选择 Coding Plan 区域；当前套餐用途尚待确认。",
+                "请先保存模型通道、协议、地址、模型和 API 密钥。",
             ));
         }
-        ensure_usage_allowed(&self.settings.base_url)?; // Deliberately before Keychain access.
-        let profile = profile_id(&self.settings.base_url)?;
+        ensure_usage_allowed(&self.settings)?; // Deliberately before Keychain access.
+        let profile = settings_profile(&self.settings.provider, &self.settings.base_url)?;
         if profile != self.settings.active_profile {
             return Err(invalid("当前通道配置不一致，请重新保存。"));
         }
         let api_key = self
-            .keychain_entry(&profile)?
+            .keychain_entry(&self.settings.base_url, &self.settings.protocol)?
             .get_password()
-            .map_err(|_| CoreError::new("AUTH", "无法读取本应用该区域的密钥，请检查模型设置。"))?;
+            .map_err(|_| CoreError::new("AUTH", "无法读取本应用此通道的密钥，请检查模型设置。"))?;
         ModelCredentials::new(self.settings(), api_key)
     }
     /// Tests only the saved configuration, via the same real Pi Agent as generation.
     pub async fn test(&mut self) -> Result<ModelTest> {
-        ensure_usage_allowed(&self.settings.base_url)?; // No key, process or persistence before the gate.
+        ensure_usage_allowed(&self.settings)?; // No key, process or persistence before the gate.
         let credentials = self.credentials()?;
         self.set_verified(false)?;
         run_sidecar(
@@ -356,7 +416,7 @@ impl ModelStore {
         self.set_verified(true)?;
         Ok(ModelTest {
             ok: true,
-            message: "已保存配置经 Pi Agent 完成真实模型连接测试。".into(),
+            message: "已按保存的协议、地址和模型完成连接测试。".into(),
         })
     }
     fn set_verified(&mut self, value: bool) -> Result<()> {
@@ -373,11 +433,18 @@ impl ModelStore {
         self.settings = next;
         Ok(())
     }
-    fn keychain_account(&self, profile: &str) -> String {
-        format!("{}:{profile}", self.keychain_namespace)
+    fn keychain_account(&self, endpoint: &str, protocol: &str) -> String {
+        let origin = Url::parse(endpoint)
+            .map(|url| url.origin().ascii_serialization())
+            .unwrap_or_default();
+        format!(
+            "{}:{}",
+            self.keychain_namespace,
+            crate::types::hash(&format!("{protocol}\n{origin}"))
+        )
     }
-    fn keychain_entry(&self, profile: &str) -> Result<keyring::Entry> {
-        keyring::Entry::new(KEYCHAIN_SERVICE, &self.keychain_account(profile))
+    fn keychain_entry(&self, endpoint: &str, protocol: &str) -> Result<keyring::Entry> {
+        keyring::Entry::new(KEYCHAIN_SERVICE, &self.keychain_account(endpoint, protocol))
             .map_err(|_| keychain_error())
     }
     fn persist(&self, settings: &ModelSettings) -> Result<()> {
@@ -407,8 +474,9 @@ impl ModelStore {
 }
 impl ModelCredentials {
     fn new(settings: ModelSettings, api_key: String) -> Result<Self> {
-        validate_settings(
+        validate_protocol_settings(
             &settings.provider,
+            &settings.protocol,
             &settings.base_url,
             &settings.model,
             false,
@@ -488,7 +556,7 @@ async fn run_sidecar(
     tool_handler: Option<ToolHandler>,
     policy: ToolPolicy,
 ) -> Result<String> {
-    ensure_usage_allowed(&credentials.settings.base_url)?;
+    ensure_usage_allowed(&credentials.settings)?;
     validate_tool_policy(&policy, tool_handler.is_some())?;
     if cancel.load(Ordering::Acquire) {
         return Err(cancelled());
@@ -626,7 +694,7 @@ async fn run_sidecar(
                                         plugin.get("id").and_then(Value::as_str)
                                             == Some("learning-station.learning")
                                             && plugin.get("version").and_then(Value::as_str)
-                                                == Some("1.0.0")
+                                                == Some("1.1.0")
                                             && plugin.get("tools") == Some(&expected)
                                     })
                                 });
@@ -796,6 +864,7 @@ fn validate_tool_call(call: &ToolCall) -> Result<()> {
             &["front", "back"],
         ),
         "create_note" => (&[("content", 12000), ("selection", 12000)], &["content"]),
+        "create_todo" => (&[("title", 500), ("dueAt", 64)], &["title"]),
         _ => return Err(sidecar_error("TOOLS_DISABLED")),
     };
     let args = call
@@ -833,6 +902,9 @@ fn validate_tool_call(call: &ToolCall) -> Result<()> {
             if text.chars().count() > *limit
                 || (!matches!(key.as_str(), "selection" | "cause") && text.trim().is_empty())
             {
+                return Err(sidecar_error("TOOL_PROTOCOL"));
+            }
+            if key == "dueAt" && chrono::DateTime::parse_from_rfc3339(text).is_err() {
                 return Err(sidecar_error("TOOL_PROTOCOL"));
             }
             if matches!(key.as_str(), "exerciseId" | "knowledgeId") && !crate::types::valid_id(text)
@@ -893,17 +965,46 @@ where
         }
     }
 }
+fn canonical_provider(provider: &str) -> Result<&str> {
+    match provider {
+        "custom" => Ok("custom"),
+        "glm-pi" | "openai-compatible" => Ok("glm-pi"),
+        _ => Err(invalid("请选择自定义 API 或 GLM Coding Plan 通道。")),
+    }
+}
+#[cfg(test)]
 fn validate_settings(
     provider: &str,
     base_url: &str,
     model: &str,
     allow_unconfigured: bool,
 ) -> Result<String> {
-    if !matches!(provider, "glm-pi" | "openai-compatible") || model != MODEL_ID {
-        return Err(invalid("本次仅支持 Pi Agent 与 glm-5.3-flash 模型。"));
+    validate_protocol_settings(provider, PROTOCOL, base_url, model, allow_unconfigured)
+}
+fn validate_protocol_settings(
+    provider: &str,
+    protocol: &str,
+    base_url: &str,
+    model: &str,
+    allow_unconfigured: bool,
+) -> Result<String> {
+    let provider = canonical_provider(provider)?;
+    if protocol != PROTOCOL {
+        return Err(invalid(
+            "当前仅支持 OpenAI Chat Completions 协议（openai-completions）。",
+        ));
     }
-    if allow_unconfigured && base_url.is_empty() {
+    if allow_unconfigured && base_url.is_empty() && model.is_empty() {
         return Ok(String::new());
+    }
+    if model.is_empty()
+        || model.len() > 256
+        || model.chars().any(char::is_control)
+        || (provider == "glm-pi" && model != MODEL_ID)
+    {
+        return Err(invalid(
+            "请输入有效模型 ID（最多 256 字节）；Coding Plan 仅支持 glm-5.3-flash。",
+        ));
     }
     if base_url.is_empty()
         || base_url.len() > 2048
@@ -911,9 +1012,9 @@ fn validate_settings(
             .chars()
             .any(|c| c.is_control() || c.is_whitespace())
     {
-        return Err(invalid("请选择有效的 Coding Plan 通道地址。"));
+        return Err(invalid("请输入有效 API 地址。"));
     }
-    let url = Url::parse(base_url).map_err(|_| invalid("Coding Plan 地址无效。"))?;
+    let url = Url::parse(base_url).map_err(|_| invalid("API 地址无效。"))?;
     let userinfo = base_url
         .split_once("://")
         .map(|(_, rest)| {
@@ -932,9 +1033,16 @@ fn validate_settings(
         return Err(invalid("通道地址不能包含账号、查询参数或片段。"));
     }
     let normalized = url.as_str().trim_end_matches('/').to_owned();
-    if normalized != DOMESTIC && normalized != INTERNATIONAL && !is_fixture(&normalized) {
+    if url.host_str().is_none() || (url.scheme() != "https" && !is_fixture(&normalized)) {
+        return Err(invalid("API 地址必须使用 HTTPS；仅本机测试可使用 HTTP。"));
+    }
+    if provider == "glm-pi"
+        && normalized != DOMESTIC
+        && normalized != INTERNATIONAL
+        && !is_fixture(&normalized)
+    {
         return Err(invalid(
-            "仅支持国内或国际 Coding Plan 专用通道；不支持普通按量付费 API。",
+            "GLM Coding Plan 仅支持国内或国际专用地址。自定义 API 请另选自定义通道。",
         ));
     }
     Ok(normalized)
@@ -956,11 +1064,35 @@ fn profile_id(endpoint: &str) -> Result<String> {
         _ => Err(invalid("Coding Plan 通道无效。")),
     }
 }
-fn ensure_usage_allowed(endpoint: &str) -> Result<()> {
-    if is_fixture(endpoint) {
-        Ok(())
+fn settings_profile(provider: &str, endpoint: &str) -> Result<String> {
+    if canonical_provider(provider)? == "custom" {
+        Ok("custom".into())
     } else {
+        profile_id(endpoint)
+    }
+}
+fn usage_blocked(provider: &str, endpoint: &str) -> bool {
+    if is_fixture(endpoint) {
+        return false;
+    }
+    provider != "custom"
+        || Url::parse(endpoint).is_ok_and(|url| {
+            matches!(url.host_str(), Some("open.bigmodel.cn" | "api.z.ai"))
+                && url.path().starts_with("/api/coding/")
+        })
+}
+fn ensure_usage_allowed(settings: &ModelSettings) -> Result<()> {
+    validate_protocol_settings(
+        &settings.provider,
+        &settings.protocol,
+        &settings.base_url,
+        &settings.model,
+        false,
+    )?;
+    if usage_blocked(&settings.provider, &settings.base_url) {
         Err(sidecar_error(USAGE_GATE))
+    } else {
+        Ok(())
     }
 }
 fn sidecar_error(code: &str) -> CoreError {
@@ -980,11 +1112,11 @@ fn sidecar_error(code: &str) -> CoreError {
         ),
         "INVALID_URL" => (
             "INVALID_URL",
-            "通道地址无效或返回重定向，请检查所选官方区域。",
+            "通道地址无效或返回重定向，请检查所填 API 地址。",
         ),
         "INVALID_MODEL_SETTINGS" => (
             "INVALID_MODEL_SETTINGS",
-            "请选择 Coding Plan 区域和 glm-5.3-flash 模型。",
+            "请检查所选 API 协议、地址和模型。",
         ),
         "MODEL_HTTP" => (
             "MODEL_HTTP",
@@ -1025,7 +1157,7 @@ fn invalid(message: &str) -> CoreError {
 fn keychain_error() -> CoreError {
     CoreError::new(
         "KEYCHAIN",
-        "无法保存本应用该区域的密钥，请检查本机钥匙串权限。",
+        "无法保存本应用此通道的密钥，请检查本机钥匙串权限。",
     )
 }
 
@@ -1040,21 +1172,25 @@ mod tests {
     fn settings(endpoint: &str) -> ModelSettings {
         let mut value = ModelSettings::default();
         value.configured = true;
+        value.provider = "glm-pi".into();
+        value.model = MODEL_ID.into();
         value.base_url = endpoint.into();
         value.active_profile = profile_id(endpoint).unwrap();
         value
     }
     #[test]
-    fn defaults_are_unconfigured_pi_glm_without_selecting_a_region() {
+    fn defaults_are_unconfigured_custom_without_guessing_endpoint_or_model() {
         let directory = tempfile::tempdir().unwrap();
         let store = ModelStore::new(directory.path()).unwrap();
         let settings = store.settings();
         assert!(!settings.configured);
         assert!(settings.base_url.is_empty());
         assert!(settings.active_profile.is_empty());
-        assert_eq!(settings.model, MODEL_ID);
+        assert_eq!(settings.provider, "custom");
+        assert_eq!(settings.protocol, PROTOCOL);
+        assert!(settings.model.is_empty());
         assert_eq!(settings.harness, HARNESS);
-        assert_eq!(settings.usage_gate, USAGE_GATE);
+        assert!(settings.usage_gate.is_empty());
         assert_eq!(settings.profiles.len(), 2);
         assert!(!directory.path().join("model-settings.json").exists());
     }
@@ -1129,8 +1265,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = ModelStore::new(directory.path()).unwrap();
         assert_ne!(
-            store.keychain_account("bigmodel-coding"),
-            store.keychain_account("zai-coding")
+            store.keychain_account(DOMESTIC, PROTOCOL),
+            store.keychain_account(INTERNATIONAL, PROTOCOL)
         );
         std::fs::write(&store.config_path, r#"{"configured":true,"provider":"openai-compatible","baseUrl":"https://api.openai.com/v1","model":"legacy","verified":true}"#).unwrap();
         let migrated = ModelStore::new(directory.path()).unwrap();
@@ -1161,7 +1297,137 @@ mod tests {
         );
         assert!(!store.config_path.exists());
     }
-    fn fixture(finish: bool) -> (ModelCredentials, thread::JoinHandle<()>) {
+    #[test]
+    fn custom_settings_validate_explicit_protocol_url_and_model_without_keychain() {
+        assert_eq!(
+            validate_protocol_settings(
+                "custom",
+                PROTOCOL,
+                "https://API.example.com:443/custom/v1/",
+                "user/model",
+                false
+            )
+            .unwrap(),
+            "https://api.example.com/custom/v1"
+        );
+        for url in [
+            "http://example.com/v1",
+            "file:///tmp/fixture-secret",
+            "https://user:fixture-secret@example.com/v1",
+            "https://@example.com/v1",
+            "https://example.com/v1?",
+            "https://example.com/v1#",
+            "https://example.com/v1?key=fixture-secret",
+        ] {
+            let error =
+                validate_protocol_settings("custom", PROTOCOL, url, "my-model", false).unwrap_err();
+            assert!(!error.to_string().contains("fixture-secret"));
+        }
+        for protocol in ["", "anthropic-messages", "openai-responses"] {
+            assert!(validate_protocol_settings(
+                "custom",
+                protocol,
+                "https://example.com/v1",
+                "my-model",
+                false
+            )
+            .is_err());
+        }
+        for model in ["".to_owned(), "x".repeat(257), "invalid\nmodel".into()] {
+            assert!(validate_protocol_settings(
+                "custom",
+                PROTOCOL,
+                "https://example.com/v1",
+                &model,
+                false
+            )
+            .is_err());
+        }
+        let mut selected = ModelSettings::default();
+        selected.base_url = "https://example.com/v1".into();
+        selected.model = "my-model".into();
+        assert!(ensure_usage_allowed(&selected).is_ok());
+        selected.base_url = DOMESTIC.into();
+        assert_eq!(
+            ensure_usage_allowed(&selected).unwrap_err().code,
+            USAGE_GATE
+        );
+    }
+    #[test]
+    fn custom_save_and_reopen_are_nonsecret_and_address_changes_require_a_new_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = ModelStore::new(directory.path()).unwrap();
+        store.settings.configured = true;
+        store.settings.base_url = "https://example.com/custom/v1".into();
+        store.settings.model = "previous-model".into();
+        store.settings.active_profile = "custom".into();
+        store.settings.verified = true;
+        let before = serde_json::to_value(store.settings()).unwrap();
+        let error = store
+            .configure_protocol(
+                "custom",
+                PROTOCOL,
+                "https://example.com/other/v1",
+                "user/model",
+                "",
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "AUTH");
+        assert_eq!(serde_json::to_value(store.settings()).unwrap(), before);
+        assert!(!store.config_path.exists());
+        let saved = store
+            .configure_protocol(
+                "custom",
+                PROTOCOL,
+                "https://EXAMPLE.com:443/custom/v1/",
+                "user/model",
+                "",
+            )
+            .unwrap();
+        assert!(!saved.verified);
+        assert!(saved.usage_gate.is_empty());
+        let reopened = ModelStore::new(directory.path()).unwrap();
+        assert_eq!(reopened.settings().provider, "custom");
+        assert_eq!(reopened.settings().protocol, PROTOCOL);
+        assert_eq!(reopened.settings().model, "user/model");
+        assert!(!std::fs::read_to_string(&store.config_path)
+            .unwrap()
+            .contains("apiKey"));
+        assert_ne!(
+            store.keychain_account("https://example.com/v1", PROTOCOL),
+            store.keychain_account("https://other.example/v1", PROTOCOL)
+        );
+        assert_ne!(
+            store.keychain_account("https://example.com/v1", PROTOCOL),
+            store.keychain_account("https://example.com/v1", "future-protocol")
+        );
+        assert_eq!(
+            store.keychain_account("https://EXAMPLE.com:443/v1", PROTOCOL),
+            store.keychain_account("https://example.com/other", PROTOCOL)
+        );
+    }
+    #[tokio::test]
+    async fn custom_real_pi_local_fixture_preserves_model_and_rejects_truncation() {
+        for finish in [true, false] {
+            let (credentials, server) = fixture(finish, true);
+            let mut partial = String::new();
+            let result = generate(
+                credentials,
+                vec![json!({"role":"user","content":"fixture only"})],
+                Arc::new(AtomicBool::new(false)),
+                |delta| partial.push_str(delta),
+            )
+            .await;
+            server.join().unwrap();
+            if finish {
+                assert_eq!(result.unwrap(), "Pi fixture 文本");
+                assert_eq!(partial, "Pi fixture 文本");
+            } else {
+                assert_eq!(result.unwrap_err().code, "MODEL_RESPONSE");
+            }
+        }
+    }
+    fn fixture(finish: bool, custom: bool) -> (ModelCredentials, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -1191,8 +1457,14 @@ mod tests {
                 request.extend_from_slice(&buf[..count]);
             }
             let payload: Value = serde_json::from_slice(&request[end..end + length]).unwrap();
-            assert_eq!(payload["model"], MODEL_ID);
-            assert_eq!(payload["thinking"]["type"], "enabled");
+            if custom {
+                assert_eq!(payload["model"], "user-selected/model-2026");
+                assert!(payload.get("thinking").is_none());
+                assert!(payload.get("reasoning_effort").is_none());
+            } else {
+                assert_eq!(payload["model"], MODEL_ID);
+                assert_eq!(payload["thinking"]["type"], "enabled");
+            }
             assert!(payload.get("tools").is_none());
             let body = format!(
                 "data: {}\n\n{}",
@@ -1206,18 +1478,21 @@ mod tests {
             let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
             socket.write_all(response.as_bytes()).unwrap();
         });
+        let mut selected = settings(&format!("http://{address}/v1"));
+        if custom {
+            selected.provider = "custom".into();
+            selected.model = "user-selected/model-2026".into();
+            selected.active_profile = "custom".into();
+            selected.usage_gate.clear();
+        }
         (
-            ModelCredentials::new(
-                settings(&format!("http://{address}/v1")),
-                "fixture-secret".into(),
-            )
-            .unwrap(),
+            ModelCredentials::new(selected, "fixture-secret".into()).unwrap(),
             server,
         )
     }
     #[tokio::test]
     async fn rust_generation_uses_real_pi_agent_sidecar_for_local_fixture() {
-        let (credentials, server) = fixture(true);
+        let (credentials, server) = fixture(true, false);
         let mut deltas = String::new();
         let output = generate(
             credentials,
@@ -1233,7 +1508,7 @@ mod tests {
     }
     #[tokio::test]
     async fn rust_sidecar_rejects_truncated_provider_stream() {
-        let (credentials, server) = fixture(false);
+        let (credentials, server) = fixture(false, false);
         let error = generate(
             credentials,
             vec![json!({"role":"user","content":"fixture only"})],
@@ -1346,7 +1621,8 @@ mod tests {
                         {"index":1,"id":"actual-error-1","type":"function","function":{"name":"create_error","arguments":serde_json::to_string(&json!({"front":"Since or for Monday?","back":"Since marks a starting point.","cause":"fixture suggestion","tags":["since"]})).unwrap()}},
                         {"index":2,"id":"actual-knowledge-1","type":"function","function":{"name":"query_related_knowledge","arguments":serde_json::to_string(&json!({"query":"Since"})).unwrap()}},
                         {"index":3,"id":"actual-card-1","type":"function","function":{"name":"create_review_card","arguments":serde_json::to_string(&json!({"front":"What does since mark?","back":"A starting point.","tags":["since"]})).unwrap()}},
-                        {"index":4,"id":"actual-note-1","type":"function","function":{"name":"create_note","arguments":serde_json::to_string(&json!({"content":"Since gives a starting point; for gives a duration.","selection":"since Monday"})).unwrap()}}
+                        {"index":4,"id":"actual-note-1","type":"function","function":{"name":"create_note","arguments":serde_json::to_string(&json!({"content":"Since gives a starting point; for gives a duration.","selection":"since Monday"})).unwrap()}},
+                        {"index":5,"id":"actual-todo-1","type":"function","function":{"name":"create_todo","arguments":serde_json::to_string(&json!({"title":"复习 since 与 for","dueAt":"2000-01-01T08:00:00+08:00"})).unwrap()}}
                     ]},"finish_reason":null}]});
                     format!("data: {first}\n\ndata: {call}\n\ndata: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n")
                 } else {
@@ -1356,7 +1632,7 @@ mod tests {
                         .iter()
                         .filter(|message| message["role"] == "tool")
                         .collect();
-                    assert_eq!(result_messages.len(), 5);
+                    assert_eq!(result_messages.len(), 6);
                     let receipts: Vec<Value> = result_messages
                         .iter()
                         .map(|message| {
@@ -1410,6 +1686,11 @@ mod tests {
                                 .contains("Since gives a starting point; for gives a duration."));
                         }
                     }
+                    let todo = &receipts[5]["result"];
+                    assert_eq!(todo["persisted"], true);
+                    assert_eq!(todo["todo"]["title"], "复习 since 与 for");
+                    assert_eq!(todo["todo"]["sessionId"], server_session);
+                    assert_eq!(todo["todo"]["reminderEnabled"], false);
                     let response = json!({"choices":[{"index":0,"delta":{"content":final_answer},"finish_reason":"stop"}]});
                     format!("data: {response}\n\ndata: [DONE]\n\n")
                 };
@@ -1438,7 +1719,7 @@ mod tests {
         let mut partial = String::new();
         let output = generate_scoped(
             credentials,
-            vec![json!({"role":"user","content":"请记录疑问、创建错题、查询关联知识、创建卡片和笔记，并返回练习JSON。"})],
+            vec![json!({"role":"user","content":"请记录疑问、创建错题、查询关联知识、创建卡片和笔记、创建复习待办但不提醒，并返回练习JSON。"})],
             Arc::new(AtomicBool::new(false)),
             |delta| partial.push_str(delta),
             Some(handler.clone()),
@@ -1457,6 +1738,11 @@ mod tests {
         drop(engine);
         let reopened = Engine::new(library, runtime).unwrap();
         assert!(!reopened.state().unwrap().model.configured);
+        let todos = reopened.reminders.list_todos().unwrap();
+        assert_eq!(todos.len(), 1);
+        assert_eq!(todos[0].title, "复习 since 与 for");
+        assert!(!todos[0].reminder_enabled);
+        assert!(reopened.reminders.tick().unwrap().is_empty());
         let mut core = reopened.lock().unwrap();
         let session = sessions::get(&mut core.content, &scope.session_id).unwrap();
         assert_eq!(session.entries.len(), 4);
@@ -1527,7 +1813,12 @@ mod tests {
         for (mode, allowed, maximum) in [
             (
                 "question",
-                vec!["query_related_knowledge", "record_question", "create_note"],
+                vec![
+                    "query_related_knowledge",
+                    "record_question",
+                    "create_note",
+                    "create_todo",
+                ],
                 4,
             ),
             ("explain", ALL_TOOLS.to_vec(), 6),

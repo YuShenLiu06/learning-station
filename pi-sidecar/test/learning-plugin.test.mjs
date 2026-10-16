@@ -216,3 +216,22 @@ test('explain registers card and note tools and consumes their real result envel
   });
   assert.deepEqual(executed, ['create_review_card', 'create_note']); assert.equal(turns, 3);
 });
+
+test('create_todo is registered in question mode and its result is consumed without enabling reminders', { timeout: 4000 }, async () => {
+  let turns = 0; const executions = [];
+  await withServer((body, res) => {
+    turns++; assert.deepEqual(body.tools.map((tool) => tool.function.name), MODE_POLICIES.question.allowedTools);
+    const schema = body.tools.find((tool) => tool.function.name === 'create_todo').function.parameters;
+    assert.deepEqual(Object.keys(schema.properties).sort(), ['dueAt', 'title']); assert.equal(schema.additionalProperties, false);
+    if (turns === 1) sse(res, { tool: call('todo-1', 'create_todo', { title: '复习 since 与 for', dueAt: '2000-01-01T08:00:00+08:00' }) });
+    else { const receipt = JSON.parse(toolMessages(body).at(-1).content); assert.equal(receipt.result.persisted, true); assert.equal(receipt.result.todo.reminderEnabled, false); sse(res, { text: '待办已保存，提醒未开启。', final: true }); }
+  }, async (endpoint) => {
+    const input = request(endpoint); input.settings = { provider: 'custom', protocol: 'openai-completions', baseUrl: endpoint, model: 'user-custom-model' };
+    input.toolPolicy = { mode: 'question', ...MODE_POLICIES.question };
+    const result = await runLearningAgent(input, () => {}, { requestTool: async (tool) => { executions.push(tool); return { result: { persisted: true, todoId: 'fixture-todo', todo: { title: tool.args.title, reminderEnabled: false } } }; } });
+    assert.equal(result.output, '待办已保存，提醒未开启。');
+  });
+  assert.equal(turns, 2); assert.equal(executions.length, 1); assert.equal(executions[0].name, 'create_todo');
+  const plugin = createLearningPlugin({ requestTool: async () => {}, allowedTools: ['create_todo'] });
+  for (const args of [{ title: 'T', reminderEnabled: true }, { title: 'T', sessionId: 'foreign' }, { title: 'T', dueAt: 'tomorrow' }]) assert.throws(() => plugin.validate({ id: 'invalid', name: 'create_todo', arguments: args }));
+});

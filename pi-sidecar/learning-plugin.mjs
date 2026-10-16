@@ -1,12 +1,12 @@
 import { Type } from 'typebox';
 
 export const LEARNING_PLUGIN = Object.freeze({
-  id: 'learning-station.learning', version: '1.0.0',
-  tools: Object.freeze(['record_question', 'create_error', 'query_related_knowledge', 'create_review_card', 'create_note']),
+  id: 'learning-station.learning', version: '1.1.0',
+  tools: Object.freeze(['record_question', 'create_error', 'query_related_knowledge', 'create_review_card', 'create_note', 'create_todo']),
 });
 export const LEGACY_TOOLS = Object.freeze(LEARNING_PLUGIN.tools.slice(0, 3));
 export const MODE_POLICIES = Object.freeze({
-  question: { allowedTools: ['query_related_knowledge', 'record_question', 'create_note'], maxCalls: 4 },
+  question: { allowedTools: ['query_related_knowledge', 'record_question', 'create_note', 'create_todo'], maxCalls: 4 },
   explain: { allowedTools: [...LEARNING_PLUGIN.tools], maxCalls: 6 },
   practice: { allowedTools: ['query_related_knowledge'], maxCalls: 2 },
   feedback: { allowedTools: [], maxCalls: 0 },
@@ -57,6 +57,9 @@ const definitions = [
   { name: 'create_review_card', label: '创建复习卡片',
     description: '按用户明确要求，把正反面内容保存为当前会话的复习卡片；只有Rust返回persisted:true才算成功。',
     parameters: Type.Object({ front: string(8000), back: string(12000), tags: Type.Optional(Type.Array(string(64), { maxItems: 12 })) }, { additionalProperties: false }) },
+  { name: 'create_todo', label: '创建待办',
+    description: '按用户明确要求创建当前会话待办。dueAt可选且必须带时区的RFC3339；即使提供时间也默认不启用提醒。成功以Rust持久化回执为准。',
+    parameters: Type.Object({ title: string(500), dueAt: Type.Optional(Type.String({ minLength: 1, maxLength: 64, format: 'date-time' })) }, { additionalProperties: false }) },
   { name: 'create_note', label: '创建笔记',
     description: '按用户明确要求，保存当前会话的学习笔记，可附原文选区。AI整理待本人确认，成功以Rust持久化回执为准。',
     parameters: Type.Object({ content: string(12000), selection: Type.Optional(Type.String({ maxLength: 12000 })) }, { additionalProperties: false }) },
@@ -68,14 +71,15 @@ export function validateCall(id, name, args) {
   const fields = name === 'record_question' ? { question: 8000, selection: 12000 }
     : name === 'create_error' ? { front: 8000, back: 12000, cause: 4000, exerciseId: 128, tags: 0 }
       : name === 'create_review_card' ? { front: 8000, back: 12000, tags: 0 }
-        : name === 'create_note' ? { content: 12000, selection: 12000 } : { query: 500, knowledgeId: 128 };
+        : name === 'create_note' ? { content: 12000, selection: 12000 } : name === 'create_todo' ? { title: 500, dueAt: 64 } : { query: 500, knowledgeId: 128 };
   for (const [key, value] of Object.entries(args)) {
     if (!Object.hasOwn(fields, key)) throw new LearningToolError('TOOL_PROTOCOL');
     if (key === 'tags') {
       if (!Array.isArray(value) || value.length > 12 || value.some((tag) => typeof tag !== 'string' || !tag.trim() || [...tag].length > 64)) throw new LearningToolError('TOOL_PROTOCOL');
     } else if (typeof value !== 'string' || (!['selection', 'cause'].includes(key) && !value.trim()) || [...value].length > fields[key]) throw new LearningToolError('TOOL_PROTOCOL');
   }
-  const required = name === 'record_question' ? ['question'] : ['create_error', 'create_review_card'].includes(name) ? ['front', 'back'] : name === 'create_note' ? ['content'] : [];
+  if (args.dueAt !== undefined && (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u.test(args.dueAt) || !Number.isFinite(Date.parse(args.dueAt)))) throw new LearningToolError('TOOL_PROTOCOL');
+  const required = name === 'create_todo' ? ['title'] : name === 'record_question' ? ['question'] : ['create_error', 'create_review_card'].includes(name) ? ['front', 'back'] : name === 'create_note' ? ['content'] : [];
   if (required.some((key) => typeof args[key] !== 'string') || (name === 'query_related_knowledge' && !args.query && !args.knowledgeId)) throw new LearningToolError('TOOL_PROTOCOL');
   return args;
 }
@@ -84,7 +88,7 @@ export function validateToolPolicy(input, legacyEnabled = false, operation = 'ge
   const policy = input ?? { mode: 'legacy', allowedTools: legacyEnabled ? [...LEGACY_TOOLS] : [], maxCalls: legacyEnabled ? 8 : 0 };
   if (!policy || typeof policy !== 'object' || Array.isArray(policy) || Object.keys(policy).some((key) => !['mode', 'allowedTools', 'maxCalls'].includes(key))) throw new LearningToolError('TOOL_PROTOCOL');
   const maximum = MODE_POLICIES[policy.mode];
-  if (!maximum || !Array.isArray(policy.allowedTools) || policy.allowedTools.length > 5 || new Set(policy.allowedTools).size !== policy.allowedTools.length
+  if (!maximum || !Array.isArray(policy.allowedTools) || policy.allowedTools.length > 6 || new Set(policy.allowedTools).size !== policy.allowedTools.length
     || policy.allowedTools.some((name) => !maximum.allowedTools.includes(name)) || !Number.isInteger(policy.maxCalls) || policy.maxCalls < 0 || policy.maxCalls > maximum.maxCalls
     || (policy.maxCalls === 0 && policy.allowedTools.length > 0)) throw new LearningToolError('TOOL_PROTOCOL');
   return { mode: policy.mode, allowedTools: [...policy.allowedTools], maxCalls: policy.maxCalls };

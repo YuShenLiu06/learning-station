@@ -17,6 +17,8 @@ pub struct Preferences {
     pub session_by_section: BTreeMap<String, String>,
     #[serde(default)]
     pub document_paths: BTreeMap<String, String>,
+    #[serde(default)]
+    pub exploration_session_id: Option<String>,
 }
 
 fn metadata(id: &str, title: &str, kind: &str) -> Metadata {
@@ -53,11 +55,30 @@ pub fn create(
     );
     meta.links = vec![section_id.to_string()];
     meta.extra.insert("sectionId".into(), json!(section_id));
+    meta.extra
+        .insert("associateCurrentSection".into(), json!(true));
     meta.extra.insert("createdAt".into(), json!(stamp));
     meta.extra.insert("contextManifest".into(), json!(manifest));
     let path = format!("sessions/{id}/session.md");
     let body = format!("# {}\n\n本次学习记录。每条提问、练习和作答存于同目录 entries/ 的 Markdown 文件；课程正文不被改写。\n", meta.title);
     store.create(meta, &body, &path)?;
+    get(store, &id)
+}
+
+/// Independent exploration has no source document or inherited links.
+pub fn create_exploration(store: &mut ContentStore) -> Result<Session> {
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let mut meta = metadata(&id, "独立探索 · 学习记录", "session");
+    meta.extra.insert("sectionId".into(), json!(""));
+    meta.extra
+        .insert("associateCurrentSection".into(), json!(false));
+    meta.extra.insert("createdAt".into(), json!(timestamp()));
+    meta.extra.insert("contextManifest".into(), json!([]));
+    store.create(
+        meta,
+        "# 独立探索\n\n未关联课程小节。只有本次探索的提问和记录进入上下文。\n",
+        &format!("sessions/{id}/session.md"),
+    )?;
     get(store, &id)
 }
 
@@ -81,6 +102,26 @@ pub fn get(store: &mut ContentStore, id: &str) -> Result<Session> {
         .and_then(Value::as_str)
         .ok_or_else(|| CoreError::new("INVALID_DOCUMENT", "学习记录缺少小节编号。"))?
         .to_string();
+    if section_id.is_empty()
+        && (doc
+            .metadata
+            .extra
+            .get("associateCurrentSection")
+            .and_then(Value::as_bool)
+            != Some(false)
+            || !doc.metadata.links.is_empty()
+            || doc
+                .metadata
+                .extra
+                .get("contextManifest")
+                .and_then(Value::as_array)
+                .is_none_or(|items| !items.is_empty()))
+    {
+        return Err(CoreError::new(
+            "INVALID_DOCUMENT",
+            "独立探索的来源信息不一致，未加载任何课程材料。",
+        ));
+    }
     let dir = store.root().join(format!("sessions/{id}/entries"));
     let mut entries = vec![];
     let mut versions = vec![doc.version.clone()];
@@ -188,6 +229,28 @@ pub fn get(store: &mut ContentStore, id: &str) -> Result<Session> {
                 .unwrap_or_else(|| json!([])),
         )?,
     })
+}
+
+/// Store the exact manifest used by the next generation, not a stale startup snapshot.
+pub fn set_context_manifest(
+    store: &mut ContentStore,
+    session_id: &str,
+    manifest: &[ManifestItem],
+) -> Result<Session> {
+    let session = get(store, session_id)?;
+    if session.section_id.is_empty() && !manifest.is_empty() {
+        return Err(CoreError::new(
+            "INVALID_INPUT",
+            "独立探索不能写入课程来源。",
+        ));
+    }
+    let mut doc = store.read(session_id)?;
+    doc.metadata
+        .extra
+        .insert("contextManifest".into(), json!(manifest));
+    let content = crate::content::serialize(&doc.metadata, &doc.body)?;
+    store.save(session_id, &content, &doc.version)?;
+    get(store, session_id)
 }
 
 fn validate_entry(entry: &Entry) -> Result<()> {

@@ -175,8 +175,11 @@ impl ContentStore {
         }
         let content = String::from_utf8(bytes)
             .map_err(|_| CoreError::new("INVALID_DOCUMENT", "Markdown 文件必须为 UTF-8"))?;
-        let (frontmatter, body) = parse(&content)?;
+        let (mut frontmatter, body) = parse(&content)?;
         let modified: DateTime<Utc> = metadata.modified().map_err(CoreError::io)?.into();
+        // Legacy filesystem time is an explicitly labelled read-only fallback,
+        // never evidence of the document's original creation date.
+        normalize_timestamps(&mut frontmatter, Some(&modified.to_rfc3339()));
         Ok(Document {
             id: frontmatter.id.clone(),
             path: relative_string(path.strip_prefix(&self.root).map_err(|_| unsafe_path())?)?,
@@ -199,6 +202,7 @@ impl ContentStore {
             return Err(CoreError::new("ALREADY_EXISTS", "稳定 ID 已存在"));
         }
         metadata.version = metadata.version.max(1);
+        initialize_timestamps(&mut metadata);
         let content = serialize(&metadata, body)?;
         let target = self.checked_path(relative, true)?;
         if target.exists() {
@@ -228,6 +232,32 @@ impl ContentStore {
                 .entry(key.clone())
                 .or_insert_with(|| value.clone());
         }
+        // Creation time and existing provenance survive older clients that omit
+        // them. Timestamp edits in a stale editor header are never treated as
+        // evidence about the original creation of the source document.
+        for key in ["createdAt", "updatedAt", "timestampSource"] {
+            if let Some(value) = current.metadata.extra.get(key) {
+                metadata.extra.insert(key.into(), value.clone());
+            }
+        }
+        metadata.version = current.metadata.version;
+        if body == current.body
+            && serde_json::to_value(&metadata)? == serde_json::to_value(&current.metadata)?
+        {
+            // No rewrite, history object, version increment, or clock refresh.
+            return Ok(current);
+        }
+        // A real body or user metadata change is a document modification;
+        // normalized migration annotations alone were excluded by the comparison.
+        metadata.extra.insert(
+            "updatedAt".into(),
+            serde_json::json!(crate::types::timestamp()),
+        );
+        let mut sources = timestamp_sources(&metadata);
+        sources.insert("updatedAt".into(), serde_json::json!("content-save"));
+        metadata
+            .extra
+            .insert("timestampSource".into(), serde_json::Value::Object(sources));
         metadata.version = current
             .metadata
             .version
@@ -481,6 +511,71 @@ fn validate_metadata(metadata: &Metadata) -> Result<()> {
     Ok(())
 }
 
+/// Preserve all pre-existing source annotations. An older non-object annotation
+/// is retained under `legacy`, so normalization never silently discards it.
+fn timestamp_sources(metadata: &Metadata) -> serde_json::Map<String, serde_json::Value> {
+    match metadata.extra.get("timestampSource") {
+        Some(serde_json::Value::Object(sources)) => sources.clone(),
+        Some(value) if !value.is_null() => {
+            let mut sources = serde_json::Map::new();
+            sources.insert("legacy".into(), value.clone());
+            sources
+        }
+        _ => serde_json::Map::new(),
+    }
+}
+
+fn normalize_timestamps(metadata: &mut Metadata, file_mtime: Option<&str>) {
+    let mut sources = timestamp_sources(metadata);
+    let created = metadata
+        .extra
+        .entry("createdAt".into())
+        .or_insert(serde_json::Value::Null);
+    sources.entry("createdAt").or_insert_with(|| {
+        serde_json::json!(if created.is_null() {
+            "unknown"
+        } else {
+            "metadata"
+        })
+    });
+    let updated = metadata
+        .extra
+        .entry("updatedAt".into())
+        .or_insert(serde_json::Value::Null);
+    if updated.is_null() && file_mtime.is_some() {
+        *updated = serde_json::json!(file_mtime.unwrap());
+        sources.insert("updatedAt".into(), serde_json::json!("file-mtime"));
+    } else {
+        sources.entry("updatedAt").or_insert_with(|| {
+            serde_json::json!(if updated.is_null() {
+                "unknown"
+            } else {
+                "metadata"
+            })
+        });
+    }
+    metadata
+        .extra
+        .insert("timestampSource".into(), serde_json::Value::Object(sources));
+}
+
+/// A caller-created Metadata without historical timestamp keys denotes a new
+/// document. parse() supplies explicit nulls for imports, which remain unknown.
+fn initialize_timestamps(metadata: &mut Metadata) {
+    let stamp = crate::types::timestamp();
+    let mut sources = timestamp_sources(metadata);
+    for key in ["createdAt", "updatedAt"] {
+        if !metadata.extra.contains_key(key) {
+            metadata.extra.insert(key.into(), serde_json::json!(stamp));
+            sources.insert(key.into(), serde_json::json!("app-created"));
+        }
+    }
+    metadata
+        .extra
+        .insert("timestampSource".into(), serde_json::Value::Object(sources));
+    normalize_timestamps(metadata, None);
+}
+
 pub fn parse(content: &str) -> Result<(Metadata, String)> {
     if content.len() as u64 > MAX_DOCUMENT_BYTES {
         return Err(too_large());
@@ -494,9 +589,13 @@ pub fn parse(content: &str) -> Result<(Metadata, String)> {
     let mut offset = 0;
     for line in rest.split_inclusive('\n') {
         if line.trim_end_matches(['\r', '\n']) == "```" {
-            let metadata: Metadata = serde_json::from_str(&rest[..offset])
+            let mut metadata: Metadata = serde_json::from_str(&rest[..offset])
                 .map_err(|_| CoreError::new("INVALID_DOCUMENT", "顶部 JSON 元数据格式无效"))?;
             validate_metadata(&metadata)?;
+            // Parsed/imported documents already existed before this operation.
+            // Missing historical timestamps stay unknown rather than becoming
+            // the import time. This changes only returned metadata, not bytes.
+            normalize_timestamps(&mut metadata, None);
             let body = rest[offset + line.len()..]
                 .strip_prefix("\r\n")
                 .or_else(|| rest[offset + line.len()..].strip_prefix('\n'))
@@ -571,6 +670,179 @@ mod tests {
         let store =
             ContentStore::new(dir.path().join("library"), dir.path().join("state")).unwrap();
         (dir, store)
+    }
+
+    #[test]
+    fn new_timestamps_are_real_and_reads_or_noop_saves_do_not_change_bytes() {
+        let (_directory, mut store) = store();
+        let before = chrono::Utc::now();
+        let first = store
+            .create(metadata("clocked"), "正文", "clocked.md")
+            .unwrap();
+        let after = chrono::Utc::now();
+        let created = first.metadata.extra["createdAt"].as_str().unwrap();
+        let parsed = chrono::DateTime::parse_from_rfc3339(created)
+            .unwrap()
+            .with_timezone(&Utc);
+        // App timestamps intentionally use milliseconds, so allow that rounding.
+        assert!(parsed >= before - chrono::Duration::milliseconds(1));
+        assert!(parsed <= after);
+        assert_eq!(
+            first.metadata.extra["updatedAt"],
+            first.metadata.extra["createdAt"]
+        );
+        assert_eq!(
+            first.metadata.extra["timestampSource"]["createdAt"],
+            "app-created"
+        );
+        let disk_path = store.root.join("clocked.md");
+        let modified = fs::metadata(&disk_path).unwrap().modified().unwrap();
+        let read = store.read("clocked").unwrap();
+        let saved = store.save("clocked", &read.content, &read.version).unwrap();
+        assert_eq!(saved.version, first.version);
+        assert_eq!(saved.metadata.version, first.metadata.version);
+        assert_eq!(saved.metadata.extra, first.metadata.extra);
+        assert_eq!(fs::read_to_string(&disk_path).unwrap(), first.content);
+        assert_eq!(
+            fs::metadata(disk_path).unwrap().modified().unwrap(),
+            modified
+        );
+        assert!(!store.state_dir.join("history").exists());
+    }
+
+    #[test]
+    fn imported_creation_is_preserved_and_only_semantic_changes_update_modified_time() {
+        let (_directory, mut store) = store();
+        let mut original = metadata("historical");
+        original
+            .extra
+            .insert("createdAt".into(), json!("2001-02-03T04:05:06Z"));
+        original
+            .extra
+            .insert("updatedAt".into(), json!("2002-03-04T05:06:07Z"));
+        original.extra.insert(
+            "timestampSource".into(),
+            json!({"createdAt":"legacy-import","updatedAt":"legacy-import","migration":"original"}),
+        );
+        let imported = serialize(&original, "旧正文").unwrap();
+        let (parsed, body) = parse(&imported).unwrap();
+        let first = store.create(parsed, &body, "historical.md").unwrap();
+        assert_eq!(first.metadata.extra["createdAt"], "2001-02-03T04:05:06Z");
+        assert_eq!(first.metadata.extra["updatedAt"], "2002-03-04T05:06:07Z");
+        let mut titled = first.metadata.clone();
+        titled.title = "仅修改标题与关联".into();
+        let metadata_edit = store
+            .save(
+                "historical",
+                &serialize(&titled, &body).unwrap(),
+                &first.version,
+            )
+            .unwrap();
+        assert_ne!(
+            metadata_edit.metadata.extra["updatedAt"],
+            first.metadata.extra["updatedAt"]
+        );
+        assert_eq!(
+            metadata_edit.metadata.extra["timestampSource"]["updatedAt"],
+            "content-save"
+        );
+        let changed = store
+            .save(
+                "historical",
+                &metadata_edit.content.replace("旧正文", "新正文"),
+                &metadata_edit.version,
+            )
+            .unwrap();
+        assert_eq!(
+            changed.metadata.extra["createdAt"],
+            first.metadata.extra["createdAt"]
+        );
+        assert_ne!(
+            changed.metadata.extra["updatedAt"],
+            first.metadata.extra["updatedAt"]
+        );
+        assert_eq!(
+            changed.metadata.extra["timestampSource"]["createdAt"],
+            "legacy-import"
+        );
+        assert_eq!(
+            changed.metadata.extra["timestampSource"]["updatedAt"],
+            "content-save"
+        );
+        assert_eq!(
+            changed.metadata.extra["timestampSource"]["migration"],
+            "original"
+        );
+        assert_eq!(
+            store
+                .save("historical", &changed.content, &changed.version)
+                .unwrap()
+                .content,
+            changed.content
+        );
+    }
+
+    #[test]
+    fn legacy_read_uses_labelled_mtime_without_writing_or_inventing_creation_time() {
+        let (_directory, mut store) = store();
+        let raw = serialize(&metadata("legacy"), "旧资料").unwrap();
+        let path = store.root.join("legacy.md");
+        fs::write(&path, &raw).unwrap();
+        let first = store.register("legacy.md").unwrap();
+        assert!(first.metadata.extra["createdAt"].is_null());
+        assert_eq!(
+            first.metadata.extra["timestampSource"]["createdAt"],
+            "unknown"
+        );
+        assert_eq!(first.metadata.extra["updatedAt"], first.modified_at);
+        assert_eq!(
+            first.metadata.extra["timestampSource"]["updatedAt"],
+            "file-mtime"
+        );
+        assert_eq!(
+            store.read("legacy").unwrap().metadata.extra,
+            first.metadata.extra
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), raw);
+        assert_eq!(
+            store.save("legacy", &raw, &first.version).unwrap().content,
+            raw
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), raw);
+        let changed = store
+            .save(
+                "legacy",
+                &raw.replace("旧资料", "第一次真实修改"),
+                &first.version,
+            )
+            .unwrap();
+        let persisted = parse(&fs::read_to_string(path).unwrap()).unwrap().0;
+        assert!(persisted.extra["createdAt"].is_null());
+        assert_eq!(persisted.extra["timestampSource"]["createdAt"], "unknown");
+        assert_eq!(
+            persisted.extra["timestampSource"]["updatedAt"],
+            "content-save"
+        );
+        assert_eq!(
+            persisted.extra["updatedAt"],
+            changed.metadata.extra["updatedAt"]
+        );
+    }
+
+    #[test]
+    fn importing_an_undated_document_keeps_unknown_creation_in_frontmatter() {
+        let (_directory, mut store) = store();
+        let raw = serialize(&metadata("imported"), "来自旧文件的内容").unwrap();
+        let (metadata, body) = parse(&raw).unwrap();
+        assert!(metadata.extra["createdAt"].is_null());
+        assert!(metadata.extra["updatedAt"].is_null());
+        let imported = store.create(metadata, &body, "imported.md").unwrap();
+        let persisted = parse(&imported.content).unwrap().0;
+        assert!(persisted.extra["createdAt"].is_null());
+        assert!(persisted.extra["updatedAt"].is_null());
+        assert_eq!(persisted.extra["timestampSource"]["createdAt"], "unknown");
+        assert_eq!(persisted.extra["timestampSource"]["updatedAt"], "unknown");
+        assert_eq!(imported.id, "imported");
     }
 
     #[test]

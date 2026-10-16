@@ -1,5 +1,5 @@
 use crate::{
-    app::{Engine, LibraryState},
+    app::{Engine, LibraryState, UiPreferences},
     context,
     generation::{self, GenerationRequest, Run, Sink},
     model::{ModelSettings, ModelTest},
@@ -91,6 +91,56 @@ async fn start_session(
     .await
 }
 #[tauri::command]
+async fn start_exploration(
+    state: State<'_, Arc<Engine>>,
+    section_id: Option<String>,
+    associate_current_section: bool,
+    fresh: Option<bool>,
+) -> Result<Value> {
+    work(state.inner().clone(), move |e| {
+        let mut core = e.lock()?;
+        let (session, context) = core.start_exploration(
+            section_id.as_deref(),
+            associate_current_section,
+            fresh.unwrap_or(false),
+        )?;
+        let last_run_id = core
+            .preferences
+            .last_run_by_session
+            .get(&session.id)
+            .cloned();
+        Ok(json!({"session":session,"context":context,"lastRunId":last_run_id}))
+    })
+    .await
+}
+#[tauri::command]
+async fn load_session_context(
+    state: State<'_, Arc<Engine>>,
+    session_id: String,
+    selection: Option<String>,
+) -> Result<Context> {
+    work(state.inner().clone(), move |e| {
+        Ok(e.lock()?
+            .session_context(&session_id, selection.as_deref())?
+            .1)
+    })
+    .await
+}
+#[tauri::command]
+async fn get_ui_preferences(state: State<'_, Arc<Engine>>) -> Result<UiPreferences> {
+    work(state.inner().clone(), |e| e.ui_preferences()).await
+}
+#[tauri::command]
+async fn save_ui_preferences(
+    state: State<'_, Arc<Engine>>,
+    font_size: u8,
+) -> Result<UiPreferences> {
+    work(state.inner().clone(), move |e| {
+        e.save_ui_preferences(UiPreferences { font_size })
+    })
+    .await
+}
+#[tauri::command]
 async fn get_session(state: State<'_, Arc<Engine>>, id: String) -> Result<Session> {
     work(state.inner().clone(), move |e| {
         sessions::get(&mut e.lock()?.content, &id)
@@ -176,12 +226,19 @@ async fn get_model_settings(state: State<'_, Arc<Engine>>) -> Result<ModelSettin
 async fn configure_model(
     state: State<'_, Arc<Engine>>,
     provider: String,
+    protocol: Option<String>,
     base_url: String,
     model: String,
     api_key: String,
 ) -> Result<ModelSettings> {
     let mut store = state.model.lock().await;
-    let result = store.configure(&provider, &base_url, &model, &api_key)?;
+    let result = store.configure_protocol(
+        &provider,
+        protocol.as_deref().unwrap_or("openai-completions"),
+        &base_url,
+        &model,
+        &api_key,
+    )?;
     *state
         .model_summary
         .write()
@@ -208,6 +265,9 @@ async fn create_todo(
     request_id: String,
 ) -> Result<Todo> {
     work(state.inner().clone(), move |e| {
+        if let Some(session_id) = &session_id {
+            sessions::get(&mut e.lock()?.content, session_id)?;
+        }
         e.reminders.create_todo(
             &title,
             due_at.as_deref(),
@@ -363,6 +423,10 @@ pub fn run() {
             open_document,
             save_document,
             start_session,
+            start_exploration,
+            load_session_context,
+            get_ui_preferences,
+            save_ui_preferences,
             get_session,
             append_entry,
             load_context,
