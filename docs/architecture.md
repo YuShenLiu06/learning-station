@@ -2,15 +2,19 @@
 
 | 部分 | 权威数据与职责 |
 | --- | --- |
-| content/context | 课程与知识点 Markdown；稳定 ID 关联、受限上下文和来源版本清单 |
-| sessions | 每会话 Markdown 及每条学习记录；作答反馈、可修正错因与复习导出 |
-| model/generation/learning_tools | Pi sidecar与按模式工具白名单；Rust复用学习记录/复习服务；用途门槛、流、取消和生成状态 |
-| reminders/feishu | 独立运行目录的 SQLite 通知 ledger；去重与固定本人通道适配 |
-| drafts | 仅允许正文／问题／导入内容的本机草稿，不接收模型密钥 |
-| desktop | Tauri IPC 和窗口事件，异步执行磁盘工作 |
+| content/library_tree/context | Markdown 稳定 ID、逻辑层级、显式关联、受限上下文与实际版本快照 |
+| exploration/trash | 固定目录普通笔记与稳定首问；加锁回收账本，保留原文件及原 ID，变更原文时整批阻止恢复 |
+| sessions/exercises/review | 学习记录、结构练习及子文档、按作答匹配反馈、本人错因、复习回执与精确集合 CSV |
+| assets | 课程资料白名单、配额、完整性校验和受控本机预览；不执行代码 |
+| model/generation/learning_tools | Pi sidecar、按模式工具白名单、用途门槛、流、取消和稳定请求状态 |
+| reminders/feishu | SQLite 通知 ledger、提醒去重和固定本人通道；显式测试不自动开启提醒 |
+| drafts/preferences | 正文、问题、导入草稿与原子合并的本机界面偏好；不保存模型密钥 |
+| desktop/qa | Tauri IPC、窗口事件；仅验收副本的强制临时目录隔离 |
 
-课程 `library/courses/*.md` 顶部是 JSON 围栏，正文可直接编辑；个人记录在 `library/sessions/`。索引可从 Markdown 重建。运行状态、保存历史、草稿和通知 ledger 存应用数据目录，排除 Git。保存按当前 SHA 校验，先保存原文快照，再原子替换。
+Markdown 顶部是 JSON 元数据。层级使用 parentId/order，移动节点不搬迁文件或改变题目 ID；旧文档不做批量改写。保存按版本校验，先保留原文快照再原子替换，索引可从文件重建。课程附件不进入学习文档扫描。回收账本隐藏完整子树及确定归属的题目记录；可选关联和受影响历史在每次请求重新排除，恢复后按实际记录重新加载。
 
-上下文只沿稳定 ID 链接加载，拒绝路径穿越与符号链接越界，最多32份、4层关联、60000字符，并给出遗漏/截断提示。资料和学习历史以引用资料进入 user 消息，不升格为 system；历史输入另有20000字符上限。
+上下文只按实际文档、显式链接、选区与同课程文本引用加载，材料最多32份、4层、60000字符。历史限定同会话，单独记录真实投影与版本，最多最近16项、总 JSON 20000字符；没有摘要算法。练习历史不自动带入参考答案/解析，工具回执不作为知识或本人原话。必需资料不可完整加载时阻止请求。
 
-提示片段仅用固定版本标记追溯，参考[PromptStore](https://github.com/YuShenLiu06/PromptStore)的整理思路，未引入其框架或复制其实现。没有接入 DSH 框架，也不声称已经符合待确认论文的完整架构。
+材料、附件和历史以引用资料进入 user 消息，不升格为 system 或工具指令。每次 Run 和助手记录保留自身来源快照，旧运行缺快照明确标为未记录；Session 后续来源不能替代历史来源。
+
+提示片段仅用固定版本标记追溯，参考 [PromptStore](https://github.com/YuShenLiu06/PromptStore) 的整理思路，未引入其框架或复制实现。未接入 DSH 框架，也不声称符合待确认论文的完整架构。
