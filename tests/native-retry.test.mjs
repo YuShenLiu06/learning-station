@@ -30,7 +30,7 @@ test('native unknown-run retry never sends after IO or corrupt state, and only N
     assert.equal(starts.length,1);assert.equal(starts[0].requestId,'same_operation');assert.equal(starts[0].userEntryId,'entry_saved');
     const actual=progress.find(value=>value.context)?.context;assert.equal(actual.truncated,true);assert.deepEqual(actual.warnings,['TRUNCATED_HISTORY']);assert.equal(actual.historyManifest[0].includedChars,84);assert.deepEqual(actual.manifest,[]);assert.equal(actual.historyManifest[0].id,'original_run_history');
     failureCode='RECOVERY';started=false;await nativeCall('session_ask',payload);assert.equal(starts.length,2);assert.equal(starts[1].requestId,'same_operation');failureCode='OLD';await nativeCall('session_ask',payload);assert.match(progress.at(-1).contextError,/未记录实际来源快照/);assert.equal(progress.at(-1).context,undefined);unsubscribe();
-    await nativeCall('preferences_save',{assistantWidth:450});await nativeCall('preferences_save',{fontSize:20});
-    assert.deepEqual(preferences,[{assistantWidth:450},{fontSize:20}]);
+    await nativeCall('preferences_save',{assistantWidth:450});await nativeCall('preferences_save',{fontSize:20});await nativeCall('preferences_save',{sidebarWidth:320});
+    assert.deepEqual(preferences,[{assistantWidth:450},{fontSize:20},{sidebarWidth:320}]);
   }finally{clearMocks();dom.window.close();await unlink(filename).catch(()=>{});}
 });

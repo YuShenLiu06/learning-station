@@ -102,3 +102,14 @@ label select{display:block;background:#fff;border:1px solid #dce5ce;border-radiu
 .exercise-reflection{border-top:1px solid var(--line);margin-top:20px;padding-top:18px}
 
 .tool-section-label{display:flex;align-items:center;gap:6px;margin:14px 0 6px;color:var(--muted);font-size:10px}.message .tool-activities{margin-bottom:14px}.message .tool-activity{margin-top:6px}
+
+/* Keep the saved expanded width while fitting the current reader and assistant. */
+.app-shell{--sidebar-right-space:clamp(280px,var(--assistant-width,346px),max(280px,calc(100vw - 180px - 350px)));--left:clamp(180px,var(--sidebar-width,240px),min(480px,max(180px,calc(100vw - 350px - var(--sidebar-right-space)))))}
+.app-shell.rightbar-collapsed{--sidebar-right-space:0px}
+.app-shell.sidebar-collapsed{--left:64px}
+.workspace-sidebar{position:relative}
+.sidebar-resize-handle{position:absolute;top:0;bottom:0;right:-10px;width:20px;z-index:15;cursor:col-resize;touch-action:none;user-select:none;-webkit-user-select:none;outline-offset:-2px}
+.sidebar-resize-handle:after{content:'';position:absolute;top:0;bottom:0;left:9px;width:2px;background:transparent}
+.sidebar-resize-handle:hover:after,.sidebar-resize-handle:focus-visible:after,.sidebar-resize-handle.resizing:after{background:var(--accent)}
+.app-shell:has(.sidebar-resize-handle.resizing) *{cursor:col-resize!important;user-select:none!important}
+@media(max-width:650px){.app-shell:not(.rightbar-collapsed){--left:0px}.app-shell:not(.rightbar-collapsed)>.workspace-sidebar .sidebar-resize-handle{display:none}}

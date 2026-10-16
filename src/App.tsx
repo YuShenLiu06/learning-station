@@ -10,6 +10,7 @@ import type { OutgoingMessage } from './outgoingMessages';
 import { foldToolActivities } from './toolActivities';
 import { ToolActivityCards } from './ToolActivityCards';
 import { useAssistantWidth } from './useAssistantWidth';
+import { useSidebarWidth } from './useSidebarWidth';
 import { AssistantResizeHandle } from './AssistantResizeHandle';
 import type { ToolActivity } from './types';
 import { WorkspaceSidebar } from './WorkspaceSidebar';
@@ -71,6 +72,8 @@ export function App() {
   const reviewRequests = useRef(new Map<string,string>());
   const reviewBusyRef = useRef(false);
   const font = useFontSize();
+  const sidebarWidth = useSidebarWidth();
+  const sidebarWidthRef = useRef(sidebarWidth); sidebarWidthRef.current = sidebarWidth;
   const assistantWidth = useAssistantWidth();
   const widthRef = useRef(assistantWidth); widthRef.current = assistantWidth;
   const fontRef = useRef(font); fontRef.current = font;
@@ -252,6 +255,7 @@ export function App() {
       if (outgoingRef.current.some(item => !item.userEntryId)) { event.preventDefault(); notify('有问题尚未写入学习记录，请先在对应会话重试保存。原文仍保留在消息中。'); return; }
       const drafts = Object.entries(docsRef.current).filter(([, doc]) => doc.body !== doc.savedBody);
       const hasInput = drafts.length || Object.values(questionDrafts.current).some(Boolean) || materialDraft.current.body || materialDraft.current.title || hasExerciseInput();
+      try { await sidebarWidthRef.current.flush(); } catch (error) { event.preventDefault(); notify(`目录宽度尚未保存，窗口已保留：${errorText(error)}`); return; }
       try { await widthRef.current.flush(); } catch (error) { event.preventDefault(); notify(`面板宽度尚未保存，窗口已保留：${errorText(error)}`); return; }
       try { await fontRef.current.flush(); } catch (error) { event.preventDefault(); notify(`字号尚未保存，窗口已保留：${errorText(error)}`); return; }
       try { await navigationRef.current.flush(); } catch (error) { event.preventDefault(); notify(`导航状态尚未保存，窗口已保留：${errorText(error)}`); return; }
@@ -538,17 +542,18 @@ export function App() {
   function appendExploration(text: string) { const doc = docsRef.current[activeId]; if (!doc || isContainerKind(doc.section.kind) || doc.section.kind === 'exercise') return; changeBody(activeId, `${doc.body.trimEnd()}\n\n${text}\n`); notify('已加入笔记正文草稿；助教原回复仍保留。'); }
   function openPanel(mode: Panel, preset?: string) { if (mode === 'practice') { void generateExercise(); return; } setRightbar(true); if (preset) setQuestion(preset); setTimeout(() => questionRef.current?.focus(), 0); }
 
-  return <div style={{ '--content-font-size': `${font.fontSize}px`, '--assistant-width': `${assistantWidth.width}px`, '--ui-font-scale': font.fontSize / 16 } as React.CSSProperties} className={`app-shell ${navigation.collapsed ? 'sidebar-collapsed' : ''} ${!rightbar || view !== 'lesson' || isContainer ? 'rightbar-collapsed' : ''}`}>
+  return <div style={{ '--content-font-size': `${font.fontSize}px`, '--assistant-width': `${assistantWidth.width}px`, '--sidebar-width': `${sidebarWidth.width}px`, '--ui-font-scale': font.fontSize / 16 } as React.CSSProperties} className={`app-shell ${navigation.collapsed ? 'sidebar-collapsed' : ''} ${!rightbar || view !== 'lesson' || isContainer ? 'rightbar-collapsed' : ''}`}>
     {isDemo && <div className="demo-banner">开发预览 · 示例材料，数据仅保留在内存 · 未连接本机服务或 AI</div>}
       <header className="topbar workspace-topbar">
         <div className="topbar-navigation"><button className="icon-button navigation-toggle" aria-label={navigation.collapsed ? '展开侧边栏' : '折叠为图标栏'} title={navigation.collapsed ? '展开左侧目录' : '收起左侧目录'} aria-expanded={!navigation.collapsed} onClick={()=>navigation.setCollapsed(!navigation.collapsed)}>{navigation.collapsed ? <PanelLeftOpen size={19}/> : <PanelLeftClose size={19}/>}</button><div className="breadcrumbs"><span>{view === 'lesson' ? (activeCourse?.title || '我的学习空间') : view === 'review' ? '复习与历史' : view === 'settings' ? '设置' : view === 'explorations' ? '探索' : view === 'history-index' ? '学习历史' : view === 'trash' ? '回收区' : view === 'history' ? '历史会话' : '学习待办'}</span><ChevronRight size={12} /><span className="breadcrumb-current">{view === 'lesson' ? '阅读与理解' : view === 'review' ? '把学过的串起来' : view === 'settings' ? '本机偏好' : view === 'explorations' ? '从问题开始' : view === 'history-index' ? '真实学习记录' : view === 'trash' ? '可恢复的学习内容' : view === 'history' ? '只读记录' : '接着完成下一步'}</span></div></div>
         <div className="topbar-actions"><button className={`icon-button notice-button ${boot.notices.some(notice => !notice.read) ? 'has-notices' : ''}`} aria-label="通知" title="通知" onClick={() => setNotifications(!notifications)}><Clock3 size={17} /></button>{view === 'lesson' && <button className="icon-button navigation-toggle" aria-label={rightbar ? '收起学习助手' : '打开学习助手'} title={rightbar ? '收起右侧学习助手' : '打开右侧学习助手'} aria-expanded={rightbar} onClick={() => setRightbar(!rightbar)}>{rightbar ? <PanelRightClose size={19} /> : <PanelRightOpen size={19} />}</button>}</div>
       </header>
-    <WorkspaceSidebar collapsed={navigation.collapsed} nodes={nodes} activeId={activeId} expandedIds={navigation.expandedIds} onExpanded={navigation.setExpandedIds} onOpen={id => { void openSection(id); }} onNew={setCreatingNode} onImport={() => setImporting(true)} onLearning={()=>switchView('lesson')} onExplorations={() => {setExplorationForm(false);switchView('explorations');}} onHistory={()=>switchView('history-index')} onTrash={()=>switchView('trash')} onTrashNode={node=>{if(busyRef.current){notify('请先停止生成，再将内容移至回收区。');return;}setTrashNode(node);}} blocked={!!busyId} onReview={() => { switchView('review'); void loadReview(reviewQuery); }} onTasks={() => switchView('tasks')} onSettings={openSettings} view={view} loading={loading} dirtyIds={Object.entries(docs).filter(([,doc])=>doc.body!==doc.savedBody).map(([id])=>id)} taskCount={boot.tasks.filter(task=>!task.completed).length} modelReady={modelReady}/>
+    <WorkspaceSidebar sidebarWidth={sidebarWidth.width} onSidebarWidth={sidebarWidth.setWidth} collapsed={navigation.collapsed} nodes={nodes} activeId={activeId} expandedIds={navigation.expandedIds} onExpanded={navigation.setExpandedIds} onOpen={id => { void openSection(id); }} onNew={setCreatingNode} onImport={() => setImporting(true)} onLearning={()=>switchView('lesson')} onExplorations={() => {setExplorationForm(false);switchView('explorations');}} onHistory={()=>switchView('history-index')} onTrash={()=>switchView('trash')} onTrashNode={node=>{if(busyRef.current){notify('请先停止生成，再将内容移至回收区。');return;}setTrashNode(node);}} blocked={!!busyId} onReview={() => { switchView('review'); void loadReview(reviewQuery); }} onTasks={() => switchView('tasks')} onSettings={openSettings} view={view} loading={loading} dirtyIds={Object.entries(docs).filter(([,doc])=>doc.body!==doc.savedBody).map(([id])=>id)} taskCount={boot.tasks.filter(task=>!task.completed).length} modelReady={modelReady}/>
 
     <main className="main-area">
 
       {Object.entries(draftErrors).map(([key, message]) => <div className="connection-banner" role="status" key={key}><CircleHelp size={16} /><span>{key === 'workspace' ? '导入草稿' : '小节草稿'}备份尚未完成：{message} 当前输入仍保留在窗口中。</span><button onClick={() => { void retryBackup(key); }}>重试读取原草稿</button></div>)}
+      {sidebarWidth.error && <div className="connection-banner" role="status">目录宽度尚未保存：{sidebarWidth.error}<button onClick={()=>{void sidebarWidth.retry().catch(()=>undefined);}}>重试读取并保存宽度</button></div>}
       {navigation.error && <div className="connection-banner" role="status">导航偏好尚未保存：{navigation.error}<button onClick={() => { void navigation.retry(); }}>重试读取偏好</button></div>}
       {boot.treeWarnings?.length ? <details className="tree-warnings"><summary>学习目录有 {boot.treeWarnings.length} 项提示</summary>{boot.treeWarnings.map((warning,index)=><p key={index}>{warning}</p>)}</details> : null}
       {bootError && <div className="connection-banner" role="status"><CircleHelp size={16} /><span>{bootError}</span><button onClick={() => { void load(); }}>重新连接</button></div>}
