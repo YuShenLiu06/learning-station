@@ -100,11 +100,6 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
     let record=old??{version:1,runId:spec.runId,userEntryId:spec.userEntryId,status:'pending',userNativeId:null};
     const previousBinding=manager.getEntries().filter(e=>e.type==='custom'&&e.customType==='learning-station-scope').at(-1)?.data;
     const revoked=previousBinding?.sourceIds?.some(id=>!spec.authorizedSourceIds.includes(id));
-    if(revoked||spec.protectHistory){
-      const boundary=manager.appendCustomMessageEntry('learning-station-permission-boundary','资料授权已变化；此前模型上下文已排除，仅使用本轮授权资料。',false,{});
-      manager.appendCompaction('应用权限边界：此前内容未重新授权，不作为本轮依据。',boundary,0,{reason:'authorization-change'},true);
-    }
-    manager.appendCustomEntry('learning-station-scope',{sourceIds:spec.authorizedSourceIds});
     // Recover a genuine tool result only from Rust's durable reply. A missing reply is unknown,
     // never a negative receipt and never permission to execute a write again.
     const branch=manager.buildSessionProjection();
@@ -128,6 +123,12 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
       const value=reply.reply.result?{ok:true,result:reply.reply.result}:{ok:false,error:reply.reply.error};
       manager.appendMessage({role:'toolResult',toolCallId:call.id,toolName:call.name,content:[{type:'text',text:JSON.stringify(value)}],isError:!!reply.reply.error,timestamp:Date.now()});
     }
+    // A changed scope must not hide an unresolved write and bypass its receipt.
+    if(revoked||spec.protectHistory){
+      const boundary=manager.appendCustomMessageEntry('learning-station-permission-boundary','资料授权已变化；此前模型上下文已排除，仅使用本轮授权资料。',false,{});
+      manager.appendCompaction('应用权限边界：此前内容未重新授权，不作为本轮依据。',boundary,0,{reason:'authorization-change'},true);
+    }
+    manager.appendCustomEntry('learning-station-scope',{sourceIds:spec.authorizedSourceIds});
     agent.state.messages=manager.buildSessionContext().messages;
     // Old per-turn references are not silently injected into later requests.
     for(const entry of manager.buildSessionProjection().entries){if(entry.sourceEntry.type==='custom_message'&&entry.sourceEntry.customType==='learning-station-turn'&&entry.messages.length)manager.appendContextEdit(entry.sourceEntry.id,null);}
