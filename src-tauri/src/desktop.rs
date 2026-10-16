@@ -45,6 +45,108 @@ async fn get_library_tree(
     .await
 }
 #[tauri::command]
+async fn list_sessions(state: State<'_, Arc<Engine>>) -> Result<Vec<DocumentSummary>> {
+    work(state.inner().clone(), |e| {
+        let mut core = e.lock()?;
+        core.content.refresh()?;
+        let mut sessions: Vec<_> = core
+            .content
+            .summaries()
+            .into_iter()
+            .filter(|document| document.kind == "session")
+            .collect();
+        sessions.sort_by(|a, b| b.modified_at.cmp(&a.modified_at).then(a.id.cmp(&b.id)));
+        Ok(sessions)
+    })
+    .await
+}
+#[tauri::command]
+async fn create_exploration_note(
+    state: State<'_, Arc<Engine>>,
+    question: String,
+    request_id: String,
+) -> Result<crate::exploration::ExplorationNote> {
+    work(state.inner().clone(), move |e| {
+        let mut core = e.lock()?;
+        core.content.refresh()?;
+        let note = crate::exploration::begin(&mut core.content, &question, &request_id)?;
+        core.preferences
+            .document_paths
+            .insert(note.document.id.clone(), note.document.path.clone());
+        core.preferences.active_document_id = Some(note.document.id.clone());
+        core.preferences.active_session_id = Some(note.session.id.clone());
+        core.preferences
+            .session_by_section
+            .insert(note.document.id.clone(), note.session.id.clone());
+        core.save_preferences()?;
+        Ok(note)
+    })
+    .await
+}
+#[tauri::command]
+async fn preview_library_trash(
+    state: State<'_, Arc<Engine>>,
+    id: String,
+) -> Result<crate::trash::Preview> {
+    work(state.inner().clone(), move |e| {
+        crate::trash::preview(&mut e.lock()?.content, &id)
+    })
+    .await
+}
+#[tauri::command]
+async fn list_library_trash(state: State<'_, Arc<Engine>>) -> Result<Vec<crate::trash::Receipt>> {
+    work(state.inner().clone(), |e| {
+        crate::trash::list(&e.lock()?.content)
+    })
+    .await
+}
+fn ensure_library_write_idle(engine: &Engine) -> Result<()> {
+    let runs = engine
+        .runs
+        .lock()
+        .map_err(|_| CoreError::new("BUSY", "生成状态暂不可用。"))?;
+    if runs
+        .values()
+        .any(|run| ["queued", "running"].contains(&run.run.status.as_str()))
+    {
+        return Err(CoreError::new(
+            "BUSY",
+            "请先停止当前生成，再回收或恢复内容；已有记录仍保留。",
+        ));
+    }
+    Ok(())
+}
+#[tauri::command]
+async fn trash_library_node(
+    state: State<'_, Arc<Engine>>,
+    id: String,
+    expected_version: String,
+    request_id: String,
+) -> Result<crate::trash::Receipt> {
+    let engine = state.inner().clone();
+    // The same gate protects generation's source capture and queued-run insertion.
+    let _gate = engine.model.lock().await;
+    ensure_library_write_idle(&engine)?;
+    work(engine.clone(), move |e| {
+        crate::trash::trash(&mut e.lock()?.content, &id, &expected_version, &request_id)
+    })
+    .await
+}
+#[tauri::command]
+async fn restore_library_node(
+    state: State<'_, Arc<Engine>>,
+    trash_id: String,
+    request_id: String,
+) -> Result<crate::trash::Receipt> {
+    let engine = state.inner().clone();
+    let _gate = engine.model.lock().await;
+    ensure_library_write_idle(&engine)?;
+    work(engine.clone(), move |e| {
+        crate::trash::restore(&mut e.lock()?.content, &trash_id, &request_id)
+    })
+    .await
+}
+#[tauri::command]
 async fn create_library_node(
     state: State<'_, Arc<Engine>>,
     kind: String,
@@ -663,6 +765,12 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_app_state,
             get_library_tree,
+            list_sessions,
+            create_exploration_note,
+            preview_library_trash,
+            list_library_trash,
+            trash_library_node,
+            restore_library_node,
             create_library_node,
             move_library_node,
             set_document_links,

@@ -44,6 +44,54 @@ pub fn create(
         // Exercise views always resume their source session; never create an unrelated attempt ledger.
         return Ok(crate::exercises::get(store, section_id)?.session);
     }
+    create_with_id(
+        store,
+        section_id,
+        manifest,
+        &uuid::Uuid::new_v4().simple().to_string(),
+    )
+}
+/// A deterministic session ID is a durable receipt; retries recover its canonical Markdown
+/// path even before the library index is refreshed, without changing an existing session.
+pub fn create_with_id(
+    store: &mut ContentStore,
+    section_id: &str,
+    manifest: &[ManifestItem],
+    id: &str,
+) -> Result<Session> {
+    if !valid_id(id) || !valid_id(section_id) {
+        return Err(CoreError::new("INVALID_INPUT", "会话或来源编号无效。"));
+    }
+    if store.is_trashed(id) || store.is_trashed(section_id) {
+        return Err(CoreError::new(
+            "TRASHED",
+            "原会话已在回收站，请先恢复；未重复创建。",
+        ));
+    }
+    let path = format!("sessions/{id}/session.md");
+    match fs::symlink_metadata(store.root().join(&path)) {
+        Ok(_) => {
+            let existing = store.register(&path)?;
+            if existing.id != id
+                || existing.metadata.kind != "session"
+                || existing
+                    .metadata
+                    .extra
+                    .get("sectionId")
+                    .and_then(Value::as_str)
+                    != Some(section_id)
+            {
+                return Err(CoreError::new(
+                    "CONFLICT",
+                    "固定会话编号已被另一份内容使用，未覆盖原记录。",
+                ));
+            }
+            return get(store, id);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let section = store.read(section_id)?;
     if !matches!(
         section.metadata.kind.as_str(),
         "section" | "knowledge" | "exploration"
@@ -53,23 +101,30 @@ pub fn create(
             "请选择课程小节、知识点或探索文档开始学习。",
         ));
     }
-    let id = uuid::Uuid::new_v4().simple().to_string();
-    let stamp = timestamp();
+    match store.read(id) {
+        Ok(_) => {
+            return Err(CoreError::new(
+                "CONFLICT",
+                "固定会话编号已由其他文件使用，未覆盖原记录。",
+            ))
+        }
+        Err(error) if error.code == "NOT_FOUND" => {}
+        Err(error) => return Err(error),
+    }
     let mut meta = metadata(
-        &id,
+        id,
         &format!("{} · 学习记录", section.metadata.title),
         "session",
     );
-    meta.links = vec![section_id.to_string()];
+    meta.links = vec![section_id.into()];
     meta.extra.insert("sectionId".into(), json!(section_id));
     meta.extra
         .insert("associateCurrentSection".into(), json!(true));
-    meta.extra.insert("createdAt".into(), json!(stamp));
+    meta.extra.insert("createdAt".into(), json!(timestamp()));
     meta.extra.insert("contextManifest".into(), json!(manifest));
-    let path = format!("sessions/{id}/session.md");
-    let body = format!("# {}\n\n本次学习记录。每条提问、练习和作答存于同目录 entries/ 的 Markdown 文件；课程正文不被改写。\n", meta.title);
+    let body=format!("# {}\n\n本次学习记录。每条提问、练习和作答存于同目录 entries/ 的 Markdown 文件；课程正文不被改写。\n",meta.title);
     store.create(meta, &body, &path)?;
-    get(store, &id)
+    get(store, id)
 }
 
 /// Independent exploration has no source document or inherited links.
@@ -164,7 +219,11 @@ pub fn get(store: &mut ContentStore, id: &str) -> Result<Session> {
                 .map_err(CoreError::io)?
                 .to_string_lossy()
                 .replace('\\', "/");
-            let doc = store.register(&relative)?;
+            let doc = match store.register(&relative) {
+                Ok(document) => document,
+                Err(error) if error.code == "TRASHED" => continue,
+                Err(error) => return Err(error),
+            };
             if doc.metadata.kind != "entry"
                 || doc.metadata.extra.get("sessionId").and_then(Value::as_str) != Some(id)
             {
@@ -235,6 +294,13 @@ pub fn get(store: &mut ContentStore, id: &str) -> Result<Session> {
                 .cloned()
                 .unwrap_or_else(|| json!([])),
         )?,
+        context_excluded_history_source_ids: serde_json::from_value(
+            doc.metadata
+                .extra
+                .get("contextExcludedHistorySourceIds")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        )?,
         context_warnings: serde_json::from_value(
             doc.metadata
                 .extra
@@ -265,24 +331,36 @@ pub fn set_context_manifest(
     session_id: &str,
     manifest: &[ManifestItem],
 ) -> Result<Session> {
-    set_context_snapshot(
-        store,
-        session_id,
-        &Context {
-            text: String::new(),
-            manifest: manifest.to_vec(),
-            history_manifest: vec![],
-            warnings: vec![],
-            truncated: false,
-        },
-    )
+    let session = get(store, session_id)?;
+    let mut context = Context {
+        text: String::new(),
+        manifest: manifest.to_vec(),
+        history_manifest: vec![],
+        excluded_history_source_ids: vec![],
+        warnings: vec![],
+        truncated: false,
+    };
+    crate::context::protect_trashed_history(&mut context, &session, &store.trashed_ids());
+    set_context_snapshot(store, session_id, &context)
 }
+
 pub fn set_context_snapshot(
     store: &mut ContentStore,
     session_id: &str,
     context: &Context,
 ) -> Result<Session> {
     let session = get(store, session_id)?;
+    let excluded: std::collections::BTreeSet<_> =
+        context.excluded_history_source_ids.iter().collect();
+    if excluded.len() != context.excluded_history_source_ids.len()
+        || excluded.len() > 4096
+        || excluded.iter().any(|id| !valid_id(id))
+    {
+        return Err(CoreError::new(
+            "INVALID_INPUT",
+            "排除的历史来源编号无效或过多。",
+        ));
+    }
     if session.section_id.is_empty() && !context.manifest.is_empty() {
         return Err(CoreError::new(
             "INVALID_INPUT",
@@ -307,6 +385,10 @@ pub fn set_context_snapshot(
     doc.metadata.extra.insert(
         "contextHistoryManifest".into(),
         json!(context.history_manifest),
+    );
+    doc.metadata.extra.insert(
+        "contextExcludedHistorySourceIds".into(),
+        json!(context.excluded_history_source_ids),
     );
     doc.metadata
         .extra
@@ -1409,5 +1491,72 @@ mod review_limit_tests {
         let all = review_items_all(&mut store).unwrap();
         assert_eq!(all.len(), 201);
         assert!(all.iter().any(|item| item["id"] == "review_card_000"));
+    }
+}
+
+#[cfg(test)]
+mod fixed_session_tests {
+    use super::*;
+    #[test]
+    fn fixed_session_reopens_without_index_or_preferences_and_conflicts_never_overwrite() {
+        let directory = tempfile::tempdir().unwrap();
+        let library = directory.path().join("library");
+        let state = directory.path().join("state");
+        let mut store = ContentStore::new(library.clone(), state.clone()).unwrap();
+        store
+            .create(
+                metadata("fixed_source", "Source", "section"),
+                "Original source.",
+                "course/source.md",
+            )
+            .unwrap();
+        store
+            .create(
+                metadata("other_source", "Other", "section"),
+                "Other source.",
+                "course/other.md",
+            )
+            .unwrap();
+        let first = create_with_id(&mut store, "fixed_source", &[], "fixed_session_id").unwrap();
+        let bytes = fs::read(store.root().join(&first.path)).unwrap();
+        assert_eq!(
+            create_with_id(&mut store, "fixed_source", &[], "fixed_session_id")
+                .unwrap()
+                .version,
+            first.version
+        );
+        assert_eq!(
+            create_with_id(&mut store, "other_source", &[], "fixed_session_id")
+                .unwrap_err()
+                .code,
+            "CONFLICT"
+        );
+        assert_eq!(fs::read(store.root().join(&first.path)).unwrap(), bytes);
+        drop(store);
+        let mut reopened = ContentStore::new(library, state).unwrap();
+        assert!(reopened.summaries().is_empty());
+        let resumed =
+            create_with_id(&mut reopened, "fixed_source", &[], "fixed_session_id").unwrap();
+        assert_eq!(resumed.id, first.id);
+        assert_eq!(resumed.section_id, "fixed_source");
+        assert_eq!(resumed.version, first.version);
+        assert_eq!(fs::read(reopened.root().join(&first.path)).unwrap(), bytes);
+        reopened
+            .create(
+                metadata("occupied_document", "Unrelated", "section"),
+                "Never overwrite.",
+                "sessions/colliding_session/session.md",
+            )
+            .unwrap();
+        assert_eq!(
+            create_with_id(&mut reopened, "fixed_source", &[], "colliding_session")
+                .unwrap_err()
+                .code,
+            "CONFLICT"
+        );
+        assert_eq!(
+            reopened.read("occupied_document").unwrap().body,
+            "Never overwrite."
+        );
     }
 }

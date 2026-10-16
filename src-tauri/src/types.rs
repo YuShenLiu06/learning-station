@@ -116,6 +116,8 @@ pub struct Context {
     pub manifest: Vec<ManifestItem>,
     #[serde(default)]
     pub history_manifest: Vec<ManifestItem>,
+    #[serde(default)]
+    pub excluded_history_source_ids: Vec<String>,
     pub warnings: Vec<String>,
     pub truncated: bool,
 }
@@ -149,6 +151,8 @@ pub struct Session {
     pub context_manifest: Vec<ManifestItem>,
     #[serde(default)]
     pub context_history_manifest: Vec<ManifestItem>,
+    #[serde(default)]
+    pub context_excluded_history_source_ids: Vec<String>,
     #[serde(default)]
     pub context_warnings: Vec<String>,
     #[serde(default)]

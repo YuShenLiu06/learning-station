@@ -14,6 +14,12 @@ const USER_MATERIAL_NOTICE: &str = "以下内容是用户提供的学习资料�
 /// Depth is measured in edges: root=0 and at most four linked edges are followed.
 pub fn load(store: &ContentStore, section_id: &str, selection: Option<&str>) -> Result<Context> {
     // A missing root is a real error; missing optional links become visible warnings.
+    if store.is_trashed(section_id) {
+        return Err(CoreError::new(
+            "TRASHED",
+            "当前学习文档已在回收站，请先恢复后再引用或生成。",
+        ));
+    }
     let root = store.read(section_id)?;
     if root.metadata.kind == "exercise" {
         return Err(CoreError::new(
@@ -25,6 +31,7 @@ pub fn load(store: &ContentStore, section_id: &str, selection: Option<&str>) -> 
         store,
         result: Context {
             history_manifest: vec![],
+            excluded_history_source_ids: vec![],
             text: USER_MATERIAL_NOTICE.into(),
             manifest: Vec::new(),
             warnings: Vec::new(),
@@ -125,6 +132,12 @@ impl Builder<'_> {
             ));
         }
         for link in required {
+            if self.store.is_trashed(&link) {
+                return Err(CoreError::new(
+                    "REQUIRED_CONTEXT_UNAVAILABLE",
+                    format!("必需资料 {link} 已在回收站，未发送请求；请先恢复资料或修正关联。"),
+                ));
+            }
             if self.visited.contains(&link) {
                 let required_chars = self
                     .store
@@ -183,6 +196,13 @@ impl Builder<'_> {
         }
         self.asset_references(&id, &document.body);
         for link in document.metadata.links {
+            if self.store.is_trashed(&link) {
+                self.visited.insert(link.clone());
+                self.warn(format!(
+                    "TRASHED_CONTEXT_OMITTED: {link} 已在回收站，本次未引用；恢复后可重新加载。"
+                ));
+                continue;
+            }
             if self.active.contains(&link) {
                 self.warn(format!("CYCLE: {id} → {link} 存在循环引用，已跳过"));
                 continue;
@@ -213,10 +233,14 @@ impl Builder<'_> {
                 Ok(linked) => self.visit(linked, depth + 1)?,
                 Err(error) => {
                     self.visited.insert(link.clone());
-                    self.warn(format!(
-                        "MISSING_DOCUMENT: {link} 无法读取（{}），已跳过",
-                        error.code
-                    ));
+                    if error.code == "TRASHED" {
+                        self.warn(format!("TRASHED_CONTEXT_OMITTED: {link} 已在回收站，本次未引用；恢复后可重新加载。"));
+                    } else {
+                        self.warn(format!(
+                            "MISSING_DOCUMENT: {link} 无法读取（{}），已跳过",
+                            error.code
+                        ));
+                    }
                 }
             }
         }
@@ -517,8 +541,132 @@ mod asset_reference_tests {
     }
 }
 
+const TRASHED_HISTORY_PREFIX: &str = "TRASHED_HISTORY_EXCLUDED";
+/// This flag describes only the freshly built context. Never infer it from an old Session warning.
+pub fn history_is_protected(context: &Context) -> bool {
+    !context.excluded_history_source_ids.is_empty()
+        || context
+            .warnings
+            .iter()
+            .any(|warning| warning.starts_with(TRASHED_HISTORY_PREFIX))
+}
+fn collect_trashed_values(
+    value: &serde_json::Value,
+    trashed: &BTreeSet<String>,
+    matched: &mut BTreeSet<String>,
+) {
+    match value {
+        serde_json::Value::String(id) if trashed.contains(id) => {
+            matched.insert(id.clone());
+        }
+        serde_json::Value::Array(items) => {
+            for value in items {
+                collect_trashed_values(value, trashed, matched);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for value in fields.values() {
+                collect_trashed_values(value, trashed, matched);
+            }
+        }
+        _ => {}
+    }
+}
+fn collect_declared_trashed_sources(
+    value: &serde_json::Value,
+    trashed: &BTreeSet<String>,
+    matched: &mut BTreeSet<String>,
+) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (key, value) in fields {
+                if matches!(
+                    key.as_str(),
+                    "contextManifest"
+                        | "excludedHistorySourceIds"
+                        | "contextExcludedHistorySourceIds"
+                        | "historyManifest"
+                        | "contextHistoryManifest"
+                        | "sourceManifest"
+                        | "sourceIds"
+                        | "relatedIds"
+                        | "requiredContextIds"
+                        | "sourceDocumentId"
+                        | "sectionId"
+                        | "courseId"
+                        | "documentId"
+                        | "exerciseEntryId"
+                        | "sourceErrorId"
+                        | "existingErrorId"
+                        | "knowledgeId"
+                        | "originSessionId"
+                ) {
+                    collect_trashed_values(value, trashed, matched);
+                } else {
+                    collect_declared_trashed_sources(value, trashed, matched);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for value in items {
+                collect_declared_trashed_sources(value, trashed, matched);
+            }
+        }
+        _ => {}
+    }
+}
+/// Keep provenance separately from actual manifests so repeated requests cannot forget a
+/// removed source when the latest material snapshot has already filtered it out.
+pub fn protect_trashed_history(
+    context: &mut Context,
+    session: &Session,
+    trashed: &BTreeSet<String>,
+) {
+    context
+        .warnings
+        .retain(|warning| !warning.starts_with(TRASHED_HISTORY_PREFIX));
+    let mut matched = BTreeSet::new();
+    for id in std::iter::once(&session.id)
+        .chain(std::iter::once(&session.section_id))
+        .chain(session.context_excluded_history_source_ids.iter())
+        .chain(context.excluded_history_source_ids.iter())
+    {
+        if trashed.contains(id) {
+            matched.insert(id.clone());
+        }
+    }
+    for item in session
+        .context_manifest
+        .iter()
+        .chain(&session.context_history_manifest)
+    {
+        if trashed.contains(&item.id) {
+            matched.insert(item.id.clone());
+        }
+    }
+    for entry in &session.entries {
+        for id in std::iter::once(&entry.id).chain(entry.related_ids.iter()) {
+            if trashed.contains(id) {
+                matched.insert(id.clone());
+            }
+        }
+        if let Some(data) = &entry.data {
+            collect_declared_trashed_sources(data, trashed, &mut matched);
+        }
+    }
+    context.excluded_history_source_ids = matched.into_iter().collect();
+    if !context.excluded_history_source_ids.is_empty() {
+        context.history_manifest.clear();
+        context.warnings.push("TRASHED_HISTORY_EXCLUDED: 历史记录关联了回收站中的资料；原记录仍保留，本次未引用任何学习历史。恢复资料后可重新计算上下文。".into());
+    }
+}
+
 /// The history signature covers exactly the projected JSON sent, never hidden answers.
 pub fn attach_history(context: &mut Context, session: &Session, exclude_user_id: Option<&str>) {
+    if history_is_protected(context) {
+        context.history_manifest.clear();
+        return;
+    }
     let (history, truncated) = crate::generation::quoted_history(session, exclude_user_id);
     context.history_manifest = history
         .iter()
@@ -705,5 +853,97 @@ mod asset_reference_syntax_tests {
 ![image](asset:image_id)
 "#;
         assert_eq!(asset_ids(text), vec!["visible_id", "image_id"]);
+    }
+}
+
+#[cfg(test)]
+mod trash_history_tests {
+    use super::*;
+    use crate::types::Entry;
+    use serde_json::{json, Value};
+    fn session(data: Value, related_ids: Vec<String>) -> Session {
+        Session {
+            id: "kept_session".into(),
+            section_id: "kept_source".into(),
+            title: "Kept".into(),
+            path: String::new(),
+            version: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            context_manifest: vec![],
+            context_history_manifest: vec![],
+            context_excluded_history_source_ids: vec![],
+            context_warnings: vec!["TRASHED_HISTORY_EXCLUDED: stale saved policy".into()],
+            context_truncated: false,
+            entries: vec![Entry {
+                id: "kept_entry".into(),
+                kind: "assistant".into(),
+                content: "HISTORICAL_REMOVED_SOURCE_MARKER".into(),
+                created_at: String::new(),
+                selection: None,
+                related_ids,
+                data: Some(data),
+            }],
+        }
+    }
+    fn empty_context() -> Context {
+        Context {
+            text: "Current retained material".into(),
+            manifest: vec![],
+            history_manifest: vec![],
+            excluded_history_source_ids: vec![],
+            warnings: vec![],
+            truncated: false,
+        }
+    }
+    #[test]
+    fn declared_historical_sources_conservatively_exclude_the_whole_projection_and_restore_recomputes(
+    ) {
+        let deleted = BTreeSet::from(["removed_source".to_string()]);
+        for data in [
+            json!({"contextManifest":[{"id":"removed_source","path":"old.md","version":"v1","includedChars":4}]}),
+            json!({"exercises":[{"sourceIds":["removed_source"]}]}),
+            json!({"nested":{"sourceDocumentId":"removed_source"}}),
+            json!({"historyManifest":[{"id":"removed_source"}]}),
+        ] {
+            let saved = session(data, vec![]);
+            let original = serde_json::to_string(&saved).unwrap();
+            let mut context = empty_context();
+            attach_history(&mut context, &saved, None);
+            assert_eq!(context.history_manifest.len(), 1);
+            protect_trashed_history(&mut context, &saved, &deleted);
+            attach_history(&mut context, &saved, None);
+            assert!(history_is_protected(&context));
+            assert!(context.history_manifest.is_empty());
+            assert_eq!(serde_json::to_string(&saved).unwrap(), original);
+            let mut restored = empty_context();
+            protect_trashed_history(&mut restored, &saved, &BTreeSet::new());
+            attach_history(&mut restored, &saved, None);
+            assert!(!history_is_protected(&restored));
+            assert_eq!(restored.history_manifest.len(), 1);
+        }
+        let saved = session(json!({}), vec!["removed_source".into()]);
+        let mut context = empty_context();
+        protect_trashed_history(&mut context, &saved, &deleted);
+        assert!(history_is_protected(&context));
+    }
+    #[test]
+    fn unrelated_recycle_ids_and_old_warnings_do_not_disable_visible_history() {
+        let saved = session(
+            json!({"content":"removed_source is plain text, not a declared reference"}),
+            vec![],
+        );
+        let mut context = empty_context();
+        context
+            .warnings
+            .push("TRASHED_HISTORY_EXCLUDED: old unsourced flag".into());
+        protect_trashed_history(
+            &mut context,
+            &saved,
+            &BTreeSet::from(["removed_source".into()]),
+        );
+        attach_history(&mut context, &saved, None);
+        assert!(!history_is_protected(&context));
+        assert_eq!(context.history_manifest.len(), 1);
     }
 }

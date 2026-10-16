@@ -20,6 +20,9 @@ struct IndexEntry {
 pub struct ContentStore {
     root: PathBuf,
     state_dir: PathBuf,
+    hidden_ids: BTreeSet<String>,
+    hidden_paths: BTreeSet<String>,
+    trash_stamp: Option<(u64, std::time::SystemTime)>,
     index: BTreeMap<String, IndexEntry>,
 }
 
@@ -30,9 +33,14 @@ impl ContentStore {
         fs::create_dir_all(&state_dir).map_err(CoreError::io)?;
         let root = fs::canonicalize(root).map_err(CoreError::io)?;
         let state_dir = fs::canonicalize(state_dir).map_err(CoreError::io)?;
+        let visibility = crate::trash::load_visibility(&state_dir)?;
+        let trash_stamp = visibility.stamp;
         Ok(Self {
             root,
             state_dir,
+            hidden_ids: visibility.ids,
+            hidden_paths: visibility.paths,
+            trash_stamp,
             index: BTreeMap::new(),
         })
     }
@@ -41,9 +49,54 @@ impl ContentStore {
         &self.root
     }
 
+    pub fn is_trashed(&self, id: &str) -> bool {
+        self.hidden_ids.contains(id)
+    }
+    pub fn trashed_ids(&self) -> BTreeSet<String> {
+        self.hidden_ids.clone()
+    }
+    pub(crate) fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+    pub(crate) fn sync_trash_visibility(&mut self) -> Result<()> {
+        let visibility = crate::trash::load_visibility(&self.state_dir)?;
+        self.hidden_ids = visibility.ids;
+        self.hidden_paths = visibility.paths;
+        self.trash_stamp = visibility.stamp;
+        self.index.retain(|id, entry| {
+            !self.hidden_ids.contains(id) && !self.hidden_paths.contains(&entry.relative)
+        });
+        Ok(())
+    }
+    pub(crate) fn install_restored(&mut self, documents: Vec<Document>) {
+        for document in documents {
+            if !self.hidden_ids.contains(&document.id)
+                && !self.hidden_paths.contains(&document.path)
+            {
+                self.index.insert(
+                    document.id.clone(),
+                    IndexEntry {
+                        relative: document.path.clone(),
+                        summary: summary(&document),
+                    },
+                );
+            }
+        }
+    }
+    fn visibility_guard(&self) -> Result<()> {
+        if crate::trash::ledger_stamp(&self.state_dir)? != self.trash_stamp {
+            return Err(CoreError::new(
+                "TRASH_STATE_CHANGED",
+                "回收记录已发生变化，请刷新课程库后重试。",
+            ));
+        }
+        Ok(())
+    }
+
     /// Refresh is transactional: a scan failure does not discard the previous index.
     /// Invalid/non-course Markdown and symlinks are ignored. Scan work is bounded.
     pub fn refresh(&mut self) -> Result<Vec<DocumentSummary>> {
+        self.sync_trash_visibility()?;
         let mut pending = vec![self.root.clone()];
         let mut files_seen = 0;
         let mut directories_seen = 0;
@@ -110,7 +163,10 @@ impl ContentStore {
                 let document = match self.read_relative(&relative) {
                     Ok(document) => document,
                     Err(error)
-                        if matches!(error.code.as_str(), "INVALID_DOCUMENT" | "LIMIT_EXCEEDED") =>
+                        if matches!(
+                            error.code.as_str(),
+                            "INVALID_DOCUMENT" | "LIMIT_EXCEEDED" | "TRASHED"
+                        ) =>
                     {
                         continue
                     }
@@ -136,9 +192,17 @@ impl ContentStore {
     }
 
     pub fn summaries(&self) -> Vec<DocumentSummary> {
+        // A changed or unreadable ledger must not expose a previously visible library.
+        if self.visibility_guard().is_err() {
+            return Vec::new();
+        }
         let mut items: Vec<_> = self
             .index
             .values()
+            .filter(|entry| {
+                !self.hidden_ids.contains(&entry.summary.id)
+                    && !self.hidden_paths.contains(&entry.relative)
+            })
             .map(|entry| entry.summary.clone())
             .collect();
         items.sort_by(|a, b| a.path.cmp(&b.path));
@@ -146,7 +210,11 @@ impl ContentStore {
     }
 
     pub fn read(&self, id: &str) -> Result<Document> {
+        self.visibility_guard()?;
         validate_id(id)?;
+        if self.hidden_ids.contains(id) {
+            return Err(trashed());
+        }
         let entry = self
             .index
             .get(id)
@@ -162,6 +230,20 @@ impl ContentStore {
     }
 
     pub fn read_relative(&self, relative: &str) -> Result<Document> {
+        self.visibility_guard()?;
+        if self.hidden_paths.contains(relative) {
+            return Err(trashed());
+        }
+        let document = self.read_relative_raw(relative)?;
+        if self.hidden_ids.contains(&document.id) || self.hidden_paths.contains(&document.path) {
+            return Err(trashed());
+        }
+        Ok(document)
+    }
+
+    /// Only the internal recovery preflight may inspect hidden original files.
+    /// Normal path, symlink, encoding and byte limits still apply.
+    pub(crate) fn read_relative_raw(&self, relative: &str) -> Result<Document> {
         let path = self.checked_path(relative, false)?;
         let file = fs::File::open(&path).map_err(CoreError::io)?;
         let metadata = file.metadata().map_err(CoreError::io)?;
@@ -202,14 +284,23 @@ impl ContentStore {
         body: &str,
         relative: &str,
     ) -> Result<Document> {
+        self.visibility_guard()?;
         validate_metadata(&metadata)?;
+        if self.hidden_ids.contains(&metadata.id) || self.hidden_paths.contains(relative) {
+            return Err(trashed());
+        }
+        let target = self.checked_path(relative, true)?;
+        let normalized =
+            relative_string(target.strip_prefix(&self.root).map_err(|_| unsafe_path())?)?;
+        if self.hidden_paths.contains(&normalized) {
+            return Err(trashed());
+        }
         if self.index.contains_key(&metadata.id) {
             return Err(CoreError::new("ALREADY_EXISTS", "稳定 ID 已存在"));
         }
         metadata.version = metadata.version.max(1);
         initialize_timestamps(&mut metadata);
         let content = serialize(&metadata, body)?;
-        let target = self.checked_path(relative, true)?;
         if target.exists() {
             return Err(CoreError::new("ALREADY_EXISTS", "目标文件已存在"));
         }
@@ -646,6 +737,9 @@ fn relative_string(path: &Path) -> Result<String> {
     path.to_str()
         .map(|text| text.replace('\\', "/"))
         .ok_or_else(unsafe_path)
+}
+fn trashed() -> CoreError {
+    CoreError::new("TRASHED", "该内容已在回收站中，恢复后才能读取或编辑。")
 }
 fn unsafe_path() -> CoreError {
     CoreError::new(

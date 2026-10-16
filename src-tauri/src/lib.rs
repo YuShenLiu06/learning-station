@@ -20,3 +20,6 @@ pub mod library_tree;
 pub mod review;
 
 pub mod qa;
+
+pub mod exploration;
+pub mod trash;

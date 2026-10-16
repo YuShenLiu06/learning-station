@@ -247,7 +247,8 @@ impl Engine {
         Ok(value)
     }
     pub fn state(&self) -> Result<LibraryState> {
-        let core = self.lock()?;
+        let mut core = self.lock()?;
+        core.content.sync_trash_visibility()?;
         let model = self
             .model_summary
             .read()
@@ -256,12 +257,21 @@ impl Engine {
         Ok(LibraryState {
             root: core.content.root().to_string_lossy().into_owned(),
             documents: core.summaries(),
-            active_document_id: core.preferences.active_document_id.clone(),
-            active_session_id: core.preferences.active_session_id.clone(),
+            active_document_id: core
+                .preferences
+                .active_document_id
+                .clone()
+                .filter(|id| !core.content.is_trashed(id)),
+            active_session_id: core
+                .preferences
+                .active_session_id
+                .clone()
+                .filter(|id| !core.content.is_trashed(id)),
             last_run_id: core
                 .preferences
                 .active_session_id
                 .as_ref()
+                .filter(|id| !core.content.is_trashed(id))
                 .and_then(|id| core.preferences.last_run_by_session.get(id))
                 .cloned(),
             model,
@@ -547,15 +557,36 @@ impl Core {
             return Ok((item.session, context));
         }
         let context = context::load(&self.content, section_id, None)?;
-        let session = if !new_session {
-            self.preferences
-                .session_by_section
-                .get(section_id)
-                .cloned()
-                .map(|id| sessions::get(&mut self.content, &id))
-                .transpose()?
-        } else {
+        let session = if new_session {
             None
+        } else if let Some(id) = self.preferences.session_by_section.get(section_id).cloned() {
+            Some(sessions::get(&mut self.content, &id)?)
+        } else {
+            // A committed note/session can survive a crash before UI preferences.
+            // Reuse real persisted ownership instead of creating an empty duplicate.
+            self.content.refresh()?;
+            let mut candidates: Vec<_> = self
+                .content
+                .summaries()
+                .into_iter()
+                .filter(|document| document.kind == "session")
+                .collect();
+            candidates.sort_by(|a, b| b.modified_at.cmp(&a.modified_at).then(a.id.cmp(&b.id)));
+            let mut previous = None;
+            for candidate in candidates {
+                let document = self.content.read(&candidate.id)?;
+                if document
+                    .metadata
+                    .extra
+                    .get("sectionId")
+                    .and_then(Value::as_str)
+                    == Some(section_id)
+                {
+                    previous = Some(sessions::get(&mut self.content, &candidate.id)?);
+                    break;
+                }
+            }
+            previous
         };
         let session = match session {
             Some(session) => session,
@@ -605,6 +636,7 @@ impl Core {
             session,
             Context {
                 history_manifest: vec![],
+                excluded_history_source_ids: vec![],
                 text: String::new(),
                 manifest: vec![],
                 warnings: vec![],
@@ -618,7 +650,7 @@ impl Core {
         selection: Option<&str>,
     ) -> Result<(Session, Context)> {
         let session = sessions::get(&mut self.content, session_id)?;
-        let context = if session.section_id.is_empty() {
+        let mut context = if session.section_id.is_empty() {
             if selection.is_some_and(|text| !text.is_empty()) {
                 return Err(CoreError::new(
                     "INVALID_INPUT",
@@ -627,6 +659,7 @@ impl Core {
             }
             Context {
                 history_manifest: vec![],
+                excluded_history_source_ids: vec![],
                 text: String::new(),
                 manifest: vec![],
                 warnings: vec![],
@@ -635,6 +668,7 @@ impl Core {
         } else {
             context::load(&self.content, &session.section_id, selection)?
         };
+        context::protect_trashed_history(&mut context, &session, &self.content.trashed_ids());
         Ok((session, context))
     }
     pub fn save_preferences(&self) -> Result<()> {
@@ -1176,6 +1210,111 @@ mod exercise_context_guard_tests {
         assert!(
             !safe.text.contains("HIDDEN_REFERENCE_MARKER")
                 && !safe.text.contains("HIDDEN_EXPLANATION_MARKER")
+        );
+    }
+}
+
+#[cfg(test)]
+mod exploration_and_trash_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn exploration_reopens_its_committed_question_without_preference_mapping() {
+        let directory = tempfile::tempdir().unwrap();
+        let library = directory.path().join("library");
+        let state = directory.path().join("state");
+        let engine = Engine::new(library.clone(), state.clone()).unwrap();
+        let question = "Why is for used with three years?";
+        let saved = {
+            let mut core = engine.lock().unwrap();
+            crate::exploration::begin(&mut core.content, question, "recovery_question_001").unwrap()
+        };
+        drop(engine); // Equivalent to loss before the command saves open/session preferences.
+        let reopened = Engine::new(library, state).unwrap();
+        let mut core = reopened.lock().unwrap();
+        core.content.refresh().unwrap();
+        assert!(!core
+            .preferences
+            .session_by_section
+            .contains_key(&saved.document.id));
+        let (session, _) = core.start_session(&saved.document.id, false).unwrap();
+        assert_eq!(session.id, saved.session.id);
+        assert_eq!(
+            session
+                .entries
+                .iter()
+                .filter(|entry| entry.kind == "user")
+                .count(),
+            1
+        );
+        assert_eq!(
+            session
+                .entries
+                .iter()
+                .find(|entry| entry.id == saved.user_entry_id)
+                .unwrap()
+                .content,
+            question
+        );
+        core.content.refresh().unwrap();
+        assert_eq!(
+            core.content
+                .summaries()
+                .iter()
+                .filter(|document| document.kind == "session")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn trashed_open_ids_are_hidden_and_restore_recovers_original_preferences() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            directory.path().join("library"),
+            directory.path().join("state"),
+        )
+        .unwrap();
+        let (document_id, session_id, receipt) = {
+            let mut core = engine.lock().unwrap();
+            let document = core
+                .create_section("English", "for three years", vec![], vec![])
+                .unwrap();
+            let (session, _) = core.start_session(&document.id, false).unwrap();
+            let preview = crate::trash::preview(&mut core.content, &document.id).unwrap();
+            let receipt = crate::trash::trash(
+                &mut core.content,
+                &document.id,
+                &preview.version,
+                "hide_open_record_001",
+            )
+            .unwrap();
+            (document.id, session.id, receipt)
+        };
+        let state = engine.state().unwrap();
+        assert!(state.active_document_id.is_none());
+        assert!(state.active_session_id.is_none());
+        assert!(!state
+            .documents
+            .iter()
+            .any(|document| document.id == document_id));
+        {
+            let mut core = engine.lock().unwrap();
+            crate::trash::restore(
+                &mut core.content,
+                &receipt.trash_id,
+                "restore_open_record_001",
+            )
+            .unwrap();
+        }
+        let state = engine.state().unwrap();
+        assert_eq!(
+            state.active_document_id.as_deref(),
+            Some(document_id.as_str())
+        );
+        assert_eq!(
+            state.active_session_id.as_deref(),
+            Some(session_id.as_str())
         );
     }
 }

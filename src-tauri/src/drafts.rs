@@ -21,6 +21,8 @@ pub struct DraftData {
     pub question: String,
     pub import_title: String,
     pub import_body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +90,7 @@ impl DraftStore {
         }
         let draft: UiDraft = serde_json::from_slice(&bytes).map_err(|_| invalid_draft())?;
         validate_data(&draft.data)?;
+        validate_request_key(key, &draft.data)?;
         if draft.key != key
             || draft.version != draft_version(&draft.key, &draft.data, &draft.updated_at)?
         {
@@ -105,6 +108,7 @@ impl DraftStore {
     ) -> Result<UiDraft> {
         let path = self.path(key)?;
         validate_data(&data)?;
+        validate_request_key(key, &data)?;
         let _guard = self
             .writes
             .lock()
@@ -166,6 +170,20 @@ fn validate_data(data: &DraftData) -> Result<()> {
     {
         return Err(too_large());
     }
+    if data
+        .request_id
+        .as_ref()
+        .is_some_and(|id| !(8..=128).contains(&id.len()) || !crate::types::valid_id(id))
+    {
+        return Err(invalid_draft());
+    }
+    Ok(())
+}
+
+fn validate_request_key(key: &str, data: &DraftData) -> Result<()> {
+    if data.request_id.is_some() && key != "exploration-launch" {
+        return Err(invalid_draft());
+    }
     Ok(())
 }
 
@@ -198,6 +216,7 @@ mod tests {
             question: "这里为什么成立？".into(),
             import_title: "待导入".into(),
             import_body: "# 待导入内容".into(),
+            request_id: None,
         };
         let saved = store.save("section:lesson-1", data.clone(), None).unwrap();
         let reopened = DraftStore::new(directory.path()).unwrap();
@@ -250,6 +269,100 @@ mod tests {
             "LIMIT_EXCEEDED"
         );
         assert!(store.get("big").unwrap().is_none());
+    }
+
+    #[test]
+    fn legacy_four_field_raw_json_keeps_its_original_version_hash() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DraftStore::new(directory.path()).unwrap();
+        let key = "section:legacy";
+        let stamp = "2026-10-16T00:00:00.000Z";
+        let old_data = r#"{"body":"旧正文","question":"旧问题","importTitle":"","importBody":""}"#;
+        let old_canonical = format!(r#"["{key}",{old_data},"{stamp}"]"#);
+        let old_version = hash(&old_canonical);
+        let record = format!(
+            r#"{{"key":"{key}","data":{old_data},"version":"{old_version}","updatedAt":"{stamp}"}}"#
+        );
+        fs::write(store.path(key).unwrap(), record.as_bytes()).unwrap();
+        drop(store);
+        let reopened = DraftStore::new(directory.path()).unwrap();
+        let old = reopened.get(key).unwrap().unwrap();
+        assert_eq!(old.version, old_version);
+        assert_eq!(old.data.request_id, None);
+        assert_eq!(serde_json::to_string(&old.data).unwrap(), old_data);
+        assert_eq!(draft_version(key, &old.data, stamp).unwrap(), old_version);
+        assert_eq!(
+            fs::read(reopened.path(key).unwrap()).unwrap(),
+            record.as_bytes()
+        );
+    }
+
+    #[test]
+    fn exploration_request_id_reopens_without_model_or_credential_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DraftStore::new(directory.path()).unwrap();
+        let data = DraftData {
+            question: "  保留原问题与空白\n".into(),
+            request_id: Some("exploration_request_0001".into()),
+            ..DraftData::default()
+        };
+        let saved = store
+            .save("exploration-launch", data.clone(), None)
+            .unwrap();
+        drop(store);
+        let reopened = DraftStore::new(directory.path()).unwrap();
+        assert_eq!(reopened.get("exploration-launch").unwrap().unwrap(), saved);
+        assert_eq!(saved.data, data);
+        let value = serde_json::to_value(&saved.data).unwrap();
+        assert_eq!(value["requestId"], "exploration_request_0001");
+        assert!(value.get("apiKey").is_none());
+        assert!(value.get("model").is_none());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert!(directory.path().join("drafts").is_dir());
+        assert!(!directory.path().join("model.json").exists());
+    }
+
+    #[test]
+    fn request_ids_are_bounded_stable_ids_and_only_for_the_exploration_launch() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DraftStore::new(directory.path()).unwrap();
+        for id in [
+            "short".into(),
+            "../traverse".into(),
+            "with spaces".into(),
+            "中文请求编号".into(),
+            "x".repeat(129),
+        ] {
+            let data = DraftData {
+                request_id: Some(id),
+                ..DraftData::default()
+            };
+            assert_eq!(
+                store
+                    .save("exploration-launch", data, None)
+                    .unwrap_err()
+                    .code,
+                "INVALID_DRAFT"
+            );
+        }
+        let data = DraftData {
+            request_id: Some("stable_request".into()),
+            ..DraftData::default()
+        };
+        assert_eq!(
+            store.save("section:legacy", data, None).unwrap_err().code,
+            "INVALID_DRAFT"
+        );
+        assert!(store.get("exploration-launch").unwrap().is_none());
+        assert_eq!(
+            fs::read_dir(directory.path().join("drafts"))
+                .unwrap()
+                .count(),
+            0
+        );
+        let no_id = serde_json::to_value(DraftData::default()).unwrap();
+        assert_eq!(no_id.as_object().unwrap().len(), 4);
+        assert!(no_id.get("requestId").is_none());
     }
 
     #[test]
