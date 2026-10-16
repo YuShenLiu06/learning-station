@@ -34,6 +34,48 @@ const ALL_TOOLS: &[&str] = &[
     "create_todo",
     "generate_exercises",
 ];
+pub const MAX_OUTPUT_TOKENS: u32 = 131_072;
+pub const MIN_INPUT_RESERVE: u32 = 1_024;
+pub fn default_output_tokens(provider: &str) -> u32 {
+    if provider == "custom" {
+        4_096
+    } else {
+        32_768
+    }
+}
+pub fn parse_limits(
+    max_output: &Value,
+    context_window: Option<&Value>,
+) -> Result<(u32, Option<u32>)> {
+    let integer = |v: &Value| {
+        v.as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| {
+                CoreError::new(
+                    "INVALID_MODEL_LIMITS",
+                    "token 上限须为整数，上下文容量未知时请留空。",
+                )
+            })
+    };
+    let max = integer(max_output)?;
+    let context = context_window
+        .filter(|v| !v.is_null())
+        .map(integer)
+        .transpose()?;
+    validate_limits(max, context)?;
+    Ok((max, context))
+}
+fn validate_limits(max_output: u32, context_window: Option<u32>) -> Result<()> {
+    if !(1..=MAX_OUTPUT_TOKENS).contains(&max_output)
+        || context_window.is_some_and(|window| {
+            !(1_024..=2_000_000).contains(&window)
+                || max_output > window.saturating_sub(MIN_INPUT_RESERVE)
+        })
+    {
+        return Err(CoreError::new("INVALID_MODEL_LIMITS", "输出上限须为 1–131072 的整数；上下文容量可留空，填写时须为 1024–2000000，且至少为输入预留 1024 token。"));
+    }
+    Ok(())
+}
 const MODEL_ID: &str = "glm-5.3-flash";
 const HARNESS: &str = "pi-agent-core";
 const PROTOCOL: &str = "openai-completions";
@@ -82,6 +124,10 @@ pub struct ModelProfileSettings {
     pub base_url: String,
     pub model: String,
     pub verified: bool,
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+    #[serde(default)]
+    pub context_window: Option<u32>,
 }
 fn default_profiles() -> Vec<ModelProfileSettings> {
     [("bigmodel-coding", DOMESTIC), ("zai-coding", INTERNATIONAL)]
@@ -94,6 +140,8 @@ fn default_profiles() -> Vec<ModelProfileSettings> {
             base_url: url.into(),
             model: MODEL_ID.into(),
             verified: false,
+            max_output_tokens: None,
+            context_window: None,
         })
         .collect()
 }
@@ -118,6 +166,10 @@ pub struct ModelSettings {
     pub usage_gate: String,
     #[serde(default, skip_deserializing)]
     pub request_url: String,
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+    #[serde(default)]
+    pub context_window: Option<u32>,
 }
 impl Default for ModelSettings {
     fn default() -> Self {
@@ -133,6 +185,8 @@ impl Default for ModelSettings {
             profiles: default_profiles(),
             usage_gate: String::new(),
             request_url: String::new(),
+            max_output_tokens: None,
+            context_window: None,
         }
     }
 }
@@ -252,6 +306,12 @@ impl ModelStore {
                     }
                     let mut ids = std::collections::BTreeSet::new();
                     for profile in &saved.profiles {
+                        validate_limits(
+                            profile
+                                .max_output_tokens
+                                .unwrap_or_else(|| default_output_tokens(&profile.provider)),
+                            profile.context_window,
+                        )?;
                         let endpoint = validate_protocol_settings(
                             &profile.provider,
                             &profile.protocol,
@@ -272,6 +332,8 @@ impl ModelStore {
                         saved.model.clear();
                         saved.provider = "custom".into();
                         saved.protocol = protocol_name();
+                        saved.max_output_tokens = None;
+                        saved.context_window = None;
                     } else {
                         let profile = saved
                             .profiles
@@ -283,6 +345,8 @@ impl ModelStore {
                         saved.base_url = profile.base_url.clone();
                         saved.model = profile.model.clone();
                         saved.configured = profile.configured;
+                        saved.max_output_tokens = profile.max_output_tokens;
+                        saved.context_window = profile.context_window;
                         // External usage remains blocked independently of any saved verification flag.
                         saved.verified =
                             profile.verified && !usage_blocked(&saved.provider, &profile.base_url);
@@ -309,7 +373,59 @@ impl ModelStore {
     pub fn settings(&self) -> ModelSettings {
         let mut settings = self.settings.clone();
         settings.request_url = request_url(&settings.protocol, &settings.base_url);
+        settings.max_output_tokens = Some(
+            settings
+                .max_output_tokens
+                .unwrap_or_else(|| default_output_tokens(&settings.provider)),
+        );
         settings
+    }
+    /// Local non-secret preference only: no credential access or model request.
+    pub fn set_limits(
+        &mut self,
+        max_output_tokens: u32,
+        context_window: Option<u32>,
+    ) -> Result<ModelSettings> {
+        if !self.settings.configured {
+            return Err(CoreError::new(
+                "NOT_CONFIGURED",
+                "请先保存供应商连接，再设置输出上限。",
+            ));
+        }
+        validate_limits(max_output_tokens, context_window)?;
+        let mut next = self.settings();
+        let profile = next
+            .profiles
+            .iter_mut()
+            .find(|p| p.profile == next.active_profile)
+            .ok_or_else(|| invalid("模型通道配置无效。"))?;
+        profile.max_output_tokens = Some(max_output_tokens);
+        profile.context_window = context_window;
+        next.max_output_tokens = Some(max_output_tokens);
+        next.context_window = context_window;
+        self.persist(&next)?;
+        self.settings = next;
+        Ok(self.settings())
+    }
+    // Limits may be reused only for the same endpoint/protocol/provider binding.
+    fn limits_for_binding(
+        &self,
+        profile: &str,
+        provider: &str,
+        protocol: &str,
+        endpoint: &str,
+    ) -> (Option<u32>, Option<u32>) {
+        self.settings
+            .profiles
+            .iter()
+            .find(|p| {
+                p.profile == profile
+                    && p.provider == provider
+                    && p.protocol == protocol
+                    && p.base_url == endpoint
+            })
+            .map(|p| (p.max_output_tokens, p.context_window))
+            .unwrap_or((None, None))
     }
     /// A local model-name change never reads or writes credentials or calls a server.
     pub fn set_model(&mut self, model: &str) -> Result<ModelSettings> {
@@ -423,6 +539,10 @@ impl ModelStore {
         } else {
             String::new()
         };
+        let (max_output_tokens, context_window) =
+            self.limits_for_binding(&profile, provider, protocol, &endpoint);
+        next.max_output_tokens = max_output_tokens;
+        next.context_window = context_window;
         let item = ModelProfileSettings {
             profile: profile.clone(),
             provider: provider.into(),
@@ -431,6 +551,8 @@ impl ModelStore {
             base_url: endpoint,
             model: model.into(),
             verified: next.verified,
+            max_output_tokens,
+            context_window,
         };
         if let Some(saved) = next.profiles.iter_mut().find(|p| p.profile == profile) {
             *saved = item;
@@ -552,7 +674,12 @@ impl ModelCredentials {
         self.settings.model = model.into();
         Ok(())
     }
-    fn new(settings: ModelSettings, api_key: String) -> Result<Self> {
+    fn new(mut settings: ModelSettings, api_key: String) -> Result<Self> {
+        let max_output = settings
+            .max_output_tokens
+            .unwrap_or_else(|| default_output_tokens(&settings.provider));
+        validate_limits(max_output, settings.context_window)?;
+        settings.max_output_tokens = Some(max_output);
         validate_protocol_settings(
             &settings.provider,
             &settings.protocol,
@@ -1313,13 +1440,14 @@ fn sidecar_error(code: &str) -> CoreError {
             "INVALID_MODEL_SETTINGS",
             "请检查所选 API 协议、地址和模型。",
         ),
+        "INVALID_MODEL_LIMITS" => ("INVALID_MODEL_LIMITS", "输出或上下文 token 上限无效，请在供应商设置中检查。"),
         "MODEL_HTTP" => (
             "MODEL_HTTP",
             "模型服务拒绝请求，请检查所选区域、密钥和模型权限。",
         ),
         "MODEL_ENDPOINT_PAGE" => ("MODEL_ENDPOINT_PAGE", "服务地址返回了网页，未得到模型 API 响应。请核对基础地址是否需要 /v1，并查看已保存的最终请求 URL；应用未自动改地址。"),
         "MODEL_FORMAT" => ("MODEL_FORMAT", "服务返回的格式不符合所选流式协议，请核对协议和最终请求 URL；未把它当作完整答案。"),
-        "MODEL_LENGTH" => ("MODEL_LENGTH", "模型因输出 token 上限而结束，正文可能不完整；可用正文已保留，未当作完整答案。"),
+        "MODEL_LENGTH" => ("MODEL_LENGTH", "模型因输出 token 上限而结束（思考也可能占用此预算）；可用正文已保留。可在供应商设置调整输出上限，不会自动重试。"),
         "MODEL_INCOMPLETE" => ("MODEL_INCOMPLETE", "模型流在有效结束标记前结束；可用正文已保留，未当作完整答案。"),
         "MODEL_THINKING_ONLY" => ("MODEL_THINKING_ONLY", "模型仅返回思考内容，没有最终正文；思考内容未当作学习答案。"),
         "MODEL_EMPTY" => ("MODEL_EMPTY", "模型声明结束，但没有返回有效正文。"),
@@ -1690,6 +1818,8 @@ mod tests {
                 assert_eq!(payload["thinking"]["type"], "enabled");
             }
             assert!(payload.get("tools").is_none());
+            assert_eq!(payload["max_tokens"], 6_144);
+            assert!(payload.get("max_completion_tokens").is_none());
             let body = format!(
                 "data: {}\n\n{}",
                 json!({"id":"fixture","choices":[{"index":0,"delta":{"content":"Pi fixture 文本"},"finish_reason":null}]}),
@@ -1703,6 +1833,8 @@ mod tests {
             socket.write_all(response.as_bytes()).unwrap();
         });
         let mut selected = settings(&format!("http://{address}/v1"));
+        selected.max_output_tokens = Some(6_144);
+        selected.context_window = None;
         if custom {
             selected.provider = "custom".into();
             selected.model = "user-selected/model-2026".into();
@@ -2199,6 +2331,8 @@ mod policy_feedback_tests {
             base_url: settings.base_url.clone(),
             model: settings.model.clone(),
             verified: false,
+            max_output_tokens: None,
+            context_window: None,
         });
         store.persist(&settings).unwrap();
         let reopened = ModelStore::new(dir.path()).unwrap().settings();
@@ -2369,6 +2503,8 @@ mod configuration_response_tests {
             base_url: settings.base_url.clone(),
             model: settings.model.clone(),
             verified: true,
+            max_output_tokens: None,
+            context_window: None,
         });
         store.persist(&settings).unwrap();
         store.settings = settings.clone();
@@ -2414,3 +2550,209 @@ mod configuration_response_tests {
 #[cfg(test)]
 #[path = "model_time_tests.rs"]
 mod time_intent_tests;
+
+#[cfg(test)]
+mod model_limit_tests {
+    use super::*;
+    fn configured(dir: &Path) -> ModelStore {
+        let mut store = ModelStore::new(dir).unwrap();
+        let mut settings = ModelSettings {
+            configured: true,
+            provider: "custom".into(),
+            protocol: PROTOCOL.into(),
+            base_url: "https://example.invalid/v1".into(),
+            model: "fixture-model".into(),
+            verified: true,
+            active_profile: "custom".into(),
+            ..ModelSettings::default()
+        };
+        settings.profiles.push(ModelProfileSettings {
+            profile: "custom".into(),
+            provider: settings.provider.clone(),
+            protocol: settings.protocol.clone(),
+            configured: true,
+            base_url: settings.base_url.clone(),
+            model: settings.model.clone(),
+            verified: true,
+            max_output_tokens: None,
+            context_window: None,
+        });
+        store.persist(&settings).unwrap();
+        store.settings = settings;
+        store
+    }
+    #[test]
+    fn legacy_limits_are_effective_defaults_and_context_capacity_stays_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = configured(dir.path());
+        let mut value = serde_json::to_value(&store.settings).unwrap();
+        value.as_object_mut().unwrap().remove("maxOutputTokens");
+        value.as_object_mut().unwrap().remove("contextWindow");
+        for profile in value["profiles"].as_array_mut().unwrap() {
+            profile.as_object_mut().unwrap().remove("maxOutputTokens");
+            profile.as_object_mut().unwrap().remove("contextWindow");
+        }
+        crate::app::atomic_json(&store.config_path, &value).unwrap();
+        let reopened = ModelStore::new(dir.path()).unwrap();
+        assert_eq!(reopened.settings().max_output_tokens, Some(4096));
+        assert_eq!(reopened.settings().context_window, None);
+        let glm = ModelCredentials::new(
+            ModelSettings {
+                provider: "glm-pi".into(),
+                base_url: "http://127.0.0.1:1/v1".into(),
+                model: MODEL_ID.into(),
+                ..ModelSettings::default()
+            },
+            "fixture-key".into(),
+        )
+        .unwrap();
+        assert_eq!(glm.settings.max_output_tokens, Some(32768));
+        assert_eq!(glm.settings.context_window, None);
+    }
+    #[test]
+    fn limits_save_without_credentials_preserves_binding_and_verification_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = configured(dir.path());
+        let before = store.settings();
+        let saved = store.set_limits(8192, Some(32768)).unwrap();
+        assert_eq!(saved.max_output_tokens, Some(8192));
+        assert_eq!(saved.context_window, Some(32768));
+        assert_eq!(
+            (
+                saved.provider,
+                saved.protocol,
+                saved.base_url,
+                saved.model,
+                saved.verified
+            ),
+            (
+                before.provider,
+                before.protocol,
+                before.base_url,
+                before.model,
+                before.verified
+            )
+        );
+        let reopened = ModelStore::new(dir.path()).unwrap().settings();
+        assert_eq!(reopened.max_output_tokens, Some(8192));
+        assert_eq!(reopened.context_window, Some(32768));
+        assert!(!std::fs::read_to_string(&store.config_path)
+            .unwrap()
+            .contains("apiKey"));
+        assert_eq!(store.set_limits(8192, None).unwrap().context_window, None);
+    }
+    #[test]
+    fn invalid_limits_do_not_modify_disk_or_memory_and_unconfigured_never_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = configured(dir.path());
+        let disk = std::fs::read(&store.config_path).unwrap();
+        let memory = serde_json::to_value(store.settings()).unwrap();
+        for (max, context) in [
+            (0, None),
+            (131073, None),
+            (1, Some(1023)),
+            (1, Some(2000001)),
+            (8192, Some(9215)),
+        ] {
+            assert_eq!(
+                store.set_limits(max, context).unwrap_err().code,
+                "INVALID_MODEL_LIMITS"
+            );
+            assert_eq!(std::fs::read(&store.config_path).unwrap(), disk);
+            assert_eq!(serde_json::to_value(store.settings()).unwrap(), memory);
+        }
+        for max in [
+            json!(-1),
+            json!(1.5),
+            json!("8192"),
+            json!(null),
+            json!(4294967296u64),
+        ] {
+            assert_eq!(
+                parse_limits(&max, None).unwrap_err().code,
+                "INVALID_MODEL_LIMITS"
+            );
+        }
+        for context in [json!(-1), json!(3.5), json!("unknown")] {
+            assert_eq!(
+                parse_limits(&json!(1), Some(&context)).unwrap_err().code,
+                "INVALID_MODEL_LIMITS"
+            );
+        }
+        assert_eq!(
+            parse_limits(&json!(1), Some(&Value::Null)).unwrap(),
+            (1, None)
+        );
+        assert!(validate_limits(131072, Some(132096)).is_ok());
+        let other = tempfile::tempdir().unwrap();
+        let mut blank = ModelStore::new(other.path()).unwrap();
+        assert_eq!(
+            blank.set_limits(8192, None).unwrap_err().code,
+            "NOT_CONFIGURED"
+        );
+        assert!(!blank.config_path.exists());
+    }
+    #[test]
+    fn limits_follow_saved_binding_and_model_change_keeps_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = configured(dir.path());
+        store.set_limits(8192, Some(32768)).unwrap();
+        let selected = store.set_model("another-fixture-model").unwrap();
+        assert_eq!(selected.max_output_tokens, Some(8192));
+        let same = store
+            .configure_protocol(
+                "custom",
+                PROTOCOL,
+                "https://example.invalid/v1",
+                "third-model",
+                "",
+            )
+            .unwrap();
+        assert_eq!(same.max_output_tokens, Some(8192));
+        assert_eq!(same.context_window, Some(32768));
+        assert_eq!(
+            store.limits_for_binding("custom", "custom", PROTOCOL, "https://else.invalid/v1"),
+            (None, None)
+        );
+        assert_eq!(
+            store.limits_for_binding("custom", "custom", ANTHROPIC, "https://example.invalid/v1"),
+            (None, None)
+        );
+        assert_eq!(
+            store.limits_for_binding("custom", "glm-pi", PROTOCOL, "https://example.invalid/v1"),
+            (None, None)
+        );
+        let mut credentials =
+            ModelCredentials::new(store.settings(), "fixture-only".into()).unwrap();
+        store.set_limits(16384, None).unwrap();
+        credentials.override_model("grading-fixture-model").unwrap();
+        assert_eq!(credentials.settings.max_output_tokens, Some(8192));
+        assert_eq!(credentials.settings.context_window, Some(32768));
+    }
+    #[tokio::test]
+    async fn grading_queued_and_running_block_limit_changes_before_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let e =
+            crate::app::Engine::new(dir.path().join("library"), dir.path().join("state")).unwrap();
+        for status in ["queued", "running"] {
+            let run = serde_json::from_value(json!({"id":"grade_fixture","sessionId":"session_fixture","attemptId":"attempt_fixture", "status":status,"result":null,"error":null,"model":"fixture","updatedAt":"fixture","digest":"fixture"})).unwrap();
+            e.grades.lock().unwrap().insert(
+                "grade_fixture".into(),
+                crate::grading::ManagedGrade {
+                    run,
+                    cancel: Arc::new(AtomicBool::new(false)),
+                },
+            );
+            assert_eq!(
+                e.set_model_limits(8192, None).await.unwrap_err().code,
+                "BUSY"
+            );
+        }
+        e.grades.lock().unwrap().clear();
+        assert_eq!(
+            e.set_model_limits(8192, None).await.unwrap_err().code,
+            "NOT_CONFIGURED"
+        );
+        assert!(!dir.path().join("state/model-settings.json").exists());
+    }
+}

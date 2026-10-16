@@ -612,6 +612,18 @@ async fn set_model(state: State<'_, Arc<Engine>>, model: String) -> Result<Model
     state.set_model(&model).await
 }
 #[tauri::command]
+async fn set_model_limits(
+    state: State<'_, Arc<Engine>>,
+    max_output_tokens: Value,
+    context_window: Option<Value>,
+) -> Result<ModelSettings> {
+    let (max_output_tokens, context_window) =
+        crate::model::parse_limits(&max_output_tokens, context_window.as_ref())?;
+    state
+        .set_model_limits(max_output_tokens, context_window)
+        .await
+}
+#[tauri::command]
 async fn test_model(state: State<'_, Arc<Engine>>) -> Result<ModelTest> {
     let mut store = state.model.lock().await;
     let result = store.test().await;
@@ -1003,6 +1015,7 @@ pub fn run() {
             check_feishu_status,
             test_feishu_notification,
             set_model,
+            set_model_limits,
             create_todo,
             list_todos,
             set_todo_done,

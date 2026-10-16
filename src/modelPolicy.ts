@@ -34,7 +34,7 @@ export function modelFailureMessage(error: unknown, operation: 'test' | 'generat
   if (value?.code === 'PLAN_USAGE_UNCONFIRMED') return `本地用途限制：${planUsageExplanation}`;
   const message = typeof value?.message === 'string' ? value.message : typeof error === 'string' ? error : '本机服务暂时没有响应，请重试。';
   const code = typeof value?.code === 'string' ? value.code : '';
-  const category = ({ NETWORK: '网络请求未完成', TIMEOUT: '请求超时', AUTH: '服务认证未通过', RATE_LIMIT: '服务额度或频率受限', MODEL_HTTP: '服务返回错误', MODEL_RESPONSE: '响应解析未完成', INVALID_URL: '服务地址需要调整', INVALID_MODEL_SETTINGS: '本机配置需要调整' } as Record<string, string>)[code] || (operation === 'test' ? '测试未完成' : operation === 'settings' ? '设置未完成' : '生成未完成');
+  const category = ({ NETWORK: '网络请求未完成', TIMEOUT: '请求超时', AUTH: '服务认证未通过', RATE_LIMIT: '服务额度或频率受限', MODEL_HTTP: '服务返回错误', MODEL_RESPONSE: '响应解析未完成', MODEL_LENGTH: '模型达到输出上限', MODEL_INCOMPLETE: '模型响应未完整结束', INVALID_URL: '服务地址需要调整', INVALID_MODEL_SETTINGS: '本机配置需要调整' } as Record<string, string>)[code] || (operation === 'test' ? '测试未完成' : operation === 'settings' ? '设置未完成' : '生成未完成');
   return `${category}（学习站诊断${code ? ` · ${code}` : ''}）：${message}`;
 }
 export function modelBindingChanged(model: ModelSettings, input: { provider: string; protocol: string; baseUrl: string }) {

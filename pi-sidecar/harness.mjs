@@ -23,13 +23,14 @@ export const SAFE_MESSAGES = Object.freeze({
   CANCELLED: '生成已停止，已收到的内容已保留。',
   NETWORK: '模型连接失败或中断；已收到的内容已保留。',
   INVALID_MODEL_SETTINGS: '请检查所选 API 协议、地址和模型。',
+  INVALID_MODEL_LIMITS: '输出或上下文 token 上限无效，请在供应商设置中检查。',
   INVALID_URL: 'API 地址无效或返回重定向，请检查所填地址。',
   INVALID_INPUT: '模型输入无效或过大，请缩小所选材料后重试。',
   MODEL_HTTP: '模型服务拒绝请求，请检查所选区域、密钥和模型权限。',
   MODEL_RESPONSE: '模型响应未通过完整性校验；可用正文已保留，未当作完整答案。',
   MODEL_ENDPOINT_PAGE: '服务地址返回了网页，未得到模型 API 响应。请核对基础地址是否需要 /v1，并查看已保存的最终请求 URL；应用未自动改地址。',
   MODEL_FORMAT: '服务返回的格式不符合所选流式协议，请核对协议和最终请求 URL；未把它当作完整答案。',
-  MODEL_LENGTH: '模型因输出 token 上限而结束，正文可能不完整；可用正文已保留，未当作完整答案。',
+  MODEL_LENGTH: '模型因输出 token 上限而结束（思考也可能占用此预算）；可用正文已保留。可在供应商设置调整输出上限，不会自动重试。',
   MODEL_INCOMPLETE: '模型流在有效结束标记前结束；可用正文已保留，未当作完整答案。',
   MODEL_THINKING_ONLY: '模型仅返回思考内容，没有最终正文；思考内容未当作学习答案。',
   MODEL_EMPTY: '模型声明结束，但没有返回有效正文。',
@@ -68,12 +69,20 @@ export function normalizeEndpoint(value, provider = 'glm-pi') {
   if (provider !== 'custom' && !OFFICIAL_ENDPOINTS.has(normalized) && !(local && url.protocol === 'http:')) throw new SafeError('INVALID_URL');
   return normalized;
 }
+export function resolveModelLimits(settings, operation = 'generate') {
+  const max = settings.maxOutputTokens ?? (settings.provider === 'custom' ? 4096 : 32768);
+  const context = settings.contextWindow ?? null;
+  if (!Number.isInteger(max) || max < 1 || max > 131072 || (context !== null &&
+      (!Number.isInteger(context) || context < 1024 || context > 2000000 || max > context - 1024))) throw new SafeError('INVALID_MODEL_LIMITS');
+  return { contextWindow: context ?? 0, maxTokens: operation === 'test' ? Math.min(max, settings.provider === 'custom' ? 256 : 2048) : max };
+}
 export function createModel(settings, operation = 'generate') {
   if (!['custom', 'glm-pi', 'openai-compatible'].includes(settings?.provider) || !['openai-completions', ...(settings.provider === 'custom' ? ['anthropic-messages'] : [])].includes(settings.protocol ?? (settings.provider === 'custom' ? '' : 'openai-completions')) || typeof settings.model !== 'string' || !settings.model.trim() || Buffer.byteLength(settings.model) > 256 || /[\u0000-\u001f\u007f]/u.test(settings.model)) throw new SafeError('INVALID_MODEL_SETTINGS');
+  const limits = resolveModelLimits(settings, operation);
   if (settings.provider === 'custom') return {
     id: settings.model, name: settings.model, provider: 'learning-custom', api: settings.protocol,
     baseUrl: normalizeEndpoint(settings.baseUrl, 'custom'), reasoning: false, input: ['text'],
-    contextWindow: 32768, maxTokens: operation === 'test' ? 256 : 4096,
+    ...limits,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     compat: settings.protocol === 'anthropic-messages' ? { supportsStrictTools: false, supportsEagerToolInputStreaming: false, supportsLongCacheRetention: false, supportsCacheControlOnTools: false, sendSessionAffinityHeaders: false } : { supportsReasoningEffort: false, maxTokensField: 'max_tokens', supportsDeveloperRole: false, supportsStore: false, supportsUsageInStreaming: false, zaiToolStream: false },
   };
@@ -81,7 +90,7 @@ export function createModel(settings, operation = 'generate') {
   return {
     id: MODEL_ID, name: 'GLM-5.3-flash', provider: 'zai', api: 'openai-completions',
     baseUrl: normalizeEndpoint(settings.baseUrl), reasoning: true, input: ['text'],
-    contextWindow: 1_000_000, maxTokens: operation === 'test' ? 2048 : 32768,
+    ...limits,
     // GLM-5.3-flash does not support disabled thinking. No fallback to an off level.
     thinkingLevelMap: { off: null, minimal: 'max', low: 'max', medium: 'max', high: 'max', xhigh: 'max', max: 'max' },
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -260,13 +269,14 @@ export async function runLearningAgent(request, emit, { signal, streamFn: fixtur
   };
   const controlledFetch = createControlledFetch({ endpoint: model.baseUrl, apiKey: request.apiKey, fail, protocol: model.api, diagnostic });
   const productionStream = (selectedModel, context, options) => (model.api === 'anthropic-messages' ? streamAnthropic : streamSimple)(selectedModel, context, {
-    ...options, apiKey: request.apiKey, fetch: controlledFetch, ...(glm ? { reasoning: 'max' } : {}),
+    ...options, maxTokens: model.maxTokens, apiKey: request.apiKey, fetch: controlledFetch, ...(glm ? { reasoning: 'max' } : {}),
     timeoutMs: request.operation === 'test' ? 30_000 : 120_000, maxRetries: 0, maxRetryDelayMs: 1,
     cacheRetention: 'none', env: {}, toolChoice: toolsEnabled ? 'auto' : 'none', temperature: 1,
     ...(glm ? { samplingParams: { top_p: 0.95, thinking: { type: 'enabled', clear_thinking: false }, reasoning_effort: 'max' } } : {}),
     onPayload: (payload) => {
       // Pin invariants after the provider's compat mapping, before any request is sent.
       payload.model = model.id; payload.stream = true;
+      payload.max_tokens = model.maxTokens; delete payload.max_completion_tokens;
       diagnostic.begin(model.baseUrl, payload.max_tokens ?? payload.max_completion_tokens ?? model.maxTokens);
       if (glm) { payload.thinking = { type: 'enabled', clear_thinking: false }; payload.reasoning_effort = 'max'; }
       else { delete payload.thinking; delete payload.reasoning_effort; delete payload.tool_stream; }

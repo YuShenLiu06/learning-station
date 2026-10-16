@@ -27,7 +27,7 @@ export type Notice = { id: string; title: string; body?: string; read: boolean }
 export type UiPreferences = { fontSize: number; assistantWidth?: number; sidebarWidth?: number; sidebarCollapsed?: boolean; expandedNodeIds?: string[] };
 export type ContextManifestItem = { id: string; path: string; version: string; includedChars: number };
 export type RequestContext = { text: string; manifest: ContextManifestItem[]; historyManifest?: ContextManifestItem[]; assistantReferenceManifest?: ContextManifestItem[]; exerciseReferenceManifest?: ContextManifestItem[]; warnings: string[]; truncated: boolean };
-export type ModelSettings = { protocol?: string; requestUrl?: string; usageGate?: string; configured: boolean; provider: string; baseUrl: string; model: string; credentialStored: boolean; harness?: string; connected?: boolean };
+export type ModelSettings = { maxOutputTokens?: number; contextWindow?: number | null; protocol?: string; requestUrl?: string; usageGate?: string; configured: boolean; provider: string; baseUrl: string; model: string; credentialStored: boolean; harness?: string; connected?: boolean };
 export type Bootstrap = { courses: Course[]; lastSectionId?: string; model: ModelSettings; tasks: Task[]; notices: Notice[]; dataPath?: string; nodes?: LibraryNode[]; treeWarnings?: string[]; recovery?: { status: string; content: string; message?: string } };
 export class StationError extends Error {
   code: string;

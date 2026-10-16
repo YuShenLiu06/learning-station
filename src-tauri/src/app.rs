@@ -131,6 +131,37 @@ impl Engine {
             .map_err(|_| CoreError::new("BUSY", "模型配置暂不可用。"))? = settings.clone();
         Ok(settings)
     }
+    pub async fn set_model_limits(
+        &self,
+        max_output_tokens: u32,
+        context_window: Option<u32>,
+    ) -> Result<ModelSettings> {
+        let mut store = self.model.lock().await;
+        let generation_active = self
+            .runs
+            .lock()
+            .map_err(|_| CoreError::new("BUSY", "生成状态暂不可用。"))?
+            .values()
+            .any(|run| ["queued", "running"].contains(&run.run.status.as_str()));
+        let grading_active = self
+            .grades
+            .lock()
+            .map_err(|_| CoreError::new("BUSY", "批改状态暂不可用。"))?
+            .values()
+            .any(|grade| ["queued", "running"].contains(&grade.run.status.as_str()));
+        if generation_active || grading_active {
+            return Err(CoreError::new(
+                "BUSY",
+                "生成或批改中不能修改输出上限，请先停止并等待结束。",
+            ));
+        }
+        let settings = store.set_limits(max_output_tokens, context_window)?;
+        *self
+            .model_summary
+            .write()
+            .map_err(|_| CoreError::new("BUSY", "模型配置暂不可用。"))? = settings.clone();
+        Ok(settings)
+    }
     pub fn new(library_root: PathBuf, state_dir: PathBuf) -> Result<Arc<Self>> {
         fs::create_dir_all(&state_dir)?;
         #[cfg(unix)]

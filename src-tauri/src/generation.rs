@@ -1472,6 +1472,10 @@ mod lifecycle_tests {
             engine.set_model("new-model").await.unwrap_err().code,
             "BUSY"
         );
+        assert_eq!(
+            engine.set_model_limits(8_192, None).await.unwrap_err().code,
+            "BUSY"
+        );
         engine
             .runs
             .lock()
