@@ -40,10 +40,17 @@ pub fn create(
     manifest: &[ManifestItem],
 ) -> Result<Session> {
     let section = store.read(section_id)?;
-    if section.metadata.kind != "section" && section.metadata.kind != "knowledge" {
+    if section.metadata.kind == "exercise" {
+        // Exercise views always resume their source session; never create an unrelated attempt ledger.
+        return Ok(crate::exercises::get(store, section_id)?.session);
+    }
+    if !matches!(
+        section.metadata.kind.as_str(),
+        "section" | "knowledge" | "exploration"
+    ) {
         return Err(CoreError::new(
             "INVALID_INPUT",
-            "请选择课程小节或知识点开始学习。",
+            "请选择课程小节、知识点或探索文档开始学习。",
         ));
     }
     let id = uuid::Uuid::new_v4().simple().to_string();
@@ -221,6 +228,27 @@ pub fn get(store: &mut ContentStore, id: &str) -> Result<Session> {
         created_at: created,
         updated_at: updated,
         entries,
+        context_history_manifest: serde_json::from_value(
+            doc.metadata
+                .extra
+                .get("contextHistoryManifest")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        )?,
+        context_warnings: serde_json::from_value(
+            doc.metadata
+                .extra
+                .get("contextWarnings")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        )?,
+        context_truncated: serde_json::from_value(
+            doc.metadata
+                .extra
+                .get("contextTruncated")
+                .cloned()
+                .unwrap_or_else(|| json!(false)),
+        )?,
         context_manifest: serde_json::from_value(
             doc.metadata
                 .extra
@@ -237,17 +265,55 @@ pub fn set_context_manifest(
     session_id: &str,
     manifest: &[ManifestItem],
 ) -> Result<Session> {
+    set_context_snapshot(
+        store,
+        session_id,
+        &Context {
+            text: String::new(),
+            manifest: manifest.to_vec(),
+            history_manifest: vec![],
+            warnings: vec![],
+            truncated: false,
+        },
+    )
+}
+pub fn set_context_snapshot(
+    store: &mut ContentStore,
+    session_id: &str,
+    context: &Context,
+) -> Result<Session> {
     let session = get(store, session_id)?;
-    if session.section_id.is_empty() && !manifest.is_empty() {
+    if session.section_id.is_empty() && !context.manifest.is_empty() {
         return Err(CoreError::new(
             "INVALID_INPUT",
             "独立探索不能写入课程来源。",
         ));
     }
+    if context.history_manifest.iter().any(|item| {
+        !item
+            .path
+            .starts_with(&format!("learning-history/{session_id}/"))
+            || !session.entries.iter().any(|entry| entry.id == item.id)
+    }) {
+        return Err(CoreError::new(
+            "OUT_OF_SCOPE",
+            "历史上下文不属于本次会话，未写入来源。",
+        ));
+    }
     let mut doc = store.read(session_id)?;
     doc.metadata
         .extra
-        .insert("contextManifest".into(), json!(manifest));
+        .insert("contextManifest".into(), json!(context.manifest));
+    doc.metadata.extra.insert(
+        "contextHistoryManifest".into(),
+        json!(context.history_manifest),
+    );
+    doc.metadata
+        .extra
+        .insert("contextWarnings".into(), json!(context.warnings));
+    doc.metadata
+        .extra
+        .insert("contextTruncated".into(), json!(context.truncated));
     let content = crate::content::serialize(&doc.metadata, &doc.body)?;
     store.save(session_id, &content, &doc.version)?;
     get(store, session_id)
@@ -275,6 +341,11 @@ fn validate_entry(entry: &Entry) -> Result<()> {
             "INVALID_INPUT",
             "请输入内容，单条记录最多1MB，选段最多3万字节。",
         ));
+    }
+    if entry.data.as_ref().is_some_and(|data| {
+        !data.is_object() || serde_json::to_vec(data).map_or(true, |bytes| bytes.len() > 512 * 1024)
+    }) {
+        return Err(CoreError::new("INVALID_INPUT", "学习记录结构无效或过大。"));
     }
     if entry.related_ids.len() > 64 || entry.related_ids.iter().any(|s| !valid_id(s)) {
         return Err(CoreError::new(
@@ -323,6 +394,29 @@ pub fn append(
         }
         return Ok(old);
     }
+    if entry.kind == "exercise" {
+        let questions = entry
+            .data
+            .as_ref()
+            .and_then(|data| data.get("exercises"))
+            .and_then(Value::as_array)
+            .filter(|items| !items.is_empty() && items.len() <= 5)
+            .ok_or_else(|| CoreError::new("INVALID_INPUT", "练习需要有效题目列表。"))?;
+        let mut ids = std::collections::BTreeSet::new();
+        for question in questions {
+            let id = question
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| valid_id(id))
+                .ok_or_else(|| CoreError::new("INVALID_INPUT", "练习缺少稳定题目编号。"))?;
+            if !ids.insert(id) || question_exists(&old, id) {
+                return Err(CoreError::new(
+                    "CONFLICT",
+                    "题目编号已存在，未覆盖原题和作答。",
+                ));
+            }
+        }
+    }
     if entry.kind == "attempt" {
         let exercise_id = entry
             .data
@@ -330,19 +424,73 @@ pub fn append(
             .and_then(|d| d.get("exerciseId"))
             .and_then(Value::as_str)
             .ok_or_else(|| CoreError::new("INVALID_INPUT", "请先选择对应练习再提交作答。"))?;
-        if !old
-            .entries
-            .iter()
-            .filter_map(|e| e.data.as_ref())
-            .filter_map(|d| d.get("exercises"))
-            .filter_map(Value::as_array)
-            .flatten()
-            .any(|q| q.get("id").and_then(Value::as_str) == Some(exercise_id))
+        if !valid_id(exercise_id)
+            || !old
+                .entries
+                .iter()
+                .filter(|entry| entry.kind == "exercise")
+                .filter_map(|e| e.data.as_ref())
+                .filter_map(|d| d.get("exercises"))
+                .filter_map(Value::as_array)
+                .flatten()
+                .any(|q| q.get("id").and_then(Value::as_str) == Some(exercise_id))
         {
             return Err(CoreError::new(
                 "NOT_FOUND",
                 "找不到对应题目，作答输入仍保留，请重新选择。",
             ));
+        }
+    }
+    if entry.kind == "attempt" {
+        let data = entry.data.as_ref().unwrap();
+        let exercise_id = data["exerciseId"].as_str().unwrap();
+        if let Some(entry_id) = data.get("exerciseEntryId") {
+            if !entry_id.as_str().is_some_and(|id| {
+                old.entries.iter().any(|entry| {
+                    entry.id == id
+                        && entry.kind == "exercise"
+                        && entry
+                            .data
+                            .as_ref()
+                            .and_then(|data| data.get("exercises"))
+                            .and_then(Value::as_array)
+                            .is_some_and(|questions| {
+                                questions.iter().any(|question| {
+                                    question.get("id").and_then(Value::as_str) == Some(exercise_id)
+                                })
+                            })
+                })
+            }) {
+                return Err(CoreError::new(
+                    "CONFLICT",
+                    "题目与练习记录不匹配，未保存作答。",
+                ));
+            }
+        }
+        if data.get("answer").is_some_and(|answer| {
+            answer
+                .as_str()
+                .is_none_or(|text| text.trim().is_empty() || text.len() > 30000)
+        }) {
+            return Err(CoreError::new("INVALID_INPUT", "作答内容无效或过长。"));
+        }
+    }
+    if entry.kind == "feedback" {
+        validate_feedback(&old, &entry)?;
+    }
+    if entry.kind == "error" {
+        if let Some(exercise_id) = entry
+            .data
+            .as_ref()
+            .and_then(|data| data.get("exerciseId"))
+            .and_then(Value::as_str)
+        {
+            if !valid_id(exercise_id) || !question_exists(&old, exercise_id) {
+                return Err(CoreError::new(
+                    "NOT_FOUND",
+                    "错题引用的题目不属于此会话，未保存。",
+                ));
+            }
         }
     }
     if expected.is_some_and(|v| v != old.version) {
@@ -351,18 +499,55 @@ pub fn append(
             "学习记录已在另一处更新。输入仍保留，请重新载入后再保存。",
         ));
     }
+    if entry.kind == "error"
+        && entry.data.as_ref().is_some_and(|data| {
+            data.get("origin").and_then(Value::as_str) == Some("pi-tool")
+                || data.get("needsConfirmation").and_then(Value::as_bool) == Some(true)
+        })
+    {
+        if let Some(data) = entry.data.as_mut() {
+            if let Some(cause) = data
+                .get("cause")
+                .and_then(Value::as_str)
+                .filter(|cause| !cause.is_empty())
+                .map(str::to_string)
+            {
+                data["suggestedCause"] = json!(cause);
+                data["cause"] = json!("");
+            }
+            data["causeConfirmed"] = json!(false);
+            let exercise_id = data.get("exerciseId").and_then(Value::as_str);
+            if let Some(previous) = old.entries.iter().rev().find(|previous| {
+                previous.kind == "error"
+                    && exercise_id.is_some()
+                    && previous
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("exerciseId"))
+                        .and_then(Value::as_str)
+                        == exercise_id
+            }) {
+                entry.kind = "note".into();
+                data["sourceErrorId"] = json!(previous.id);
+                data["errorSuggestion"] = json!(true);
+            }
+        }
+    }
     // A personal correction refines a historical error without discarding its reference answer.
     if entry.kind == "error" {
         if let Some(data) = entry.data.as_mut() {
+            let human_cause = data.get("origin").and_then(Value::as_str) != Some("pi-tool")
+                && data.get("needsConfirmation").and_then(Value::as_bool) != Some(true);
             if let (Some(exercise_id), Some(cause)) = (
                 data.get("exerciseId")
                     .and_then(Value::as_str)
                     .map(str::to_string),
                 data.get("cause")
                     .and_then(Value::as_str)
-                    .filter(|s| !s.trim().is_empty())
+                    .filter(|s| human_cause && !s.trim().is_empty())
                     .map(str::to_string),
             ) {
+                data["causeConfirmed"] = json!(true);
                 if let Some(previous) = old.entries.iter().rev().find(|e| {
                     e.kind == "error"
                         && e.data
@@ -391,13 +576,33 @@ pub fn append(
                             data["tags"] = prior.get("tags").cloned().unwrap_or_else(|| json!([]));
                         }
                         data["sourceErrorId"] = json!(previous.id);
+                        data["causeConfirmed"] = json!(true);
+                        if let Some(suggestion) = prior.get("suggestedCause") {
+                            data["suggestedCause"] = suggestion.clone();
+                        }
+                        if let Some(origin) = prior.get("origin") {
+                            data["sourceOrigin"] = origin.clone();
+                        }
                     }
                 }
             }
         }
     }
     entry.id = id;
-    entry.created_at = timestamp();
+    // Millisecond ties must not let a lexicographically larger old attempt become "latest".
+    let newest = old
+        .entries
+        .iter()
+        .filter_map(|entry| chrono::DateTime::parse_from_rfc3339(&entry.created_at).ok())
+        .map(|stamp| stamp.timestamp_millis())
+        .max()
+        .unwrap_or(i64::MIN);
+    let millis = chrono::Utc::now()
+        .timestamp_millis()
+        .max(newest.saturating_add(1));
+    entry.created_at = chrono::DateTime::from_timestamp_millis(millis)
+        .ok_or_else(|| CoreError::new("INVALID_STATE", "学习记录时间无效。"))?
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let mut meta = metadata(&entry.id, &entry.kind, "entry");
     meta.links = entry.related_ids.clone();
     meta.extra.insert("sessionId".into(), json!(session_id));
@@ -418,6 +623,53 @@ pub fn append(
         grade_exact(store, session_id, &entry, request_id)?;
     }
     get(store, session_id)
+}
+
+fn question_exists(session: &Session, exercise_id: &str) -> bool {
+    session
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == "exercise")
+        .filter_map(|entry| entry.data.as_ref())
+        .filter_map(|data| data.get("exercises"))
+        .filter_map(Value::as_array)
+        .flatten()
+        .any(|question| question.get("id").and_then(Value::as_str) == Some(exercise_id))
+}
+fn validate_feedback(session: &Session, entry: &Entry) -> Result<()> {
+    let data = entry
+        .data
+        .as_ref()
+        .ok_or_else(|| CoreError::new("INVALID_INPUT", "反馈必须关联题目和本次作答。"))?;
+    let exercise_id = data
+        .get("exerciseId")
+        .and_then(Value::as_str)
+        .filter(|id| valid_id(id))
+        .ok_or_else(|| CoreError::new("INVALID_INPUT", "反馈缺少有效题目编号。"))?;
+    let attempt_id = data
+        .get("attemptId")
+        .and_then(Value::as_str)
+        .filter(|id| valid_id(id))
+        .ok_or_else(|| CoreError::new("INVALID_INPUT", "反馈缺少有效作答编号。"))?;
+    if !question_exists(session, exercise_id) {
+        return Err(CoreError::new("NOT_FOUND", "反馈题目不属于当前会话。"));
+    }
+    let latest = session.entries.iter().rev().find(|candidate| {
+        candidate.kind == "attempt"
+            && candidate
+                .data
+                .as_ref()
+                .and_then(|data| data.get("exerciseId"))
+                .and_then(Value::as_str)
+                == Some(exercise_id)
+    });
+    if latest.is_none_or(|attempt| attempt.id != attempt_id) {
+        return Err(CoreError::new(
+            "CONFLICT",
+            "反馈不对应此题最新作答，未把历史反馈套用到新答案。",
+        ));
+    }
+    Ok(())
 }
 
 fn normalize(s: &str) -> String {
@@ -447,6 +699,7 @@ fn grade_exact(
     let exercise = session
         .entries
         .iter()
+        .filter(|entry| entry.kind == "exercise")
         .filter_map(|e| e.data.as_ref())
         .filter_map(|d| d.get("exercises"))
         .filter_map(Value::as_array)
@@ -479,7 +732,7 @@ fn grade_exact(
         .get("explanation")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let content = match correct { Some(true) => format!("答案正确。\n\n{explanation}"), Some(false) => format!("本次答案未匹配参考答案。\n\n参考：{}\n\n{explanation}\n\n错因待本人确认，可补充或修正。", reference.join(" / ")), None => format!("作答已保存，开放题尚未自动判分。\n\n参考：{}\n\n{explanation}\n\n可发起AI反馈或自行记录理解。", reference.join(" / ")) };
+    let content = match correct { Some(true) => format!("答案正确。\n\n{explanation}"), Some(false) => format!("本次答案未匹配参考答案。\n\n参考：{}\n\n{explanation}\n\n错因待本人确认，可补充或修正。", reference.join(" / ")), None => format!("作答已保存，开放题不自动判分。\n\n参考：{}\n\n{explanation}\n\n请对照参考答案与解析，自行记录理解和错因。", reference.join(" / ")) };
     let feedback = Entry {
         id: String::new(),
         kind: "feedback".into(),
@@ -499,7 +752,22 @@ fn grade_exact(
         &format!("feedback-{}", &hash(request_id)[..32]),
     )?;
     if correct == Some(false) {
-        let error = Entry {
+        let error_request = format!("error-{}", &hash(request_id)[..32]);
+        let error_id = format!("entry_{}", &hash(&error_request)[..32]);
+        if session.entries.iter().any(|entry| entry.id == error_id) {
+            return Ok(());
+        }
+        // A later wrong answer cannot displace an existing reference/confirmed cause in review or CSV.
+        let previous_error = session.entries.iter().rev().find(|entry| {
+            entry.kind == "error"
+                && entry
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("exerciseId"))
+                    .and_then(Value::as_str)
+                    == Some(exercise_id)
+        });
+        let mut error = Entry {
             id: String::new(),
             kind: "error".into(),
             content: format!(
@@ -517,13 +785,17 @@ fn grade_exact(
                 json!({"exerciseId":exercise_id,"attemptId":attempt.id,"cause":"","tags":exercise.get("tags").cloned().unwrap_or_else(||json!([])),"front":exercise.get("question"),"back":format!("{}\n{}",reference.join(" / "),explanation)}),
             ),
         };
-        append(
-            store,
-            session_id,
-            error,
-            None,
-            &format!("error-{}", &hash(request_id)[..32]),
-        )?;
+        if let Some(previous) = previous_error {
+            error.kind = "note".into();
+            error.related_ids.push(previous.id.clone());
+            if let Some(data) = error.data.as_mut() {
+                data["sourceErrorId"] = json!(previous.id);
+                data["errorSuggestion"] = json!(true);
+                data["origin"] = json!("exact-grader");
+                data["needsConfirmation"] = json!(true);
+            }
+        }
+        append(store, session_id, error, None, &error_request)?;
     }
     Ok(())
 }
@@ -534,7 +806,7 @@ pub fn export_csv(
     destination: &Path,
 ) -> Result<(String, usize)> {
     get(store, session_id)?;
-    let cards = review_items(store, "")?
+    let cards = review_items_all(store)?
         .into_iter()
         .filter(|v| v["sessionId"].as_str() == Some(session_id))
         .collect::<Vec<_>>();
@@ -647,8 +919,20 @@ pub fn review_items(store: &mut ContentStore, query: &str) -> Result<Vec<Value>>
     let tokens = query
         .to_lowercase()
         .split_whitespace()
-        .map(str::to_string)
+        .map(str::to_owned)
         .collect::<Vec<_>>();
+    let mut items = review_items_all(store)?
+        .into_iter()
+        .filter(|item| {
+            let search = item.to_string().to_lowercase();
+            tokens.iter().all(|token| search.contains(token))
+        })
+        .collect::<Vec<_>>();
+    items.truncate(200);
+    Ok(items)
+}
+/// Complete bounded-library candidates for exact-ID operations, independent from UI search limits.
+pub fn review_items_all(store: &mut ContentStore) -> Result<Vec<Value>> {
     let summaries = store.summaries();
     let mut grouped: BTreeMap<String, Value> = BTreeMap::new();
     for summary in summaries.into_iter().filter(|s| s.kind == "entry") {
@@ -726,15 +1010,8 @@ pub fn review_items(store: &mut ContentStore, query: &str) -> Result<Vec<Value>>
             grouped.insert(key, item);
         }
     }
-    let mut items = grouped
-        .into_values()
-        .filter(|item| {
-            let search = item.to_string().to_lowercase();
-            tokens.iter().all(|t| search.contains(t))
-        })
-        .collect::<Vec<_>>();
+    let mut items = grouped.into_values().collect::<Vec<_>>();
     items.sort_by(|a, b| b["createdAt"].as_str().cmp(&a["createdAt"].as_str()));
-    items.truncate(200);
     Ok(items)
 }
 
@@ -850,5 +1127,287 @@ mod loop_tests {
             export_csv(&mut reopened, &session.id, &temp.path().join("exports")).unwrap();
         assert_eq!(count, 1);
         assert!(fs::read_to_string(path).unwrap().contains("误当成起点"));
+    }
+}
+
+#[cfg(test)]
+mod integrity_tests {
+    use super::*;
+    fn entry(kind: &str, content: &str, data: Value) -> Entry {
+        Entry {
+            id: String::new(),
+            kind: kind.into(),
+            content: content.into(),
+            created_at: String::new(),
+            selection: None,
+            related_ids: vec![],
+            data: Some(data),
+        }
+    }
+    fn fixture() -> (tempfile::TempDir, ContentStore, Session) {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = ContentStore::new(
+            directory.path().join("library"),
+            directory.path().join("state"),
+        )
+        .unwrap();
+        store
+            .create(
+                metadata("section_integrity", "Time", "section"),
+                "For is a duration.",
+                "course/integrity.md",
+            )
+            .unwrap();
+        let session = create(&mut store, "section_integrity", &[]).unwrap();
+        let session = append(&mut store, &session.id, entry("exercise", "Fixture questions", json!({"exercises":[{"id":"q_integrity","question":"Three years?","format":"exact","answers":["for"],"explanation":"A duration.","tags":["time"]},{"id":"q_other","question":"Monday?","format":"self","answers":["since"],"explanation":"A time point.","tags":["time"]}]})), None, "integrity-questions").unwrap();
+        (directory, store, session)
+    }
+    #[test]
+    fn feedback_is_bound_to_latest_attempt_of_the_same_question_and_retries_preserve_history() {
+        let (_directory, mut store, session) = fixture();
+        let first = append(
+            &mut store,
+            &session.id,
+            entry(
+                "attempt",
+                "since",
+                json!({"exerciseId":"q_integrity","answer":"since"}),
+            ),
+            None,
+            "integrity-first-answer",
+        )
+        .unwrap();
+        let first_attempt = first
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "attempt")
+            .unwrap()
+            .id
+            .clone();
+        let second = append(
+            &mut store,
+            &session.id,
+            entry(
+                "attempt",
+                "for",
+                json!({"exerciseId":"q_integrity","answer":"for"}),
+            ),
+            None,
+            "integrity-second-answer",
+        )
+        .unwrap();
+        let latest = second
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| entry.kind == "attempt")
+            .unwrap();
+        assert_ne!(latest.id, first_attempt);
+        let latest_feedback = second
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == "feedback")
+            .find(|entry| entry.data.as_ref().unwrap()["attemptId"] == latest.id)
+            .unwrap();
+        assert_eq!(
+            latest_feedback.data.as_ref().unwrap()["exerciseId"],
+            "q_integrity"
+        );
+        assert_eq!(latest_feedback.data.as_ref().unwrap()["correct"], true);
+        for (question, attempt) in [
+            ("q_integrity", first_attempt.as_str()),
+            ("q_other", latest.id.as_str()),
+            ("q_integrity", "missing_attempt"),
+        ] {
+            let error = append(
+                &mut store,
+                &session.id,
+                entry(
+                    "feedback",
+                    "Must be rejected",
+                    json!({"exerciseId":question,"attemptId":attempt,"correct":true}),
+                ),
+                None,
+                &format!("invalid-feedback-{question}-{attempt}"),
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "CONFLICT");
+        }
+        let retry = append(
+            &mut store,
+            &session.id,
+            entry(
+                "attempt",
+                "since",
+                json!({"exerciseId":"q_integrity","answer":"since"}),
+            ),
+            None,
+            "integrity-first-answer",
+        )
+        .unwrap();
+        assert_eq!(retry.entries.len(), second.entries.len());
+        assert_eq!(
+            retry
+                .entries
+                .iter()
+                .filter(|entry| entry.kind == "attempt")
+                .count(),
+            2
+        );
+    }
+    #[test]
+    fn subsequent_wrong_answers_and_ai_suggestions_never_replace_personal_cause_or_reference_card()
+    {
+        let (_directory, mut store, session) = fixture();
+        append(
+            &mut store,
+            &session.id,
+            entry(
+                "attempt",
+                "since",
+                json!({"exerciseId":"q_integrity","answer":"since"}),
+            ),
+            None,
+            "cause-first-answer",
+        )
+        .unwrap();
+        append(&mut store, &session.id, entry("error", "My confirmed explanation", json!({"exerciseId":"q_integrity","cause":"I confused a duration with a point.","front":"Changed front must not replace reference","back":"Discard this supplied back","tags":[]})), None, "cause-human-confirmation").unwrap();
+        let before = review_items(&mut store, "time").unwrap();
+        assert_eq!(before.len(), 1);
+        assert!(before[0]["back"].as_str().unwrap().contains("for"));
+        assert!(before[0]["back"].as_str().unwrap().contains("I confused"));
+        let answered = append(
+            &mut store,
+            &session.id,
+            entry(
+                "attempt",
+                "on",
+                json!({"exerciseId":"q_integrity","answer":"on"}),
+            ),
+            None,
+            "cause-second-answer",
+        )
+        .unwrap();
+        assert!(answered.entries.iter().any(|entry| entry.kind == "note"
+            && entry
+                .data
+                .as_ref()
+                .is_some_and(|data| data["origin"] == "exact-grader")));
+        append(&mut store, &session.id, entry("error", "Pending AI alternative", json!({"exerciseId":"q_integrity","cause":"AI alternative","front":"AI front","back":"AI alternative back","origin":"pi-tool","needsConfirmation":true,"tags":["time"]})), None, "cause-ai-pending-suggestion").unwrap();
+        let after = review_items(&mut store, "time").unwrap();
+        assert_eq!(after[0]["id"], before[0]["id"]);
+        assert_eq!(after[0]["back"], before[0]["back"]);
+        let saved = get(&mut store, &session.id).unwrap();
+        let pending = saved
+            .entries
+            .iter()
+            .find(|entry| entry.content == "Pending AI alternative")
+            .unwrap();
+        assert_eq!(pending.kind, "note");
+        assert_eq!(pending.data.as_ref().unwrap()["cause"], "");
+        assert_eq!(
+            pending.data.as_ref().unwrap()["suggestedCause"],
+            "AI alternative"
+        );
+    }
+    #[test]
+    fn spoofed_note_questions_duplicate_ids_foreign_entry_and_error_targets_are_rejected() {
+        let (_directory, mut store, session) = fixture();
+        append(
+            &mut store,
+            &session.id,
+            entry(
+                "note",
+                "Not a question record",
+                json!({"exercises":[{"id":"q_spoofed","answers":["yes"]}]}),
+            ),
+            None,
+            "spoofed-note-record",
+        )
+        .unwrap();
+        for (kind, data) in [
+            ("attempt", json!({"exerciseId":"q_spoofed","answer":"yes"})),
+            ("attempt", json!({"exerciseId":"../escape","answer":"yes"})),
+            (
+                "attempt",
+                json!({"exerciseId":"q_integrity","exerciseEntryId":"other_entry","answer":"for"}),
+            ),
+            (
+                "error",
+                json!({"exerciseId":"foreign_question","cause":"Must not save"}),
+            ),
+            (
+                "exercise",
+                json!({"exercises":[{"id":"q_integrity","question":"Duplicate"}]}),
+            ),
+        ] {
+            assert!(append(
+                &mut store,
+                &session.id,
+                entry(kind, "Invalid target", data),
+                None,
+                &format!("invalid-{}-{}", kind, uuid::Uuid::new_v4().simple())
+            )
+            .is_err());
+        }
+        assert!(!get(&mut store, &session.id)
+            .unwrap()
+            .entries
+            .iter()
+            .any(|entry| entry.kind == "attempt"));
+    }
+}
+
+#[cfg(test)]
+mod review_limit_tests {
+    use super::*;
+    #[test]
+    fn exact_id_candidates_include_old_cards_beyond_the_display_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = ContentStore::new(
+            directory.path().join("library"),
+            directory.path().join("state"),
+        )
+        .unwrap();
+        store
+            .create(
+                metadata("section_review_limit", "Time", "section"),
+                "Reference.",
+                "course/review-limit.md",
+            )
+            .unwrap();
+        let session = create(&mut store, "section_review_limit", &[]).unwrap();
+        for index in 0..201 {
+            let id = format!("review_card_{index:03}");
+            let mut meta = metadata(&id, "Card", "entry");
+            meta.extra.insert("sessionId".into(), json!(session.id));
+            meta.extra.insert("entryKind".into(), json!("note"));
+            meta.extra.insert(
+                "createdAt".into(),
+                json!(
+                    (chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").unwrap()
+                        + chrono::Duration::seconds(index))
+                    .to_rfc3339()
+                ),
+            );
+            meta.extra.insert("data".into(),json!({"reviewCard":true,"front":if index==0{"needle_oldest"}else{"Question"},"back":"Reference","tags":[]}));
+            store
+                .create(
+                    meta,
+                    "Review fixture",
+                    &format!("sessions/{}/entries/{id}.md", session.id),
+                )
+                .unwrap();
+        }
+        let visible = review_items(&mut store, "").unwrap();
+        assert_eq!(visible.len(), 200);
+        assert!(!visible.iter().any(|item| item["id"] == "review_card_000"));
+        assert_eq!(
+            review_items(&mut store, "needle_oldest").unwrap()[0]["id"],
+            "review_card_000"
+        );
+        let all = review_items_all(&mut store).unwrap();
+        assert_eq!(all.len(), 201);
+        assert!(all.iter().any(|item| item["id"] == "review_card_000"));
     }
 }

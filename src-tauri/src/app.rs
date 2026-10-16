@@ -41,12 +41,18 @@ pub struct UiPreferences {
     pub font_size: u8,
     #[serde(default = "default_assistant_width")]
     pub assistant_width: u16,
+    #[serde(default)]
+    pub sidebar_collapsed: bool,
+    #[serde(default)]
+    pub expanded_node_ids: Vec<String>,
 }
 impl Default for UiPreferences {
     fn default() -> Self {
         Self {
             font_size: 16,
             assistant_width: default_assistant_width(),
+            sidebar_collapsed: false,
+            expanded_node_ids: vec![],
         }
     }
 }
@@ -66,6 +72,14 @@ impl UiPreferences {
             return Err(CoreError::new(
                 "INVALID_INPUT",
                 "助教栏宽度请选择280至960之间的整数。",
+            ));
+        }
+        if self.expanded_node_ids.len() > 4096
+            || self.expanded_node_ids.iter().any(|id| !valid_id(id))
+        {
+            return Err(CoreError::new(
+                "INVALID_INPUT",
+                "目录展开状态包含无效编号或过多项目。",
             ));
         }
         Ok(())
@@ -166,7 +180,9 @@ impl Engine {
                 Ok(UiPreferences::default())
             }
             Err(error) => Err(CoreError::io(error)),
-            Ok(meta) if meta.file_type().is_symlink() || !meta.is_file() || meta.len() > 4096 => {
+            Ok(meta)
+                if meta.file_type().is_symlink() || !meta.is_file() || meta.len() > 600 * 1024 =>
+            {
                 Err(CoreError::new(
                     "INVALID_STATE",
                     "字号设置文件无效，请保留原文件后重试。",
@@ -193,11 +209,24 @@ impl Engine {
         font_size: Option<u8>,
         assistant_width: Option<u16>,
     ) -> Result<UiPreferences> {
+        self.patch_all_ui_preferences(font_size, assistant_width, None, None)
+    }
+    pub fn patch_all_ui_preferences(
+        &self,
+        font_size: Option<u8>,
+        assistant_width: Option<u16>,
+        sidebar_collapsed: Option<bool>,
+        expanded_node_ids: Option<Vec<String>>,
+    ) -> Result<UiPreferences> {
         let _guard = UI_PREFERENCE_WRITE
             .lock()
             .map_err(|_| CoreError::new("BUSY", "界面设置暂不可用。"))?;
         let mut value = self.ui_preferences()?;
-        if font_size.is_none() && assistant_width.is_none() {
+        if font_size.is_none()
+            && assistant_width.is_none()
+            && sidebar_collapsed.is_none()
+            && expanded_node_ids.is_none()
+        {
             return Ok(value);
         }
         if let Some(size) = font_size {
@@ -205,6 +234,12 @@ impl Engine {
         }
         if let Some(width) = assistant_width {
             value.assistant_width = width;
+        }
+        if let Some(collapsed) = sidebar_collapsed {
+            value.sidebar_collapsed = collapsed;
+        }
+        if let Some(ids) = expanded_node_ids {
+            value.expanded_node_ids = ids;
         }
         value.validate()?;
         let path = self.lock()?.state_dir.join("ui-preferences.json");
@@ -242,7 +277,12 @@ impl Core {
         self.content
             .summaries()
             .into_iter()
-            .filter(|d| d.kind == "section" || d.kind == "knowledge")
+            .filter(|d| {
+                matches!(
+                    d.kind.as_str(),
+                    "course" | "folder" | "section" | "knowledge" | "exploration" | "exercise"
+                )
+            })
             .collect()
     }
     pub fn refresh(&mut self) -> Result<Vec<DocumentSummary>> {
@@ -302,17 +342,142 @@ impl Core {
         Ok(doc)
     }
     pub fn import(&mut self, content: &str) -> Result<Document> {
+        self.import_at(content, None, None)
+    }
+    /// Import retains authored stable IDs/links and commits the parent in the same Markdown write.
+    pub fn import_at(
+        &mut self,
+        content: &str,
+        parent_id: Option<&str>,
+        request_id: Option<&str>,
+    ) -> Result<Document> {
         if content.len() > 1_500_000 {
             return Err(CoreError::new("LIMIT_EXCEEDED", "单份材料最多1.5MB。"));
         }
-        let (meta, body) = content::parse(content)?;
-        if meta.kind != "section" && meta.kind != "knowledge" {
+        let (mut meta, body) = content::parse(content)?;
+        if !matches!(meta.kind.as_str(), "section" | "knowledge" | "exploration") {
             return Err(CoreError::new(
                 "INVALID_INPUT",
-                "只能导入课程小节或知识点；学习记录请放回原库。",
+                "只能导入学习材料或探索正文；练习与学习记录请保留原库归属。",
             ));
         }
         let id = meta.id.clone();
+        if let Some(parent) = parent_id {
+            meta.extra.insert("parentId".into(), json!(parent));
+        }
+        let parent = match meta.extra.get("parentId") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(value)) if valid_id(value) => Some(value.clone()),
+            _ => return Err(CoreError::new("INVALID_INPUT", "父节点编号无效。")),
+        };
+        if let Some(parent) = &parent {
+            crate::library_tree::course_id(&self.content, parent)?;
+            let mut next = Some(parent.clone());
+            let mut depth = 1;
+            while let Some(current) = next {
+                if current == id {
+                    return Err(CoreError::new(
+                        "INVALID_HIERARCHY",
+                        "导入文档不能把自身作为祖先。",
+                    ));
+                }
+                depth += 1;
+                if depth > 12 {
+                    return Err(CoreError::new("LIMIT_EXCEEDED", "课程层级最多12层。"));
+                }
+                let doc = self.content.read(&current)?;
+                if doc.metadata.kind == "exercise" {
+                    return Err(CoreError::new("INVALID_HIERARCHY", "练习不能容纳子文档。"));
+                }
+                next = doc
+                    .metadata
+                    .extra
+                    .get("parentId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+        }
+        let digest = hash(&serde_json::to_string(
+            &json!({"content":content,"parentId":parent_id}),
+        )?);
+        if let Some(request) = request_id {
+            if request.len() < 8 || !valid_id(request) {
+                return Err(CoreError::new(
+                    "INVALID_INPUT",
+                    "导入请求缺少有效防重复编号。",
+                ));
+            }
+            let dir = self.state_dir.join("import-receipts");
+            match fs::symlink_metadata(&dir) {
+                Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                    return Err(CoreError::new("UNSAFE_PATH", "导入回执目录不可安全使用。"))
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    fs::create_dir(&dir)?;
+                }
+                Err(e) => return Err(CoreError::io(e)),
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+            }
+            let path = dir.join(format!("{}.json", hash(request)));
+            let receipt = json!({"documentId":id,"digest":digest});
+            if !path.exists() {
+                let mut temp = tempfile::NamedTempFile::new_in(&dir)?;
+                temp.write_all(&serde_json::to_vec(&receipt)?)?;
+                temp.as_file().sync_all()?;
+                match temp.persist_noclobber(&path) {
+                    Ok(_) => {}
+                    Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(CoreError::io(error.error)),
+                }
+            }
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 4096 {
+                return Err(CoreError::new(
+                    "INVALID_STATE",
+                    "导入回执不可安全读取，未覆盖原文件。",
+                ));
+            }
+            let saved: Value = serde_json::from_slice(&fs::read(&path)?)?;
+            if saved != receipt {
+                return Err(CoreError::new(
+                    "CONFLICT",
+                    "该导入请求编号已用于其他材料，原文件未更改。",
+                ));
+            }
+            meta.extra.insert("importRequestId".into(), json!(request));
+            meta.extra.insert("importDigest".into(), json!(digest));
+            match self.content.read(&id) {
+                Ok(doc)
+                    if doc
+                        .metadata
+                        .extra
+                        .get("importRequestId")
+                        .and_then(Value::as_str)
+                        == Some(request)
+                        && doc
+                            .metadata
+                            .extra
+                            .get("importDigest")
+                            .and_then(Value::as_str)
+                            == Some(&digest) =>
+                {
+                    return Ok(doc)
+                }
+                Ok(_) => {
+                    return Err(CoreError::new(
+                        "ALREADY_EXISTS",
+                        "相同文档ID已存在，未覆盖原材料。",
+                    ))
+                }
+                Err(error) if error.code == "NOT_FOUND" => {}
+                Err(error) => return Err(error),
+            }
+        }
         let doc = self
             .content
             .create(meta, &body, &format!("courses/{id}.md"))?;
@@ -323,11 +488,64 @@ impl Core {
         self.save_preferences()?;
         Ok(doc)
     }
+    pub fn set_document_links(
+        &mut self,
+        id: &str,
+        links: Vec<String>,
+        expected_version: &str,
+    ) -> Result<Document> {
+        let mut doc = self.content.read(id)?;
+        if !matches!(
+            doc.metadata.kind.as_str(),
+            "section" | "knowledge" | "exploration"
+        ) {
+            return Err(CoreError::new(
+                "INVALID_INPUT",
+                "只能为学习材料或探索正文设置关联资料。",
+            ));
+        }
+        let unique = links.iter().collect::<std::collections::BTreeSet<_>>();
+        if links.len() > 16
+            || unique.len() != links.len()
+            || links.iter().any(|link| !valid_id(link) || link == id)
+        {
+            return Err(CoreError::new(
+                "INVALID_INPUT",
+                "请显式选择最多16份不重复的其他学习材料。",
+            ));
+        }
+        for link in &links {
+            let source = self.content.read(link)?;
+            if !matches!(
+                source.metadata.kind.as_str(),
+                "section" | "knowledge" | "exploration"
+            ) {
+                return Err(CoreError::new(
+                    "INVALID_INPUT",
+                    "不能把练习答案、目录或系统记录设为自动学习资料。",
+                ));
+            }
+        }
+        doc.metadata.links = links;
+        let content = content::serialize(&doc.metadata, &doc.body)?;
+        self.content.save(id, &content, expected_version)
+    }
     pub fn start_session(
         &mut self,
         section_id: &str,
         new_session: bool,
     ) -> Result<(Session, Context)> {
+        if self.content.read(section_id)?.metadata.kind == "exercise" {
+            let item = crate::exercises::get(&mut self.content, section_id)?;
+            let (_, context) = self.session_context(&item.session.id, None)?;
+            self.preferences.active_document_id = Some(section_id.into());
+            self.preferences.active_session_id = Some(item.session.id.clone());
+            self.preferences
+                .session_by_section
+                .insert(section_id.into(), item.session.id.clone());
+            self.save_preferences()?;
+            return Ok((item.session, context));
+        }
         let context = context::load(&self.content, section_id, None)?;
         let session = if !new_session {
             self.preferences
@@ -386,6 +604,7 @@ impl Core {
         Ok((
             session,
             Context {
+                history_manifest: vec![],
                 text: String::new(),
                 manifest: vec![],
                 warnings: vec![],
@@ -407,6 +626,7 @@ impl Core {
                 ));
             }
             Context {
+                history_manifest: vec![],
                 text: String::new(),
                 manifest: vec![],
                 warnings: vec![],
@@ -713,7 +933,8 @@ mod width_preference_tests {
             engine.ui_preferences().unwrap(),
             UiPreferences {
                 font_size: 20,
-                assistant_width: 600
+                assistant_width: 600,
+                ..UiPreferences::default()
             }
         );
         let old = fs::read(state.join("ui-preferences.json")).unwrap();
@@ -728,8 +949,233 @@ mod width_preference_tests {
                 .unwrap(),
             UiPreferences {
                 font_size: 20,
-                assistant_width: 600
+                assistant_width: 600,
+                ..UiPreferences::default()
             }
+        );
+    }
+}
+
+#[cfg(test)]
+mod navigation_preferences_tests {
+    use super::*;
+    #[test]
+    fn navigation_patches_preserve_width_font_and_legacy_defaults() {
+        let temp = tempfile::tempdir().unwrap();
+        let library = temp.path().join("library");
+        let state = temp.path().join("state");
+        let engine = Engine::new(library.clone(), state.clone()).unwrap();
+        fs::write(
+            state.join("ui-preferences.json"),
+            r#"{"fontSize":18,"assistantWidth":420}"#,
+        )
+        .unwrap();
+        assert!(!engine.ui_preferences().unwrap().sidebar_collapsed);
+        engine
+            .patch_all_ui_preferences(
+                None,
+                None,
+                Some(true),
+                Some(vec!["course_a".into(), "folder_b".into()]),
+            )
+            .unwrap();
+        engine.patch_ui_preferences(Some(20), None).unwrap();
+        let saved = engine.ui_preferences().unwrap();
+        assert_eq!(saved.font_size, 20);
+        assert_eq!(saved.assistant_width, 420);
+        assert!(saved.sidebar_collapsed);
+        assert_eq!(saved.expanded_node_ids.len(), 2);
+        let before = fs::read(state.join("ui-preferences.json")).unwrap();
+        assert!(engine
+            .patch_all_ui_preferences(None, None, None, Some(vec!["../bad".into()]))
+            .is_err());
+        assert_eq!(before, fs::read(state.join("ui-preferences.json")).unwrap());
+        drop(engine);
+        assert_eq!(
+            Engine::new(library, state)
+                .unwrap()
+                .ui_preferences()
+                .unwrap(),
+            saved
+        );
+    }
+}
+
+#[cfg(test)]
+mod nested_import_tests {
+    use super::*;
+    #[test]
+    fn json_import_preserves_identity_links_and_parent_in_one_receipted_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = Engine::new(temp.path().join("library"), temp.path().join("state")).unwrap();
+        let mut core = engine.lock().unwrap();
+        let course = crate::library_tree::create(
+            &mut core.content,
+            "course",
+            "Course",
+            None,
+            "",
+            "import_course_001",
+        )
+        .unwrap();
+        let folder = crate::library_tree::create(
+            &mut core.content,
+            "folder",
+            "Folder",
+            Some(&course.id),
+            "",
+            "import_folder_001",
+        )
+        .unwrap();
+        let original="```json\n{\"id\":\"import_original_id\",\"title\":\"Authored\",\"kind\":\"section\",\"links\":[\"related_material\"]}\n```\n\nAuthored body";
+        let doc = core
+            .import_at(original, Some(&folder.id), Some("import_request_001"))
+            .unwrap();
+        assert_eq!(doc.id, "import_original_id");
+        assert_eq!(doc.metadata.links, vec!["related_material"]);
+        assert_eq!(doc.metadata.extra["parentId"], folder.id);
+        assert_eq!(
+            core.import_at(original, Some(&folder.id), Some("import_request_001"))
+                .unwrap()
+                .version,
+            doc.version
+        );
+        let altered = original.replace("Authored body", "Different body");
+        assert_eq!(
+            core.import_at(&altered, Some(&folder.id), Some("import_request_001"))
+                .unwrap_err()
+                .code,
+            "CONFLICT"
+        );
+        assert_eq!(core.content.read(&doc.id).unwrap().version, doc.version);
+        assert!(core
+            .import_at(original, Some(&folder.id), Some("other_import_request"))
+            .is_err());
+    }
+}
+
+#[cfg(test)]
+mod linked_exploration_tests {
+    use super::*;
+    #[test]
+    fn explicit_links_selection_and_unlink_use_actual_versions_without_other_courses() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = Engine::new(temp.path().join("library"), temp.path().join("state")).unwrap();
+        let mut core = engine.lock().unwrap();
+        let material = core
+            .create_section("Chosen material", "CHOSEN_SOURCE_MARKER", vec![], vec![])
+            .unwrap();
+        let foreign = core
+            .create_section("Other course", "FOREIGN_SOURCE_MARKER", vec![], vec![])
+            .unwrap();
+        let explore = crate::library_tree::create(
+            &mut core.content,
+            "exploration",
+            "My exploration",
+            None,
+            "OWN_EXPLORATION_MARKER",
+            "exploration_scope_001",
+        )
+        .unwrap();
+        let session = core.start_session(&explore.id, false).unwrap().0;
+        let (_, before) = core
+            .session_context(&session.id, Some("EXPLICIT_SELECTION_MARKER"))
+            .unwrap();
+        assert!(
+            before.text.contains("OWN_EXPLORATION_MARKER")
+                && before.text.contains("EXPLICIT_SELECTION_MARKER")
+        );
+        assert!(
+            !before.text.contains("CHOSEN_SOURCE_MARKER")
+                && !before.text.contains("FOREIGN_SOURCE_MARKER")
+        );
+        let linked = core
+            .set_document_links(&explore.id, vec![material.id.clone()], &explore.version)
+            .unwrap();
+        let (_, context) = core.session_context(&session.id, None).unwrap();
+        assert!(
+            context.text.contains("CHOSEN_SOURCE_MARKER")
+                && !context.text.contains("FOREIGN_SOURCE_MARKER")
+        );
+        assert_eq!(
+            context
+                .manifest
+                .iter()
+                .find(|item| item.id == material.id)
+                .unwrap()
+                .version,
+            material.version
+        );
+        core.set_document_links(&explore.id, vec![], &linked.version)
+            .unwrap();
+        let (_, unlinked) = core.session_context(&session.id, None).unwrap();
+        assert!(
+            !unlinked.text.contains("CHOSEN_SOURCE_MARKER")
+                && !unlinked.text.contains("FOREIGN_SOURCE_MARKER")
+        );
+        assert!(core
+            .set_document_links(&foreign.id, vec![foreign.id.clone()], &foreign.version)
+            .is_err());
+    }
+}
+
+#[cfg(test)]
+mod exercise_context_guard_tests {
+    use super::*;
+    #[test]
+    fn exercise_routing_uses_origin_and_direct_links_never_read_reference_answers() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = Engine::new(temp.path().join("library"), temp.path().join("state")).unwrap();
+        let mut core = engine.lock().unwrap();
+        let source = core
+            .create_section(
+                "Question source",
+                "SOURCE_WITHOUT_REFERENCE",
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        let session = core.start_session(&source.id, false).unwrap().0;
+        let item = crate::exercises::create_manual(
+            &mut core.content,
+            &session.id,
+            &source.id,
+            crate::exercises::ManualExercise {
+                question: "Try first".into(),
+                format: "self".into(),
+                answers: vec!["HIDDEN_REFERENCE_MARKER".into()],
+                explanation: "HIDDEN_EXPLANATION_MARKER".into(),
+            },
+            "context_guard_exercise",
+        )
+        .unwrap();
+        assert!(item.document.body.contains("HIDDEN_REFERENCE_MARKER"));
+        assert_eq!(
+            context::load(&core.content, &item.document.id, None)
+                .unwrap_err()
+                .code,
+            "EXERCISE_CONTEXT_RESTRICTED"
+        );
+        let (actual, ctx) = core.start_session(&item.document.id, false).unwrap();
+        assert_eq!(actual.id, session.id);
+        assert!(!ctx.text.contains("HIDDEN_REFERENCE_MARKER"));
+        let mut metadata = source.metadata.clone();
+        metadata.links = vec![item.document.id.clone()];
+        core.content
+            .save(
+                &source.id,
+                &content::serialize(&metadata, &source.body).unwrap(),
+                &source.version,
+            )
+            .unwrap();
+        let safe = context::load(&core.content, &source.id, None).unwrap();
+        assert!(safe
+            .warnings
+            .iter()
+            .any(|warning| warning.starts_with("EXERCISE_CONTEXT_OMITTED")));
+        assert!(
+            !safe.text.contains("HIDDEN_REFERENCE_MARKER")
+                && !safe.text.contains("HIDDEN_EXPLANATION_MARKER")
         );
     }
 }

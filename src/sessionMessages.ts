@@ -10,6 +10,7 @@ export function sessionMessages(entries: Entry[]): Message[] {
     content: entry.content,
     createdAt: entry.createdAt,
 
+    context: entry.kind === 'assistant' && Array.isArray(entry.data?.contextManifest) ? { text: '', manifest: entry.data.contextManifest as NonNullable<Message['context']>['manifest'], historyManifest: Array.isArray(entry.data.historyManifest) ? entry.data.historyManifest as NonNullable<Message['context']>['manifest'] : [], warnings: Array.isArray(entry.data.contextWarnings) ? entry.data.contextWarnings.filter((value): value is string => typeof value === 'string') : [], truncated: entry.data.contextTruncated === true } : undefined,
     needsConfirmation: entry.kind === 'note' && entry.data?.needsConfirmation === true,
   }));
 }

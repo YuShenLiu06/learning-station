@@ -34,6 +34,208 @@ async fn refresh_library(
     Ok(docs)
 }
 #[tauri::command]
+async fn get_library_tree(
+    state: State<'_, Arc<Engine>>,
+) -> Result<crate::library_tree::LibraryTree> {
+    work(state.inner().clone(), |e| {
+        let mut core = e.lock()?;
+        core.refresh()?;
+        crate::library_tree::list(&core.content)
+    })
+    .await
+}
+#[tauri::command]
+async fn create_library_node(
+    state: State<'_, Arc<Engine>>,
+    kind: String,
+    title: String,
+    parent_id: Option<String>,
+    body: Option<String>,
+    request_id: String,
+) -> Result<Document> {
+    work(state.inner().clone(), move |e| {
+        let mut core = e.lock()?;
+        core.refresh()?;
+        let doc = crate::library_tree::create(
+            &mut core.content,
+            &kind,
+            &title,
+            parent_id.as_deref(),
+            body.as_deref().unwrap_or(""),
+            &request_id,
+        )?;
+        core.preferences
+            .document_paths
+            .insert(doc.id.clone(), doc.path.clone());
+        core.preferences.active_document_id = Some(doc.id.clone());
+        core.save_preferences()?;
+        Ok(doc)
+    })
+    .await
+}
+#[tauri::command]
+async fn move_library_node(
+    state: State<'_, Arc<Engine>>,
+    id: String,
+    parent_id: Option<String>,
+    order: i64,
+    expected_version: String,
+) -> Result<Document> {
+    work(state.inner().clone(), move |e| {
+        let mut core = e.lock()?;
+        core.refresh()?;
+        crate::library_tree::move_node(
+            &mut core.content,
+            &id,
+            parent_id.as_deref(),
+            order,
+            &expected_version,
+        )
+    })
+    .await
+}
+#[tauri::command]
+async fn get_exercise_document(
+    state: State<'_, Arc<Engine>>,
+    id: String,
+) -> Result<crate::exercises::ExerciseDocument> {
+    work(state.inner().clone(), move |e| {
+        let mut core = e.lock()?;
+        core.open(&id)?;
+        crate::exercises::get(&mut core.content, &id)
+    })
+    .await
+}
+#[tauri::command]
+async fn create_manual_exercise(
+    state: State<'_, Arc<Engine>>,
+    session_id: String,
+    source_document_id: String,
+    input: crate::exercises::ManualExercise,
+    request_id: String,
+) -> Result<crate::exercises::ExerciseDocument> {
+    work(state.inner().clone(), move |e| {
+        let mut core = e.lock()?;
+        let item = crate::exercises::create_manual(
+            &mut core.content,
+            &session_id,
+            &source_document_id,
+            input,
+            &request_id,
+        )?;
+        core.preferences
+            .document_paths
+            .insert(item.document.id.clone(), item.document.path.clone());
+        core.save_preferences()?;
+        Ok(item)
+    })
+    .await
+}
+#[tauri::command]
+async fn materialize_legacy_exercise(
+    state: State<'_, Arc<Engine>>,
+    session_id: String,
+    exercise_entry_id: String,
+) -> Result<Document> {
+    work(state.inner().clone(), move |e| {
+        let mut core = e.lock()?;
+        let doc = crate::exercises::materialize_legacy(
+            &mut core.content,
+            &session_id,
+            &exercise_entry_id,
+        )?;
+        core.preferences
+            .document_paths
+            .insert(doc.id.clone(), doc.path.clone());
+        core.save_preferences()?;
+        Ok(doc)
+    })
+    .await
+}
+#[tauri::command]
+async fn import_course_asset(
+    state: State<'_, Arc<Engine>>,
+    course_id: String,
+    file_name: String,
+    bytes: Vec<u8>,
+    request_id: String,
+) -> Result<crate::assets::Asset> {
+    work(state.inner().clone(), move |e| {
+        let mut core = e.lock()?;
+        core.refresh()?;
+        crate::assets::import(&core.content, &course_id, &file_name, &bytes, &request_id)
+    })
+    .await
+}
+#[tauri::command]
+async fn list_course_assets(
+    state: State<'_, Arc<Engine>>,
+    course_id: String,
+) -> Result<Vec<crate::assets::Asset>> {
+    work(state.inner().clone(), move |e| {
+        let mut core = e.lock()?;
+        core.refresh()?;
+        crate::assets::list(&core.content, &course_id)
+    })
+    .await
+}
+#[tauri::command]
+async fn read_course_asset(
+    state: State<'_, Arc<Engine>>,
+    course_id: String,
+    asset_id: String,
+) -> Result<crate::assets::AssetPreview> {
+    work(state.inner().clone(), move |e| {
+        let mut core = e.lock()?;
+        core.refresh()?;
+        crate::assets::read(&core.content, &course_id, &asset_id)
+    })
+    .await
+}
+#[tauri::command]
+async fn set_review_state(
+    state: State<'_, Arc<Engine>>,
+    id: String,
+    status: String,
+    request_id: String,
+) -> Result<serde_json::Value> {
+    work(state.inner().clone(), move |e| {
+        let mut core = e.lock()?;
+        core.refresh()?;
+        crate::review::set(&mut core.content, &id, &status, &request_id)
+    })
+    .await
+}
+#[tauri::command]
+async fn export_review_items(
+    state: State<'_, Arc<Engine>>,
+    ids: Vec<String>,
+) -> Result<serde_json::Value> {
+    work(state.inner().clone(), move |e| {
+        let mut core = e.lock()?;
+        core.refresh()?;
+        let destination = core.state_dir.join("exports");
+        let (path, count) = crate::review::export(&mut core.content, &ids, &destination)?;
+        Ok(json!({"path":path,"count":count,"synced":false}))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn set_document_links(
+    state: State<'_, Arc<Engine>>,
+    id: String,
+    links: Vec<String>,
+    expected_version: String,
+) -> Result<Document> {
+    work(state.inner().clone(), move |e| {
+        let mut core = e.lock()?;
+        core.refresh()?;
+        core.set_document_links(&id, links, &expected_version)
+    })
+    .await
+}
+#[tauri::command]
 async fn create_section(
     state: State<'_, Arc<Engine>>,
     title: String,
@@ -56,9 +258,16 @@ async fn import_markdown(
     state: State<'_, Arc<Engine>>,
     content: String,
     filename: Option<String>,
+    parent_id: Option<String>,
+    request_id: Option<String>,
 ) -> Result<Document> {
     let _ = filename;
-    work(state.inner().clone(), move |e| e.lock()?.import(&content)).await
+    work(state.inner().clone(), move |e| {
+        let mut core = e.lock()?;
+        core.refresh()?;
+        core.import_at(&content, parent_id.as_deref(), request_id.as_deref())
+    })
+    .await
 }
 #[tauri::command]
 async fn open_document(state: State<'_, Arc<Engine>>, id: String) -> Result<Document> {
@@ -120,9 +329,11 @@ async fn load_session_context(
     selection: Option<String>,
 ) -> Result<Context> {
     work(state.inner().clone(), move |e| {
-        Ok(e.lock()?
-            .session_context(&session_id, selection.as_deref())?
-            .1)
+        let (session, mut context) = e
+            .lock()?
+            .session_context(&session_id, selection.as_deref())?;
+        crate::context::attach_history(&mut context, &session, None);
+        Ok(context)
     })
     .await
 }
@@ -135,9 +346,16 @@ async fn save_ui_preferences(
     state: State<'_, Arc<Engine>>,
     font_size: Option<u8>,
     assistant_width: Option<u16>,
+    sidebar_collapsed: Option<bool>,
+    expanded_node_ids: Option<Vec<String>>,
 ) -> Result<UiPreferences> {
     work(state.inner().clone(), move |e| {
-        e.patch_ui_preferences(font_size, assistant_width)
+        e.patch_all_ui_preferences(
+            font_size,
+            assistant_width,
+            sidebar_collapsed,
+            expanded_node_ids,
+        )
     })
     .await
 }
@@ -332,7 +550,9 @@ async fn list_review_items(
     query: Option<String>,
 ) -> Result<Vec<Value>> {
     work(state.inner().clone(), move |e| {
-        sessions::review_items(&mut e.lock()?.content, query.as_deref().unwrap_or(""))
+        let mut core = e.lock()?;
+        core.refresh()?;
+        crate::review::list(&mut core.content, query.as_deref().unwrap_or(""))
     })
     .await
 }
@@ -409,12 +629,18 @@ pub fn run() {
             let home = std::env::var_os("HOME")
                 .map(std::path::PathBuf::from)
                 .ok_or("无法定位本机用户目录")?;
-            let library = std::env::var_os("LEARNING_STATION_LIBRARY")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| home.join("opt/learning-station/library"));
-            let state_dir = std::env::var_os("LEARNING_STATION_STATE")
-                .map(std::path::PathBuf::from)
-                .unwrap_or(app.path().app_data_dir()?);
+            let forced_qa = crate::qa::locations(&std::env::current_exe()?)?;
+            let (library, state_dir) = match forced_qa {
+                Some(paths) => paths,
+                None => (
+                    std::env::var_os("LEARNING_STATION_LIBRARY")
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| home.join("opt/learning-station/library")),
+                    std::env::var_os("LEARNING_STATION_STATE")
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or(app.path().app_data_dir()?),
+                ),
+            };
             let engine = Engine::new(library, state_dir)?;
             app.manage(engine.clone());
             let handle = app.handle().clone();
@@ -436,6 +662,18 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_app_state,
+            get_library_tree,
+            create_library_node,
+            move_library_node,
+            set_document_links,
+            get_exercise_document,
+            create_manual_exercise,
+            materialize_legacy_exercise,
+            import_course_asset,
+            list_course_assets,
+            read_course_asset,
+            set_review_state,
+            export_review_items,
             refresh_library,
             create_section,
             import_markdown,

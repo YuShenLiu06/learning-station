@@ -115,7 +115,8 @@ test('independent exploration rejects a linked session or source manifest', asyn
 });
 test('historical assistant prose cannot borrow the current session source manifest', () => {
   const messages=sessionMessages([{id:'old',kind:'assistant',content:'old answer',createdAt:'then'}],[{title:'unrelated latest source'}]);
-  assert.equal(messages[0].sources,undefined);
+  assert.equal(messages[0].sources,undefined);assert.equal(messages[0].context,undefined);
+  const recorded=sessionMessages([{id:'new',kind:'assistant',content:'new',createdAt:'now',data:{contextManifest:[{id:'own',path:'own.md',version:'own_v',includedChars:20}],historyManifest:[],contextWarnings:['actual warning'],contextTruncated:true}}]);assert.equal(recorded[0].context.manifest[0].id,'own');assert.equal(recorded[0].context.truncated,true);
 });
 
  test('local usage policy errors are distinct from connection failures, including plain CoreError objects', async () => {

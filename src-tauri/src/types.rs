@@ -114,6 +114,8 @@ pub struct ManifestItem {
 pub struct Context {
     pub text: String,
     pub manifest: Vec<ManifestItem>,
+    #[serde(default)]
+    pub history_manifest: Vec<ManifestItem>,
     pub warnings: Vec<String>,
     pub truncated: bool,
 }
@@ -145,6 +147,12 @@ pub struct Session {
     pub updated_at: String,
     pub entries: Vec<Entry>,
     pub context_manifest: Vec<ManifestItem>,
+    #[serde(default)]
+    pub context_history_manifest: Vec<ManifestItem>,
+    #[serde(default)]
+    pub context_warnings: Vec<String>,
+    #[serde(default)]
+    pub context_truncated: bool,
 }
 
 pub fn timestamp() -> String {

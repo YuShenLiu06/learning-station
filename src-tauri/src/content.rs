@@ -73,6 +73,11 @@ impl ContentStore {
                 if path.starts_with(self.state_dir.join("history")) {
                     continue;
                 }
+                // Uploaded source/code may include arbitrary Markdown examples.
+                // The root assets directory is not part of the course index.
+                if path == self.root.join("assets") {
+                    continue;
+                }
                 let meta = fs::symlink_metadata(&path).map_err(CoreError::io)?;
                 if meta.file_type().is_symlink() {
                     continue;
@@ -483,12 +488,19 @@ fn validate_metadata(metadata: &Metadata) -> Result<()> {
     if metadata.title.trim().is_empty()
         || !matches!(
             metadata.kind.as_str(),
-            "section" | "knowledge" | "session" | "entry"
+            "course"
+                | "folder"
+                | "section"
+                | "knowledge"
+                | "exploration"
+                | "exercise"
+                | "session"
+                | "entry"
         )
     {
         return Err(CoreError::new(
             "INVALID_DOCUMENT",
-            "文档需要标题和有效类型（section、knowledge、session、entry）",
+            "文档需要标题和有效类型（course、folder、section、knowledge、exploration、exercise、session、entry）",
         ));
     }
     for link in &metadata.links {
@@ -1018,6 +1030,24 @@ mod tests {
                 .code,
             "ALREADY_EXISTS"
         );
+    }
+
+    #[test]
+    fn refresh_excludes_uploaded_markdown_under_root_assets() {
+        let (_dir, mut store) = store();
+        let document = store
+            .create(metadata("lesson"), "课程正文", "lesson.md")
+            .unwrap();
+        fs::create_dir_all(store.root.join("assets/project")).unwrap();
+        // A copied frontmatter ID in an uploaded README must not collide with a course.
+        fs::write(
+            store.root.join("assets/project/README.md"),
+            &document.content,
+        )
+        .unwrap();
+        let summaries = store.refresh().unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, "lesson");
     }
 
     #[test]

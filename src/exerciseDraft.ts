@@ -16,10 +16,10 @@ export async function flushExerciseDrafts() {
   await Promise.all([...inputs.entries()].filter(([, input]) => input.edited).map(([key, input]) => write(key, input)));
 }
 
-export function useExerciseDraft(id: string, submittedAnswer: string) {
+export function useExerciseDraft(id: string, submittedAnswer: string, confirmedCause = '', causeUpdatedAt?: string) {
   const key = `exercise:${id}`;
   let input = inputs.get(key);
-  if (!input) { input = { answer: submittedAnswer, reason: '', loaded: !nativeAvailable, edited: false }; inputs.set(key, input); }
+  if (!input) { input = { answer: submittedAnswer, reason: confirmedCause, loaded: !nativeAvailable, edited: false }; inputs.set(key, input); }
   const record = input;
   const [answer, updateAnswer] = useState(record.answer);
   const [reason, updateReason] = useState(record.reason);
@@ -38,11 +38,11 @@ export function useExerciseDraft(id: string, submittedAnswer: string) {
         if (alive.current) { setConflict(previous); setError('发现不同的旧草稿，请先选择保留哪份。'); }
         return;
       }
-      if (!record.edited && saved) { record.answer = saved.data.question ?? submittedAnswer; record.reason = saved.data.body ?? ''; }
+      if (!record.edited && saved) { record.answer = saved.data.question ?? submittedAnswer; record.reason = causeUpdatedAt && Date.parse(saved.updatedAt) < Date.parse(causeUpdatedAt) ? confirmedCause : saved.data.body ?? confirmedCause; }
       record.loaded = true;
       if (alive.current) { updateAnswer(record.answer); updateReason(record.reason); setLoaded(true); setError(''); }
     } catch (error) { if (alive.current) setError(error instanceof Error ? error.message : String(error)); }
-  }, [key, record, submittedAnswer]);
+  }, [key, record, submittedAnswer, confirmedCause, causeUpdatedAt]);
   useEffect(() => { alive.current = true; void restore(); return () => { alive.current = false; if (record.edited && record.loaded) void write(key, record).catch(() => undefined); }; }, [key, record, restore]);
   useEffect(() => {
     if (!loaded || !record.edited) return;

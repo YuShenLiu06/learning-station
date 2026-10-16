@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ArrowLeft, ChevronDown, FolderOpen, LoaderCircle } from 'lucide-react';
+import { ArrowLeft, Bell, FolderOpen, LoaderCircle, Palette, Settings2 } from 'lucide-react';
 import { call } from './api';
 import { modelAccessReason, modelAccessMessage, modelBindingChanged, modelFailureMessage, modelFormError, modelRequestTarget, supportedProtocol } from './modelPolicy';
 import type { ModelSettings } from './types';
@@ -8,6 +8,7 @@ import { FeishuSettings } from './FeishuSettings';
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 
 export function SettingsPage({ model, dataPath, onClose, onSaved, font, blocked }: { model: ModelSettings; dataPath?: string; onClose: () => void; onSaved: (model: ModelSettings) => void; font: ReturnType<typeof useFontSize>; blocked: boolean }) {
+  const [category, setCategory] = useState<'provider' | 'appearance' | 'notifications'>('provider');
   const [provider, setProvider] = useState(model.provider === 'glm-pi' ? 'glm-pi' : 'custom');
   const [protocol, setProtocol] = useState(model.protocol || supportedProtocol);
   const [baseUrl, setBaseUrl] = useState(model.baseUrl || '');
@@ -39,7 +40,9 @@ export function SettingsPage({ model, dataPath, onClose, onSaved, font, blocked 
     catch (error) { setError(modelFailureMessage(error, 'test')); }
     finally { setBusy(''); }
   }
-  return <section className="utility-page settings-page" aria-label="供应商与设置"><button className="text-back" onClick={onClose}><ArrowLeft size={14} />返回学习</button><span className="eyebrow">YOUR MODEL CONNECTION</span><h1>供应商与设置</h1><p className="page-description">连接信息保存在本机。日常更换模型可直接在对话中完成，无需重新填写供应商或密钥。</p><div className="provider-settings">
+  return <section className="utility-page settings-page" aria-label="供应商与设置"><button className="text-back" onClick={onClose}><ArrowLeft size={14} />返回学习</button><span className="eyebrow">YOUR MODEL CONNECTION</span><h1>设置</h1><p className="page-description">调整自己的学习空间。连接、阅读与通知分别管理，修改时已有输入会保留。</p><div className="settings-layout"><nav className="settings-categories" role="tablist" aria-label="设置分类" aria-orientation="vertical" onKeyDown={event => { const keys = ['provider', 'appearance', 'notifications'] as const; const index = keys.indexOf(category); const next = event.key === 'ArrowDown' ? keys[(index + 1) % keys.length] : event.key === 'ArrowUp' ? keys[(index + keys.length - 1) % keys.length] : event.key === 'Home' ? keys[0] : event.key === 'End' ? keys.at(-1) : undefined; if (next) { event.preventDefault(); setCategory(next); document.getElementById(`settings-tab-${next}`)?.focus(); } }}>
+      {([{id:'provider',label:'供应商',icon:Settings2},{id:'appearance',label:'外观与阅读',icon:Palette},{id:'notifications',label:'通知',icon:Bell}] as const).map(item => <button key={item.id} id={`settings-tab-${item.id}`} role="tab" aria-selected={category === item.id} aria-controls={`settings-${item.id}`} tabIndex={category === item.id ? 0 : -1} className={category === item.id ? 'selected' : ''} onClick={() => setCategory(item.id)}><item.icon size={16}/>{item.label}</button>)}
+    </nav><div className="settings-panels"><section id="settings-provider" role="tabpanel" aria-labelledby="settings-tab-provider" hidden={category !== 'provider'}><h2 className="settings-section-title">模型供应商</h2><p className="muted small">连接信息保存在本机。日常更换模型可直接在对话中完成，无需重新填写供应商或密钥。</p><div className="provider-settings">
 
     <div className={`settings-status ${model.connected && !modelAccessReason(model) ? 'connected' : ''}`}><span className="connection-dot" />{modelAccessReason(model) ? '已保存配置 · 本地用途限制' : model.connected ? '已保存目标的真实连接已验证' : model.configured ? '已保存配置 · 连接待验证' : '模型服务尚未配置'}</div>
     {modelAccessMessage(model) && <div className="inline-error model-policy" role="status"><strong>当前保存的地址受本地限制</strong><p>{modelAccessMessage(model)}</p></div>}
@@ -55,10 +58,10 @@ export function SettingsPage({ model, dataPath, onClose, onSaved, font, blocked 
       </fieldset>{blocked && <p className="muted small">正在生成或切换模型；请先回到对话停止生成，再修改连接。</p>}{error && <div className="inline-error" role="alert">{error}</div>}{result && <p className="settings-result" role="status">{result}</p>}
       <div className="dialog-footer"><button type="button" className="quiet-button" disabled={!!busy || blocked} onClick={() => { void test(); }}>{busy === 'test' ? <><LoaderCircle size={14} className="spin" />正在测试已保存连接…</> : modelAccessReason(model) && !settingsChanged ? '查看本地用途限制' : '测试已保存连接'}</button><button className="primary-button" disabled={!!busy || blocked}>{busy === 'save' ? <><LoaderCircle size={14} className="spin" />正在保存配置…</> : '保存连接设置'}</button></div>
     </form>
-    </div><FeishuSettings /><details className="reading-settings"><summary>阅读与本机设置 <ChevronDown size={14} /></summary>
+    </div></section><section id="settings-notifications" role="tabpanel" aria-labelledby="settings-tab-notifications" hidden={category !== 'notifications'}><FeishuSettings /></section><section id="settings-appearance" className="appearance-settings" role="tabpanel" aria-labelledby="settings-tab-appearance" hidden={category !== 'appearance'}><h2 className="settings-section-title">外观与阅读</h2>
     <section className="font-settings" aria-label="内容字号设置"><div><strong>内容字号</strong><output aria-live="polite">{font.fontSize}px</output></div><div className="font-controls"><button className="quiet-button" aria-label="减小内容字号" disabled={font.fontSize <= 12} onClick={() => font.setFontSize(font.fontSize - 1)}>A−</button><input aria-label="内容字号" type="range" min="12" max="24" step="1" value={font.fontSize} onChange={event => font.setFontSize(Number(event.target.value))} /><button className="quiet-button" aria-label="增大内容字号" disabled={font.fontSize >= 24} onClick={() => font.setFontSize(font.fontSize + 1)}>A＋</button></div><p>阅读、编辑、对话与复习内容同步调整。{font.status}</p>{font.error && <div className="inline-error" role="alert">字号设置：{font.error}<button onClick={() => { void font.flush().catch(() => undefined); }}>重试保存字号</button><button onClick={() => { void font.retry(); }}>重新读取字号</button></div>}</section>
     <div className="settings-local"><p>Anki：仅 CSV 导出，未同步</p><strong><FolderOpen size={14} />本机材料目录</strong><p>{dataPath || '由本机服务管理，连接后显示路径'}</p><p>Markdown 是学习内容的原始文件，保存时会检查版本变化。</p></div>
-    </details>
+    </section></div></div>
   </section>;
 }
 

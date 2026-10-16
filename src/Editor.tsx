@@ -6,14 +6,14 @@ import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
 import { markdown } from '@codemirror/lang-markdown';
 import { syntaxHighlighting, defaultHighlightStyle } from '@codemirror/language';
 
-export type EditorHandle = { getValue: () => string; focus: () => void };
+export type EditorHandle = { getValue: () => string; focus: () => void; insertText: (text: string) => void };
 type Props = { initial: string; onChange: (value: string) => void; onSelection: (text: string) => void; onSave: () => void; onReady?: () => void };
 export const Editor = forwardRef<EditorHandle, Props>(function Editor(props, ref) {
   const root = useRef<HTMLDivElement>(null);
   const editor = useRef<EditorView | null>(null);
   const callbacks = useRef(props);
   callbacks.current = props;
-  useImperativeHandle(ref, () => ({ getValue: () => editor.current?.state.doc.toString() ?? props.initial, focus: () => editor.current?.focus() }), []);
+  useImperativeHandle(ref, () => ({ getValue: () => editor.current?.state.doc.toString() ?? props.initial, focus: () => editor.current?.focus(), insertText: (text: string) => { const view = editor.current; if (!view) return; const selection = view.state.selection.main; view.dispatch({ changes: { from: selection.from, to: selection.to, insert: text }, selection: { anchor: selection.from + text.length }, scrollIntoView: true }); view.focus(); } }), []);
   useEffect(() => {
     if (!root.current) return;
     const view = new EditorView({
@@ -38,5 +38,6 @@ export const Editor = forwardRef<EditorHandle, Props>(function Editor(props, ref
     const frame = requestAnimationFrame(() => callbacks.current.onReady?.());
     return () => { cancelAnimationFrame(frame); view.destroy(); editor.current = null; };
   }, []);
+  useEffect(() => { const view = editor.current; if (!view || view.state.doc.toString() === props.initial) return; const selection = Math.min(view.state.selection.main.head, props.initial.length); view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: props.initial }, selection: { anchor: selection } }); }, [props.initial]);
   return <div className="editor-root" ref={root} />;
 });

@@ -16,13 +16,13 @@ test('controlled React flow preserves next draft, retries one saved user entry, 
   globalThis.cancelAnimationFrame=dom.window.cancelAnimationFrame.bind(dom.window);
   globalThis.IS_REACT_ACT_ENVIRONMENT=true;globalThis.isTauri=true;
   const {mockIPC,mockWindows,clearMocks}=await import('@tauri-apps/api/mocks');
-  const commands=[];const runs=new Map();let generationCount=0;let releaseSave;
+  const commands=[];const runs=new Map();let generationCount=0;let releaseSave;let contextFailed=false;let practiceReads=0;
   const saveGate=new Promise(resolve=>{releaseSave=resolve;});
   const clone=value=>structuredClone(value);
   const model={configured:true,provider:'custom',protocol:'openai-completions',model:'fixture-original',baseUrl:'http://127.0.0.1:1/v1',requestUrl:'http://127.0.0.1:1/v1/chat/completions',verified:true,usageGate:''};
   const session={id:'session_fixture',sectionId:'section_fixture',title:'fixture',version:'v1',entries:[],contextManifest:[]};
   const context={text:'local fixture',manifest:[],warnings:[],truncated:false};
-  let prefs={fontSize:16,assistantWidth:346};let feishuCount=0;const todos=[];
+  let prefs={fontSize:16,assistantWidth:346,sidebarCollapsed:false,expandedNodeIds:[]};let feishuCount=0;const todos=[];
   const toolReceipt={id:'activity_fixture',toolCallId:'call_fixture',runId:'',sessionId:session.id,name:'create_todo',status:'succeeded',title:'untrusted title',summary:'untrusted summary',startedAt:'now',updatedAt:'now',persisted:true,object:{kind:'todo',id:'todo_fixture',sessionId:session.id,sectionId:session.sectionId}};
   mockWindows('main');
   mockIPC(async (command,args={})=>{
@@ -30,6 +30,7 @@ test('controlled React flow preserves next draft, retries one saved user entry, 
     switch(command){
       case 'get_app_state':return {root:'/tmp/fake-learning-station',documents:[{id:'section_fixture',path:'fixture.md',title:'Local fixture',kind:'section',tags:[],version:'v1'}],activeDocumentId:'section_fixture',model:clone(model)};
       case 'get_ui_preferences':return clone(prefs);
+      case 'get_library_tree':return {nodes:[{id:'section_fixture',parentId:null,courseId:'section_fixture',kind:'section',title:'Local fixture',version:'v1',order:0,path:'fixture.md'}],warnings:[]};
       case 'save_ui_preferences':prefs={...prefs,...args};return clone(prefs);
       case 'list_todos':return clone(todos);
       case 'list_notifications':case 'list_review_items':return [];
@@ -39,20 +40,21 @@ test('controlled React flow preserves next draft, retries one saved user entry, 
       case 'open_document':return {id:'section_fixture',path:'fixture.md',metadata:{id:'section_fixture',title:'Local fixture',kind:'section',goals:[],tags:[],links:[],version:1},body:'# Local fixture\nReading material.',content:'',version:'v1',modifiedAt:'now'};
       case 'start_session':return {session:clone(session)};
       case 'get_session':return clone(session);
-      case 'load_session_context':return clone(context);
+      case 'load_session_context':if(session.entries.length&&!contextFailed){contextFailed=true;throw {code:'REQUIRED_CONTEXT_UNAVAILABLE',message:'Controlled required material unavailable'};}return clone(context);
       case 'append_entry':{
         await saveGate;
         if(!session.entries.some(entry=>entry.data?.clientMessageId===args.entry.data?.clientMessageId)) session.entries.push({...args.entry,id:'entry_user_fixture',createdAt:'now'});
         session.version='v2';return clone(session);
       }
       case 'start_generation':{
+        if(args.mode==='practice'){const id='run_'+createHash('sha256').update(args.requestId).digest('hex').slice(0,32);runs.set(id,{id,sessionId:session.id,status:'running',content:'{\"answers\":[\"REFERENCE_MUST_STAY_HIDDEN\"],\"explanation\":\"secret\"}',toolCalls:[]});return clone(runs.get(id));}
         generationCount++;assert.equal(args.userEntryId,'entry_user_fixture');
         const id='run_'+createHash('sha256').update(args.requestId).digest('hex').slice(0,32);
         runs.set(id,{id,sessionId:session.id,userEntryId:args.userEntryId,status:generationCount===1?'failed':'succeeded',content:'',toolCalls:generationCount===2?[{...toolReceipt,runId:id}]:[],error:generationCount===1?{code:'MODEL_RESPONSE',message:'controlled failure'}:undefined});
         if(generationCount===2){session.entries.push({id:'entry_assistant',kind:'assistant',content:'Controlled fixture response',createdAt:'now',relatedIds:[]},{id:'entry_tool',kind:'note',content:'internal activity snapshot',createdAt:'now',data:{origin:'pi-tool-activity',toolActivity:{...toolReceipt,runId:id}}});todos.push({id:'todo_fixture',title:'Controlled persisted task',done:false,reminderEnabled:false});}
         return clone(runs.get(id));
       }
-      case 'get_run':if(runs.has(args.runId))return clone(runs.get(args.runId));throw {code:'NOT_FOUND',message:'not found'};
+      case 'get_run':if(runs.has(args.runId)){const value=runs.get(args.runId);if(value.content.includes('REFERENCE_MUST_STAY_HIDDEN')&&++practiceReads>1){value.status='failed';value.error={code:'MODEL_RESPONSE',message:'Controlled invalid practice'};}return clone(value);}throw {code:'NOT_FOUND',message:'not found'};
       case 'set_model':Object.assign(model,{model:args.model,verified:false});return clone(model);
       case 'check_feishu_status':return {ready:true,reason:'Controlled fake bridge only'};
       case 'test_feishu_notification':return ++feishuCount===1?{status:'unknown',messageId:null,reason:'Controlled unknown result'}:{status:'sent',messageId:'fake_receipt',reason:'Controlled fake receipt'};
@@ -78,17 +80,19 @@ test('controlled React flow preserves next draft, retries one saved user entry, 
     assert.equal(commands.filter(x=>x.command==='append_entry').length,1);
     await React.act(async()=>releaseSave());await waitFor(()=>button('重试生成'));
     assert.equal(composer.value,'next unsent draft');assert.equal(document.querySelectorAll('.message.user').length,1);
-    await click(button('重试生成'));await waitFor(()=>document.querySelector('.message.assistant'));
+    assert.equal(generationCount,0);assert.equal(session.entries.filter(x=>x.kind==='user').length,1);await click(button('重试生成'));await waitFor(()=>generationCount===1&&button('重试生成'));await click(button('重试生成'));await waitFor(()=>document.querySelector('.message.assistant'));
     assert.equal(document.querySelectorAll('.tool-activity').length,1);assert.match(document.querySelector('.tool-activity').textContent,/创建待办.*成功/);assert.doesNotMatch(document.querySelector('.messages').textContent,/internal activity snapshot/);
     await click(button('打开待办'));await waitFor(()=>document.querySelector('[role="dialog"]'));assert.match(document.querySelector('[role="dialog"]').textContent,/Controlled persisted task/);await click(document.querySelector('[aria-label="关闭弹窗"]'));
     const starts=commands.filter(x=>x.command==='start_generation');assert.equal(starts.length,2);assert.notEqual(starts[0].args.requestId,starts[1].args.requestId);assert.equal(starts[0].args.userEntryId,starts[1].args.userEntryId);
     assert.equal(commands.filter(x=>x.command==='append_entry').length,1);assert.equal(composer.value,'next unsent draft');assert.equal(document.querySelectorAll('.message.user').length,1);
+    await click(button('生成练习子文档'));await waitFor(()=>practiceReads===1);assert.equal(document.querySelector('.partial-message'),null);assert.doesNotMatch(document.querySelector('.assistant-scroll').textContent,/REFERENCE_MUST_STAY_HIDDEN/);await tick(390);await waitFor(()=>document.querySelector('.recovery-message pre'));assert.match(document.querySelector('.recovery-message summary').textContent,/模型原返回（含参考）/);assert.equal(document.querySelector('.recovery-message').open,false);
+    for(let i=0;i<4;i++)await click(document.querySelector('[aria-label="折叠为图标栏"],[aria-label="展开侧边栏"]'));await click(document.querySelector('[aria-label="折叠为图标栏"]'));await tick(250);assert.equal(prefs.sidebarCollapsed,true);assert.equal(document.querySelector('[aria-label="向学习助手提问"]'),composer);assert.equal(composer.value,'next unsent draft');
     await click(document.querySelector('.chat-model-current'));await input(document.querySelector('[aria-label="对话模型 ID"]'),'fixture-new');await click(button('应用模型'));await waitFor(()=>document.querySelector('.chat-model-current').textContent.includes('fixture-new'));
     assert.deepEqual(commands.filter(x=>x.command==='set_model').map(x=>x.args),[{model:'fixture-new'}]);assert.equal(document.querySelector('[aria-label="向学习助手提问"]'),composer);assert.equal(composer.value,'next unsent draft');
     const separator=document.querySelector('[role="separator"]');await key(separator,'ArrowRight');await tick(300);
     const widthWrite=commands.filter(x=>x.command==='save_ui_preferences').at(-1);assert.deepEqual(widthWrite.args,{assistantWidth:330});assert.equal(document.querySelector('[aria-label="向学习助手提问"]'),composer);
-    await click(document.querySelector('[aria-label="供应商设置"]'));await waitFor(()=>button('发送测试消息')&&!button('发送测试消息').disabled);
-    assert.equal(document.querySelector('[role="dialog"]'),null);assert.match(document.querySelector('.settings-page h1').textContent,/供应商与设置/);assert.equal(feishuCount,0);
+    await click(document.querySelector('[aria-label="供应商设置"]'));const address=document.querySelector('[aria-label="模型服务地址"]');await input(address,'http://127.0.0.1:9/v1');await click(document.querySelector('[aria-controls="settings-appearance"]'));await click(document.querySelector('[aria-controls="settings-provider"]'));assert.equal(document.querySelector('[aria-label="模型服务地址"]'),address);assert.equal(address.value,'http://127.0.0.1:9/v1');await click(document.querySelector('[aria-controls="settings-notifications"]'));await waitFor(()=>button('发送测试消息')&&!button('发送测试消息').disabled);
+    assert.equal(document.querySelector('[role="dialog"]'),null);assert.match(document.querySelector('.settings-page h1').textContent,/设置/);assert.equal(feishuCount,0);
     await click(button('发送测试消息'));await waitFor(()=>button('核对上次发送结果'));await click(button('核对上次发送结果'));await waitFor(()=>document.querySelector('.feishu-settings').textContent.includes('测试消息已发送'));
     const tests=commands.filter(x=>x.command==='test_feishu_notification');assert.equal(tests.length,2);assert.equal(tests[0].args.requestId,tests[1].args.requestId);assert.match(tests[0].args.requestId,/^[A-Za-z0-9_-]{8,128}$/);
     assert.equal(commands.some(x=>['test_model','configure_model'].includes(x.command)),false);
