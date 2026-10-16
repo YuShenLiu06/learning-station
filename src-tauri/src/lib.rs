@@ -1,4 +1,5 @@
 pub mod app;
+pub mod assistant_references;
 pub mod content;
 pub mod context;
 #[cfg(feature = "desktop")]

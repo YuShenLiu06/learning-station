@@ -1,8 +1,8 @@
-import type { ContextInjection, RequestedContext } from './types';
+import type { AssistantReference, ContextInjection, RequestedContext } from './types';
 const validId = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/u.test(value);
 const bytes = (value: string) => new TextEncoder().encode(value).length;
-export function freezeRequestedContext(documentId: string, selection: string, injections: ContextInjection[] = []): RequestedContext {
- return { documentId, selection, injections: injections.map(item => ({ ...item })) };
+export function freezeRequestedContext(documentId: string, selection: string, injections: ContextInjection[] = [], assistantReferences: AssistantReference[] = []): RequestedContext {
+ return { documentId, selection, injections: injections.map(item => ({ ...item })), ...(assistantReferences.length ? { assistantReferences: assistantReferences.map(item => ({ ...item })) } : {}) };
 }
 // This is the persisted request intent, never a substitute for a Run's actual manifest.
 export function readRequestedContext(value: unknown, entrySelection = ''): RequestedContext | undefined {
@@ -17,5 +17,16 @@ export function readRequestedContext(value: unknown, entrySelection = ''): Reque
   seen.add(item.documentId);
   injections.push({ documentId: item.documentId, expectedVersion: item.expectedVersion, ...(item.selection === undefined ? {} : { selection: item.selection as string }) });
  }
- return { documentId: data.documentId, selection: data.selection, injections };
+ const assistantReferences: AssistantReference[] = [], seenAnswers = new Set<string>();
+ if (data.assistantReferences !== undefined) {
+  if (!Array.isArray(data.assistantReferences) || data.assistantReferences.length > 4 || data.assistantReferences.length + injections.length > 8) return;
+  for (const raw of data.assistantReferences) {
+   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return;
+   const item = raw as Record<string, unknown>;
+   if (!validId(item.sessionId) || !validId(item.entryId) || seenAnswers.has(item.entryId) || item.runId !== undefined && !validId(item.runId) || typeof item.textHash !== 'string' || !/^[a-f0-9]{64}$/u.test(item.textHash) || typeof item.selection !== 'string' || !item.selection || Array.from(item.selection).length > 8000 || bytes(item.selection) > 30000) return;
+   seenAnswers.add(item.entryId);
+   assistantReferences.push({ sessionId: item.sessionId, entryId: item.entryId, ...(item.runId === undefined ? {} : { runId: item.runId as string }), textHash: item.textHash, selection: item.selection });
+  }
+ }
+ return { documentId: data.documentId, selection: data.selection, injections, ...(assistantReferences.length ? { assistantReferences } : {}) };
 }

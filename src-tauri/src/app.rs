@@ -657,6 +657,7 @@ impl Core {
         Ok((
             session,
             Context {
+                assistant_reference_manifest: vec![],
                 history_manifest: vec![],
                 excluded_history_source_ids: vec![],
                 text: String::new(),
@@ -680,6 +681,7 @@ impl Core {
                 ));
             }
             Context {
+                assistant_reference_manifest: vec![],
                 history_manifest: vec![],
                 excluded_history_source_ids: vec![],
                 text: String::new(),

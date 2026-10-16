@@ -430,15 +430,17 @@ async fn load_session_context(
     session_id: String,
     selection: Option<String>,
     injections: Option<Vec<context::ContextInjection>>,
+    assistant_references: Option<Vec<context::AssistantReference>>,
 ) -> Result<Context> {
     work(state.inner().clone(), move |e| {
-        let (session, mut context) = e
-            .lock()?
-            .session_context(&session_id, selection.as_deref())?;
-        context::inject(
-            &e.lock()?.content,
+        let mut core = e.lock()?;
+        let (session, mut context) = core.session_context(&session_id, selection.as_deref())?;
+        context::inject_request(
+            &core.content,
             &mut context,
+            &session,
             &injections.unwrap_or_default(),
+            &assistant_references.unwrap_or_default(),
         )?;
         crate::context::attach_history(&mut context, &session, None);
         Ok(context)
@@ -517,6 +519,7 @@ async fn start_generation(
     request_id: String,
     user_entry_id: Option<String>,
     injections: Option<Vec<context::ContextInjection>>,
+    assistant_references: Option<Vec<context::AssistantReference>>,
 ) -> Result<Value> {
     let sink: Sink = Arc::new(move |event| {
         let _ = app.emit("generation", event);
@@ -530,6 +533,7 @@ async fn start_generation(
             prompt,
             request_id,
             user_entry_id,
+            assistant_references: assistant_references.unwrap_or_default(),
             injections: injections.unwrap_or_default(),
         },
         sink,

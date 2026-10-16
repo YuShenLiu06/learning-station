@@ -287,6 +287,13 @@ pub fn get(store: &mut ContentStore, id: &str) -> Result<Session> {
         created_at: created,
         updated_at: updated,
         entries,
+        context_assistant_reference_manifest: serde_json::from_value(
+            doc.metadata
+                .extra
+                .get("contextAssistantReferenceManifest")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        )?,
         context_history_manifest: serde_json::from_value(
             doc.metadata
                 .extra
@@ -335,6 +342,7 @@ pub fn set_context_manifest(
     let mut context = Context {
         text: String::new(),
         manifest: manifest.to_vec(),
+        assistant_reference_manifest: vec![],
         history_manifest: vec![],
         excluded_history_source_ids: vec![],
         warnings: vec![],
@@ -386,7 +394,28 @@ pub fn set_context_snapshot_explicit(
             "历史上下文不属于本次会话，未写入来源。",
         ));
     }
+    if context.assistant_reference_manifest.len() > 4
+        || context.assistant_reference_manifest.iter().any(|item| {
+            item.path != format!("ai-answer/{session_id}/{}", item.id)
+                || !session.entries.iter().any(|entry| {
+                    entry.id == item.id
+                        && entry.kind == "assistant"
+                        && hash(&entry.content) == item.version
+                })
+                || item.included_chars == 0
+                || item.included_chars > 8000
+        })
+    {
+        return Err(CoreError::new(
+            "OUT_OF_SCOPE",
+            "AI回答来源不属于本次会话或版本已变化，未写入来源。",
+        ));
+    }
     let mut doc = store.read(session_id)?;
+    doc.metadata.extra.insert(
+        "contextAssistantReferenceManifest".into(),
+        json!(context.assistant_reference_manifest),
+    );
     doc.metadata
         .extra
         .insert("contextManifest".into(), json!(context.manifest));
@@ -485,7 +514,13 @@ pub fn append(
         }
         return Ok(old);
     }
-    crate::context::requested_context(&entry, Some(&old.section_id))?;
+    if let Some(frozen) = crate::context::requested_context(&entry, Some(&old.section_id))? {
+        crate::assistant_references::validate_references(
+            store,
+            &old,
+            &frozen.assistant_references,
+        )?;
+    }
     if entry.kind == "exercise" {
         let questions = entry
             .data

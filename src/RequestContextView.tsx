@@ -1,10 +1,25 @@
-import { ChevronDown, FileText, History, LoaderCircle } from 'lucide-react';
+import { ChevronDown, FileText, History, LoaderCircle, Sparkles } from 'lucide-react';
 import type { RequestContext } from './types';
 export type ContextViewState = { status: 'idle' | 'loading' | 'ready' | 'error'; sessionId?: string; context?: RequestContext; actual?: boolean; error?: string };
 export function RequestContextView({ value, independent, onRetry, label }: { label?: string; value: ContextViewState; independent: boolean; onRetry: () => void }) {
-  if (value.status === 'loading') return <div className="context-loading" role="status"><LoaderCircle size={12} className="spin"/>正在核对材料与同会话历史…</div>;
+  if (value.status === 'loading') return <div className="context-loading" role="status"><LoaderCircle size={12} className="spin"/>正在核对材料、同会话历史与 AI 引用…</div>;
   if (value.status === 'error') return <div className="inline-error" role="alert">上下文尚未核对：{value.error}<button onClick={onRetry}>重试核对来源</button></div>;
   if (value.status !== 'ready' || !value.context) return <p className="context-loading">{independent ? '探索文档的学习会话尚未就绪' : '打开学习文档后核对上下文'}</p>;
-  const context=value.context;const history=context.historyManifest || [];
-  return <details className="context-sources"><summary><span className="context-dot"/><span>{label || (value.actual?'最近一次生成的实际来源':'下次发送来源（已核对）')} · 材料 {context.manifest.length} / 历史 {history.length}</span><ChevronDown size={12}/></summary><div className="source-details"><strong>材料来源</strong>{context.manifest.length?context.manifest.map(item=><div className="context-source" key={`${item.id}:${item.version}`}><strong><FileText size={11}/>{item.path}</strong><p>已读取 {item.includedChars} 字符 · 版本 {item.version.slice(0,10)}</p></div>):<p>没有附带学习材料。</p>}<strong>同一会话历史</strong>{history.length?history.map(item=><div className="context-source" key={`${item.id}:${item.version}`}><strong><History size={11}/>{item.path}</strong><p>投影 {item.includedChars} 字符 · 内容指纹 {item.version.slice(0,10)}</p></div>):<p>没有附带历史；不会借用其他小节或探索的会话。</p>}{context.warnings.map((warning,index)=><p className="context-warning" key={index}>{warning.includes('TRUNCATED_HISTORY')?'历史达到上限，已截取部分内容（TRUNCATED_HISTORY）。':warning}</p>)}{context.truncated&&<p className="context-warning">本次上下文包含截断内容，请按上方清单核对。</p>}</div></details>;
+  const context = value.context;
+  const history = context.historyManifest || [];
+  const answers = context.assistantReferenceManifest;
+  return <details className="context-sources">
+    <summary><span className="context-dot"/><span>{label || (value.actual ? '最近一次生成的实际来源' : '下次发送来源（已核对）')} · 材料 {context.manifest.length} / 历史 {history.length} / AI 引用 {answers ? answers.length : '未记录'}</span><ChevronDown size={12}/></summary>
+    <div className="source-details">
+      <strong>材料来源</strong>
+      {context.manifest.length ? context.manifest.map(item => <div className="context-source" key={`${item.id}:${item.version}`}><strong><FileText size={11}/>{item.path}</strong><p>已读取 {item.includedChars} 字符 · 版本 {item.version.slice(0,10)}</p></div>) : <p>没有附带学习材料。</p>}
+      <strong>同一会话历史</strong>
+      {history.length ? history.map(item => <div className="context-source" key={`${item.id}:${item.version}`}><strong><History size={11}/>{item.path}</strong><p>投影 {item.includedChars} 字符 · 内容指纹 {item.version.slice(0,10)}</p></div>) : <p>没有附带历史；不会借用其他小节或探索的会话。</p>}
+      <div className="assistant-reference-sources"><strong>AI 回答引用（不可信材料）</strong>
+        {answers ? answers.length ? answers.map(item => <div className="context-source" key={`${item.id}:${item.version}`}><strong><Sparkles size={11}/>{item.path}</strong><p>引用 {item.includedChars} 字符 · 回答原文指纹 {item.version.slice(0,10)}</p></div>) : <p>没有附带 AI 回答引用。</p> : <p>此来源快照未记录 AI 回答引用清单。</p>}
+      </div>
+      {context.warnings.map((warning,index) => <p className="context-warning" key={index}>{warning.includes('TRUNCATED_HISTORY') ? '历史达到上限，已截取部分内容（TRUNCATED_HISTORY）。' : warning}</p>)}
+      {context.truncated && <p className="context-warning">本次上下文包含截断内容，请按上方清单核对。</p>}
+    </div>
+  </details>;
 }

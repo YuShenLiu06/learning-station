@@ -1,4 +1,5 @@
 //! Linked learning documents are user reference material, never system instructions.
+pub use crate::assistant_references::{inject_request, AssistantReference};
 use crate::content::ContentStore;
 use crate::types::{Context, CoreError, Document, ManifestItem, Result, Session};
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,8 @@ pub struct RequestedContext {
     pub document_id: String,
     pub selection: String,
     pub injections: Vec<ContextInjection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assistant_references: Vec<AssistantReference>,
 }
 /// Frozen request intent, not a claim about which sources a model actually received.
 pub fn requested_context(
@@ -44,12 +47,14 @@ pub fn requested_context(
     if (!frozen.document_id.is_empty() && !crate::types::valid_id(&frozen.document_id))
         || frozen.selection.len() > 30000
         || frozen.selection != entry.selection.as_deref().unwrap_or_default()
-        || frozen.injections.len() > 8
+        || frozen.injections.len() + frozen.assistant_references.len() > 8
         || section_id.is_some_and(|id| id != frozen.document_id)
         || (frozen.document_id.is_empty() && !frozen.selection.is_empty())
     {
         return Err(invalid());
     }
+    crate::assistant_references::validate_shape(&frozen.assistant_references)
+        .map_err(|_| invalid())?;
     let mut seen = BTreeSet::new();
     for source in &frozen.injections {
         if !crate::types::valid_id(&source.document_id)
@@ -274,6 +279,7 @@ pub fn load(store: &ContentStore, section_id: &str, selection: Option<&str>) -> 
     let mut builder = Builder {
         store,
         result: Context {
+            assistant_reference_manifest: vec![],
             history_manifest: vec![],
             excluded_history_source_ids: vec![],
             text: USER_MATERIAL_NOTICE.into(),
@@ -831,6 +837,9 @@ fn collect_declared_trashed_sources(
                         | "contextExcludedHistorySourceIds"
                         | "historyManifest"
                         | "contextHistoryManifest"
+                        | "assistantReferenceManifest"
+                        | "contextAssistantReferenceManifest"
+                        | "assistantReferences"
                         | "sourceManifest"
                         | "sourceIds"
                         | "relatedIds"
@@ -883,6 +892,7 @@ pub fn protect_trashed_history(
         .context_manifest
         .iter()
         .chain(&session.context_history_manifest)
+        .chain(&session.context_assistant_reference_manifest)
     {
         if trashed.contains(&item.id) {
             matched.insert(item.id.clone());
@@ -1115,6 +1125,7 @@ mod trash_history_tests {
             created_at: String::new(),
             updated_at: String::new(),
             context_manifest: vec![],
+            context_assistant_reference_manifest: vec![],
             context_history_manifest: vec![],
             context_excluded_history_source_ids: vec![],
             context_warnings: vec!["TRASHED_HISTORY_EXCLUDED: stale saved policy".into()],
@@ -1134,6 +1145,7 @@ mod trash_history_tests {
         Context {
             text: "Current retained material".into(),
             manifest: vec![],
+            assistant_reference_manifest: vec![],
             history_manifest: vec![],
             excluded_history_source_ids: vec![],
             warnings: vec![],

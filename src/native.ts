@@ -5,7 +5,7 @@ import { sessionMessages } from './sessionMessages';
 import { historicalTools, foldToolActivities } from './toolActivities';
 import { noticeBody } from './noticePolicy';
 import { freezeRequestedContext } from './requestedContext';
-import type { ContextInjection } from './types';
+import type { AssistantReference, ContextInjection } from './types';
 import { stableRunId } from './outgoingMessages';
 import type { ToolActivity } from './types';
 
@@ -13,12 +13,12 @@ type NativeDoc = { id: string; path: string; metadata: { id: string; title: stri
 type Summary = { id: string; path: string; title: string; kind: string; tags: string[]; version: string };
 type Entry = { id: string; kind: string; content: string; createdAt: string; selection?: string; relatedIds: string[]; data?: Record<string, unknown> };
 type Manifest = { id: string; path: string; version: string; includedChars: number };
-type NativeSession = { id: string; sectionId: string; title: string; version: string; entries: Entry[]; contextManifest: Manifest[]; contextHistoryManifest?: Manifest[]; contextWarnings?: string[]; contextTruncated?: boolean };
+type NativeSession = { id: string; sectionId: string; title: string; version: string; entries: Entry[]; contextManifest: Manifest[]; contextHistoryManifest?: Manifest[]; contextAssistantReferenceManifest?: Manifest[]; contextWarnings?: string[]; contextTruncated?: boolean };
 type NativeModel = { configured: boolean; provider: string; baseUrl: string; model: string; verified?: boolean; harness?: string; protocol?: string; requestUrl?: string; usageGate?: string };
 type NativeState = { root: string; documents: Summary[]; activeDocumentId?: string; model: NativeModel; lastRunId?: string };
 type NativeTodo = { id: string; title: string; dueAt?: string; reminderEnabled?: boolean; done: boolean };
 type NativeNotice = { id: string; title: string; dueAt?: string; read: boolean; deliveryStatus?: string };
-type Run = { id: string; status: string; content: string; error?: { code: string; message: string; details?: Record<string, unknown> } | string; sessionId: string; userEntryId?: string; toolCalls?: ToolActivity[]; contextSnapshotVersion?: number; contextManifest?: Manifest[]; historyManifest?: Manifest[]; contextWarnings?: string[]; contextTruncated?: boolean };
+type Run = { id: string; status: string; content: string; error?: { code: string; message: string; details?: Record<string, unknown> } | string; sessionId: string; userEntryId?: string; toolCalls?: ToolActivity[]; contextSnapshotVersion?: number; contextManifest?: Manifest[]; historyManifest?: Manifest[]; assistantReferenceManifest?: Manifest[]; contextWarnings?: string[]; contextTruncated?: boolean };
 const draftVersions = new Map<string, string>();
 const draftReadKeys = new Set<string>();
 const appendRequests = new Map<string, string>();
@@ -32,7 +32,7 @@ const sessionIds = new Map<string, NativeSession>();
 function cacheSession(value: NativeSession) { sessions.set(value.sectionId, value); sessionIds.set(value.id, value); return value; }
 const operationRuns = new Map<string, string>();
 const cancelled = new Set<string>();
-export type GenerationProgress = { operationId: string; sectionId: string; sessionId: string; content: string; mode?: string; runId?: string; toolCalls?: ToolActivity[]; manifest?: RequestContext['manifest']; context?: RequestContext; contextError?: string };
+export type GenerationProgress = { operationId: string; sectionId: string; sessionId: string; content: string; userEntryId?: string; userEntryConfirmed?: boolean; mode?: string; runId?: string; toolCalls?: ToolActivity[]; manifest?: RequestContext['manifest']; context?: RequestContext; contextError?: string };
 const progressListeners = new Set<(progress: GenerationProgress) => void>();
 export function onGenerationProgress(listener: (progress: GenerationProgress) => void) { progressListeners.add(listener); return () => { progressListeners.delete(listener); }; }
 const nativeCommands = new Set(['get_app_state', 'refresh_library', 'create_section', 'import_markdown', 'open_document', 'save_document', 'start_session', 'get_session', 'append_entry', 'load_context', 'start_generation', 'cancel_generation', 'get_run', 'configure_model', 'get_model_settings', 'set_model', 'test_model', 'create_todo', 'list_todos', 'set_todo_done', 'list_notifications', 'mark_notification_read', 'export_anki_csv', 'list_review_items', 'get_ui_draft', 'save_ui_draft', 'set_todo_reminder', 'record_ui_metric', 'get_ui_preferences', 'save_ui_preferences', 'start_exploration', 'load_session_context', 'check_feishu_status', 'test_feishu_notification', 'get_library_tree', 'create_library_node', 'move_library_node', 'get_exercise_document', 'create_manual_exercise', 'materialize_legacy_exercise', 'import_course_asset', 'list_course_assets', 'read_course_asset', 'set_review_state', 'export_review_items', 'set_document_links', 'create_exploration_note', 'preview_library_trash', 'trash_library_node', 'list_library_trash', 'restore_library_node', 'list_sessions', 'get_grading_settings', 'set_grading_model', 'grade_attempt', 'get_grade_run', 'cancel_grade_run', 'check_anki_connection', 'get_anki_due', 'reveal_anki_card', 'answer_anki_card', 'get_anki_operation', 'add_review_items_to_anki', 'get_feishu_bot_settings', 'configure_feishu_bot', 'start_feishu_bot', 'stop_feishu_bot', 'get_feishu_bot_snapshot']);
@@ -60,7 +60,7 @@ function learning(value: NativeSession): LearningSession {
     }
   }
   const toCard = (entry: Entry): ReviewCard => ({ id: entry.id, sessionId: value.id, sectionId: value.sectionId, front: String(entry.data?.front ?? entry.content), back: String(entry.data?.back ?? ''), source: documents.get(value.sectionId)?.metadata.title || '学习记录' });
-  return { id: value.id, sectionId: value.sectionId, sources: sources(value.contextManifest),
+  return { id: value.id, sectionId: value.sectionId, sources: sources(value.contextManifest), contextAssistantReferenceManifest: value.contextAssistantReferenceManifest,
     messages: sessionMessages(value.entries), toolCalls: historicalTools(value.entries, value.id),
     exercises,
     mistakes: value.entries.filter(entry => entry.kind === 'error').map(entry => ({ id: entry.id, question: String(entry.data?.front ?? entry.content), reason: String(entry.data?.cause ?? ''), sectionId: value.sectionId })),
@@ -111,15 +111,22 @@ async function generation(payload: Record<string, unknown>, mode: string, prompt
     if (!resumed || recoverSavedOutput) {
       resumed = undefined;
       if (cancelled.has(operationId)) throw new StationError('已停止，问题保存在学习记录中。', 'CANCELLED', { sendStage: 'generation', runId });
-      await ipc('start_generation', { sessionId: value.id, mode, selection: String(payload.selection || ''), prompt, requestId: operationId, userEntryId: payload.userEntryId || undefined, injections: payload.injections || [] });
+      await ipc('start_generation', { sessionId: value.id, mode, selection: String(payload.selection || ''), prompt, requestId: operationId, userEntryId: payload.userEntryId || undefined, injections: payload.injections || [], ...(Array.isArray(payload.assistantReferences) && payload.assistantReferences.length ? { assistantReferences: payload.assistantReferences } : {}) });
     }
-    await ipc<NativeSession>('get_session', { id: value.id }).then(cacheSession).catch(() => undefined);
+    let userSnapshot = await ipc<NativeSession>('get_session', { id: value.id }).then(cacheSession).catch(() => undefined);
+    const checkedUserEntries = new Set<string>();
     if (cancelled.has(operationId)) await ipc('cancel_generation', { runId });
     const deadline = Date.now() + 130_000;
     while (Date.now() < deadline) {
       const run = resumed || await ipc<Run>('get_run', { runId }); resumed = undefined;
       confirmedStatus = run.status;
-      progressListeners.forEach(listener => listener({ operationId, mode, sectionId, sessionId: value.id, runId, content: run.content || '', ...(run.contextSnapshotVersion === 1 && Array.isArray(run.contextManifest) ? { context: { text: '', manifest: run.contextManifest, historyManifest: run.historyManifest || [], warnings: run.contextWarnings || [], truncated: run.contextTruncated === true } } : { contextError: '此历史运行未记录实际来源快照，不能用当前会话或空清单代替核实。' }), toolCalls: foldToolActivities(run.toolCalls || [], value.id) }));
+      const matchesUser = () => run.sessionId === value.id && userSnapshot?.id === value.id && typeof run.userEntryId === 'string' && userSnapshot.entries.some(entry => entry.id === run.userEntryId && entry.kind === 'user' && entry.content === prompt && entry.data?.mode === mode && (entry.data?.runId === run.id || payload.userEntryId === run.userEntryId && (entry.selection || '') === String(payload.selection || '')));
+      if (mode === 'practice' && run.userEntryId && !matchesUser() && (!checkedUserEntries.has(run.userEntryId) || ['succeeded','failed','cancelled','interrupted'].includes(run.status))) {
+        checkedUserEntries.add(run.userEntryId);
+        userSnapshot = await ipc<NativeSession>('get_session', { id: value.id }).then(cacheSession).catch(() => undefined);
+      }
+      const userEntryConfirmed = mode === 'practice' && matchesUser();
+      progressListeners.forEach(listener => listener({ operationId, mode, sectionId, sessionId: value.id, runId, userEntryId: run.userEntryId, userEntryConfirmed, content: run.content || '', ...(run.contextSnapshotVersion === 1 && Array.isArray(run.contextManifest) ? { context: { text: '', manifest: run.contextManifest, historyManifest: run.historyManifest || [], assistantReferenceManifest: run.assistantReferenceManifest, warnings: run.contextWarnings || [], truncated: run.contextTruncated === true } } : { contextError: '此历史运行未记录实际来源快照，不能用当前会话或空清单代替核实。' }), toolCalls: foldToolActivities(run.toolCalls || [], value.id) }));
       if (run.status === 'succeeded') return learning(await ipc<NativeSession>('get_session', { id: value.id }));
       if (['failed', 'cancelled', 'interrupted'].includes(run.status)) throw new StationError(typeof run.error === 'string' ? run.error : run.error?.message || '生成未完成，已收到的内容仍保留。', typeof run.error === 'object' ? run.error.code : run.status.toUpperCase(), { ...(typeof run.error === 'object' ? run.error.details : {}), sendStage: 'generation', runId, runStatus: run.status });
       await new Promise(resolve => setTimeout(resolve, 350));
@@ -147,7 +154,7 @@ export async function nativeCall(command: string, payload: Record<string, unknow
     case 'preferences_get': return ipc('get_ui_preferences');
     case 'preferences_save': return ipc('save_ui_preferences', { ...(payload.fontSize === undefined ? {} : { fontSize: payload.fontSize }), ...(payload.assistantWidth === undefined ? {} : { assistantWidth: payload.assistantWidth }), ...(payload.sidebarWidth === undefined ? {} : { sidebarWidth: payload.sidebarWidth }), ...(payload.sidebarCollapsed === undefined ? {} : { sidebarCollapsed: payload.sidebarCollapsed }), ...(payload.expandedNodeIds === undefined ? {} : { expandedNodeIds: payload.expandedNodeIds }) });
     case 'exploration_open': { const result = await ipc<{ session: NativeSession; context: unknown; lastRunId?: string }>('start_exploration', { sectionId: payload.sectionId || undefined, associateCurrentSection: payload.associateCurrentSection === true, fresh: false }); return { session: learning(result.session), context: result.context, lastRunId: result.lastRunId }; }
-    case 'context_load': { const session = await sessionFor(String(payload.sectionId || ''), payload.sessionId ? String(payload.sessionId) : undefined); return ipc('load_session_context', { sessionId: session.id, selection: String(payload.selection || ''), injections: payload.injections || [] }); }
+    case 'context_load': { const session = await sessionFor(String(payload.sectionId || ''), payload.sessionId ? String(payload.sessionId) : undefined); return ipc('load_session_context', { sessionId: session.id, selection: String(payload.selection || ''), injections: payload.injections || [], ...(Array.isArray(payload.assistantReferences) && payload.assistantReferences.length ? { assistantReferences: payload.assistantReferences } : {}) }); }
     case 'activity_refresh': { const [tasks, notices] = await Promise.all([ipc<NativeTodo[]>('list_todos'), ipc<NativeNotice[]>('list_notifications')]); return { tasks: tasks.map(item => ({ ...item, completed: item.done })), notices: notices.map(item => ({ ...item, body: noticeBody(item.deliveryStatus) })) }; }
     case 'metric': return ipc('record_ui_metric', { name: payload.name, valueMs: payload.valueMs });
     case 'draft_get': { draftReadKeys.delete(String(payload.key)); const result = await ipc<UiDraft | null>('get_ui_draft', { key: payload.key }); draftReadKeys.add(String(payload.key)); if (result) draftVersions.set(result.key, result.version); else draftVersions.delete(String(payload.key)); return result; }
@@ -191,7 +198,7 @@ export async function nativeCall(command: string, payload: Record<string, unknow
     case 'session_refresh': { const value = await sessionFor(String(payload.sectionId || ''), payload.sessionId ? String(payload.sessionId) : undefined); return learning(await ipc<NativeSession>('get_session', { id: value.id })); }
     case 'message_save': {
       const sendId = String(payload.sendId);
-      const value = await append(String(payload.sectionId || ''), 'user', String(payload.question), { mode: payload.mode, clientMessageId: sendId, requestedContext: freezeRequestedContext(String(payload.sectionId || ''), String(payload.selection || ''), (payload.injections || []) as ContextInjection[]) }, [], String(payload.selection || ''), String(payload.sessionId), sendId);
+      const value = await append(String(payload.sectionId || ''), 'user', String(payload.question), { mode: payload.mode, clientMessageId: sendId, requestedContext: freezeRequestedContext(String(payload.sectionId || ''), String(payload.selection || ''), (payload.injections || []) as ContextInjection[], (payload.assistantReferences || []) as AssistantReference[]) }, [], String(payload.selection || ''), String(payload.sessionId), sendId);
       const entry = value.entries.find(item => item.kind === 'user' && item.data?.clientMessageId === sendId);
       if (!entry) throw new StationError('尚未读到这条问题的保存回执，请重试核对。', 'STATUS_UNKNOWN');
       return { session: learning(value), userEntryId: entry.id };
