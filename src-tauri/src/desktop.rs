@@ -879,6 +879,8 @@ pub fn run() {
             crate::model::set_node_path(app.path().resource_dir()?.join("runtime/node"))?;
             #[cfg(not(debug_assertions))]
             crate::feishu_bot::set_resource_dir(app.path().resource_dir()?.join("feishu-bot"))?;
+            #[cfg(not(debug_assertions))]
+            crate::learning_skills::set_resource_dir(app.path().resource_dir()?.join("skills"))?;
             let home = std::env::var_os("HOME")
                 .map(std::path::PathBuf::from)
                 .ok_or("无法定位本机用户目录")?;

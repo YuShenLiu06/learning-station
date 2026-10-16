@@ -4,6 +4,8 @@ import { StationError } from './types';
 import { sessionMessages } from './sessionMessages';
 import { historicalTools, foldToolActivities } from './toolActivities';
 import { noticeBody } from './noticePolicy';
+import { freezeRequestedContext } from './requestedContext';
+import type { ContextInjection } from './types';
 import { stableRunId } from './outgoingMessages';
 import type { ToolActivity } from './types';
 
@@ -189,7 +191,7 @@ export async function nativeCall(command: string, payload: Record<string, unknow
     case 'session_refresh': { const value = await sessionFor(String(payload.sectionId || ''), payload.sessionId ? String(payload.sessionId) : undefined); return learning(await ipc<NativeSession>('get_session', { id: value.id })); }
     case 'message_save': {
       const sendId = String(payload.sendId);
-      const value = await append(String(payload.sectionId || ''), 'user', String(payload.question), { mode: payload.mode, clientMessageId: sendId }, [], String(payload.selection || ''), String(payload.sessionId), sendId);
+      const value = await append(String(payload.sectionId || ''), 'user', String(payload.question), { mode: payload.mode, clientMessageId: sendId, requestedContext: freezeRequestedContext(String(payload.sectionId || ''), String(payload.selection || ''), (payload.injections || []) as ContextInjection[]) }, [], String(payload.selection || ''), String(payload.sessionId), sendId);
       const entry = value.entries.find(item => item.kind === 'user' && item.data?.clientMessageId === sendId);
       if (!entry) throw new StationError('尚未读到这条问题的保存回执，请重试核对。', 'STATUS_UNKNOWN');
       return { session: learning(value), userEntryId: entry.id };

@@ -205,8 +205,8 @@ fn validate_tool_policy(policy: &ToolPolicy, has_handler: bool) -> Result<()> {
             4,
         ),
         "explain" => (ALL_TOOLS, 6),
-        "practice" => (&["query_related_knowledge"], 2),
-        "feedback" => (&[], 0),
+        "practice" | "review" => (&["query_related_knowledge"], 2),
+        "feedback" | "grading" => (&[], 0),
         "legacy" => (&ALL_TOOLS[..3], 8),
         _ => return Err(sidecar_error("TOOL_PROTOCOL")),
     };
@@ -477,6 +477,7 @@ impl ModelStore {
             "test",
             None,
             ToolPolicy::legacy(false),
+            vec![],
         )
         .await?;
         self.set_verified(true)?;
@@ -586,6 +587,7 @@ pub async fn generate(
         "generate",
         None,
         ToolPolicy::legacy(false),
+        vec![],
     )
     .await
 }
@@ -605,6 +607,7 @@ pub async fn generate_with_tools(
         "generate",
         Some(tool_handler),
         ToolPolicy::legacy(true),
+        vec![],
     )
     .await
 }
@@ -616,6 +619,7 @@ pub async fn generate_scoped(
     on_delta: impl FnMut(&str) + Send,
     tool_handler: Option<ToolHandler>,
     policy: ToolPolicy,
+    skills: Vec<crate::learning_skills::SkillSnapshot>,
 ) -> Result<String> {
     run_sidecar(
         credentials,
@@ -625,6 +629,7 @@ pub async fn generate_scoped(
         "generate",
         tool_handler,
         policy,
+        skills,
     )
     .await
 }
@@ -636,10 +641,12 @@ async fn run_sidecar(
     operation: &str,
     tool_handler: Option<ToolHandler>,
     policy: ToolPolicy,
+    skills: Vec<crate::learning_skills::SkillSnapshot>,
 ) -> Result<String> {
     ensure_usage_allowed(&credentials.settings)?;
     let diagnostic_path = credentials.diagnostic_path.take();
     validate_tool_policy(&policy, tool_handler.is_some())?;
+    crate::learning_skills::validate(&policy.mode, &policy.allowed_tools, &skills)?;
     if cancel.load(Ordering::Acquire) {
         return Err(cancelled());
     }
@@ -671,6 +678,7 @@ async fn run_sidecar(
         messages: &'a [Value],
         learning_tools: bool,
         tool_policy: &'a ToolPolicy,
+        learning_skills: &'a [crate::learning_skills::SkillSnapshot],
     }
     let mut input = serde_json::to_vec(&Input {
         protocol: 1,
@@ -682,6 +690,7 @@ async fn run_sidecar(
             && operation == "generate"
             && !policy.allowed_tools.is_empty(),
         tool_policy: &policy,
+        learning_skills: &skills,
     })
     .map_err(|_| sidecar_error("INVALID_INPUT"))?;
     if input.len() > 4 * MAX_OUTPUT - 1 {
@@ -761,6 +770,15 @@ async fn run_sidecar(
                 line.clear();
                 match event.get("type").and_then(Value::as_str) {
                     Some("ready") if !ready && !settled => {
+                        if !skills.is_empty()
+                            && event.get("learningSkills")
+                                != Some(&json!(skills
+                                    .iter()
+                                    .map(|skill| skill.version())
+                                    .collect::<Vec<_>>()))
+                        {
+                            return Err(sidecar_error("SKILL_INVALID"));
+                        }
                         if event.get("harness").and_then(Value::as_str) != Some(HARNESS)
                             || event.get("version").and_then(Value::as_str) != Some("1.3.0")
                         {
@@ -1262,6 +1280,8 @@ fn sidecar_error(code: &str) -> CoreError {
             "模型输出超过限制，已停止；已收到的内容已保留。",
         ),
         "TOOL_LIMIT" => ("TOOL_LIMIT", "学习工具调用超过本次预算，已停止。"),
+        "SKILL_MISSING" => ("SKILL_MISSING", "本次学习指导缺失，未发送模型请求。"),
+        "SKILL_INVALID" => ("SKILL_INVALID", "学习指导版本或模式校验失败，未发送模型请求。"),
         "TOOL_PROTOCOL" => ("TOOL_PROTOCOL", "学习工具协议或参数无效，已停止。"),
         "TOOL_FAILED" => ("TOOL_FAILED", "学习工具执行失败，未确认完成。"),
         "TOOLS_DISABLED" => ("TOOLS_DISABLED", "模型请求了未启用的工具，已停止本次生成。"),
@@ -1558,20 +1578,35 @@ mod tests {
                 |delta| partial.push_str(delta),
             )
             .await;
-            server.join().unwrap();
             if finish {
                 assert_eq!(result.unwrap(), "Pi fixture 文本");
                 assert_eq!(partial, "Pi fixture 文本");
             } else {
                 assert_eq!(result.unwrap_err().code, "MODEL_INCOMPLETE");
             }
+            server.join().unwrap();
         }
     }
     fn fixture(finish: bool, custom: bool) -> (ModelCredentials, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
         let server = thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(45);
+            let (mut socket, _) = loop {
+                match listener.accept() {
+                    Ok(socket) => break socket,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("local fixture accept deadline: {error}"),
+                }
+            };
+            // macOS accepted sockets inherit O_NONBLOCK from the bounded listener.
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
@@ -1864,6 +1899,7 @@ mod tests {
             |delta| partial.push_str(delta),
             Some(handler.clone()),
             ToolPolicy { mode:"explain".into(), allowed_tools: ALL_TOOLS.iter().map(|name| (*name).into()).collect(), max_calls:6 },
+            crate::learning_skills::capture("explain", &ALL_TOOLS.iter().map(|name| (*name).into()).collect::<Vec<String>>()).unwrap(),
         )
         .await
         .unwrap();
@@ -1964,7 +2000,9 @@ mod tests {
             ),
             ("explain", ALL_TOOLS.to_vec(), 6),
             ("practice", vec!["query_related_knowledge"], 2),
+            ("review", vec!["query_related_knowledge"], 2),
             ("feedback", vec![], 0),
+            ("grading", vec![], 0),
         ] {
             let mut policy = ToolPolicy {
                 mode: mode.into(),

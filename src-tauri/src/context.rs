@@ -12,6 +12,167 @@ pub struct ContextInjection {
     pub selection: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RequestedContext {
+    pub document_id: String,
+    pub selection: String,
+    pub injections: Vec<ContextInjection>,
+}
+/// Frozen request intent, not a claim about which sources a model actually received.
+pub fn requested_context(
+    entry: &crate::types::Entry,
+    section_id: Option<&str>,
+) -> Result<Option<RequestedContext>> {
+    let Some(value) = entry
+        .data
+        .as_ref()
+        .and_then(|data| data.get("requestedContext"))
+    else {
+        return Ok(None);
+    };
+    let invalid = || {
+        CoreError::new(
+            "INVALID_CONTEXT_REQUEST",
+            "本条问题的附加引用结构或所属会话无效，原记录保留。",
+        )
+    };
+    if entry.kind != "user" {
+        return Err(invalid());
+    }
+    let frozen: RequestedContext = serde_json::from_value(value.clone()).map_err(|_| invalid())?;
+    if (!frozen.document_id.is_empty() && !crate::types::valid_id(&frozen.document_id))
+        || frozen.selection.len() > 30000
+        || frozen.selection != entry.selection.as_deref().unwrap_or_default()
+        || frozen.injections.len() > 8
+        || section_id.is_some_and(|id| id != frozen.document_id)
+        || (frozen.document_id.is_empty() && !frozen.selection.is_empty())
+    {
+        return Err(invalid());
+    }
+    let mut seen = BTreeSet::new();
+    for source in &frozen.injections {
+        if !crate::types::valid_id(&source.document_id)
+            || !seen.insert(&source.document_id)
+            || source.expected_version.is_empty()
+            || source.expected_version.len() > 256
+            || source.expected_version.chars().any(char::is_control)
+            || source.selection.as_ref().is_some_and(|text| {
+                text.is_empty() || text.chars().count() > 8000 || text.len() > 30000
+            })
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(Some(frozen))
+}
+
+#[cfg(test)]
+mod requested_context_tests {
+    use super::*;
+    use serde_json::json;
+    fn entry(value: serde_json::Value) -> crate::types::Entry {
+        crate::types::Entry {
+            id: "entry_context".into(),
+            kind: "user".into(),
+            content: "请解释这个问题".into(),
+            created_at: String::new(),
+            selection: Some("原文".into()),
+            related_ids: vec![],
+            data: Some(json!({"requestedContext":value})),
+        }
+    }
+    fn value() -> serde_json::Value {
+        json!({"documentId":"source_a","selection":"原文","injections":[{"documentId":"source_b","expectedVersion":"version_1","selection":"附加选段"}]})
+    }
+    #[test]
+    fn intent_is_bounded_bound_to_its_session_and_never_resolves_current_titles() {
+        let e = entry(value());
+        let frozen = requested_context(&e, Some("source_a")).unwrap().unwrap();
+        assert_eq!(frozen.injections[0].expected_version, "version_1");
+        assert!(requested_context(&e, Some("other_source")).is_err());
+        let mut empty = entry(json!({"documentId":"","selection":"","injections":[]}));
+        empty.selection = None;
+        assert!(requested_context(&empty, Some("")).is_ok());
+        empty.data = None;
+        assert!(requested_context(&empty, Some("")).unwrap().is_none());
+    }
+    #[test]
+    fn persisted_intent_retries_keep_the_same_entry_and_history_omits_reference_metadata() {
+        use crate::{app::Engine, sessions};
+        let temp = tempfile::tempdir().unwrap();
+        let engine = Engine::new(temp.path().join("library"), temp.path().join("state")).unwrap();
+        let mut core = engine.lock().unwrap();
+        let source = core.create_section("资料", "原文", vec![], vec![]).unwrap();
+        let (session, _) = core.start_session(&source.id, false).unwrap();
+        let mut v = value();
+        v["documentId"] = json!(source.id);
+        v["injections"][0]["documentId"] = json!("frozen_reference_only");
+        let original = entry(v);
+        let saved = sessions::append(
+            &mut core.content,
+            &session.id,
+            original.clone(),
+            Some(&session.version),
+            "stable-reference-intent",
+        )
+        .unwrap();
+        let retry = sessions::append(
+            &mut core.content,
+            &session.id,
+            original,
+            Some("stale-client-version"),
+            "stable-reference-intent",
+        )
+        .unwrap();
+        assert_eq!(saved.entries.len(), retry.entries.len());
+        assert_eq!(saved.entries[0].data, retry.entries[0].data);
+        let (history, _) = crate::generation::quoted_history(&retry, None);
+        assert!(!serde_json::to_string(&history)
+            .unwrap()
+            .contains("frozen_reference_only"));
+        let mut foreign = entry(value());
+        foreign.data.as_mut().unwrap()["requestedContext"]["documentId"] = json!("another_source");
+        assert_eq!(
+            sessions::append(
+                &mut core.content,
+                &session.id,
+                foreign,
+                None,
+                "foreign-reference-intent"
+            )
+            .unwrap_err()
+            .code,
+            "INVALID_CONTEXT_REQUEST"
+        );
+    }
+    #[test]
+    fn malformed_duplicates_extra_fields_and_wrong_selection_are_rejected() {
+        let mut invalid = value();
+        invalid["title"] = json!("invented current title");
+        assert!(requested_context(&entry(invalid), None).is_err());
+        let mut invalid = value();
+        invalid["selection"] = json!("另一条选句");
+        assert!(requested_context(&entry(invalid), None).is_err());
+        let mut invalid = value();
+        let duplicate = invalid["injections"][0].clone();
+        invalid["injections"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+        assert!(requested_context(&entry(invalid), None).is_err());
+        let mut invalid = value();
+        invalid["injections"] = json!(vec![
+            json!({"documentId":"source_b","expectedVersion":"v"});
+            9
+        ]);
+        assert!(requested_context(&entry(invalid), None).is_err());
+        let mut e = entry(value());
+        e.kind = "assistant".into();
+        assert!(requested_context(&e, None).is_err());
+    }
+}
+
 pub fn inject(store: &ContentStore, ctx: &mut Context, inputs: &[ContextInjection]) -> Result<()> {
     if inputs.len() > 8 {
         return Err(CoreError::new(

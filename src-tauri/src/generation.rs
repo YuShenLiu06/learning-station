@@ -50,6 +50,10 @@ pub struct Run {
     #[serde(default)]
     pub context_snapshot_version: u8,
     #[serde(default)]
+    pub skill_snapshot_version: u8,
+    #[serde(default)]
+    pub learning_skills: Vec<crate::learning_skills::SkillVersion>,
+    #[serde(default)]
     pub user_entry_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub injections: Vec<context::ContextInjection>,
@@ -184,7 +188,7 @@ pub fn cancel(engine: &Engine, id: &str) -> Result<Run> {
 }
 
 pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) -> Result<Run> {
-    if !["explain", "question", "practice", "feedback"].contains(&request.mode.as_str())
+    if !["explain", "question", "practice", "feedback", "review"].contains(&request.mode.as_str())
         || request.prompt.len() > 30000
         || request.selection.len() > 30000
         || request.request_id.len() < 8
@@ -240,6 +244,24 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
                 &request.selection,
             )?;
         }
+        if let Some(entry_id) = &request.user_entry_id {
+            let entry = session
+                .entries
+                .iter()
+                .find(|entry| &entry.id == entry_id)
+                .ok_or_else(|| CoreError::new("NOT_FOUND", "原问题记录不存在。"))?;
+            if let Some(frozen) = context::requested_context(entry, Some(&session.section_id))? {
+                if frozen.selection != request.selection
+                    || serde_json::to_value(frozen.injections)?
+                        != serde_json::to_value(&request.injections)?
+                {
+                    return Err(CoreError::new(
+                        "CONTEXT_CONFLICT",
+                        "本次引用与原问题冻结的请求不同，请保留原记录后重新提问。",
+                    ));
+                }
+            }
+        }
         context::inject(&core.content, &mut ctx, &request.injections)?;
         context::attach_history(&mut ctx, &session, request.user_entry_id.as_deref());
         let session = sessions::set_context_snapshot_explicit(
@@ -251,6 +273,12 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
         (ctx, session)
     };
     // Resolve visible sources and recycle-bin protections before touching this app's credential.
+    let policy = task_tool_policy(&request.mode);
+    let skills = crate::learning_skills::capture(&policy.mode, &policy.allowed_tools)?;
+    let versions = skills
+        .iter()
+        .map(|skill| skill.version())
+        .collect::<Vec<_>>();
     let credentials = model_store.credentials()?;
     let stamp = timestamp();
     let run = Run {
@@ -270,6 +298,8 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
         context_warnings: ctx.warnings.clone(),
         context_truncated: ctx.truncated,
         context_snapshot_version: 1,
+        skill_snapshot_version: 1,
+        learning_skills: versions,
         user_entry_id: Some(
             request
                 .user_entry_id
@@ -320,7 +350,9 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
         created_at: timestamp(),
         selection: (!request.selection.is_empty()).then_some(request.selection.clone()),
         related_ids: vec![],
-        data: Some(json!({"mode":request.mode,"runId":id})),
+        data: Some(
+            json!({"mode":request.mode,"runId":id,"requestedContext":{"documentId":session.section_id,"selection":request.selection,"injections":request.injections}}),
+        ),
     };
     record_user_and_resume(
         &engine,
@@ -347,7 +379,6 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
             m.cancel.clone()
         };
         let mut last_persist = std::time::Instant::now();
-        let policy = task_tool_policy(&request.mode);
         let tool_handler = (!policy.allowed_tools.is_empty())
             .then(|| learning_tool_handler(engine.clone(), tool_scope, sink.clone()));
         let result = model::generate_scoped(
@@ -369,6 +400,7 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
             },
             tool_handler,
             policy,
+            skills,
         )
         .await;
         let result = match result {
@@ -445,7 +477,7 @@ fn task_tool_policy(mode: &str) -> model::ToolPolicy {
             ],
             6,
         ),
-        "practice" => (&["query_related_knowledge"], 2),
+        "practice" | "review" => (&["query_related_knowledge"], 2),
         _ => (&[], 0),
     };
     model::ToolPolicy {
@@ -539,6 +571,7 @@ fn default_request(mode: &str) -> &'static str {
     match mode {
         "practice" => "请根据当前材料和学习疑点生成3道针对练习。",
         "feedback" => "请根据本次作答给出有材料依据的反馈，错因仅作为待确认建议。",
+        "review" => "请依据本次卡片与错误记录引导回忆，先不展示答案，作答后再针对问题反馈。",
         _ => "请结合所选材料讲清楚这一点，并提出一个检查理解的问题。",
     }
 }
@@ -817,6 +850,13 @@ fn save_result(
     run_id: &str,
     text: &str,
 ) -> Result<Session> {
+    let versions = engine
+        .runs
+        .lock()
+        .map_err(|_| CoreError::new("INTERNAL", "生成状态锁不可用。"))?
+        .get(run_id)
+        .map(|managed| managed.run.learning_skills.clone())
+        .unwrap_or_default();
     if request.mode == "practice" {
         let mut data = practice(text, &ctx.manifest, run_id)?;
         data["contextManifest"] = json!(ctx.manifest);
@@ -860,7 +900,7 @@ fn save_result(
         "assistant",
         text.to_string(),
         Some(
-            json!({"mode":request.mode,"runId":run_id,"contextManifest":ctx.manifest,"historyManifest":ctx.history_manifest,"excludedHistorySourceIds":ctx.excluded_history_source_ids,"contextWarnings":ctx.warnings,"contextTruncated":ctx.truncated,"promptVersion":"learning-v2"}),
+            json!({"mode":request.mode,"runId":run_id,"contextManifest":ctx.manifest,"historyManifest":ctx.history_manifest,"excludedHistorySourceIds":ctx.excluded_history_source_ids,"contextWarnings":ctx.warnings,"contextTruncated":ctx.truncated,"learningSkills":versions,"promptVersion":"learning-v2"}),
         ),
     );
     let entry = Entry {
@@ -968,6 +1008,8 @@ mod prestart_tests {
             context_warnings: vec![],
             context_truncated: false,
             context_snapshot_version: 1,
+            skill_snapshot_version: 0,
+            learning_skills: vec![],
             user_entry_id: None,
             injections: vec![],
             tool_calls: vec![],
@@ -1228,6 +1270,8 @@ mod lifecycle_tests {
             context_warnings: vec![],
             context_truncated: false,
             context_snapshot_version: 1,
+            skill_snapshot_version: 0,
+            learning_skills: vec![],
             user_entry_id: None,
             injections: vec![],
             tool_calls: vec![],
@@ -1643,6 +1687,8 @@ mod exercise_repair_tests {
             context_warnings: vec![],
             context_truncated: false,
             context_snapshot_version: 1,
+            skill_snapshot_version: 0,
+            learning_skills: vec![],
             user_entry_id: None,
             injections: vec![],
             tool_calls: vec![],
@@ -1907,6 +1953,7 @@ mod history_audit_tests {
                 ],
             ),
             ("practice", 2, vec!["query_related_knowledge"]),
+            ("review", 2, vec!["query_related_knowledge"]),
             ("feedback", 0, vec![]),
         ] {
             let policy = task_tool_policy(mode);
@@ -2239,6 +2286,8 @@ mod recycle_integration_tests {
             context_warnings: vec![],
             context_truncated: false,
             context_snapshot_version: 1,
+            skill_snapshot_version: 0,
+            learning_skills: vec![],
             user_entry_id: None,
             injections: vec![],
             tool_calls: vec![],

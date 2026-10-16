@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { runLearningAgent } from '../harness.mjs';
+import { runLearningAgentWithSkills as runLearningAgent } from './skills-fixture.mjs';
 const KEY='local-anthropic-tool-fixture-key';
 const encode=events=>events.map(event=>`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join('');
 const start=()=>({type:'message_start',message:{id:'fixture',type:'message',role:'assistant',model:'glm-5.3-flash',content:[],stop_reason:null,stop_sequence:null,usage:{input_tokens:1,output_tokens:0}}});

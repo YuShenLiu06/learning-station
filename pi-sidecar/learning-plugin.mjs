@@ -10,6 +10,8 @@ export const MODE_POLICIES = Object.freeze({
   explain: { allowedTools: [...LEARNING_PLUGIN.tools], maxCalls: 6 },
   practice: { allowedTools: ['query_related_knowledge'], maxCalls: 2 },
   feedback: { allowedTools: [], maxCalls: 0 },
+  grading: { allowedTools: [], maxCalls: 0 },
+  review: { allowedTools: ['query_related_knowledge'], maxCalls: 2 },
   legacy: { allowedTools: [...LEGACY_TOOLS], maxCalls: 8 },
 });
 export const MAX_TOOL_CALLS = 8;
@@ -100,7 +102,7 @@ export function validateToolPolicy(input, legacyEnabled = false, operation = 'ge
     || (policy.maxCalls === 0 && policy.allowedTools.length > 0)) throw new LearningToolError('TOOL_PROTOCOL');
   return { mode: policy.mode, allowedTools: [...policy.allowedTools], maxCalls: policy.maxCalls };
 }
-export function createLearningPlugin({ requestTool, secret = '', fail = () => {}, allowedTools = LEGACY_TOOLS, maxCalls = MAX_TOOL_CALLS }) {
+export function createLearningPlugin({ requestTool, secret = '', fail = () => {}, allowedTools = LEGACY_TOOLS, maxCalls = MAX_TOOL_CALLS, exerciseGuidance = '' }) {
   if (typeof requestTool !== 'function') throw new LearningToolError('TOOLS_DISABLED');
   if (!Array.isArray(allowedTools) || allowedTools.some((name) => !known.has(name)) || !Number.isInteger(maxCalls) || maxCalls < 1 || maxCalls > MAX_TOOL_CALLS) throw new LearningToolError('TOOL_PROTOCOL');
   const permitted = new Set(allowedTools);
@@ -169,7 +171,7 @@ export function createLearningPlugin({ requestTool, secret = '', fail = () => {}
     id: LEARNING_PLUGIN.id, version: LEARNING_PLUGIN.version,
     preflight,
     validate: (call) => safeCall(call.id, call.name, call.arguments),
-    tools: allowedTools.map((name) => definitions.find((definition) => definition.name === name)).map((definition) => ({ ...definition, executionMode: 'sequential', replay: definition.name === 'query_related_knowledge' ? 'safe' : 'never',
+    tools: allowedTools.map((name) => definitions.find((definition) => definition.name === name)).map((definition) => ({ ...definition, description: definition.description + (definition.name === 'generate_exercises' && exerciseGuidance ? `\n\n${exerciseGuidance}` : ''), executionMode: 'sequential', replay: definition.name === 'query_related_knowledge' ? 'safe' : 'never',
       execute: (id, args, signal) => execute(definition.name, id, args, signal) })),
     stats: () => ({ attempts, executed }),
   };

@@ -41,7 +41,11 @@
       "../tools/feishu-bot/package.json": "feishu-bot/package.json",
       "../tools/feishu-bot/package-lock.json": "feishu-bot/package-lock.json",
       "../tools/feishu-bot/node_modules/": "feishu-bot/node_modules/",
-      "../runtime/manifest.json": "runtime/manifest.json"
+      "../runtime/manifest.json": "runtime/manifest.json",
+      "../pi-sidecar/learning-skills.mjs": "pi-sidecar/learning-skills.mjs",
+      "../skills/learning-explore/SKILL.md": "skills/learning-explore/SKILL.md",
+      "../skills/learning-review/SKILL.md": "skills/learning-review/SKILL.md",
+      "../skills/learning-exercises/SKILL.md": "skills/learning-exercises/SKILL.md"
     }
   }
 }

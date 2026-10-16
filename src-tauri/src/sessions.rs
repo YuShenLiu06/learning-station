@@ -443,6 +443,7 @@ fn validate_entry(entry: &Entry) -> Result<()> {
             "关联记录编号无效或数量过多。",
         ));
     }
+    crate::context::requested_context(entry, None)?;
     Ok(())
 }
 
@@ -484,6 +485,7 @@ pub fn append(
         }
         return Ok(old);
     }
+    crate::context::requested_context(&entry, Some(&old.section_id))?;
     if entry.kind == "exercise" {
         let questions = entry
             .data
