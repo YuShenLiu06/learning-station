@@ -130,9 +130,21 @@ pub fn get(engine: &Engine, id: &str) -> Result<Run> {
         return Ok(managed.run.clone());
     }
     let path = run_path(engine, id)?;
-    let mut run: Run = serde_json::from_str(
-        &fs::read_to_string(&path).map_err(|_| CoreError::new("NOT_FOUND", "找不到生成记录。"))?,
-    )?;
+    let metadata = fs::symlink_metadata(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            CoreError::new("NOT_FOUND", "找不到生成记录。")
+        } else {
+            CoreError::io(error)
+        }
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 8 * 1024 * 1024
+    {
+        return Err(CoreError::new(
+            "INVALID_STATE",
+            "生成记录不可安全读取；未重新发送，请保留原记录后重试读取。",
+        ));
+    }
+    let mut run: Run = serde_json::from_str(&fs::read_to_string(&path).map_err(CoreError::io)?)?;
     if run.status == "queued" || run.status == "running" {
         run.status = "interrupted".into();
         run.updated_at = timestamp();
@@ -172,12 +184,16 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
     }
     let id = format!("run_{}", &hash(&request.request_id)[..32]);
     let digest = hash(&serde_json::to_string(&request)?);
-    if let Ok(old) = get(&engine, &id) {
-        return if old.request_digest == digest {
-            Ok(old)
-        } else {
-            Err(CoreError::new("CONFLICT", "生成请求编号已被另一内容使用。"))
-        };
+    match get(&engine, &id) {
+        Ok(old) => {
+            return if old.request_digest == digest {
+                Ok(old)
+            } else {
+                Err(CoreError::new("CONFLICT", "生成请求编号已被另一内容使用。"))
+            }
+        }
+        Err(error) if error.code == "NOT_FOUND" => {}
+        Err(error) => return Err(error),
     }
     // credentials() touches only the Keychain item this app created; no existing account is reused.
     let model_store = engine.model.lock().await;
@@ -1138,5 +1154,53 @@ mod lifecycle_tests {
         assert_eq!(failed.status, "failed");
         assert!(!failed.persisted);
         assert!(failed.object.is_none());
+    }
+}
+
+#[cfg(test)]
+mod unknown_ack_tests {
+    use super::*;
+    #[tokio::test]
+    async fn unreadable_or_corrupt_previous_run_cannot_be_treated_as_a_missing_send() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = Engine::new(temp.path().join("library"), temp.path().join("state")).unwrap();
+        let session = {
+            let mut core = engine.lock().unwrap();
+            let section = core
+                .create_section("English", "for a period", vec![], vec![])
+                .unwrap();
+            core.start_session(&section.id, false).unwrap().0
+        };
+        let request = GenerationRequest {
+            session_id: session.id,
+            mode: "question".into(),
+            selection: String::new(),
+            prompt: "why?".into(),
+            request_id: "unknown_ack_stable".into(),
+            user_entry_id: None,
+        };
+        let id = format!("run_{}", &hash(&request.request_id)[..32]);
+        let path = run_path(&engine, &id).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "{broken original record").unwrap();
+        let sink: Sink = Arc::new(|_| {});
+        assert_eq!(
+            start(engine.clone(), request.clone(), sink.clone())
+                .await
+                .unwrap_err()
+                .code,
+            "INVALID_JSON"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "{broken original record"
+        );
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert_eq!(
+            start(engine.clone(), request, sink).await.unwrap_err().code,
+            "INVALID_STATE"
+        );
+        assert!(path.is_dir());
     }
 }

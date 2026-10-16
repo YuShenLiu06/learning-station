@@ -1,8 +1,17 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
-import { ArrowDownToLine, ArrowLeft, ArrowRight, ArrowUp, BookOpen, Check, CheckCheck, ChevronDown, ChevronRight, CircleHelp, Clock3, FileText, FolderOpen, Highlighter, Layers2, ListTodo, LoaderCircle, MessageCircle, Maximize2, Minimize2, MoreHorizontal, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, PencilLine, Plus, Search, Settings2, Sparkles, Square, X } from 'lucide-react';
+import { ArrowDownToLine, ArrowLeft, ArrowRight, ArrowUp, BookOpen, Check, CheckCheck, ChevronDown, ChevronRight, CircleHelp, Clock3, FileText, FolderOpen, Highlighter, Layers2, ListTodo, LoaderCircle, MessageCircle, MoreHorizontal, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, PencilLine, Plus, Search, Settings2, Sparkles, Square, X } from 'lucide-react';
 import { call, emptyBootstrap, isDemo, nativeAvailable, recordMetric, sampleBody } from './api';
 const Editor = lazy(() => import('./Editor').then(module => ({ default: module.Editor })));
-import { modelAccessReason, modelAccessMessage, modelBindingChanged, modelFailureMessage, modelFormError, supportedProtocol } from './modelPolicy';
+import { modelAccessReason, modelFailureMessage, modelSelectionError } from './modelPolicy';
+import { SettingsPage } from './SettingsPage';
+import { ChatModelPicker } from './ChatModelPicker';
+import { mergeOutgoing, reconcileOutgoing, retryOperation, sendStageLabel } from './outgoingMessages';
+import type { OutgoingMessage } from './outgoingMessages';
+import { foldToolActivities } from './toolActivities';
+import { ToolActivityCards } from './ToolActivityCards';
+import { useAssistantWidth } from './useAssistantWidth';
+import { AssistantResizeHandle } from './AssistantResizeHandle';
+import type { ToolActivity } from './types';
 import { assertExplorationScope } from './explorationPolicy';
 import { useIndependentExploration } from './useIndependentExploration';
 import { RequestContextView } from './RequestContextView';
@@ -19,7 +28,7 @@ import type { GenerationProgress } from './native';
 import type { Bootstrap, Course, Exercise, LearningSession, ModelSettings, ReviewCard, Section, Source, Task, UiDraft, RequestContext } from './types';
 import { StationError } from './types';
 
-type View = 'lesson' | 'review' | 'tasks';
+type View = 'lesson' | 'review' | 'tasks' | 'settings';
 type Panel = 'explain' | 'explore' | 'practice';
 type DocState = { section: Section; body: string; savedBody: string; saving: boolean; error?: string; conflict?: boolean; recovery?: boolean; draftLoaded?: boolean };
 type CardDraft = { front: string; back: string };
@@ -29,6 +38,8 @@ const makeId = () => crypto.randomUUID();
 
 export function App() {
   const font = useFontSize();
+  const assistantWidth = useAssistantWidth();
+  const widthRef = useRef(assistantWidth); widthRef.current = assistantWidth;
   const fontRef = useRef(font); fontRef.current = font;
   const [boot, setBoot] = useState<Bootstrap>(emptyBootstrap);
   const [loading, setLoading] = useState(true);
@@ -61,26 +72,35 @@ export function App() {
   const contextSequence = useRef(0);
   const [sidebar, setSidebar] = useState(true);
   const [rightbar, setRightbar] = useState(true);
-  const [immersive, setImmersive] = useState(false);
-  const assistantScroll = useRef<HTMLDivElement>(null);
-  const assistantScrollPositions = useRef({ normal: 0, immersive: 0 });
-  function toggleImmersive() {
-    const scroll = assistantScroll.current;
-    if (scroll) assistantScrollPositions.current[immersive ? 'immersive' : 'normal'] = scroll.scrollTop;
-    setImmersive(!immersive);
-    requestAnimationFrame(() => { if (scroll) scroll.scrollTop = assistantScrollPositions.current[immersive ? 'normal' : 'immersive']; });
-  }
   const [selection, setSelection] = useState('');
   const [question, setQuestion] = useState('');
   const [localQuestionSaving, setLocalQuestionSaving] = useState(false);
   const [busyId, setBusyId] = useState('');
   const [partial, setPartial] = useState<GenerationProgress | null>(null);
-  useEffect(() => onGenerationProgress(progress => { if (progress.operationId !== busyRef.current) return; if (progress.content) setPartial(progress); if (progress.manifest) setContextView({ status: 'ready', actual: true, sessionId: progress.sessionId, context: { text: '', manifest: progress.manifest, warnings: [], truncated: false } }); if (progress.contextError) setContextView({ status: 'error', sessionId: progress.sessionId, error: progress.contextError }); }), []);
+  const [outgoing, setOutgoing] = useState<OutgoingMessage[]>([]);
+  const outgoingRef = useRef<OutgoingMessage[]>([]);
+  function updateOutgoing(change: (items: OutgoingMessage[]) => OutgoingMessage[]) { const next = change(outgoingRef.current); outgoingRef.current = next; setOutgoing(next); }
+  function patchOutgoing(sendId: string, patch: Partial<OutgoingMessage>) { updateOutgoing(items => items.map(item => item.sendId === sendId ? { ...item, ...patch } : item)); }
+  const [liveTools, setLiveTools] = useState<Record<string, ToolActivity[]>>({});
+  const [activeRunId, setActiveRunId] = useState('');
+  const [objectPreview, setObjectPreview] = useState<{ kind: string; id: string; title: string; body?: string; front?: string; back?: string; dueAt?: string; done?: boolean; reminderEnabled?: boolean } | null>(null);
+  useEffect(() => onGenerationProgress(progress => { if (progress.operationId !== busyRef.current) return; if (progress.content) setPartial(progress); if (progress.runId) setActiveRunId(progress.runId); if (progress.toolCalls) setLiveTools(old => ({ ...old, [progress.sessionId]: foldToolActivities([...(old[progress.sessionId] || []), ...progress.toolCalls!], progress.sessionId) })); if (progress.manifest) setContextView({ status: 'ready', actual: true, sessionId: progress.sessionId, context: { text: '', manifest: progress.manifest, warnings: [], truncated: false } }); if (progress.contextError) setContextView({ status: 'error', sessionId: progress.sessionId, error: progress.contextError }); }), []);
   const busyRef = useRef('');
   const [aiError, setAiError] = useState('');
   const [importing, setImporting] = useState(false);
   const materialDraft = useRef({ title: '', body: '' });
-  const [settings, setSettings] = useState(false);
+  const settingsReturnView = useRef<View>('lesson');
+  function openSettings() { if (view !== 'settings') settingsReturnView.current = view; switchView('settings'); }
+  const [modelChanging, setModelChanging] = useState(false);
+  const modelChangingRef = useRef(false);
+  async function changeModel(name: string) {
+    if (busyRef.current || modelChangingRef.current) throw new StationError('请先停止生成，再更换模型。', 'BUSY');
+    const validation = modelSelectionError(name, boot.model);
+    if (validation) throw new StationError(validation, 'INVALID_MODEL_SETTINGS');
+    modelChangingRef.current = true; setModelChanging(true);
+    try { const model = await call<ModelSettings>('model_select', { model: name.trim() }); setBoot(old => ({ ...old, model })); }
+    finally { modelChangingRef.current = false; setModelChanging(false); }
+  }
   const [manualExercise, setManualExercise] = useState(false);
   const [backupConflict, setBackupConflict] = useState<UiDraft | null>(null);
   const workspaceDraftLoaded = useRef(false);
@@ -113,6 +133,8 @@ export function App() {
   const openSequence = useRef(0);
   const current = docs[activeId];
   const session = independentMode ? independent.session ?? emptySession('') : sessions[activeId] ?? emptySession(activeId);
+  const conversation = mergeOutgoing(session.messages, outgoing, session.id);
+  const toolCalls = foldToolActivities([...(session.toolCalls || []), ...(liveTools[session.id] || [])], session.id);
   const composerQuestion = independentMode ? independent.question : question;
   const requestSelection = independentMode ? '' : selection;
   const canCompose = independentMode ? !!independent.session : !!current;
@@ -191,8 +213,10 @@ export function App() {
   useEffect(() => {
     if (!nativeAvailable) return;
     const subscription = getCurrentWindow().onCloseRequested(async event => {
+      if (outgoingRef.current.some(item => !item.userEntryId)) { event.preventDefault(); notify('有问题尚未写入学习记录，请先在对应会话重试保存。原文仍保留在消息中。'); return; }
       const drafts = Object.entries(docsRef.current).filter(([, doc]) => doc.body !== doc.savedBody);
       const hasInput = drafts.length || Object.values(questionDrafts.current).some(Boolean) || materialDraft.current.body || materialDraft.current.title || hasExerciseInput();
+      try { await widthRef.current.flush(); } catch (error) { event.preventDefault(); notify(`面板宽度尚未保存，窗口已保留：${errorText(error)}`); return; }
       try { await fontRef.current.flush(); } catch (error) { event.preventDefault(); notify(`字号尚未保存，窗口已保留：${errorText(error)}`); return; }
       try { await independentRef.current.flush(); } catch (error) { event.preventDefault(); notify(`独立探索草稿尚未保存，窗口已保留：${errorText(error)}`); return; }
       if (!hasInput) return;
@@ -225,12 +249,12 @@ export function App() {
   useEffect(() => {
     const key = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key === 's') { event.preventDefault(); void save(activeId); }
-      if (event.key === 'Escape') { setSelection(''); setImporting(false); setSettings(false); setCardDraft(null); }
+      if (event.key === 'Escape') { setSelection(''); setImporting(false); setCardDraft(null); }
     };
     window.addEventListener('keydown', key);
     return () => window.removeEventListener('keydown', key);
   }, [activeId, save]);
-  useEffect(() => { const area = chatEnd.current?.parentElement; if (area) area.scrollTop = area.scrollHeight; }, [session.messages.length, busyId]);
+  useEffect(() => { const area = chatEnd.current?.parentElement; if (area) area.scrollTop = area.scrollHeight; }, [conversation.length, busyId]);
 
   async function openLinkedExploration() {
     if (!activeId) { setLinkedError('先打开一个小节，或关闭关联开始独立探索。'); return; }
@@ -250,7 +274,7 @@ export function App() {
     return () => clearTimeout(timer);
   }, [session.id, requestSelection, current?.body, current?.savedBody, current?.section.version, independentMode, busyId, contextRetry]);
   function updateComposer(value: string) { if (independentMode) independent.setQuestion(value); else setQuestion(value); }
-  function updateTargetSession(result: LearningSession, independentTarget: boolean) { if (independentTarget) independentRef.current.setSession(result); else setSessions(old => ({ ...old, [result.sectionId]: result })); }
+  function updateTargetSession(result: LearningSession, independentTarget: boolean) { updateOutgoing(items => reconcileOutgoing(items, result.messages, result.id)); if (independentTarget) independentRef.current.setSession(result); else setSessions(old => ({ ...old, [result.sectionId]: result })); }
   async function refreshAfterGeneration(target: LearningSession, independentTarget: boolean) {
     const results = await Promise.allSettled([call<LearningSession>('session_refresh', { sectionId: target.sectionId, sessionId: target.id }), call<Pick<Bootstrap, 'tasks' | 'notices'>>('activity_refresh')]);
     if (results[0].status === 'fulfilled') updateTargetSession(results[0].value, independentTarget); else notify(`学习记录刷新失败，已有内容仍保留：${errorText(results[0].reason)}`);
@@ -264,32 +288,65 @@ export function App() {
     catch (error) { setAiError(`困惑尚未保存，输入仍保留：${errorText(error)}`); }
     finally { setLocalQuestionSaving(false); }
   }
+  async function executeSend(item: OutgoingMessage, operationId: string) {
+    const target = { id: item.sessionId, sectionId: item.sectionId } as LearningSession;
+    let userEntryId = item.userEntryId;
+    try {
+      if (!item.detached) await prepareSource(item.sectionId);
+      const context = await call<RequestContext>('context_load', { sessionId: item.sessionId, sectionId: item.sectionId, selection: item.selection });
+      if (visibleSessionRef.current === item.sessionId) setContextView({ status: 'loading', sessionId: item.sessionId, context });
+      if (!userEntryId) {
+        const saved = await call<{ session: LearningSession; userEntryId: string }>('message_save', { sectionId: item.sectionId, sessionId: item.sessionId, question: item.content, selection: item.selection, mode: item.mode, sendId: item.sendId });
+        userEntryId = saved.userEntryId; patchOutgoing(item.sendId, { userEntryId }); updateTargetSession(saved.session, item.detached);
+      }
+      patchOutgoing(item.sendId, { stage: 'generating' });
+      const result = await call<LearningSession>('session_ask', { sectionId: item.sectionId, sessionId: item.sessionId, mode: item.mode, question: item.content, selection: item.selection, userEntryId, operationId, resume: item.failureStage === 'unknown' });
+      updateTargetSession(result, item.detached); patchOutgoing(item.sendId, { stage: 'done', error: undefined, failureStage: undefined });
+    } catch (error) {
+      const details = error instanceof StationError ? error.details as { sendStage?: string } | undefined : undefined;
+      patchOutgoing(item.sendId, { stage: 'failed', userEntryId, error: modelFailureMessage(error, 'generation'), failureStage: !userEntryId ? 'save' : details?.sendStage === 'unknown' ? 'unknown' : 'generation' });
+    } finally {
+      await refreshAfterGeneration(target, item.detached);
+      if (busyRef.current === operationId) { busyRef.current = ''; setBusyId(''); }
+    }
+  }
   async function ask(preset?: string) {
     const value = (preset ?? composerQuestion).trim();
     if (!value || busyRef.current) return;
+    if (modelChangingRef.current) { notify('正在更换模型，请稍候再提问。'); return; }
     if (!canCompose || !session.id) { setAiError('学习会话尚未就绪，请重试打开，问题仍保留。'); return; }
-    if (!modelReady) { notify(modelBlocked ? '此模型用途受限，请查看设置中的说明或配置获准使用的自定义服务。' : '请先保存你自己的模型连接配置。'); setSettings(true); return; }
-    const target = session; const detached = independentMode; const selected = requestSelection;
-    const id = makeId(); busyRef.current = id; setBusyId(id); setPartial(null); setAiError('');
-    try {
-      if (!detached) await prepareSource(target.sectionId);
-      const context = await call<RequestContext>('context_load', { sessionId: target.id, sectionId: target.sectionId, selection: selected });
-      setContextView({ status: 'loading', sessionId: target.id, context });
-      const result = await call<LearningSession>('session_ask', { sectionId: target.sectionId, sessionId: target.id, mode: panel, question: value, selection: selected, operationId: id });
-      updateTargetSession(result, detached);
-      if (detached) { if (independentRef.current.question.trim() === value) independentRef.current.setQuestion(''); } else if (activeIdRef.current === target.sectionId) setQuestion(old => old.trim() === value ? '' : old);
-    } catch (error) { if (visibleSessionRef.current === target.id) setAiError(modelFailureMessage(error, 'generation')); else notify(`另一会话生成未完成，输入仍保留：${modelFailureMessage(error, 'generation')}`); }
-    finally { await refreshAfterGeneration(target, detached); if (busyRef.current === id) { busyRef.current = ''; setBusyId(''); } }
+    if (!modelReady) { notify(modelBlocked ? '此模型用途受限，请查看供应商设置。问题仍保留，未发送请求。' : '请先保存供应商连接，问题仍保留。'); openSettings(); return; }
+    const operationId = makeId();
+    const item: OutgoingMessage = { sendId: makeId(), operationId, sessionId: session.id, sectionId: session.sectionId, detached: independentMode, mode: panel, content: value, selection: requestSelection, createdAt: new Date().toISOString(), stage: 'saving' };
+    busyRef.current = operationId; setBusyId(operationId); setPartial(null); setActiveRunId(''); setAiError('');
+    updateOutgoing(items => [...items, item]);
+    if (independentMode) { if (independentRef.current.question.trim() === value) independentRef.current.setQuestion(''); }
+    else setQuestion(old => old.trim() === value ? '' : old);
+    await executeSend(item, operationId);
   }
+  async function retrySend(sendId: string) {
+    const item = outgoingRef.current.find(value => value.sendId === sendId);
+    if (!item || busyRef.current || modelChangingRef.current) return;
+    if (!modelReady) { notify('请先检查供应商配置；原消息与新草稿均保留。'); openSettings(); return; }
+    const operationId = retryOperation(item, makeId());
+    busyRef.current = operationId; setBusyId(operationId); setPartial(null); setActiveRunId('');
+    patchOutgoing(sendId, { operationId, stage: item.userEntryId ? 'generating' : 'saving', error: undefined });
+    await executeSend(item, operationId);
+  }
+  async function openToolObject(object: NonNullable<ToolActivity['object']>) {
+    try { setObjectPreview(await call('tool_object_open', object)); }
+    catch (error) { notify(`未能打开已保存对象：${errorText(error)}`); }
+  }
+
   async function cancel() {
     const id = busyRef.current; if (!id) return;
     try { await call('operation_cancel', { operationId: id }); notify('已请求停止生成，已保存的对话仍保留。'); }
     catch (error) { notify(`停止请求未确认：${errorText(error)}`); }
-    finally { busyRef.current = ''; setBusyId(''); }
   }
   async function generateExercise() {
     if (!current || busyRef.current) return;
-    if (!modelReady) { notify(modelBlocked ? '该模型用途受限，请查看设置说明。' : '请先保存模型连接配置。'); setSettings(true); return; }
+    if (modelChangingRef.current) { notify('正在更换模型，请稍候再生成练习。'); return; }
+    if (!modelReady) { notify(modelBlocked ? '该模型用途受限，请查看设置说明。' : '请先保存模型连接配置。'); openSettings(); return; }
     const id = makeId(); busyRef.current = id; setBusyId(id); setPartial(null); setAiError('');
     const sectionId = activeId;
     try { await prepareSource(sectionId); const result = await call<LearningSession>('exercise_generate', { sectionId, sessionId: session.id, selection, operationId: id }); if (busyRef.current === id) setSessions(old => ({ ...old, [sectionId]: result })); }
@@ -369,7 +426,7 @@ export function App() {
   }
   function openPanel(mode: Panel, preset?: string) { setPanel(mode); setRightbar(true); if (preset) { if (mode === 'explore' && !associateSection) independent.setQuestion(preset); else setQuestion(preset); } setTimeout(() => questionRef.current?.focus(), 0); }
 
-  return <div style={{ '--content-font-size': `${font.fontSize}px`, '--ui-font-scale': font.fontSize / 16 } as React.CSSProperties} className={`app-shell ${!sidebar ? 'sidebar-collapsed' : ''} ${!rightbar || view !== 'lesson' ? 'rightbar-collapsed' : ''} ${immersive && rightbar && view === 'lesson' ? 'immersive' : ''}`}>
+  return <div style={{ '--content-font-size': `${font.fontSize}px`, '--assistant-width': `${assistantWidth.width}px`, '--ui-font-scale': font.fontSize / 16 } as React.CSSProperties} className={`app-shell ${!sidebar ? 'sidebar-collapsed' : ''} ${!rightbar || view !== 'lesson' ? 'rightbar-collapsed' : ''}`}>
     {isDemo && <div className="demo-banner">开发预览 · 示例材料，数据仅保留在内存 · 未连接本机服务或 AI</div>}
     <aside className="sidebar">
       <div className="brand"><span className="brand-mark"><BookOpen size={18} /></span><div>学习站<span>LEARNING STATION</span></div><button className="icon-button sidebar-collapse" title="收起课程栏" aria-label="收起课程栏" onClick={() => setSidebar(false)}><PanelLeftClose size={17} /></button></div>
@@ -388,14 +445,14 @@ export function App() {
         <button className={`bottom-link ${view === 'review' ? 'active' : ''}`} onClick={() => { switchView('review'); void loadReview(); }}><Layers2 size={17} /><span>复习与历史</span><ArrowRight size={14} /></button>
         <button className={`bottom-link ${view === 'tasks' ? 'active' : ''}`} onClick={() => switchView('tasks')}><ListTodo size={17} /><span>学习待办</span>{boot.tasks.filter(task => !task.completed).length > 0 && <span className="count">{boot.tasks.filter(task => !task.completed).length}</span>}</button>
         <div className="sidebar-divider" />
-        <button className="bottom-link" onClick={() => setSettings(true)}><Settings2 size={17} /><span>设置与连接</span><span className={`connection-dot ${modelReady ? 'connected' : ''}`} /></button>
+        <button className={`bottom-link ${view === 'settings' ? 'active' : ''}`} onClick={openSettings}><Settings2 size={17} /><span>供应商与设置</span><span className={`connection-dot ${modelReady ? 'connected' : ''}`} /></button>
         <div className="local-status"><span className="tiny-dot" /> {isDemo ? '开发预览 · 未写入文件' : '材料保存在这台电脑'}</div>
       </div>
     </aside>
 
     <main className="main-area">
       <header className="topbar">
-        <div className="breadcrumbs">{!sidebar && <button className="icon-button" aria-label="展开课程栏" onClick={() => setSidebar(true)}><PanelLeftOpen size={18} /></button>}<span>{view === 'lesson' ? (activeCourse?.title || '我的学习空间') : view === 'review' ? '复习与历史' : '学习待办'}</span><ChevronRight size={12} /><span className="breadcrumb-current">{view === 'lesson' ? '阅读与理解' : view === 'review' ? '把学过的串起来' : '接着完成下一步'}</span></div>
+        <div className="breadcrumbs">{!sidebar && <button className="icon-button" aria-label="展开课程栏" onClick={() => setSidebar(true)}><PanelLeftOpen size={18} /></button>}<span>{view === 'lesson' ? (activeCourse?.title || '我的学习空间') : view === 'review' ? '复习与历史' : view === 'settings' ? '供应商与设置' : '学习待办'}</span><ChevronRight size={12} /><span className="breadcrumb-current">{view === 'lesson' ? '阅读与理解' : view === 'review' ? '把学过的串起来' : view === 'settings' ? '本机连接' : '接着完成下一步'}</span></div>
         <div className="topbar-actions"><button className={`icon-button notice-button ${boot.notices.some(notice => !notice.read) ? 'has-notices' : ''}`} aria-label="通知" title="通知" onClick={() => setNotifications(!notifications)}><Clock3 size={17} /></button>{view === 'lesson' && <button className="icon-button" aria-label={rightbar ? '收起学习助手' : '打开学习助手'} onClick={() => setRightbar(!rightbar)}>{rightbar ? <PanelRightClose size={18} /> : <PanelRightOpen size={18} />}</button>}</div>
       </header>
       {Object.entries(draftErrors).map(([key, message]) => <div className="connection-banner" role="status" key={key}><CircleHelp size={16} /><span>{key === 'workspace' ? '导入草稿' : '小节草稿'}备份尚未完成：{message} 当前输入仍保留在窗口中。</span><button onClick={() => { void retryBackup(key); }}>重试读取原草稿</button></div>)}
@@ -421,30 +478,34 @@ export function App() {
 
       {view === 'review' && <div className="utility-page"><button className="text-back" onClick={() => switchView('lesson')}><ArrowLeft size={14} />回到小节</button><span className="eyebrow">CONNECT WHAT YOU KNOW</span><h1>学过的，下次用得上。</h1><p className="page-description">输入下一次考试或任务，找回相关选句与错因。检索来自你真实保存的学习记录。</p><form className="review-search" onSubmit={event => { event.preventDefault(); void loadReview(reviewQuery); }}><Search size={18} /><input aria-label="复习情境" placeholder="例如：雅思阅读、转折关系、写作论证…" value={reviewQuery} onChange={event => setReviewQuery(event.target.value)} /><button className="primary-button" type="submit" disabled={reviewLoading}>{reviewLoading ? <LoaderCircle size={15} className="spin" /> : <ArrowRight size={16} />}</button></form><div className="section-heading"><h2>我的复习卡 <span>{cards.length}</span></h2><button className="quiet-button" disabled={!cards.length} onClick={() => { void exportCards(); }}><ArrowDownToLine size={14} />导出当前小节 CSV</button></div><p className="muted small">CSV 可自行导入 Anki；当前未连接 Anki 同步。</p>{reviewError && <div className="inline-error" role="alert">{reviewError}<button onClick={() => { void loadReview(reviewQuery); }}>重试</button></div>}{!reviewLoading && !cards.length && !reviewError && <div className="empty-state"><Layers2 size={30} strokeWidth={1.2} /><h3>{reviewQuery ? '还没有相关的历史记录' : '值得记住的内容，会留在这里'}</h3><p>{reviewQuery ? '换一个关键词，或先在小节里保存选句和错因。' : '阅读时选中一句话，选择“留作复习”。错题反馈里的错因也可以保存。'}</p><button className="quiet-button" onClick={() => switchView('lesson')}>回到小节 <ArrowRight size={14} /></button></div>}<div className="review-cards">{cards.map(card => <article className="review-card" key={card.id}><span className="card-label"><Layers2 size={13} />回忆一下</span><Markdown text={card.front} />{showBack[card.id] && <div className="card-answer"><Markdown text={card.back || '这张卡片还没有补充解释。'} /></div>}<div className="card-footer"><span>{card.source || '来自我的小节'}</span><button title="回到原小节" onClick={() => { void openSection(card.sectionId); }}><FileText size={12} />来源小节</button><button onClick={() => setShowBack(old => ({ ...old, [card.id]: !old[card.id] }))}>{showBack[card.id] ? '收起解释' : '查看解释'}<ChevronDown size={13} /></button></div></article>)}</div></div>}
       {view === 'tasks' && <div className="utility-page"><button className="text-back" onClick={() => switchView('lesson')}><ArrowLeft size={14} />回到小节</button><span className="eyebrow">ONE SMALL NEXT STEP</span><h1>给下次学习，留一步。</h1><p className="page-description">记下一个具体动作，让开始变得容易。到期状态由本机服务管理。</p><form className="task-form" onSubmit={event => { void createTask(event); }}><label>下一步做什么<input value={taskTitle} onChange={event => setTaskTitle(event.target.value)} placeholder="例如：再读一遍今天的转折句" required maxLength={200} /></label><div className="task-form-bottom"><div className="task-reminder-fields"><label className="checkbox-label"><input type="checkbox" checked={taskReminder} onChange={event => setTaskReminder(event.target.checked)} />到时间提醒我</label>{taskReminder && <label>提醒时间<input type="datetime-local" value={taskDue} onChange={event => setTaskDue(event.target.value)} required /></label>}</div><button className="primary-button" disabled={taskBusy || !taskTitle.trim()}>{taskBusy ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />}添加待办</button></div>{taskReminder && <p className="muted small">应用退出或电脑休眠时无法准点提醒；重开后会补入通知。飞书提醒未启用。</p>}</form>{taskError && <div className="inline-error" role="alert">{taskError}</div>}<div className="section-heading"><h2>学习待办 <span>{boot.tasks.filter(task => !task.completed).length}</span></h2></div>{!boot.tasks.length && <div className="empty-state"><ListTodo size={30} strokeWidth={1.2} /><h3>现在没有待办</h3><p>今天不必安排很多。一个能完成的小动作就够了。</p></div>}<div className="task-list">{boot.tasks.map(task => <div className={`task-item ${task.completed ? 'completed' : ''}`} key={task.id}><button className="task-check" aria-label={task.completed ? '标为未完成' : '完成待办'} onClick={() => { void toggleTask(task); }}>{task.completed && <Check size={14} />}</button><div><span>{task.title}</span>{task.dueAt && <small><Clock3 size={11} />{new Date(task.dueAt).toLocaleString('zh-CN', { month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' })} · {task.reminderEnabled ? '提醒已开启' : '提醒未开启'}</small>}</div>{task.dueAt && !task.completed && <button className="task-reminder-toggle" onClick={() => { void toggleReminder(task); }}>{task.reminderEnabled ? '关闭提醒' : '开启提醒'}</button>}</div>)}</div></div>}
+      {view === 'settings' && <SettingsPage font={font} model={boot.model} dataPath={boot.dataPath} blocked={!!busyId || modelChanging} onClose={() => switchView(settingsReturnView.current)} onSaved={model => setBoot(old => ({ ...old, model }))} />}
       <footer className="statusbar"><span><span className={`tiny-dot ${nativeAvailable ? '' : 'offline'}`} />{isDemo ? '开发预览' : nativeAvailable ? '本机工作空间' : '等待本机连接'}</span><span>{dirtyCount ? `${dirtyCount} 份草稿待保存` : '每一点理解，都值得留下'}</span><span>⌘ S 保存</span></footer>
     </main>
 
-    {view === 'lesson' && <aside className="assistant-panel"><div className="assistant-heading"><span className="assistant-mark"><Sparkles size={17} /></span><div><h2>一起读明白</h2><p>顺着你的问题，往前一步</p></div><button className="expand-assistant" aria-label={immersive ? '恢复三栏阅读' : '全展开学习助手'} aria-pressed={immersive} onClick={toggleImmersive}>{immersive ? <Minimize2 size={15} /> : <Maximize2 size={15} />}<span>{immersive ? '恢复阅读' : '全展开'}</span></button><button className="icon-button" aria-label="收起学习助手" onClick={() => { setImmersive(false); setRightbar(false); }}><PanelRightClose size={17} /></button></div><div className="assistant-tabs" role="tablist" aria-label="学习方式">{(['explain', 'explore', 'practice'] as Panel[]).map(mode => <button role="tab" aria-selected={panel === mode} key={mode} className={panel === mode ? 'selected' : ''} onClick={() => setPanel(mode)}>{mode === 'explain' ? '讲解' : mode === 'explore' ? '探索' : '练习'}</button>)}</div>
-      <div className="assistant-scroll" ref={assistantScroll}>
+    {view === 'lesson' && <aside className="assistant-panel"><AssistantResizeHandle width={assistantWidth.width} onChange={assistantWidth.setWidth} /><div className="assistant-heading"><span className="assistant-mark"><Sparkles size={17} /></span><div><h2>一起读明白</h2><p>顺着你的问题，往前一步</p></div><button className="icon-button" aria-label="收起学习助手" onClick={() => setRightbar(false)}><PanelRightClose size={17} /></button></div><ChatModelPicker model={boot.model} busy={!!busyId || modelChanging} onApply={changeModel} onSettings={openSettings} /><div className="assistant-tabs" role="tablist" aria-label="学习方式">{(['explain', 'explore', 'practice'] as Panel[]).map(mode => <button role="tab" aria-selected={panel === mode} key={mode} className={panel === mode ? 'selected' : ''} onClick={() => setPanel(mode)}>{mode === 'explain' ? '讲解' : mode === 'explore' ? '探索' : '练习'}</button>)}</div>
+      {assistantWidth.error && <div className="inline-error" role="status">面板宽度尚未保存：{assistantWidth.error}<button onClick={() => { void assistantWidth.flush().catch(() => undefined); }}>重试保存</button></div>}
+      <div className="assistant-scroll">
         {panel === 'explore' && <div className="exploration-scope"><label className="checkbox-label"><input type="checkbox" checked={associateSection} disabled={!!busyId} onChange={event => { setAssociateSection(event.target.checked); setAiError(''); setPartial(null); }} />关联当前小节</label><p>{associateSection ? '关联探索：仅使用服务端核对的来源。' : '独立探索：不带入当前小节、选句或其他小节历史。'}</p>{busyId && <p>生成中；请先停止，再切换关联方式。</p>}{(independentMode ? independent.loading : linkedOpening) && <p role="status">正在打开探索会话…</p>}{(independentMode ? independent.error : linkedError) && <div className="inline-error" role="alert">{independentMode ? independent.error : linkedError}<button onClick={() => { if (independentMode) void independent.retry(); else void openLinkedExploration(); }}>重试打开探索</button></div>}</div>}
         <RequestContextView value={contextView.sessionId && contextView.sessionId !== session.id ? { status: 'loading' } : contextView} independent={independentMode} onRetry={() => setContextRetry(old => old + 1)} />
         {!independentMode && selection && <div className="selection-tray"><div className="selected-quote"><Highlighter size={13} /><span>当前选句 · 发送前会核对上下文</span><button className="icon-button" aria-label="取消选句" onClick={() => setSelection('')}><X size={13} /></button></div><blockquote>{selection}</blockquote><div className="selection-actions"><button onClick={() => openPanel('explain', '请帮我理解这句话的含义和表达。')}><MessageCircle size={12} />问一句</button><button onClick={() => openPanel('practice')}><Sparkles size={12} />考考我</button><button onClick={() => setCardDraft({ front: selection, back: '' })}><Layers2 size={12} />留作复习</button></div></div>}
         {independentMode && independent.draftError && <div className="inline-error" role="alert">独立探索草稿尚未备份：{independent.draftError}{independent.conflict !== null ? <><p>旧问题：{independent.conflict || '（空）'}</p><button onClick={() => independent.resolveDraft(true)}>恢复旧问题</button><button onClick={() => independent.resolveDraft(false)}>保留当前问题并备份</button></> : <button onClick={() => { void independent.retryDraft(); }}>重试读取探索草稿</button>}</div>}
         {independentMode && independent.recovery && <details className="recovery-message"><summary>独立探索上次生成未完成</summary><p>{independent.recovery.message || '已有记录仍保留。'}</p><Markdown text={independent.recovery.content} /></details>}
         {!independentMode && boot.recovery && <details className="recovery-message"><summary>上次生成未完成 · 查看保留内容<ChevronDown size={12} /></summary><p>{boot.recovery.message || '应用关闭时生成尚未完成，已保存内容仍保留。'}</p>{boot.recovery.content ? <Markdown text={boot.recovery.content} /> : <p>尚未收到正文。可以重新发送问题。</p>}</details>}
-        {!modelReady && <div className="model-prompt"><span className="model-prompt-icon"><Sparkles size={16} /></span><div><strong>{modelBlocked ? '当前模型用途受限' : '连接自己的模型，开始对话'}</strong><p>{modelBlocked ? '可在设置中查看限制或配置获准使用的自定义服务。' : '可手动填写服务地址、协议和模型名称。'}</p><button onClick={() => setSettings(true)}>设置模型连接 <ArrowRight size={13} /></button></div></div>}
+        {!modelReady && <div className="model-prompt"><span className="model-prompt-icon"><Sparkles size={16} /></span><div><strong>{modelBlocked ? '当前模型用途受限' : '连接自己的模型，开始对话'}</strong><p>{modelBlocked ? '可在设置中查看限制或配置获准使用的自定义服务。' : '可手动填写服务地址、协议和模型名称。'}</p><button onClick={() => openSettings()}>设置模型连接 <ArrowRight size={13} /></button></div></div>}
         {panel !== 'practice' && <>
-          {!session.messages.length && <div className="assistant-empty"><div className="little-line" /><h3>{panel === 'explore' ? '好问题，可以从这里展开。' : '哪里卡住了？'}</h3><p>{panel === 'explore' ? '从一个想法出发，比较、追问，再回到自己的理解。' : '词义、句子关系，或一整段的意思，都可以慢慢问。'}</p><div className="starter-questions"><button disabled={!canCompose} onClick={() => { updateComposer(independentMode ? '我想独立探索一个问题，请先帮我澄清。' : '请带我梳理这一小节的核心意思，先从一个问题开始。'); questionRef.current?.focus(); }}>{independentMode ? '澄清一个独立问题' : '带我梳理这一小节'} <ArrowRight size={13} /></button><button disabled={!canCompose} onClick={() => { updateComposer(independentMode ? '请从不同角度分析我接下来提出的问题。' : '这篇材料里，有哪些容易理解错的表达？'); questionRef.current?.focus(); }}>{independentMode ? '从不同角度展开' : '找找容易理解错的表达'} <ArrowRight size={13} /></button></div></div>}
-          <div className="messages">{session.messages.slice(-30).map(message => <article className={`message ${message.role}`} key={message.id}><div className="message-label">{message.role === 'user' ? '我的问题' : message.role === 'note' ? <><FileText size={12} />学习记录 · AI整理{message.needsConfirmation && <span className="pending-label">待确认</span>}</> : <><Sparkles size={12} />学习助手</>}</div><Markdown text={message.content} />{message.sources?.length ? <SourceList sources={message.sources} /> : null}{message.role === 'assistant' && <button className="message-save" onClick={() => setCardDraft({ front: selection || '这一小节中值得回忆的问题', back: message.content })}><Plus size={12} />留作复习</button>}</article>)}</div>{session.messages.length > 30 && <p className="muted small">显示最近 30 条。完整记录保存在学习文件中。</p>}
+          {!conversation.length && <div className="assistant-empty"><div className="little-line" /><h3>{panel === 'explore' ? '好问题，可以从这里展开。' : '哪里卡住了？'}</h3><p>{panel === 'explore' ? '从一个想法出发，比较、追问，再回到自己的理解。' : '词义、句子关系，或一整段的意思，都可以慢慢问。'}</p><div className="starter-questions"><button disabled={!canCompose} onClick={() => { updateComposer(independentMode ? '我想独立探索一个问题，请先帮我澄清。' : '请带我梳理这一小节的核心意思，先从一个问题开始。'); questionRef.current?.focus(); }}>{independentMode ? '澄清一个独立问题' : '带我梳理这一小节'} <ArrowRight size={13} /></button><button disabled={!canCompose} onClick={() => { updateComposer(independentMode ? '请从不同角度分析我接下来提出的问题。' : '这篇材料里，有哪些容易理解错的表达？'); questionRef.current?.focus(); }}>{independentMode ? '从不同角度展开' : '找找容易理解错的表达'} <ArrowRight size={13} /></button></div></div>}
+          <div className="messages">{conversation.slice(-30).map(message => <article className={`message ${message.role}`} key={message.clientMessageId || message.id}><div className="message-label">{message.role === 'user' ? '我的问题' : message.role === 'note' ? <><FileText size={12} />学习记录 · AI整理{message.needsConfirmation && <span className="pending-label">待确认</span>}</> : <><Sparkles size={12} />学习助手</>}</div><Markdown text={message.content} />{message.outgoing && message.outgoing.stage !== 'done' && <div className={`message-delivery ${message.outgoing.stage}`} role="status"><span>{sendStageLabel(message.outgoing)}</span>{message.outgoing.error && <p>{message.outgoing.error}</p>}{message.outgoing.stage === 'failed' && <button className="quiet-button" disabled={!!busyId || modelChanging} onClick={() => { void retrySend(message.outgoing!.sendId); }}>{message.outgoing.failureStage === 'unknown' ? '核对生成状态' : message.outgoing.userEntryId ? '重试生成' : '重试保存并生成'}</button>}</div>}{message.sources?.length ? <SourceList sources={message.sources} /> : null}{message.role === 'assistant' && <button className="message-save" onClick={() => setCardDraft({ front: selection || '这一小节中值得回忆的问题', back: message.content })}><Plus size={12} />留作复习</button>}</article>)}</div>{conversation.length > 30 && <p className="muted small">显示最近 30 条。完整记录保存在学习文件中。</p>}
         </>}
+        <ToolActivityCards items={toolCalls} liveRunId={busyId ? activeRunId : undefined} onOpen={object => { void openToolObject(object); }} />
         {panel === 'practice' && <div className="practice-panel"><span className="card-label">TRY IT YOURSELF</span><h3>用一道题，检查理解。</h3><p className="muted">围绕{selection ? '当前选句' : '当前小节'}与已记录的困惑生成，不必先听完讲解。</p><button className="primary-button full-width" disabled={!!busyId} onClick={() => { void generateExercise(); }}><Sparkles size={14} />生成一道针对练习</button><button className="manual-exercise-link" disabled={!current} onClick={() => setManualExercise(true)}><PencilLine size={12} />或手动添加一道题</button>{session.exercises.map(exercise => <ExerciseCard key={exercise.id} exercise={exercise} onAnswer={answer => submitAnswer(exercise, answer)} onReason={reason => saveReason(exercise, reason)} />)}</div>}
         {partial && partial.sessionId === session.id && busyId && <article className="message assistant partial-message"><div className="message-label"><Sparkles size={12} />正在回复</div><Markdown text={partial.content} /></article>}{busyId && <div className="generating" role="status"><LoaderCircle size={15} className="spin" /><div>正在等待模型回复…<small>{independentMode ? '独立探索 · 未关联当前小节' : '来源以核对后的实际清单为准'}</small></div><button className="quiet-button" onClick={() => { void cancel(); }}><Square size={11} />停止</button></div>}{aiError && <div className="inline-error" role="alert"><strong>这次没有得到回复</strong><p>{aiError}</p><span>输入仍保留，可以修改后重试。</span></div>}<div ref={chatEnd} />
       </div>
-      <div className="composer-area"><form className="composer" onSubmit={event => { event.preventDefault(); void ask(); }}><textarea ref={questionRef} aria-label="向学习助手提问" placeholder={independentMode ? '独立探索，不关联当前小节…' : current ? '写下你的问题…' : '先打开材料，或切换到独立探索'} value={composerQuestion} disabled={!canCompose} rows={3} onChange={event => updateComposer(event.target.value)} onCompositionStart={() => { cancelAnimationFrame(composerCommitFrame.current); composerComposing.current = true; }} onCompositionEnd={() => { composerCommitFrame.current = requestAnimationFrame(() => { composerComposing.current = false; }); }} onBlur={() => { cancelAnimationFrame(composerCommitFrame.current); composerComposing.current = false; }} onKeyDown={event => { const action = composerKeyAction(event.nativeEvent, composerComposing.current); if (action === 'native') return; event.preventDefault(); if (action === 'send') void ask(); }} /><div className="composer-bottom"><button type="button" className="save-question" disabled={!composerQuestion.trim() || localQuestionSaving} onClick={() => { void saveLocalQuestion(); }}>{localQuestionSaving ? <LoaderCircle size={11} className="spin" /> : <Plus size={11} />}保存困惑</button><button type="submit" className="send-button" aria-label={modelReady ? '发送问题' : '配置模型后提问'} disabled={!composerQuestion.trim() || !!busyId}><ArrowUp size={17} /></button></div></form><p className="composer-note">{modelReady ? `${boot.model.model} · ${independentMode ? '独立探索' : '关联来源可展开核对'}` : '可配置自定义模型 · 本地阅读与练习可独立使用'}<br />Enter 发送 · Shift+Enter 换行</p></div>
+      <div className="composer-area"><form className="composer" onSubmit={event => { event.preventDefault(); void ask(); }}><textarea ref={questionRef} aria-label="向学习助手提问" placeholder={independentMode ? '独立探索，不关联当前小节…' : current ? '写下你的问题…' : '先打开材料，或切换到独立探索'} value={composerQuestion} disabled={!canCompose} rows={3} onChange={event => updateComposer(event.target.value)} onCompositionStart={() => { cancelAnimationFrame(composerCommitFrame.current); composerComposing.current = true; }} onCompositionEnd={() => { composerCommitFrame.current = requestAnimationFrame(() => { composerComposing.current = false; }); }} onBlur={() => { cancelAnimationFrame(composerCommitFrame.current); composerComposing.current = false; }} onKeyDown={event => { const action = composerKeyAction(event.nativeEvent, composerComposing.current); if (action === 'native') return; event.preventDefault(); if (action === 'send') void ask(); }} /><div className="composer-bottom"><button type="button" className="save-question" disabled={!composerQuestion.trim() || localQuestionSaving} onClick={() => { void saveLocalQuestion(); }}>{localQuestionSaving ? <LoaderCircle size={11} className="spin" /> : <Plus size={11} />}保存困惑</button><button type="submit" className="send-button" aria-label={modelReady ? '发送问题' : '配置模型后提问'} disabled={!composerQuestion.trim() || !!busyId || modelChanging}><ArrowUp size={17} /></button></div></form></div>
     </aside>}
 
     {importing && <ImportDialog draft={materialDraft} onDraftLoaded={loaded => { workspaceDraftLoaded.current = loaded; if (loaded) clearDraftError('workspace'); }} onClose={() => setImporting(false)} onImported={async section => { if (section.draftError) reportDraftError(`section:${section.id}`, section.draftError); if (workspaceDraftLoaded.current) { materialDraft.current = { title: '', body: '' }; if (nativeAvailable) void call('draft_save', { key: 'workspace', data: { importTitle: '', importBody: '' } }).catch(error => reportDraftError('workspace', error)); } setImporting(false); setDocs(old => ({ ...old, [section.id]: { section, body: section.body, savedBody: section.body, saving: false, draftLoaded: section.draftReady !== false } })); setSessions(old => ({ ...old, [section.id]: emptySession(section.id) })); setActiveId(section.id); setQuestion(questionForSection(questionDrafts.current, section.id)); setSelection(''); setAiError(''); switchView('lesson'); setEditing(false); try { setBoot(await call<Bootstrap>('bootstrap')); } catch (error) { notify(errorText(error)); } }} />}
-    {settings && <SettingsDialog font={font} model={boot.model} dataPath={boot.dataPath} onClose={() => setSettings(false)} onSaved={model => setBoot(old => ({ ...old, model }))} />}
+
+    {objectPreview && <Dialog title={objectPreview.kind === 'todo' ? '已保存的待办' : objectPreview.title} description="从本机真实记录打开，未重新调用模型或工具。" onClose={() => setObjectPreview(null)}>{objectPreview.kind === 'todo' ? <><h3>{objectPreview.title}</h3><p>{objectPreview.done ? '已完成' : '待完成'} · {objectPreview.reminderEnabled ? '提醒已开启' : '提醒关闭'}</p>{objectPreview.dueAt && <p>{new Date(objectPreview.dueAt).toLocaleString('zh-CN')}</p>}<button className="quiet-button" onClick={() => { setObjectPreview(null); switchView('tasks'); }}>到学习待办</button></> : <><Markdown text={objectPreview.front || objectPreview.body || ''} />{objectPreview.back && <Markdown text={objectPreview.back} />}</>}</Dialog>}
     {backupConflict && <Dialog title="找回了之前的草稿" description="旧草稿还没有被覆盖。请对照正文与未发送的问题，再选择保留哪份输入。" onClose={() => setBackupConflict(null)}><div className="conflict-compare">{[{ label: '当前窗口输入', data: currentDraftData(backupConflict.key) }, { label: '找回的旧草稿', data: backupConflict.data }].map(item => <div key={item.label}><h3>{item.label}</h3>{backupConflict.key === 'workspace' ? <><h4>小节名称</h4><p>{item.data.importTitle || '（空）'}</p><h4>正文</h4><Markdown text={item.data.importBody || '（空）'} /></> : <><h4>正文</h4><Markdown text={item.data.body || '（空）'} /><h4>未发送的问题</h4><p className="draft-question">{item.data.question || '（空）'}</p></>}</div>)}</div><div className="dialog-footer"><button className="quiet-button" onClick={() => { void resolveBackup(true); }}>使用找回的草稿</button><button className="primary-button" onClick={() => { void resolveBackup(false); }}>保留当前输入并备份</button></div></Dialog>}
     {manualExercise && <ManualExerciseDialog sectionId={activeId} onClose={() => setManualExercise(false)} onSaved={result => { setSessions(old => ({ ...old, [activeId]: result })); setManualExercise(false); notify('手动题目已保存，可以开始作答。'); }} />}
     {comparison && <Dialog title="对照外部的新版本" description="左侧是仍保留的本地编辑，右侧是当前文件。关闭对照后可以继续整理，或将草稿另存为新小节。" onClose={() => setComparison(null)}><div className="conflict-compare"><div><h3>我的编辑</h3><Markdown text={current?.body || ''} /></div><div><h3>外部文件</h3><Markdown text={comparison.body} /></div></div></Dialog>}
@@ -482,54 +543,6 @@ function ImportDialog({ onClose, onImported, draft, onDraftLoaded }: { onClose: 
   useEffect(() => { draft.current = { title, body }; if (!nativeAvailable || !draftLoaded) return; const timer = setTimeout(() => { void call('draft_save', { key: 'workspace', data: { importTitle: title, importBody: body } }).catch(error => setError(`导入草稿尚未备份：${errorText(error)}`)); }, 600); return () => clearTimeout(timer); }, [title, body, draft, draftLoaded]);
   async function submit(event: React.FormEvent) { event.preventDefault(); if (!body.trim() || busy) return; setBusy(true); setError(''); try { onImported(await call<Section>('section_import', { title: title.trim() || '未命名小节', body })); } catch (error) { setError(errorText(error)); } finally { setBusy(false); } }
   return <Dialog title="打开一份自己的材料" description="一篇短文、一页笔记，或今天要读的小节。系统会自动保存为课程材料。" onClose={onClose}><form onSubmit={event => { void submit(event); }}><input ref={file} type="file" accept=".md,.markdown,.txt,text/plain,text/markdown" hidden onChange={async event => { const selected = event.target.files?.[0]; if (!selected) return; edited.current = true; if (selected.size > 1_500_000) { setError('这份文件超过 1.5MB，请先按小节拆分。'); return; } try { setBody(await selected.text()); if (!title) setTitle(selected.name.replace(/\.(md|markdown|txt)$/i, '')); } catch { setError('无法读取这份文件，请确认文件可用后重试，也可以粘贴正文。'); } }} /><button type="button" className="file-picker" onClick={() => file.current?.click()}><FolderOpen size={20} /><span>选择 Markdown 或文本文件<small>也可以直接粘贴在下方</small></span><Plus size={17} /></button><label>小节名称<input value={title} onChange={event => { edited.current = true; setTitle(event.target.value); }} placeholder="例如：阅读 · Daily habits" maxLength={200} /></label><label>小节正文<textarea className="import-body" value={body} onChange={event => { edited.current = true; setBody(event.target.value); }} placeholder="把自己的学习材料粘贴在这里…" required rows={8} /></label>{error && <div className="inline-error" role="alert">{error}{savedImport ? <><p>旧名称：{savedImport.data.importTitle || '（空）'}</p><details><summary>查看旧正文</summary><Markdown text={savedImport.data.importBody || '（空）'} /></details><div className="button-row"><button type="button" onClick={() => { setTitle(savedImport.data.importTitle || ''); setBody(savedImport.data.importBody || ''); loadedRef.current = true; setDraftLoaded(true); onDraftLoaded(true); setSavedImport(null); setError(''); }}>恢复旧导入草稿</button><button type="button" onClick={() => { loadedRef.current = true; setDraftLoaded(true); onDraftLoaded(true); setSavedImport(null); setError(''); }}>保留当前输入并备份</button></div></> : !draftLoaded && <button type="button" onClick={() => { void restoreDraft(); }}>重试读取导入草稿</button>}</div>}<div className="dialog-footer"><span>正文可随时编辑</span><button className="primary-button" disabled={busy || !body.trim()}>{busy ? <LoaderCircle className="spin" size={15} /> : <ArrowRight size={15} />}{busy ? '正在保存到本机…' : '保存并开始阅读'}</button></div></form></Dialog>;
-}
-function SettingsDialog({ model, dataPath, onClose, onSaved, font }: { model: ModelSettings; dataPath?: string; onClose: () => void; onSaved: (model: ModelSettings) => void; font: ReturnType<typeof useFontSize> }) {
-  const [provider, setProvider] = useState(model.provider === 'glm-pi' ? 'glm-pi' : 'custom');
-  const [protocol, setProtocol] = useState(model.protocol || supportedProtocol);
-  const [baseUrl, setBaseUrl] = useState(model.baseUrl || '');
-  const [name, setName] = useState(model.model || '');
-  const [secret, setSecret] = useState('');
-  const [busy, setBusy] = useState<'save' | 'test' | ''>('');
-  const [error, setError] = useState('');
-  const [result, setResult] = useState('');
-  const bindingChanged = modelBindingChanged(model, { provider, protocol, baseUrl });
-  const settingsChanged = bindingChanged || name.trim() !== model.model;
-  async function save(event: React.FormEvent) {
-    event.preventDefault(); if (busy) return;
-    setError(''); setResult('');
-    const validation = modelFormError({ provider, protocol, baseUrl, model: name, apiKey: secret }, model);
-    if (validation) { setError(validation); return; }
-    setBusy('save'); const apiKey = secret; setSecret('');
-    try { const saved = await call<ModelSettings>('model_save', { provider, protocol, baseUrl: baseUrl.trim(), model: name.trim(), apiKey: apiKey || undefined }); onSaved(saved); setBaseUrl(saved.baseUrl); setName(saved.model); setProtocol(saved.protocol || supportedProtocol); setResult(modelAccessMessage(saved) ? `配置已保存到本机。${modelAccessMessage(saved)}` : '配置已保存到本机，尚未发送模型请求。可以继续测试已保存的连接。'); }
-    catch (error) { setError(`连接配置尚未保存：${errorText(error)}`); }
-    finally { setBusy(''); }
-  }
-  async function test() {
-    if (busy) return; setError(''); setResult('');
-    if (!model.configured || settingsChanged) { setError(settingsChanged ? '配置有更改，请先保存，再测试这个目标。' : '请先填写并保存模型连接，再测试。'); return; }
-    if (modelAccessMessage(model)) { setError(`本地用途限制：${modelAccessMessage(model)}`); return; }
-    setBusy('test');
-    try { const response = await call<{ ok: boolean; message: string }>('model_test'); setResult(response.message); onSaved(await call<ModelSettings>('model_get')); }
-    catch (error) { setError(modelFailureMessage(error, 'test')); }
-    finally { setBusy(''); }
-  }
-  return <Dialog title="模型与本机设置" description="填写你自己的模型服务。保存只写入本机，点击测试或发送问题时才请求已保存的地址。" onClose={onClose}>
-    <section className="font-settings" aria-label="内容字号设置"><div><strong>内容字号</strong><output aria-live="polite">{font.fontSize}px</output></div><div className="font-controls"><button className="quiet-button" aria-label="减小内容字号" disabled={font.fontSize <= 12} onClick={() => font.setFontSize(font.fontSize - 1)}>A−</button><input aria-label="内容字号" type="range" min="12" max="24" step="1" value={font.fontSize} onChange={event => font.setFontSize(Number(event.target.value))} /><button className="quiet-button" aria-label="增大内容字号" disabled={font.fontSize >= 24} onClick={() => font.setFontSize(font.fontSize + 1)}>A＋</button></div><p>阅读、编辑、对话与复习内容同步调整。{font.status}</p>{font.error && <div className="inline-error" role="alert">字号设置：{font.error}<button onClick={() => { void font.flush().catch(() => undefined); }}>重试保存字号</button><button onClick={() => { void font.retry(); }}>重新读取字号</button></div>}</section>
-    <div className={`settings-status ${model.connected && !modelAccessReason(model) ? 'connected' : ''}`}><span className="connection-dot" />{modelAccessReason(model) ? '已保存配置 · 本地用途限制' : model.connected ? '已保存目标的真实连接已验证' : model.configured ? '已保存配置 · 连接待验证' : '模型服务尚未配置'}</div>
-    {modelAccessMessage(model) && <div className="inline-error model-policy" role="status"><strong>当前保存的地址受本地限制</strong><p>{modelAccessMessage(model)}</p></div>}
-    <form noValidate onSubmit={event => { void save(event); }}>
-      <label>模型服务类型<select aria-label="模型服务类型" value={provider} onChange={event => { setProvider(event.target.value); setSecret(''); }}><option value="custom">自定义模型服务</option><option value="glm-pi">GLM Pi · Coding Plan 用途受限</option></select></label>
-      {provider === 'glm-pi' && !modelAccessReason(model) && <div className="inline-error model-policy" role="status"><strong>Coding Plan 用途限制仍有效</strong><p>Pi 接入不代表套餐授权。此用途尚未确认，服务端会保留请求门槛；不会自动切换到付费 API。自定义服务请使用你获准调用的接口。</p></div>}
-      <label>模型协议<select aria-label="模型协议" value={protocol} onChange={event => { setProtocol(event.target.value); setSecret(''); }}><option value={supportedProtocol}>OpenAI Chat Completions</option></select><span className="label-note">当前支持 openai-completions，由 Pi 适配</span></label>
-      <label>服务地址 base_url<input aria-label="模型服务地址" type="url" value={baseUrl} onChange={event => { setBaseUrl(event.target.value); setSecret(''); }} placeholder="填写服务提供方给出的基础 base_url" spellCheck={false} autoComplete="off" /><span className="label-note">填写基础地址，不含 /chat/completions；测试也会调用该地址下的服务，并按服务方规则计费。</span></label>
-      <label>模型名称<input aria-label="模型名称" value={name} onChange={event => setName(event.target.value)} placeholder="填写服务端支持的模型 ID" spellCheck={false} autoComplete="off" /></label>
-      <label>API 密钥 <span className="label-note">{model.credentialStored && !bindingChanged ? '已由本机安全存储管理；留空保留' : '更改地址或协议后需要新密钥'}</span><input aria-label="API 密钥" type="password" value={secret} onChange={event => setSecret(event.target.value)} placeholder={model.credentialStored && !bindingChanged ? '留空保留已有密钥' : '请在本机输入此服务的密钥'} autoComplete="new-password" spellCheck={false} /></label>
-      <p className="muted small">密钥不进入网页存储或日志；提交后立即清空输入框。测试只针对已保存的地址、协议和模型。</p>
-      {error && <div className="inline-error" role="alert">{error}</div>}{result && <p className="settings-result" role="status">{result}</p>}
-      <div className="dialog-footer"><button type="button" className="quiet-button" disabled={!!busy} onClick={() => { void test(); }}>{busy === 'test' ? <><LoaderCircle size={14} className="spin" />正在测试已保存连接…</> : modelAccessReason(model) && !settingsChanged ? '查看本地用途限制' : '测试已保存连接'}</button><button className="primary-button" disabled={!!busy}>{busy === 'save' ? <><LoaderCircle size={14} className="spin" />正在保存配置…</> : '保存连接设置'}</button></div>
-    </form>
-    <div className="settings-local"><p>飞书提醒：未启用 · Anki：仅 CSV 导出，未同步</p><strong><FolderOpen size={14} />本机材料目录</strong><p>{dataPath || '由本机服务管理，连接后显示路径'}</p><p>Markdown 是学习内容的原始文件，保存时会检查版本变化。</p></div>
-  </Dialog>;
 }
 
 function CardDialog({ draft, sectionId, onClose, onSaved }: { draft: CardDraft; sectionId: string; onClose: () => void; onSaved: (card: ReviewCard) => void }) {

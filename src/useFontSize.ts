@@ -12,12 +12,12 @@ export function useFontSize() {
     try { const result = await call<{ fontSize: number }>('preferences_get'); if (!validFontSize(result.fontSize)) throw new Error('本机字号不在支持范围内。'); record.current.saved = result.fontSize; if (!record.current.edited) { record.current.value = result.fontSize; setValue(result.fontSize); } setError(''); setStatus('字号已从本机恢复'); } catch (error) { setError(error instanceof Error ? error.message : String(error)); setStatus('字号尚未读取成功'); }
   }
   async function flush() {
-    if (!nativeAvailable || !record.current.edited || record.current.value === record.current.saved) return;
+    if (!nativeAvailable || !record.current.edited) return;
     const value = record.current.value;
     setStatus('正在保存字号…');
-    const next = writes.current.catch(() => undefined).then(() => call<{ fontSize: number }>('preferences_save', { fontSize: value }));
+    const next = writes.current.catch(() => undefined).then(async () => { if (value !== record.current.saved) { await call<{ fontSize: number }>('preferences_save', { fontSize: value }); record.current.saved = value; } });
     writes.current = next;
-    try { await next; record.current.saved = value; setError(''); setStatus(record.current.value === value ? '字号已保存到本机' : '正在保存新字号…'); }
+    try { await next; setError(''); setStatus(record.current.value === value ? '字号已保存到本机' : '正在保存新字号…'); }
     catch (error) { const message = error instanceof Error ? error.message : String(error); setError(message); setStatus('字号尚未保存'); throw error; }
   }
   useEffect(() => { void load(); }, []);

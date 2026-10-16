@@ -1,0 +1,9 @@
+import { Check, ChevronDown, CircleHelp, LoaderCircle, Wrench } from 'lucide-react';
+import { toolState } from './toolActivities';
+import type { ToolActivity } from './types';
+export function ToolActivityCards({ items, liveRunId, onOpen }: { items: ToolActivity[]; liveRunId?: string; onOpen: (object: NonNullable<ToolActivity['object']>) => void }) {
+  return <div className="tool-activities">{items.map(item => {
+    const state = toolState(item, liveRunId);
+    return <article key={item.id} className={`tool-activity tool-${state}`} aria-label={`${item.title} · ${state === 'running' ? '运行中' : state === 'succeeded' ? '成功' : state === 'failed' ? '失败' : '结果未确认'}`}><div className="tool-activity-title">{state === 'running' ? <LoaderCircle size={13} className="spin" /> : state === 'succeeded' ? <Check size={13} /> : <CircleHelp size={13} />}<strong>{item.title}</strong><span>{state === 'running' ? '运行中' : state === 'succeeded' ? '成功' : state === 'failed' ? '失败' : '结果未确认'}</span></div><p>{state === 'unconfirmed' ? '未读到完整保存回执，不会自动重跑。' : state === 'running' ? '正在调用本机工具…' : item.summary}</p>{state === 'failed' && <p className="tool-error">{item.errorCode === 'CONFLICT' ? '保存版本发生变化，请检查学习记录。' : item.errorCode === 'NOT_FOUND' ? '对应内容未找到。' : item.errorCode === 'INVALID_INPUT' ? '工具提供的内容或格式无效。' : '工具返回错误，请查看记录后再决定是否重试。'}</p>}{state === 'succeeded' && item.persisted && item.object && <button className="quiet-button" onClick={() => onOpen(item.object!)}>打开{item.object.kind === 'todo' ? '待办' : item.object.kind === 'review-card' ? '复习卡' : '学习记录'}</button>}<details><summary><Wrench size={10} />详情 <ChevronDown size={10} /></summary><p>工具回执：{item.id}</p>{item.errorCode && <p>学习站诊断：{item.errorCode}</p>}<p>{item.persisted && item.object && state === 'succeeded' ? '本机记录已保存' : '未确认新增保存记录'}</p></details></article>;
+  })}</div>;
+}

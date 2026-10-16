@@ -123,3 +123,9 @@ ToolActivity=`{id,toolCallId,runId,sessionId,name,status:running|succeeded|faile
 响应诊断只含固定枚举、状态码、字符/token计数和完成标志，不含正文、reasoning原文、headers或凭据。最近一次在私有状态目录`model-response-diagnostic.json`，生成失败也保留到Run.error.details.response。MODEL_ENDPOINT_PAGE说明返回网页且提示核对/v1；MODEL_FORMAT、MODEL_LENGTH、MODEL_INCOMPLETE、MODEL_THINKING_ONLY、MODEL_EMPTY区分格式、截断和无正文；均不能冒充完整答案。原Pi流解析未替换，预算不自动提高，真实测试由用户在本机触发。
 
 本轮明确取消旧全展开，改边缘拖动调宽。探索左移/作业结构的半截需求、课程资源目录和课件功能只记录后续，不做迁移。
+
+### 后续学习 Skill 的边界（尚未实现）
+
+保留现有 `app::session_context`、`generation::messages` 与 `task_tool_policy(mode)` 作为流程级组合入口；未来可按 mode 声明 required Skill/context，并将实际加载版本记入上下文清单。必需加载失败必须在模型请求前报错；可选学习资料继续沿用现有可见 warning。当前无 Skill loader/安装/自动扫描能力，不加载用户 coding skills。
+
+生成状态恢复仅把真正不存在的记录返回 `NOT_FOUND`；损坏、不可读或不安全文件分别报原错误并保留，不应视作首次发送。

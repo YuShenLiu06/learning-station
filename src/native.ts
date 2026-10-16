@@ -2,17 +2,20 @@ import { invoke } from '@tauri-apps/api/core';
 import type { Bootstrap, Course, Exercise, LearningSession, ModelSettings, ReviewCard, Section, Source, UiDraft, RequestContext } from './types';
 import { StationError } from './types';
 import { sessionMessages } from './sessionMessages';
+import { historicalTools, foldToolActivities } from './toolActivities';
+import { stableRunId } from './outgoingMessages';
+import type { ToolActivity } from './types';
 
 type NativeDoc = { id: string; path: string; metadata: { id: string; title: string; kind: string; goals: string[]; tags: string[]; links: string[]; version: number }; body: string; content: string; version: string; modifiedAt: string };
 type Summary = { id: string; path: string; title: string; kind: string; tags: string[]; version: string };
 type Entry = { id: string; kind: string; content: string; createdAt: string; selection?: string; relatedIds: string[]; data?: Record<string, unknown> };
 type Manifest = { id: string; path: string; version: string; includedChars: number };
 type NativeSession = { id: string; sectionId: string; title: string; version: string; entries: Entry[]; contextManifest: Manifest[] };
-type NativeModel = { configured: boolean; provider: string; baseUrl: string; model: string; verified?: boolean; harness?: string; protocol?: string; usageGate?: string };
+type NativeModel = { configured: boolean; provider: string; baseUrl: string; model: string; verified?: boolean; harness?: string; protocol?: string; requestUrl?: string; usageGate?: string };
 type NativeState = { root: string; documents: Summary[]; activeDocumentId?: string; model: NativeModel; lastRunId?: string };
 type NativeTodo = { id: string; title: string; dueAt?: string; reminderEnabled?: boolean; done: boolean };
 type NativeNotice = { id: string; title: string; dueAt?: string; read: boolean; deliveryStatus?: string };
-type Run = { id: string; status: string; content: string; error?: { code: string; message: string } | string; sessionId: string };
+type Run = { id: string; status: string; content: string; error?: { code: string; message: string; details?: Record<string, unknown> } | string; sessionId: string; userEntryId?: string; toolCalls?: ToolActivity[] };
 const draftVersions = new Map<string, string>();
 const draftReadKeys = new Set<string>();
 const appendRequests = new Map<string, string>();
@@ -24,10 +27,10 @@ const sessionIds = new Map<string, NativeSession>();
 function cacheSession(value: NativeSession) { sessions.set(value.sectionId, value); sessionIds.set(value.id, value); return value; }
 const operationRuns = new Map<string, string>();
 const cancelled = new Set<string>();
-export type GenerationProgress = { operationId: string; sectionId: string; sessionId: string; content: string; manifest?: RequestContext['manifest']; contextError?: string };
+export type GenerationProgress = { operationId: string; sectionId: string; sessionId: string; content: string; runId?: string; toolCalls?: ToolActivity[]; manifest?: RequestContext['manifest']; contextError?: string };
 const progressListeners = new Set<(progress: GenerationProgress) => void>();
 export function onGenerationProgress(listener: (progress: GenerationProgress) => void) { progressListeners.add(listener); return () => { progressListeners.delete(listener); }; }
-const nativeCommands = new Set(['get_app_state', 'refresh_library', 'create_section', 'import_markdown', 'open_document', 'save_document', 'start_session', 'get_session', 'append_entry', 'load_context', 'start_generation', 'cancel_generation', 'get_run', 'configure_model', 'get_model_settings', 'test_model', 'create_todo', 'list_todos', 'set_todo_done', 'list_notifications', 'mark_notification_read', 'export_anki_csv', 'list_review_items', 'get_ui_draft', 'save_ui_draft', 'set_todo_reminder', 'record_ui_metric', 'get_ui_preferences', 'save_ui_preferences', 'start_exploration', 'load_session_context']);
+const nativeCommands = new Set(['get_app_state', 'refresh_library', 'create_section', 'import_markdown', 'open_document', 'save_document', 'start_session', 'get_session', 'append_entry', 'load_context', 'start_generation', 'cancel_generation', 'get_run', 'configure_model', 'get_model_settings', 'set_model', 'test_model', 'create_todo', 'list_todos', 'set_todo_done', 'list_notifications', 'mark_notification_read', 'export_anki_csv', 'list_review_items', 'get_ui_draft', 'save_ui_draft', 'set_todo_reminder', 'record_ui_metric', 'get_ui_preferences', 'save_ui_preferences', 'start_exploration', 'load_session_context', 'check_feishu_status', 'test_feishu_notification']);
 async function ipc<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
   if (!nativeCommands.has(command)) throw new StationError('不支持的本机命令。', 'INVALID_COMMAND');
   return invoke<T>(command, args);
@@ -51,7 +54,7 @@ function learning(value: NativeSession): LearningSession {
   }
   const toCard = (entry: Entry): ReviewCard => ({ id: entry.id, sessionId: value.id, sectionId: value.sectionId, front: String(entry.data?.front ?? entry.content), back: String(entry.data?.back ?? ''), source: documents.get(value.sectionId)?.metadata.title || '学习记录' });
   return { id: value.id, sectionId: value.sectionId, sources: sources(value.contextManifest),
-    messages: sessionMessages(value.entries),
+    messages: sessionMessages(value.entries), toolCalls: historicalTools(value.entries, value.id),
     exercises,
     mistakes: value.entries.filter(entry => entry.kind === 'error').map(entry => ({ id: entry.id, question: String(entry.data?.front ?? entry.content), reason: String(entry.data?.cause ?? ''), sectionId: value.sectionId })),
     cards: value.entries.filter(entry => entry.kind === 'error' || entry.data?.reviewCard === true).map(toCard),
@@ -63,9 +66,9 @@ async function sessionFor(sectionId: string, sessionId?: string) {
   if (!sectionId) throw new StationError('探索会话尚未就绪，请重试打开独立探索。', 'NO_SESSION');
   const opened = await ipc<{ session: NativeSession }>('start_session', { sectionId }); return cacheSession(opened.session);
 }
-async function append(sectionId: string, kind: string, content: string, data?: Record<string, unknown>, relatedIds: string[] = [], selection?: string, sessionId?: string) {
+async function append(sectionId: string, kind: string, content: string, data?: Record<string, unknown>, relatedIds: string[] = [], selection?: string, sessionId?: string, requestIdOverride?: string) {
   const key = JSON.stringify({ sectionId, sessionId, kind, content, data, relatedIds, selection });
-  const requestId = appendRequests.get(key) || crypto.randomUUID();
+  const requestId = requestIdOverride || appendRequests.get(key) || crypto.randomUUID();
   appendRequests.set(key, requestId);
   const value = await sessionFor(sectionId, sessionId);
   const args = { sessionId: value.id, entry: { id: '', kind, content, createdAt: '', relatedIds, data, selection }, expectedVersion: value.version, requestId };
@@ -86,28 +89,42 @@ async function append(sectionId: string, kind: string, content: string, data?: R
 
 async function generation(payload: Record<string, unknown>, mode: string, prompt: string) {
   const operationId = String(payload.operationId); const value = await sessionFor(String(payload.sectionId || ''), payload.sessionId ? String(payload.sessionId) : undefined); const sectionId = value.sectionId;
-  let runId: string | undefined;
+  const runId = await stableRunId(operationId);
+  operationRuns.set(operationId, runId);
+  let confirmedStatus: string | undefined;
   try {
-    if (payload.draftBody) throw new StationError('请先保存当前小节，再发起生成。问题与选句仍保留。', 'UNSAVED_CONTEXT');
-    const started = await ipc<{ runId: string }>('start_generation', { sessionId: value.id, mode, selection: String(payload.selection || ''), prompt, requestId: operationId });
-    runId = started.runId;
-    operationRuns.set(operationId, runId);
-    try { const actual = cacheSession(await ipc<NativeSession>('get_session', { id: value.id })); progressListeners.forEach(listener => listener({ operationId, sectionId, sessionId: value.id, content: '', manifest: actual.contextManifest })); }
-    catch { progressListeners.forEach(listener => listener({ operationId, sectionId, sessionId: value.id, content: '', contextError: '本次实际来源暂未读到，读取成功前不展示来源清单。' })); }
-    if (cancelled.has(operationId)) { await ipc('cancel_generation', { runId }); throw new StationError('已请求停止生成，已有记录仍保留。', 'CANCELLED'); }
+    if (payload.draftBody) throw new StationError('请先保存当前小节，再发起生成。', 'UNSAVED_CONTEXT');
+    let resumed: Run | undefined;
+    if (payload.resume === true) {
+      try { resumed = await ipc<Run>('get_run', { runId }); }
+      catch (error) { if (!(error && typeof error === 'object' && 'code' in error && error.code === 'NOT_FOUND')) throw new StationError('尚不能核实上次生成状态，请稍后再次核对，未新发请求。', 'STATUS_UNKNOWN', { sendStage: 'unknown', runId }); }
+    }
+    if (!resumed) {
+      if (cancelled.has(operationId)) throw new StationError('已停止，问题保存在学习记录中。', 'CANCELLED', { sendStage: 'generation', runId });
+      await ipc('start_generation', { sessionId: value.id, mode, selection: String(payload.selection || ''), prompt, requestId: operationId, userEntryId: payload.userEntryId || undefined });
+    }
+    try { const actual = cacheSession(await ipc<NativeSession>('get_session', { id: value.id })); progressListeners.forEach(listener => listener({ operationId, sectionId, sessionId: value.id, runId, content: '', manifest: actual.contextManifest })); }
+    catch { progressListeners.forEach(listener => listener({ operationId, sectionId, sessionId: value.id, runId, content: '', contextError: '本次实际来源暂未读到，读取成功前不展示来源清单。' })); }
+    if (cancelled.has(operationId)) await ipc('cancel_generation', { runId });
     const deadline = Date.now() + 130_000;
     while (Date.now() < deadline) {
-      if (cancelled.has(operationId)) throw new StationError('已请求停止生成，已有记录仍保留。', 'CANCELLED');
-      const run = await ipc<Run>('get_run', { runId });
-      if (run.content) progressListeners.forEach(listener => listener({ operationId, sectionId, sessionId: value.id, content: run.content }));
+      const run = resumed || await ipc<Run>('get_run', { runId }); resumed = undefined;
+      confirmedStatus = run.status;
+      progressListeners.forEach(listener => listener({ operationId, sectionId, sessionId: value.id, runId, content: run.content || '', toolCalls: foldToolActivities(run.toolCalls || [], value.id) }));
       if (run.status === 'succeeded') return learning(await ipc<NativeSession>('get_session', { id: value.id }));
-      if (['failed', 'cancelled', 'interrupted'].includes(run.status)) throw new StationError(typeof run.error === 'string' ? run.error : run.error?.message || '生成未完成，已收到的内容仍保留。', typeof run.error === 'object' ? run.error.code : run.status.toUpperCase());
+      if (['failed', 'cancelled', 'interrupted'].includes(run.status)) throw new StationError(typeof run.error === 'string' ? run.error : run.error?.message || '生成未完成，已收到的内容仍保留。', typeof run.error === 'object' ? run.error.code : run.status.toUpperCase(), { ...(typeof run.error === 'object' ? run.error.details : {}), sendStage: 'generation', runId, runStatus: run.status });
       await new Promise(resolve => setTimeout(resolve, 350));
     }
     await ipc('cancel_generation', { runId });
-    throw new StationError('模型长时间未完成，已请求停止。问题仍保留。', 'TIMEOUT');
+    throw new StationError('模型长时间未完成，已请求停止；请先核对状态，避免重复生成。', 'TIMEOUT', { sendStage: 'unknown', runId });
+  } catch (error) {
+    const data = error && typeof error === 'object' ? error as { code?: string; message?: string; details?: Record<string, unknown> } : {};
+    if (data.details?.sendStage) throw error;
+    try { confirmedStatus = (await ipc<Run>('get_run', { runId })).status; }
+    catch (checkError) { if (checkError && typeof checkError === 'object' && 'code' in checkError && checkError.code === 'NOT_FOUND') confirmedStatus = 'not-started'; }
+    const terminal = ['failed', 'cancelled', 'interrupted', 'not-started'].includes(confirmedStatus || '');
+    throw new StationError(data.message || '未能读取生成结果，请先核对上次状态。', data.code || 'STATUS_UNKNOWN', { ...data.details, sendStage: terminal ? 'generation' : 'unknown', runId, runStatus: confirmedStatus });
   } finally {
-    // Starting a run may already have committed a user entry, even if IPC then fails.
     const latest = await ipc<NativeSession>('get_session', { id: value.id }).catch(() => undefined);
     if (latest) cacheSession(latest);
     operationRuns.delete(operationId); cancelled.delete(operationId);
@@ -118,7 +135,7 @@ export async function nativeCall(command: string, payload: Record<string, unknow
   switch (command) {
     case 'run_get': return ipc('get_run', { runId: payload.id });
     case 'preferences_get': return ipc('get_ui_preferences');
-    case 'preferences_save': return ipc('save_ui_preferences', { fontSize: payload.fontSize });
+    case 'preferences_save': return ipc('save_ui_preferences', { ...(payload.fontSize === undefined ? {} : { fontSize: payload.fontSize }), ...(payload.assistantWidth === undefined ? {} : { assistantWidth: payload.assistantWidth }) });
     case 'exploration_open': { const result = await ipc<{ session: NativeSession; context: unknown; lastRunId?: string }>('start_exploration', { sectionId: payload.sectionId || undefined, associateCurrentSection: payload.associateCurrentSection === true, fresh: false }); return { session: learning(result.session), context: result.context, lastRunId: result.lastRunId }; }
     case 'context_load': { const session = await sessionFor(String(payload.sectionId || ''), payload.sessionId ? String(payload.sessionId) : undefined); return ipc('load_session_context', { sessionId: session.id, selection: String(payload.selection || '') }); }
     case 'activity_refresh': { const [tasks, notices] = await Promise.all([ipc<NativeTodo[]>('list_todos'), ipc<NativeNotice[]>('list_notifications')]); return { tasks: tasks.map(item => ({ ...item, completed: item.done })), notices: notices.map(item => ({ ...item, body: item.deliveryStatus === 'disabled' ? '站内提醒 · 飞书未启用' : undefined })) }; }
@@ -147,6 +164,27 @@ export async function nativeCall(command: string, payload: Record<string, unknow
     }
     case 'session_open': { const result = await ipc<{ session: NativeSession }>('start_session', { sectionId: payload.sectionId }); return learning(result.session); }
     case 'session_refresh': { const value = await sessionFor(String(payload.sectionId || ''), payload.sessionId ? String(payload.sessionId) : undefined); return learning(await ipc<NativeSession>('get_session', { id: value.id })); }
+    case 'message_save': {
+      const sendId = String(payload.sendId);
+      const value = await append(String(payload.sectionId || ''), 'user', String(payload.question), { mode: payload.mode, clientMessageId: sendId }, [], String(payload.selection || ''), String(payload.sessionId), sendId);
+      const entry = value.entries.find(item => item.kind === 'user' && item.data?.clientMessageId === sendId);
+      if (!entry) throw new StationError('尚未读到这条问题的保存回执，请重试核对。', 'STATUS_UNKNOWN');
+      return { session: learning(value), userEntryId: entry.id };
+    }
+    case 'feishu_status': return ipc('check_feishu_status');
+    case 'feishu_test': return ipc('test_feishu_notification', { requestId: payload.requestId });
+    case 'tool_object_open': {
+      const kind = String(payload.kind); const id = String(payload.id);
+      if (kind === 'todo') {
+        const task = (await ipc<NativeTodo[]>('list_todos')).find(item => item.id === id);
+        if (!task) throw new StationError('对应待办未找到，请刷新学习待办。', 'NOT_FOUND');
+        return { kind, id, title: task.title, dueAt: task.dueAt, done: task.done, reminderEnabled: task.reminderEnabled === true };
+      }
+      const value = cacheSession(await ipc<NativeSession>('get_session', { id: payload.sessionId }));
+      const entry = value.entries.find(item => item.id === id && (item.kind === 'note' || item.kind === 'error'));
+      if (!entry || kind === 'review-card' && entry.kind !== 'error' && entry.data?.reviewCard !== true) throw new StationError('对应学习记录未找到，请刷新后重试。', 'NOT_FOUND');
+      return { kind, id, title: kind === 'review-card' ? '已保存的复习卡' : '已保存的学习记录', body: entry.content, front: String(entry.data?.front || ''), back: String(entry.data?.back || '') };
+    }
     case 'question_save': return learning(await append(String(payload.sectionId), 'user', String(payload.question), { mode: 'local', noAi: true }, [], String(payload.selection || ''), payload.sessionId ? String(payload.sessionId) : undefined));
     case 'session_ask': return generation(payload, payload.mode === 'explore' ? 'question' : 'explain', String(payload.question));
     case 'exercise_generate': return generation(payload, 'practice', '请围绕当前小节和选句生成一道针对理解盲点的英语练习。');
@@ -159,6 +197,7 @@ export async function nativeCall(command: string, payload: Record<string, unknow
     case 'cards_export': { const sectionId = String(payload.sectionId || ''); const value = sectionId ? await sessionFor(sectionId) : [...sessions.values()].at(-1); if (!value) throw new StationError('请先打开保存过复习卡的小节。', 'NO_SESSION'); return ipc('export_anki_csv', { sessionId: value.id }); }
     case 'model_get': return model(await ipc<NativeModel>('get_model_settings'));
     case 'model_save': return model(await ipc<NativeModel>('configure_model', { provider: payload.provider, protocol: payload.protocol, baseUrl: payload.baseUrl, model: payload.model, apiKey: String(payload.apiKey || '') }));
+    case 'model_select': return model(await ipc<NativeModel>('set_model', { model: String(payload.model || '') }));
     case 'model_test': return ipc('test_model');
     case 'notice_read': return ipc('mark_notification_read', { id: payload.id });
     case 'task_create': { const task = await ipc<NativeTodo>('create_todo', { title: payload.title, dueAt: payload.dueAt, reminderEnabled: payload.reminderEnabled === true, requestId: crypto.randomUUID(), sessionId: sessions.get(String(payload.sectionId))?.id }); return { ...task, completed: task.done }; }

@@ -126,6 +126,38 @@ test('historical assistant prose cannot borrow the current session source manife
   const policy=modelFailureMessage({code:'PLAN_USAGE_UNCONFIRMED',message:'old gate wording'},'test');
   assert.match(policy,/本地用途限制/);
   assert.doesNotMatch(policy,/连接测试未通过|测试未完成|网络失败/);
-  assert.match(modelFailureMessage({code:'NETWORK',message:'connection refused'},'test'),/^测试未完成：connection refused$/);
+  assert.match(modelFailureMessage({code:'NETWORK',message:'connection refused'},'test'),/^网络请求未完成（学习站诊断 · NETWORK）：connection refused$/);
+  assert.match(modelFailureMessage({code:'MODEL_RESPONSE',message:'safe application diagnostic'},'test'),/^响应解析未完成（学习站诊断 · MODEL_RESPONSE）：safe application diagnostic$/);
   assert.match(modelFailureMessage(Object.assign(new Error('gate'),{code:'PLAN_USAGE_UNCONFIRMED'}),'generation'),/未发送网络请求/);
+});
+
+
+test('request targets preserve explicit OpenAI prefixes and exact Anthropic SDK path without modifying settings', async () => {
+  const {modelRequestTarget}=await import('../src/modelPolicy.ts');
+  const input={provider:'custom',protocol:'openai-completions',baseUrl:'https://example.test:37174',model:'unchanged-model'};
+  const snapshot={...input};
+  assert.equal(modelRequestTarget(input),'https://example.test:37174/chat/completions');
+  assert.equal(modelRequestTarget({...input,baseUrl:'https://example.test:37174/v1/'}),'https://example.test:37174/v1/chat/completions');
+  assert.equal(modelRequestTarget({...input,protocol:'anthropic-messages',baseUrl:'https://example.test/proxy/'}),'https://example.test/proxy/v1/messages?beta=true');
+  assert.equal(modelRequestTarget({...input,protocol:'anthropic-messages',baseUrl:'http://127.0.0.1:56789'}),'http://127.0.0.1:56789/v1/messages?beta=true');
+  assert.deepEqual(input,snapshot);
+});
+test('Anthropic endpoint validation prevents duplicate paths and keeps credential binding protocol-specific', async () => {
+  const {modelFormError,modelRequestTarget,modelBindingChanged}=await import('../src/modelPolicy.ts');
+  const old={configured:true,provider:'custom',protocol:'openai-completions',baseUrl:'https://example.test',model:'same-model',credentialStored:true,usageGate:''};
+  const changed={provider:'custom',protocol:'anthropic-messages',baseUrl:old.baseUrl,model:old.model,apiKey:''};
+  assert.equal(modelBindingChanged(old,changed),true);
+  assert.match(modelFormError(changed,old),/新密钥/);
+  assert.equal(modelFormError({...changed,apiKey:'public-fixture-key'},old),'');
+  assert.equal(modelFormError({...changed,apiKey:''},{...old,protocol:'anthropic-messages'}),'');
+  assert.match(modelFormError({...changed,provider:'glm-pi',apiKey:'public-fixture-key'},old),/仅支持.*OpenAI/);
+  for (const suffix of ['/v1','/v1/','/messages','/v1/messages']) {
+    const input={...changed,baseUrl:old.baseUrl+suffix,apiKey:'public-fixture-key'};
+    assert.match(modelFormError(input,old),/不要以 \/v1 或 \/messages 结尾/);
+    assert.equal(modelRequestTarget(input),'');
+  }
+  for (const baseUrl of ['https://example.test?key=not-real','https://example.test#fragment','https://user:pass@example.test','http://example.test']) {
+    assert.notEqual(modelFormError({...changed,baseUrl,apiKey:'public-fixture-key'},old),'');
+    assert.equal(modelRequestTarget({...changed,baseUrl}),'');
+  }
 });
