@@ -16,3 +16,7 @@ src-tauri/gen/
 
 runtime/node
 tests/bridge-harness/target/
+evidence/
+docs/*build*.json
+docs/acceptance.md
+tools/local/

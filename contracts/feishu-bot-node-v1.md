@@ -6,7 +6,7 @@
 
 ## 资源与启动
 
-固定复用Pi现有 `./local-development-path`，实测v24.18.0。核心统一安排与Pi共用运行时，不使用PATH、不引入Python。数据库使用Node24内置node:sqlite，无额外SQLite npm包。
+固定复用Pi现有 `runtime/node`，实测v24.18.0。核心统一安排与Pi共用运行时，不使用PATH、不引入Python。数据库使用Node24内置node:sqlite，无额外SQLite npm包。
 
 启动：`<固定Node24> --disable-warning=ExperimentalWarning <固定资源目录>/worker.mjs --state-dir <专用私有目录>`。参数只屏蔽Node内置SQLite实验性warning，不影响安全状态。目录来自可信后端，不接受前端/模型自由输入。
 
