@@ -49,7 +49,7 @@ ReviewSource={reviewItemId,sessionId,sectionId:null|string,sectionTitle:string,c
 - configure_feishu_bot({appId,ownerOpenId,chatId,receiveEnabled,deliveryEnabled,appSecret?:string}) → 同上。首次/变更绑定须新secret，现binding空secret可保留；仅用户本机输入，保存独立Keychain，提交即清空。进程尚在运行时BUSY，先停再改。
 - start_feishu_bot() / stop_feishu_bot() / get_feishu_bot_snapshot() → {state,reason,counts,processExited,outputClosed}，state=unconfigured|stopped|starting|blocked|connecting|connected|disconnected|reconnecting|failed|receive_disabled|stopping；只有connected且存活是接收已联通。runtime缺失为blocked，不伪造按钮成功。
 - check_feishu_status/test_feishu_notification 保持原IdentityStatus/DeliveryOutcome与同requestId去重；test仅用户显式发送固定文字，成功须messageId。收取和发送分别启用，接收内容仅被动持久通知，不执行资料指令/自动回复/自动模型请求。
-- 原设置页通知分类下加已有飞书配置/启停/安全状态即可，不加新的主导航。标明应用退出/休眠不能保证及时提醒。配置精确步骤见contracts/feishu-bot-v1.md（适配器随后合并）。
+- 原设置页通知分类下加已有飞书配置/启停/安全状态即可，不加新的主导航。标明应用退出/休眠不能保证及时提醒。配置精确步骤见contracts/feishu-bot-node-v1.md（适配器随后合并）。
 
 飞书deliveryEnabled的用户可见含义为“发送新到期提醒及手动测试”。tick仍仅入站内库，独立协调器只有机器人已显式启动、发送已启用时才处理启用后新建的到期通知；先持久unknown预占，真实messageId才sent。旧历史不补发，unknown/failed不自动重发；用户关闭提醒/完成todo后不发尚未发送项。应用退出不保证发送，不另建后台服务。草稿feishu-test可携带原测试requestId（同通用草稿先读/版本校验）。
 
