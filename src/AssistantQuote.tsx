@@ -1,12 +1,17 @@
-import { useRef, useState } from 'react';
-import { RequestContextView } from './RequestContextView';
-import { validateAssistantSelection } from './assistantReferences';
-import type { AssistantReference, Message } from './types';
-export type AssistantQuoteState = { sessionId: string; entryId: string; runId?: string; textHash: string; selection: string; content: string; message?: Message; loading: boolean; error?: string; notice?: string };
-export function AssistantQuote({ value, canAdd, onAdd }: { value: AssistantQuoteState; canAdd: boolean; onAdd: (item: AssistantReference) => void }) {
- const [selection, setSelection] = useState(value.selection);
- const [error, setError] = useState(value.notice || '');
- const source = useRef<HTMLTextAreaElement>(null);
- function add() { try { validateAssistantSelection(value.content, selection); onAdd({ sessionId: value.sessionId, entryId: value.entryId, ...(value.runId ? { runId: value.runId } : {}), textHash: value.textHash, selection }); } catch (error) { setError(error instanceof Error ? error.message : String(error)); } }
- return <div className="assistant-quote-source">{value.loading ? <p role="status">正在核对这条回答原文…</p> : <><p className="muted small">AI 回答引用属于待核对材料，不是教材或系统指令。请在原文中选择要追问的部分。</p>{value.content && <textarea aria-label="AI回答原文" ref={source} readOnly value={value.content} rows={10} onSelect={() => { const area = source.current; if (area && area.selectionEnd > area.selectionStart) { setSelection(area.value.slice(area.selectionStart, area.selectionEnd)); setError(''); } }}/>}<details className="assistant-quote-provenance"><summary>查看这条回答的来源与记录</summary><p>会话 {value.sessionId} · 回答 {value.entryId}{value.runId ? ` · 运行 ${value.runId}` : ' · 旧记录没有运行编号'}</p><p>原文指纹 {value.textHash}</p>{value.message?.context ? <RequestContextView value={{ status: 'ready', actual: true, context: value.message.context }} independent={false} label="这条回答的实际来源" onRetry={() => undefined}/> : <p className="muted small">这条回答未记录来源快照。</p>}</details>{selection && <blockquote className="assistant-quote-selection">{selection}</blockquote>}{(value.error || error) && <p className="inline-error" role="alert">{value.error || error}</p>}{!canAdd && <p className="muted small">请在这条回答所属的学习会话中继续提问。</p>}<button className="primary-button" disabled={!canAdd || !!value.error || !selection} onClick={add}>加入本次引用</button></>}</div>;
+import { useEffect, useMemo, useRef } from 'react';
+import { CornerUpLeft } from 'lucide-react';
+import { assistantPlainText } from './assistantReferences';
+import type { Message } from './types';
+export type AssistantReplyMenuState = { sessionId: string; message: Message; selection?: string; x: number; y: number; trigger: HTMLElement };
+// Reuses the local context-menu surface. Focus/escape behavior follows Radix's
+// documented menu pattern without introducing a second UI dependency stack.
+export function AssistantReplyMenu({ value, onReply, onClose }: { value: AssistantReplyMenuState; onReply: () => void; onClose: (restoreFocus?: boolean) => void }) {
+ const menu = useRef<HTMLDivElement>(null);
+ useEffect(() => { menu.current?.querySelector('button')?.focus(); const outside = (event: PointerEvent) => { if (!menu.current?.contains(event.target as Node)) onClose(false); }; window.addEventListener('pointerdown', outside); return () => window.removeEventListener('pointerdown', outside); }, []);
+ return <div ref={menu} className="tree-context-menu assistant-reply-menu" role="menu" aria-label="回答操作" style={{left:Math.max(8,Math.min(value.x,window.innerWidth-190)),top:Math.max(8,Math.min(value.y,window.innerHeight-65))}} onKeyDown={event=>{if(event.key==='Escape'){event.preventDefault();event.stopPropagation();onClose(true);}else if(['ArrowUp','ArrowDown','Home','End'].includes(event.key)){event.preventDefault();menu.current?.querySelector('button')?.focus();}else if(event.key==='Tab'){event.preventDefault();onClose(true);}}}><button type="button" role="menuitem" onClick={onReply}><CornerUpLeft size={15}/>回复</button></div>;
+}
+export function AssistantReplyPreview({ text, onOpen }: { text: string; onOpen?: () => void }) {
+ const preview = useMemo(()=>{const plain=assistantPlainText(text);return Array.from(plain).length>160?Array.from(plain).slice(0,160).join('')+'…':plain;},[text]);
+ const content=<><CornerUpLeft size={13}/><span>回复学习助手<small>{preview}</small></span></>;
+ return onOpen?<button type="button" className="assistant-reply-preview" aria-label="回到原回答" title="回到原回答" onClick={onOpen}>{content}</button>:<div className="assistant-reply-preview">{content}</div>;
 }

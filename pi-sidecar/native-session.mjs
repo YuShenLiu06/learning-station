@@ -166,10 +166,17 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
       agent.state.messages=manager.buildSessionContext().messages;
       await onManifest?.(inventory);
     };
-    const unsub=session.subscribe(async event=>{
+    let pendingProjection=Promise.resolve();
+    const nativePrepare=agent.prepareRequest;
+    agent.prepareRequest=async (...args)=>{await pendingProjection;return nativePrepare?.(...args);};
+    const unsub=session.subscribe(event=>{
       if(['compaction_start','compaction_end'].includes(event.type)){
-        await onLifecycle?.({type:event.type,reason:event.reason,aborted:event.aborted??false});
-        if(event.type==='compaction_end'&&!event.aborted&&currentTurn){await applyContext(currentTurn);}
+        // SDK event listeners are synchronous. Update the projection immediately,
+        // and explicitly await its receipt before the next prepared request.
+        const projection=event.type==='compaction_end'&&!event.aborted&&currentTurn?applyContext(currentTurn):undefined;
+        const lifecycle=onLifecycle?.({type:event.type,reason:event.reason,aborted:event.aborted??false});
+        pendingProjection=Promise.all([pendingProjection,projection,lifecycle]).then(()=>{});
+        void pendingProjection.catch(()=>{});
       }
     });
     // Public AgentSession listeners run before its persistence. The Agent subscriber below is
@@ -201,9 +208,9 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
           await session.prompt(question,{expandPromptTemplates:false,source:'rpc'});
 
         }
-        await agent.waitForIdle();return {};
+        await agent.waitForIdle();await pendingProjection;return {};
       },
-      async complete(finalContent){record.status='complete';record.finalContent=finalContent;persist(record);await checkpoint();},
+      async complete(finalContent){await pendingProjection;record.status='complete';record.finalContent=finalContent;persist(record);await checkpoint();},
       close(){unsub();userUnsub();close();},
     };
   }catch(error){session?.dispose();try{fs.closeSync(lockFd);}catch{}try{fs.unlinkSync(lock);}catch{}throw error instanceof NativeSessionError?error:new NativeSessionError('NATIVE_SESSION_INVALID',error);}
