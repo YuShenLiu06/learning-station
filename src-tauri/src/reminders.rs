@@ -41,6 +41,28 @@ pub struct Notification {
     pub delivery_status: String,
 }
 
+pub fn due_notification_text(notification: &Notification) -> String {
+    let when = chrono::DateTime::parse_from_rfc3339(&notification.due_at).ok();
+    let display = match (when, crate::time_context::system_time_zone()) {
+        (Some(time), Some(zone)) => format!(
+            "{}（{}）",
+            time.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S %:z"),
+            zone
+        ),
+        (Some(time), None) => format!(
+            "{}（UTC，未确认本机时区）",
+            time.with_timezone(&chrono::Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ),
+        _ => "未能读取到期时间，请在学习站核对".into(),
+    };
+    format!(
+        "小主人，你的任务「{}」到时间啦，记得处理哦。\n到期时间：{}",
+        notification.title, display
+    )
+}
+
 /// Future external adapters must expose their actual configuration state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "status", rename_all = "camelCase")]
@@ -1317,5 +1339,36 @@ mod bot_integration_tests {
         assert_eq!(l.list_notifications().unwrap()[0].delivery_status, "sent");
         l.set_reminder_enabled(&todo.id, false).unwrap();
         assert!(l.pending_deliveries("1999").unwrap().is_empty());
+    }
+}
+#[cfg(test)]
+mod template_tests {
+    use super::*;
+    #[test]
+    fn due_text_keeps_title_and_offset_and_never_claims_advance_notice() {
+        let n = Notification {
+            id: "n".into(),
+            todo_id: "todo".into(),
+            title: "复习相对论".into(),
+            due_at: "2026-10-16T16:05:00Z".into(),
+            read: false,
+            delivery_status: "pending".into(),
+        };
+        let text = due_notification_text(&n);
+        assert!(
+            text.starts_with("小主人，你的任务「复习相对论」到时间啦，记得处理哦。\n到期时间：")
+        );
+        assert!(!text.contains("即将"));
+        assert!(!text.contains("测试通知"));
+        let d = DateTime::parse_from_rfc3339(&n.due_at).unwrap();
+        if crate::time_context::system_time_zone().is_some() {
+            assert!(text.contains(
+                &d.with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M:%S %:z")
+                    .to_string()
+            ));
+        } else {
+            assert!(text.contains("UTC，未确认本机时区"));
+        }
     }
 }

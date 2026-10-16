@@ -45,7 +45,8 @@
       "../pi-sidecar/learning-skills.mjs": "pi-sidecar/learning-skills.mjs",
       "../skills/learning-explore/SKILL.md": "skills/learning-explore/SKILL.md",
       "../skills/learning-review/SKILL.md": "skills/learning-review/SKILL.md",
-      "../skills/learning-exercises/SKILL.md": "skills/learning-exercises/SKILL.md"
+      "../skills/learning-exercises/SKILL.md": "skills/learning-exercises/SKILL.md",
+      "../pi-sidecar/time-context.mjs": "pi-sidecar/time-context.mjs"
     }
   }
 }

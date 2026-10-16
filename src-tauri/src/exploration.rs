@@ -101,6 +101,77 @@ pub fn begin(
     })
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExplorationContext {
+    pub scenario: String,
+    pub original_question: String,
+    pub user_goal: String,
+    pub storage_document_id: String,
+    pub material_source_ids: Vec<String>,
+}
+pub fn request_context(
+    store: &ContentStore,
+    session: &Session,
+    goal: &str,
+    manifest: &[ManifestItem],
+) -> Result<Option<ExplorationContext>> {
+    if session.section_id.is_empty() {
+        return Ok(None);
+    }
+    let doc = store.read(&session.section_id)?;
+    let fixed = format!("node_{}", &hash(FOLDER_REQUEST_ID)[..32]);
+    let mut found = doc.metadata.kind == "exploration";
+    let mut parent = doc
+        .metadata
+        .extra
+        .get("parentId")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let mut visited = std::collections::BTreeSet::new();
+    for _ in 0..16 {
+        let Some(id) = parent else { break };
+        if !visited.insert(id.clone()) {
+            break;
+        }
+        if id == fixed {
+            found = true;
+            break;
+        }
+        let ancestor = match store.read(&id) {
+            Ok(doc) => doc,
+            Err(error) if error.code == "NOT_FOUND" => break,
+            Err(error) => return Err(error),
+        };
+        parent = ancestor
+            .metadata
+            .extra
+            .get("parentId")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+    }
+    if !found {
+        return Ok(None);
+    }
+    let original = session
+        .entries
+        .iter()
+        .find(|e| e.kind == "user")
+        .map(|e| e.content.clone())
+        .unwrap_or_else(|| goal.into());
+    Ok(Some(ExplorationContext {
+        scenario: "question-led-exploration".into(),
+        original_question: original,
+        user_goal: goal.into(),
+        storage_document_id: session.section_id.clone(),
+        material_source_ids: manifest
+            .iter()
+            .filter(|m| m.id != session.section_id)
+            .map(|m| m.id.clone())
+            .collect(),
+    }))
+}
+
 fn validate(question: &str, request_id: &str) -> Result<()> {
     if question.trim().is_empty()
         || question.len() > MAX_QUESTION_BYTES
@@ -429,5 +500,34 @@ mod tests {
         assert_eq!(result.document.body, exact);
         assert!(result.document.metadata.title.len() <= 320);
         assert_eq!(counts(&mut store), (1, 1, 1, 1));
+    }
+}
+
+#[cfg(test)]
+mod intent_boundary_tests {
+    use super::*;
+    #[test]
+    fn ordinary_orphaned_note_is_not_forced_into_exploration_or_blocked_by_unindexed_ancestor() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = ContentStore::new(t.path().join("library"), t.path().join("state")).unwrap();
+        let d = library_tree::create(
+            &mut c,
+            "section",
+            "普通材料",
+            None,
+            "真实材料",
+            "ordinary_note_fixture",
+        )
+        .unwrap();
+        let mut d = c.read(&d.id).unwrap();
+        d.metadata
+            .extra
+            .insert("parentId".into(), json!("unindexed_parent"));
+        let raw = crate::content::serialize(&d.metadata, &d.body).unwrap();
+        c.save(&d.id, &raw, &d.version).unwrap();
+        let session = sessions::create_with_id(&mut c, &d.id, &[], "ordinary_session").unwrap();
+        assert!(request_context(&c, &session, "解释这段材料", &[])
+            .unwrap()
+            .is_none());
     }
 }

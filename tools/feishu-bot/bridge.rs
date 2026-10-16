@@ -439,7 +439,10 @@ impl NotificationChannel for BotNotificationChannel {
         }
     }
     fn deliver(&self, notification: &Notification) -> Result<DeliveryReceipt> {
-        let result = self.0.send(&notification.id, &notification.title);
+        let result = self.0.send(
+            &notification.id,
+            &crate::reminders::due_notification_text(notification),
+        );
         match result.status {
             DeliveryState::Sent => Ok(DeliveryReceipt {
                 external_id: result.message_id.ok_or_else(error)?,

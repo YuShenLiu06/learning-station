@@ -478,6 +478,7 @@ impl ModelStore {
             None,
             ToolPolicy::legacy(false),
             vec![],
+            None,
         )
         .await?;
         self.set_verified(true)?;
@@ -588,6 +589,7 @@ pub async fn generate(
         None,
         ToolPolicy::legacy(false),
         vec![],
+        None,
     )
     .await
 }
@@ -608,8 +610,22 @@ pub async fn generate_with_tools(
         Some(tool_handler),
         ToolPolicy::legacy(true),
         vec![],
+        None,
     )
     .await
+}
+#[derive(Clone)]
+pub struct RequestContext {
+    pub time: crate::time_context::TimeContext,
+    pub exploration: Option<crate::exploration::ExplorationContext>,
+}
+impl RequestContext {
+    fn capture() -> Self {
+        Self {
+            time: crate::time_context::TimeContext::capture(),
+            exploration: None,
+        }
+    }
 }
 /// The caller supplies a fixed mode policy; Rust and Pi independently enforce its subset.
 pub async fn generate_scoped(
@@ -620,6 +636,7 @@ pub async fn generate_scoped(
     tool_handler: Option<ToolHandler>,
     policy: ToolPolicy,
     skills: Vec<crate::learning_skills::SkillSnapshot>,
+    request_context: Option<RequestContext>,
 ) -> Result<String> {
     run_sidecar(
         credentials,
@@ -630,6 +647,7 @@ pub async fn generate_scoped(
         tool_handler,
         policy,
         skills,
+        request_context,
     )
     .await
 }
@@ -642,7 +660,10 @@ async fn run_sidecar(
     tool_handler: Option<ToolHandler>,
     policy: ToolPolicy,
     skills: Vec<crate::learning_skills::SkillSnapshot>,
+    request_context: Option<RequestContext>,
 ) -> Result<String> {
+    let request_context = request_context.unwrap_or_else(RequestContext::capture);
+    request_context.time.validate()?;
     ensure_usage_allowed(&credentials.settings)?;
     let diagnostic_path = credentials.diagnostic_path.take();
     validate_tool_policy(&policy, tool_handler.is_some())?;
@@ -679,6 +700,8 @@ async fn run_sidecar(
         learning_tools: bool,
         tool_policy: &'a ToolPolicy,
         learning_skills: &'a [crate::learning_skills::SkillSnapshot],
+        time_context: &'a crate::time_context::TimeContext,
+        exploration_context: Option<&'a crate::exploration::ExplorationContext>,
     }
     let mut input = serde_json::to_vec(&Input {
         protocol: 1,
@@ -691,6 +714,8 @@ async fn run_sidecar(
             && !policy.allowed_tools.is_empty(),
         tool_policy: &policy,
         learning_skills: &skills,
+        time_context: &request_context.time,
+        exploration_context: request_context.exploration.as_ref(),
     })
     .map_err(|_| sidecar_error("INVALID_INPUT"))?;
     if input.len() > 4 * MAX_OUTPUT - 1 {
@@ -707,7 +732,10 @@ async fn run_sidecar(
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("LANG", "en_US.UTF-8")
-        .env("TZ", "UTC")
+        .env(
+            "TZ",
+            request_context.time.time_zone.as_deref().unwrap_or("UTC"),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -770,6 +798,19 @@ async fn run_sidecar(
                 line.clear();
                 match event.get("type").and_then(Value::as_str) {
                     Some("ready") if !ready && !settled => {
+                        if event
+                            .get("timeContext")
+                            .and_then(|v| v.get("referenceTime"))
+                            .and_then(Value::as_str)
+                            != Some(request_context.time.reference_time.as_str())
+                            || event.get("timeContext").and_then(|v| v.get("timeZone"))
+                                != Some(&json!(request_context.time.time_zone))
+                        {
+                            return Err(CoreError::new(
+                                "TIME_CONTEXT_INVALID",
+                                "模型请求时间回执不一致，未确认生成。",
+                            ));
+                        }
                         if !skills.is_empty()
                             && event.get("learningSkills")
                                 != Some(&json!(skills
@@ -1006,7 +1047,10 @@ fn validate_tool_call(call: &ToolCall) -> Result<()> {
             &["front", "back"],
         ),
         "create_note" => (&[("content", 12000), ("selection", 12000)], &["content"]),
-        "create_todo" => (&[("title", 500), ("dueAt", 64)], &["title"]),
+        "create_todo" => (
+            &[("title", 500), ("dueAt", 64), ("relativeMinutes", 0)],
+            &["title"],
+        ),
         _ => return Err(sidecar_error("TOOLS_DISABLED")),
     };
     let args = call
@@ -1025,7 +1069,11 @@ fn validate_tool_call(call: &ToolCall) -> Result<()> {
             .iter()
             .find(|(field, _)| *field == key.as_str())
             .ok_or_else(|| sidecar_error("TOOL_PROTOCOL"))?;
-        if key == "tags" {
+        if key == "relativeMinutes" {
+            if value.as_u64().is_none_or(|n| !(1..=525600).contains(&n)) {
+                return Err(sidecar_error("TOOL_PROTOCOL"));
+            }
+        } else if key == "tags" {
             let tags = value
                 .as_array()
                 .ok_or_else(|| sidecar_error("TOOL_PROTOCOL"))?;
@@ -1280,6 +1328,7 @@ fn sidecar_error(code: &str) -> CoreError {
             "模型输出超过限制，已停止；已收到的内容已保留。",
         ),
         "TOOL_LIMIT" => ("TOOL_LIMIT", "学习工具调用超过本次预算，已停止。"),
+        "TIME_CONTEXT_INVALID" => ("TIME_CONTEXT_INVALID","请求时间或时区无效，未发送模型请求。"),
         "SKILL_MISSING" => ("SKILL_MISSING", "本次学习指导缺失，未发送模型请求。"),
         "SKILL_INVALID" => ("SKILL_INVALID", "学习指导版本或模式校验失败，未发送模型请求。"),
         "TOOL_PROTOCOL" => ("TOOL_PROTOCOL", "学习工具协议或参数无效，已停止。"),
@@ -1900,6 +1949,7 @@ mod tests {
             Some(handler.clone()),
             ToolPolicy { mode:"explain".into(), allowed_tools: ALL_TOOLS.iter().map(|name| (*name).into()).collect(), max_calls:6 },
             crate::learning_skills::capture("explain", &ALL_TOOLS.iter().map(|name| (*name).into()).collect::<Vec<String>>()).unwrap(),
+            None,
         )
         .await
         .unwrap();
@@ -2360,3 +2410,7 @@ mod configuration_response_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "model_time_tests.rs"]
+mod time_intent_tests;

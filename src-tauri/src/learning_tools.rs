@@ -61,6 +61,8 @@ struct CreateTodo {
     title: String,
     #[serde(default)]
     due_at: Option<String>,
+    #[serde(default)]
+    relative_minutes: Option<u32>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -149,6 +151,12 @@ pub fn execute(
                 bounded(due_at, 1, 64)?;
                 chrono::DateTime::parse_from_rfc3339(due_at).map_err(|_| invalid())?;
             }
+            if value
+                .relative_minutes
+                .is_some_and(|n| !(1..=525600).contains(&n))
+            {
+                return Err(invalid());
+            }
             Operation::Todo(value)
         }
         "query_related_knowledge" => {
@@ -184,6 +192,22 @@ pub fn execute(
             return Err(out_of_scope());
         }
         Some(run)
+    } else {
+        None
+    };
+    let request_clock = if let Operation::Todo(ref value) = operation {
+        if value.relative_minutes.is_some() {
+            let run = crate::generation::get(engine, &scope.run_id)?;
+            if run.session_id != scope.session_id {
+                return Err(out_of_scope());
+            }
+            Some(crate::time_context::TimeContext {
+                reference_time: run.reference_time.ok_or_else(invalid)?,
+                time_zone: run.time_zone,
+            })
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -258,16 +282,21 @@ pub fn execute(
         );
     }
     if let Operation::Todo(value) = operation {
+        let due = crate::time_context::resolve_due(
+            request_clock.as_ref(),
+            value.due_at.as_deref(),
+            value.relative_minutes,
+        )?;
         let todo = engine.reminders.create_todo(
             &value.title,
-            value.due_at.as_deref(),
+            due.as_deref(),
             false,
             Some(&session.id),
             &request_id,
         )?;
         return Ok(
             json!({"persisted":true,"todoId":todo.id,"sessionId":session.id,
-            "sectionId":session.section_id,"todo":todo}),
+            "sectionId":session.section_id,"dueAt":todo.due_at,"referenceTime":request_clock.as_ref().map(|c|&c.reference_time),"timeZone":request_clock.as_ref().and_then(|c|c.time_zone.as_ref()),"todo":todo}),
         );
     }
     let section_related_ids = if scope.section_id.is_empty() {
@@ -1678,5 +1707,56 @@ mod tests {
             .unwrap()
             .entries
             .is_empty());
+    }
+}
+#[cfg(test)]
+mod time_todo_tests {
+    use super::*;
+    #[test]
+    fn relative_todo_is_verified_against_durable_run_clock_and_replay_does_not_duplicate() {
+        let d = tempfile::tempdir().unwrap();
+        let e = Engine::new(d.path().join("library"), d.path().join("state")).unwrap();
+        let session = {
+            let mut c = e.lock().unwrap();
+            let doc = c
+                .create_section("fixture", "timing", vec![], vec![])
+                .unwrap();
+            c.start_session(&doc.id, false).unwrap().0
+        };
+        let run:crate::generation::Run=serde_json::from_value(json!({"id":"run_relative","sessionId":session.id,"mode":"question","status":"succeeded","content":"","error":null,"createdAt":"2026-10-16T15:55:00Z","updatedAt":"2026-10-16T15:55:00Z","requestDigest":"fixture","contextManifest":[],"referenceTime":"2026-10-16T15:55:00Z","timeZone":"Asia/Shanghai"})).unwrap();
+        e.runs.lock().unwrap().insert(
+            run.id.clone(),
+            crate::generation::ManagedRun {
+                run: run.clone(),
+                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        );
+        let scope = ToolScope {
+            session_id: session.id,
+            section_id: session.section_id,
+            run_id: run.id,
+            allowed_ids: vec![],
+        };
+        let args =
+            json!({"title":"跨日待办","relativeMinutes":10,"dueAt":"2026-10-17T00:05:00+08:00"});
+        let a = execute(&e, &scope, "same-clock", "create_todo", args.clone()).unwrap();
+        let b = execute(&e, &scope, "same-clock", "create_todo", args).unwrap();
+        assert_eq!(a["todoId"], b["todoId"]);
+        assert_eq!(
+            chrono::DateTime::parse_from_rfc3339(a["dueAt"].as_str().unwrap()).unwrap(),
+            chrono::DateTime::parse_from_rfc3339("2026-10-16T16:05:00Z").unwrap()
+        );
+        assert_eq!(a["referenceTime"], "2026-10-16T15:55:00Z");
+        assert_eq!(e.reminders.list_todos().unwrap().len(), 1);
+        assert!(!e.reminders.list_todos().unwrap()[0].reminder_enabled);
+        assert!(execute(
+            &e,
+            &scope,
+            "wrong-clock",
+            "create_todo",
+            json!({"title":"Bad","relativeMinutes":10,"dueAt":"2026-10-17T00:15:00+08:00"})
+        )
+        .is_err());
+        assert_eq!(e.reminders.list_todos().unwrap().len(), 1);
     }
 }

@@ -96,7 +96,9 @@ test('real Pi Agent has empty tools, fixed system, explicit Rust history, and st
     onAgent: (agent) => { actualAgent = agent; assert(agent instanceof Agent); assert.deepEqual(agent.state.tools, []); },
     streamFn: fakeStream('fixture 文本', { inspect: (model, context) => {
       assert.equal(model.id, MODEL_ID); assert.equal(model.compat.thinkingFormat, 'zai');
-      assert.equal(context.messages[0].content, `${FIXED_SYSTEM}\n本次没有注册工具，禁止请求任何工具。`);
+      assert(context.messages[0].content.startsWith(`${FIXED_SYSTEM}\n本次没有注册工具，禁止请求任何工具。\n\n可信请求时间`));
+      assert(context.messages[0].content.includes('referenceTime:'));
+      assert(context.messages[0].content.includes('timeZone:'));
       assert(!JSON.stringify(context).includes('UNTRUSTED SYSTEM'));
       assert(context.messages.some((message) => message.role === 'assistant'));
       assert(!context.messages.some((message) => message.role === 'toolResult'));

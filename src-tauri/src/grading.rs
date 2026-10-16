@@ -26,6 +26,10 @@ pub struct GradeRun {
     pub error: Option<CoreError>,
     pub model: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub reference_time: Option<String>,
+    #[serde(default)]
+    pub time_zone: Option<String>,
     digest: String,
 }
 pub struct ManagedGrade {
@@ -422,6 +426,8 @@ pub async fn start(
     let mut credentials = store.credentials()?;
     let model = config["effectiveModel"].as_str().unwrap_or("").to_string();
     credentials.override_model(&model)?;
+    let time_context =
+        crate::time_context::for_operation(&e.lock()?.state_dir, &format!("grading:{request_id}"))?;
     let run = GradeRun {
         id: id.clone(),
         session_id: session_id.clone(),
@@ -430,6 +436,8 @@ pub async fn start(
         result: None,
         error: None,
         model,
+        reference_time: Some(time_context.reference_time.clone()),
+        time_zone: time_context.time_zone.clone(),
         updated_at: timestamp(),
         digest,
     };
@@ -468,6 +476,10 @@ pub async fn start(
                     max_calls: 0,
                 },
                 vec![],
+                Some(model::RequestContext {
+                    time: time_context,
+                    exploration: None,
+                }),
             ),
         )
         .await;
@@ -637,6 +649,8 @@ mod recovery_tests {
             result: None,
             error: None,
             model: "offline-fixture".into(),
+            reference_time: None,
+            time_zone: None,
             updated_at: timestamp(),
             digest: hash(&serde_json::to_string(&(&session_id, &attempt_id)).unwrap()),
         };

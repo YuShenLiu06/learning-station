@@ -1,3 +1,4 @@
+import {freezeTodoTime} from './time-context.mjs';
 import { Type } from 'typebox';
 
 export const LEARNING_PLUGIN = Object.freeze({
@@ -63,10 +64,10 @@ const definitions = [
     description: '按用户明确要求，把正反面内容保存为当前会话的复习卡片；只有Rust返回persisted:true才算成功。',
     parameters: Type.Object({ front: string(8000), back: string(12000), tags: Type.Optional(Type.Array(string(64), { maxItems: 12 })) }, { additionalProperties: false }) },
   { name: 'create_todo', label: '创建待办',
-    description: '按用户明确要求创建当前会话待办。dueAt可选且必须带时区的RFC3339；即使提供时间也默认不启用提醒。成功以Rust持久化回执为准。',
-    parameters: Type.Object({ title: string(500), dueAt: Type.Optional(Type.String({ minLength: 1, maxLength: 64, format: 'date-time' })) }, { additionalProperties: false }) },
+    description: '按用户明确要求创建当前会话待办。经过时长优先用relativeMinutes（1至525600整数分钟），程序按本次固定时间计算并校验；绝对dueAt可选且必须带时区的RFC3339；即使提供时间也默认不启用提醒。成功以Rust持久化回执为准。',
+    parameters: Type.Object({ title: string(500), dueAt: Type.Optional(Type.String({ minLength: 1, maxLength: 64, format: 'date-time' })), relativeMinutes:Type.Optional(Type.Integer({minimum:1,maximum:525600})) }, { additionalProperties: false }) },
   { name: 'create_note', label: '创建笔记',
-    description: '按用户明确要求，保存当前会话的学习笔记，可附原文选区。AI整理待本人确认，成功以Rust持久化回执为准。',
+    description: '沿已授权的正常探索沉淀流程或用户明确要求，追加保存当前会话的学习笔记，可附原文选区。AI整理待本人确认，成功以Rust持久化回执为准。',
     parameters: Type.Object({ content: string(12000), selection: Type.Optional(Type.String({ maxLength: 12000 })) }, { additionalProperties: false }) },
 ];
 export function validateCall(id, name, args) {
@@ -80,10 +81,11 @@ export function validateCall(id, name, args) {
   const fields = name === 'record_question' ? { question: 8000, selection: 12000 }
     : name === 'create_error' ? { front: 8000, back: 12000, cause: 4000, exerciseId: 128, tags: 0 }
       : name === 'create_review_card' ? { front: 8000, back: 12000, tags: 0 }
-        : name === 'create_note' ? { content: 12000, selection: 12000 } : name === 'create_todo' ? { title: 500, dueAt: 64 } : { query: 500, knowledgeId: 128 };
+        : name === 'create_note' ? { content: 12000, selection: 12000 } : name === 'create_todo' ? { title: 500, dueAt: 64, relativeMinutes: 0 } : { query: 500, knowledgeId: 128 };
   for (const [key, value] of Object.entries(args)) {
     if (!Object.hasOwn(fields, key)) throw new LearningToolError('TOOL_PROTOCOL');
-    if (key === 'tags') {
+    if(key==='relativeMinutes'){if(!Number.isInteger(value)||value<1||value>525600)throw new LearningToolError('TOOL_PROTOCOL');}
+    else if (key === 'tags') {
       if (!Array.isArray(value) || value.length > 12 || value.some((tag) => typeof tag !== 'string' || !tag.trim() || [...tag].length > 64)) throw new LearningToolError('TOOL_PROTOCOL');
     } else if (typeof value !== 'string' || (!['selection', 'cause'].includes(key) && !value.trim()) || [...value].length > fields[key]) throw new LearningToolError('TOOL_PROTOCOL');
   }
@@ -102,7 +104,7 @@ export function validateToolPolicy(input, legacyEnabled = false, operation = 'ge
     || (policy.maxCalls === 0 && policy.allowedTools.length > 0)) throw new LearningToolError('TOOL_PROTOCOL');
   return { mode: policy.mode, allowedTools: [...policy.allowedTools], maxCalls: policy.maxCalls };
 }
-export function createLearningPlugin({ requestTool, secret = '', fail = () => {}, allowedTools = LEGACY_TOOLS, maxCalls = MAX_TOOL_CALLS, exerciseGuidance = '' }) {
+export function createLearningPlugin({ requestTool, secret = '', fail = () => {}, allowedTools = LEGACY_TOOLS, maxCalls = MAX_TOOL_CALLS, exerciseGuidance = '', timeContext }) {
   if (typeof requestTool !== 'function') throw new LearningToolError('TOOLS_DISABLED');
   if (!Array.isArray(allowedTools) || allowedTools.some((name) => !known.has(name)) || !Number.isInteger(maxCalls) || maxCalls < 1 || maxCalls > MAX_TOOL_CALLS) throw new LearningToolError('TOOL_PROTOCOL');
   const permitted = new Set(allowedTools);
@@ -111,8 +113,9 @@ export function createLearningPlugin({ requestTool, secret = '', fail = () => {}
   const cache = new Map();
   const safeCall = (id, name, args) => {
     if ((secret && id?.includes(secret)) || !permitted.has(name)) throw new LearningToolError('TOOLS_DISABLED');
-    const safeArgs = redactStrings(args, secret);
+    let safeArgs = redactStrings(args, secret);
     validateCall(id, name, safeArgs);
+    if(name==='create_todo'){try{safeArgs=freezeTodoTime(safeArgs,timeContext);}catch{throw new LearningToolError('TOOL_PROTOCOL');}}
     return { id, name, args: safeArgs };
   };
   const preflight = (toolCall, args) => {
