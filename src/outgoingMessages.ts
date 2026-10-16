@@ -1,6 +1,6 @@
 import { freezeRequestedContext } from './requestedContext.ts';
-import type { AssistantReference, ContextInjection, Message } from './types';
-export type OutgoingMessage = { sendId: string; operationId: string; sessionId: string; sectionId: string; documentId?: string; detached: boolean; mode: string; content: string; selection: string; injections?: ContextInjection[]; assistantReferences?: AssistantReference[]; createdAt: string; userEntryId?: string; stage: 'saving' | 'preparing' | 'generating' | 'failed' | 'done'; failureStage?: 'save' | 'generation' | 'unknown'; error?: string };
+import type { AssistantReference, ContextInjection, ExerciseReference, Message } from './types';
+export type OutgoingMessage = { sendId: string; operationId: string; sessionId: string; sectionId: string; documentId?: string; detached: boolean; mode: string; content: string; selection: string; injections?: ContextInjection[]; assistantReferences?: AssistantReference[]; exerciseReferences?: ExerciseReference[]; createdAt: string; userEntryId?: string; stage: 'saving' | 'preparing' | 'generating' | 'failed' | 'done'; failureStage?: 'save' | 'generation' | 'unknown'; error?: string };
 export type ConversationMessage = Message & { outgoing?: OutgoingMessage };
 export function mergeOutgoing(messages: Message[], outgoing: OutgoingMessage[], sessionId: string): ConversationMessage[] {
   const pending = outgoing.filter(item => item.sessionId === sessionId);
@@ -8,9 +8,9 @@ export function mergeOutgoing(messages: Message[], outgoing: OutgoingMessage[], 
   const result = messages.map(message => {
     const local = message.role === 'user' ? pending.find(item => item.userEntryId === message.id || item.sendId === message.clientMessageId) : undefined;
     if (local) matched.add(local.sendId);
-    return { ...message, requestedContext: message.requestedContext || (local ? freezeRequestedContext(local.sectionId, local.selection, local.injections, local.assistantReferences) : undefined), outgoing: local };
+    return { ...message, requestedContext: message.requestedContext || (local ? freezeRequestedContext(local.sectionId, local.selection, local.injections, local.assistantReferences, local.exerciseReferences) : undefined), outgoing: local };
   });
-  for (const local of pending) if (!matched.has(local.sendId)) result.push({ id: local.sendId, clientMessageId: local.sendId, role: 'user', content: local.content, createdAt: local.createdAt, requestedContext: freezeRequestedContext(local.sectionId, local.selection, local.injections, local.assistantReferences), outgoing: local });
+  for (const local of pending) if (!matched.has(local.sendId)) result.push({ id: local.sendId, clientMessageId: local.sendId, role: 'user', content: local.content, createdAt: local.createdAt, requestedContext: freezeRequestedContext(local.sectionId, local.selection, local.injections, local.assistantReferences, local.exerciseReferences), outgoing: local });
   return result;
 }
 export function reconcileOutgoing(outgoing: OutgoingMessage[], messages: Message[], sessionId: string) {

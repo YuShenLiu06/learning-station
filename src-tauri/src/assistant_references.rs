@@ -380,6 +380,7 @@ mod tests {
             request_id: "stale-ai-reference".into(),
             user_entry_id: None,
             injections: vec![],
+            exercise_references: vec![],
             assistant_references: vec![r.clone()],
         };
         request.assistant_references[0].text_hash = hash("stale");

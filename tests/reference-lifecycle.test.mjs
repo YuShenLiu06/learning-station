@@ -111,4 +111,8 @@ test('AI reference manifests stay separate and retain each preview/run/reply sna
  }finally{off();if(root)await React.act(async()=>root.unmount());clearMocks();}
 });
 
+test('ordinary practice shortcut uses the current queue after a confirmed send, never a previous failed practice snapshot',async()=>{
+ await fixture(async h=>{h.modelFail=true;await queueDocument('附加材料');await click(button('生成练习子文档',document.querySelector('.document-actions')));await wait(()=>button('重试生成练习'));const failed=h.calls.find(x=>x.command==='start_generation').args;assert.equal(failed.injections.length,1);assert.equal(document.querySelector('.composer-references'),null);h.modelFail=false;await input('新问题不再带上一次材料');await click(document.querySelector('[aria-label="发送问题"]'));await wait(()=>h.calls.filter(x=>x.command==='start_generation').length===2);await wait(()=>!document.querySelector('.generating'));await click(button('生成练习子文档',document.querySelector('.document-actions')));await wait(()=>h.calls.filter(x=>x.command==='start_generation').length===3);await wait(()=>!document.querySelector('.generating'));const current=h.calls.filter(x=>x.command==='start_generation').at(-1).args;assert.deepEqual(current.injections,[]);assert.deepEqual(current.exerciseReferences||[],[]);assert.equal(current.selection,'');assert.notEqual(current.userEntryId,[...h.runs.values()][0].userEntryId);});
+});
+
 test.after(async()=>{clearMocks();dom.window.close();await unlink(file).catch(()=>{});});

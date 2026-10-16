@@ -287,6 +287,13 @@ pub fn get(store: &mut ContentStore, id: &str) -> Result<Session> {
         created_at: created,
         updated_at: updated,
         entries,
+        context_exercise_reference_manifest: serde_json::from_value(
+            doc.metadata
+                .extra
+                .get("contextExerciseReferenceManifest")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        )?,
         context_assistant_reference_manifest: serde_json::from_value(
             doc.metadata
                 .extra
@@ -342,6 +349,7 @@ pub fn set_context_manifest(
     let mut context = Context {
         text: String::new(),
         manifest: manifest.to_vec(),
+        exercise_reference_manifest: vec![],
         assistant_reference_manifest: vec![],
         history_manifest: vec![],
         excluded_history_source_ids: vec![],
@@ -411,7 +419,16 @@ pub fn set_context_snapshot_explicit(
             "AI回答来源不属于本次会话或版本已变化，未写入来源。",
         ));
     }
+    crate::exercise_references::validate_manifest(
+        store,
+        &session,
+        &context.exercise_reference_manifest,
+    )?;
     let mut doc = store.read(session_id)?;
+    doc.metadata.extra.insert(
+        "contextExerciseReferenceManifest".into(),
+        json!(context.exercise_reference_manifest),
+    );
     doc.metadata.extra.insert(
         "contextAssistantReferenceManifest".into(),
         json!(context.assistant_reference_manifest),
@@ -520,6 +537,7 @@ pub fn append(
             &old,
             &frozen.assistant_references,
         )?;
+        crate::exercise_references::validate_references(store, &old, &frozen.exercise_references)?;
     }
     if entry.kind == "exercise" {
         let questions = entry

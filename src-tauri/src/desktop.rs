@@ -425,22 +425,45 @@ async fn start_exploration(
     .await
 }
 #[tauri::command]
+async fn get_exercise_reference(
+    state: State<'_, Arc<Engine>>,
+    session_id: String,
+    document_id: String,
+    question_id: String,
+    part: String,
+    entry_id: Option<String>,
+) -> Result<crate::exercise_references::ExerciseProjection> {
+    work(state.inner().clone(), move |e| {
+        crate::exercise_references::load(
+            &mut e.lock()?.content,
+            &session_id,
+            &document_id,
+            &question_id,
+            &part,
+            entry_id.as_deref(),
+        )
+    })
+    .await
+}
+#[tauri::command]
 async fn load_session_context(
     state: State<'_, Arc<Engine>>,
     session_id: String,
     selection: Option<String>,
     injections: Option<Vec<context::ContextInjection>>,
     assistant_references: Option<Vec<context::AssistantReference>>,
+    exercise_references: Option<Vec<crate::exercise_references::ExerciseReference>>,
 ) -> Result<Context> {
     work(state.inner().clone(), move |e| {
         let mut core = e.lock()?;
         let (session, mut context) = core.session_context(&session_id, selection.as_deref())?;
-        context::inject_request(
-            &core.content,
+        crate::exercise_references::inject_request(
+            &mut core.content,
             &mut context,
             &session,
             &injections.unwrap_or_default(),
             &assistant_references.unwrap_or_default(),
+            &exercise_references.unwrap_or_default(),
         )?;
         crate::context::attach_history(&mut context, &session, None);
         Ok(context)
@@ -520,6 +543,7 @@ async fn start_generation(
     user_entry_id: Option<String>,
     injections: Option<Vec<context::ContextInjection>>,
     assistant_references: Option<Vec<context::AssistantReference>>,
+    exercise_references: Option<Vec<crate::exercise_references::ExerciseReference>>,
 ) -> Result<Value> {
     let sink: Sink = Arc::new(move |event| {
         let _ = app.emit("generation", event);
@@ -533,6 +557,7 @@ async fn start_generation(
             prompt,
             request_id,
             user_entry_id,
+            exercise_references: exercise_references.unwrap_or_default(),
             assistant_references: assistant_references.unwrap_or_default(),
             injections: injections.unwrap_or_default(),
         },
@@ -958,6 +983,7 @@ pub fn run() {
             start_session,
             start_exploration,
             load_session_context,
+            get_exercise_reference,
             get_ui_preferences,
             save_ui_preferences,
             get_session,

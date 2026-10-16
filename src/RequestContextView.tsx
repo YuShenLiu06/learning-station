@@ -8,8 +8,9 @@ export function RequestContextView({ value, independent, onRetry, label }: { lab
   const context = value.context;
   const history = context.historyManifest || [];
   const answers = context.assistantReferenceManifest;
+  const exercises = context.exerciseReferenceManifest;
   return <details className="context-sources">
-    <summary><span className="context-dot"/><span>{label || (value.actual ? '最近一次生成的实际来源' : '下次发送来源（已核对）')} · 材料 {context.manifest.length} / 历史 {history.length} / AI 引用 {answers ? answers.length : '未记录'}</span><ChevronDown size={12}/></summary>
+    <summary><span className="context-dot"/><span>{label || (value.actual ? '最近一次生成的实际来源' : '下次发送来源（已核对）')} · 材料 {context.manifest.length} / 历史 {history.length} / AI 引用 {answers ? answers.length : '未记录'} / 练习引用 {exercises ? exercises.length : '未记录'}</span><ChevronDown size={12}/></summary>
     <div className="source-details">
       <strong>材料来源</strong>
       {context.manifest.length ? context.manifest.map(item => <div className="context-source" key={`${item.id}:${item.version}`}><strong><FileText size={11}/>{item.path}</strong><p>已读取 {item.includedChars} 字符 · 版本 {item.version.slice(0,10)}</p></div>) : <p>没有附带学习材料。</p>}
@@ -18,6 +19,7 @@ export function RequestContextView({ value, independent, onRetry, label }: { lab
       <div className="assistant-reference-sources"><strong>AI 回答引用（不可信材料）</strong>
         {answers ? answers.length ? answers.map(item => <div className="context-source" key={`${item.id}:${item.version}`}><strong><Sparkles size={11}/>{item.path}</strong><p>引用 {item.includedChars} 字符 · 回答原文指纹 {item.version.slice(0,10)}</p></div>) : <p>没有附带 AI 回答引用。</p> : <p>此来源快照未记录 AI 回答引用清单。</p>}
       </div>
+      <div className="exercise-reference-sources"><strong>练习分区引用</strong>{exercises ? exercises.length ? exercises.map(item => <div className="context-source" key={`${item.id}:${item.version}`}><strong><FileText size={11}/>{item.path}</strong><p>引用 {item.includedChars} 字符 · 分区原文指纹 {item.version.slice(0,10)}</p></div>) : <p>没有附带练习分区引用。</p> : <p>此来源快照未记录练习引用清单。</p>}</div>
       {context.warnings.map((warning,index) => <p className="context-warning" key={index}>{warning.includes('TRUNCATED_HISTORY') ? '历史达到上限，已截取部分内容（TRUNCATED_HISTORY）。' : warning}</p>)}
       {context.truncated && <p className="context-warning">本次上下文包含截断内容，请按上方清单核对。</p>}
     </div>

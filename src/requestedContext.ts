@@ -1,8 +1,9 @@
-import type { AssistantReference, ContextInjection, RequestedContext } from './types';
+import type { AssistantReference, ContextInjection, ExerciseReference, RequestedContext } from './types';
+import { exerciseReferenceKey } from './exerciseReferences.ts';
 const validId = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/u.test(value);
 const bytes = (value: string) => new TextEncoder().encode(value).length;
-export function freezeRequestedContext(documentId: string, selection: string, injections: ContextInjection[] = [], assistantReferences: AssistantReference[] = []): RequestedContext {
- return { documentId, selection, injections: injections.map(item => ({ ...item })), ...(assistantReferences.length ? { assistantReferences: assistantReferences.map(item => ({ ...item })) } : {}) };
+export function freezeRequestedContext(documentId: string, selection: string, injections: ContextInjection[] = [], assistantReferences: AssistantReference[] = [], exerciseReferences: ExerciseReference[] = []): RequestedContext {
+ return { documentId, selection, injections: injections.map(item => ({ ...item })), ...(assistantReferences.length ? { assistantReferences: assistantReferences.map(item => ({ ...item })) } : {}), ...(exerciseReferences.length ? { exerciseReferences: exerciseReferences.map(item => ({ ...item })) } : {}) };
 }
 // This is the persisted request intent, never a substitute for a Run's actual manifest.
 export function readRequestedContext(value: unknown, entrySelection = ''): RequestedContext | undefined {
@@ -28,5 +29,16 @@ export function readRequestedContext(value: unknown, entrySelection = ''): Reque
    assistantReferences.push({ sessionId: item.sessionId, entryId: item.entryId, ...(item.runId === undefined ? {} : { runId: item.runId as string }), textHash: item.textHash, selection: item.selection });
   }
  }
- return { documentId: data.documentId, selection: data.selection, injections, ...(assistantReferences.length ? { assistantReferences } : {}) };
+ const exerciseReferences: ExerciseReference[] = [], seenExercise = new Set<string>();
+ if (data.exerciseReferences !== undefined) {
+  if (!Array.isArray(data.exerciseReferences) || data.exerciseReferences.length + injections.length + assistantReferences.length > 8) return;
+  for (const raw of data.exerciseReferences) {
+   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return;
+   const item = raw as Record<string, unknown>;
+   if (!validId(item.sessionId) || !validId(item.documentId) || !validId(item.exerciseEntryId) || !validId(item.questionId) || !validId(item.entryId) || !['question','attempt','feedback','reference'].includes(String(item.part)) || typeof item.textHash !== 'string' || !/^[a-f0-9]{64}$/u.test(item.textHash) || typeof item.selection !== 'string' || !item.selection || Array.from(item.selection).length > 8000 || bytes(item.selection) > 30000) return;
+   const reference: ExerciseReference = { sessionId: item.sessionId, documentId: item.documentId, exerciseEntryId: item.exerciseEntryId, questionId: item.questionId, part: item.part as ExerciseReference['part'], entryId: item.entryId, textHash: item.textHash, selection: item.selection };
+   const key = exerciseReferenceKey(reference); if (seenExercise.has(key)) return; seenExercise.add(key); exerciseReferences.push(reference);
+  }
+ }
+ return { documentId: data.documentId, selection: data.selection, injections, ...(assistantReferences.length ? { assistantReferences } : {}), ...(exerciseReferences.length ? { exerciseReferences } : {}) };
 }

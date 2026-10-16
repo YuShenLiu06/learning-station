@@ -11,7 +11,7 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
     let library = dir.path().join("library");
     let state = dir.path().join("state");
     let e = Engine::new(library.clone(), state.clone()).unwrap();
-    let (launched, ai_reference) = {
+    let (launched, ai_reference, exercise_reference) = {
         let mut c = e.lock().unwrap();
         let note = crate::exploration::begin(
             &mut c.content,
@@ -54,7 +54,40 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
             text_hash: crate::types::hash(&entry.content),
             selection: entry.content.clone(),
         };
-        (note, reference)
+        let exercise = crate::exercises::create_manual(
+            &mut c.content,
+            &note.session.id,
+            &note.document.id,
+            crate::exercises::ManualExercise {
+                question: "RENDERED_QUESTION_TYPED_SOURCE".into(),
+                format: "exact".into(),
+                answers: vec!["UNREVEALED_TYPED_ANSWER_SENTINEL".into()],
+                explanation: "UNREVEALED_TYPED_EXPLANATION_SENTINEL".into(),
+            },
+            "typed-question-wire-fixture",
+        )
+        .unwrap();
+        let question = exercise.exercises["exercises"][0]["id"].as_str().unwrap();
+        let p = crate::exercise_references::project(
+            &mut c.content,
+            &exercise.session,
+            &exercise.document.id,
+            question,
+            "question",
+            None,
+        )
+        .unwrap();
+        let exercise_reference = crate::exercise_references::ExerciseReference {
+            session_id: p.session_id,
+            document_id: p.document_id,
+            exercise_entry_id: p.exercise_entry_id,
+            question_id: p.question_id,
+            part: p.part,
+            entry_id: p.entry_id,
+            text_hash: p.text_hash,
+            selection: p.text,
+        };
+        (note, reference, exercise_reference)
     };
     drop(e);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -163,6 +196,11 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
             prompt: (*goal).into(),
             request_id: format!("prompt_op_{i}"),
             user_entry_id: Some(entry_id.clone()),
+            exercise_references: if i == 0 {
+                vec![exercise_reference.clone()]
+            } else {
+                vec![]
+            },
             assistant_references: if i == 0 {
                 vec![ai_reference.clone()]
             } else {
@@ -171,13 +209,14 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
             injections: vec![],
         };
         {
-            let c = e.lock().unwrap();
-            crate::context::inject_request(
-                &c.content,
+            let mut c = e.lock().unwrap();
+            crate::exercise_references::inject_request(
+                &mut c.content,
                 &mut ctx,
                 &session,
                 &request.injections,
                 &request.assistant_references,
+                &request.exercise_references,
             )
             .unwrap();
         }
@@ -248,6 +287,23 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
                 .len(),
             if i == 0 { 1 } else { 0 }
         );
+        assert_eq!(
+            request_payload["exerciseReferenceManifest"]
+                .as_array()
+                .unwrap()
+                .len(),
+            if i == 0 { 1 } else { 0 }
+        );
+        assert!(!p.to_string().contains("UNREVEALED_TYPED_ANSWER_SENTINEL"));
+        assert!(!p
+            .to_string()
+            .contains("UNREVEALED_TYPED_EXPLANATION_SENTINEL"));
+        if i == 0 {
+            assert!(request_payload["context"]
+                .as_str()
+                .unwrap()
+                .contains("quoted_exercise_part"));
+        }
         if i == 0 {
             assert!(request_payload["context"]
                 .as_str()

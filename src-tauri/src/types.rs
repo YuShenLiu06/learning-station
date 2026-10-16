@@ -119,6 +119,8 @@ pub struct Context {
     #[serde(default)]
     pub assistant_reference_manifest: Vec<ManifestItem>,
     #[serde(default)]
+    pub exercise_reference_manifest: Vec<ManifestItem>,
+    #[serde(default)]
     pub excluded_history_source_ids: Vec<String>,
     pub warnings: Vec<String>,
     pub truncated: bool,
@@ -155,6 +157,8 @@ pub struct Session {
     pub context_history_manifest: Vec<ManifestItem>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context_assistant_reference_manifest: Vec<ManifestItem>,
+    #[serde(default)]
+    pub context_exercise_reference_manifest: Vec<ManifestItem>,
     #[serde(default)]
     pub context_excluded_history_source_ids: Vec<String>,
     #[serde(default)]
