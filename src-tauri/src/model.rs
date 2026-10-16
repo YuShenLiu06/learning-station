@@ -32,6 +32,7 @@ const ALL_TOOLS: &[&str] = &[
     "create_review_card",
     "create_note",
     "create_todo",
+    "generate_exercises",
 ];
 const MODEL_ID: &str = "glm-5.3-flash";
 const HARNESS: &str = "pi-agent-core";
@@ -40,6 +41,19 @@ const ANTHROPIC: &str = "anthropic-messages";
 const USAGE_GATE: &str = "PLAN_USAGE_UNCONFIRMED";
 const KEYCHAIN_SERVICE: &str = "com.yushen.learning-station.pi-api-key";
 const NODE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../runtime/node");
+static NODE_RESOURCE: OnceLock<PathBuf> = OnceLock::new();
+pub fn node_path() -> PathBuf {
+    NODE_RESOURCE
+        .get()
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from(NODE_PATH))
+}
+pub fn set_node_path(path: PathBuf) -> Result<()> {
+    if !path.is_absolute() || !path.is_file() {
+        return Err(runtime_error());
+    }
+    NODE_RESOURCE.set(path).map_err(|_| runtime_error())
+}
 const DOMESTIC: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
 const INTERNATIONAL: &str = "https://api.z.ai/api/coding/paas/v4";
 static SIDECAR_DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -186,6 +200,7 @@ fn validate_tool_policy(policy: &ToolPolicy, has_handler: bool) -> Result<()> {
                 "record_question",
                 "create_note",
                 "create_todo",
+                "generate_exercises",
             ],
             4,
         ),
@@ -524,6 +539,17 @@ impl ModelStore {
     }
 }
 impl ModelCredentials {
+    pub fn override_model(&mut self, model: &str) -> Result<()> {
+        validate_protocol_settings(
+            &self.settings.provider,
+            &self.settings.protocol,
+            &self.settings.base_url,
+            model,
+            false,
+        )?;
+        self.settings.model = model.into();
+        Ok(())
+    }
     fn new(settings: ModelSettings, api_key: String) -> Result<Self> {
         validate_protocol_settings(
             &settings.provider,
@@ -625,7 +651,7 @@ async fn run_sidecar(
         .cloned()
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../pi-sidecar"));
     let directory = std::fs::canonicalize(directory).map_err(|_| runtime_error())?;
-    if !Path::new(NODE_PATH).is_file()
+    if !node_path().is_file()
         || !directory.join("sidecar.mjs").is_file()
         || !directory.join("harness.mjs").is_file()
         || !directory.join("learning-plugin.mjs").is_file()
@@ -664,7 +690,7 @@ async fn run_sidecar(
     }
     input.push(b'\n');
     credentials.api_key.clear();
-    let mut child = Command::new(NODE_PATH)
+    let mut child = Command::new(node_path())
         .arg("--permission")
         .arg(format!("--allow-fs-read={}", directory.display()))
         .arg(directory.join("sidecar.mjs"))
@@ -921,6 +947,28 @@ fn validate_tool_call(call: &ToolCall) -> Result<()> {
     if call.id.is_empty() || call.id.chars().count() > 256 || call.id.chars().any(char::is_control)
     {
         return Err(sidecar_error("TOOL_PROTOCOL"));
+    }
+    if call.name == "generate_exercises" {
+        let a = call
+            .args
+            .as_object()
+            .ok_or_else(|| sidecar_error("TOOL_PROTOCOL"))?;
+        if a.keys()
+            .any(|k| !["requirements", "exercises", "summary"].contains(&k.as_str()))
+            || a.get("requirements")
+                .and_then(Value::as_str)
+                .is_none_or(|s| s.trim().is_empty() || s.chars().count() > 8000)
+            || a.get("summary")
+                .and_then(Value::as_str)
+                .is_none_or(|s| s.len() > 10000)
+            || a.get("exercises")
+                .and_then(Value::as_array)
+                .is_none_or(|a| a.is_empty() || a.len() > 5)
+            || serde_json::to_vec(&call.args)?.len() > MAX_TOOL_BYTES
+        {
+            return Err(sidecar_error("TOOL_PROTOCOL"));
+        }
+        return Ok(());
     }
     let (fields, required): (&[(&str, usize)], &[&str]) = match call.name.as_str() {
         "record_question" => (&[("question", 8000), ("selection", 12000)], &["question"]),
@@ -1910,6 +1958,7 @@ mod tests {
                     "record_question",
                     "create_note",
                     "create_todo",
+                    "generate_exercises",
                 ],
                 4,
             ),

@@ -4,6 +4,7 @@ import { call } from './api';
 import { modelAccessReason, modelAccessMessage, modelBindingChanged, modelFailureMessage, modelFormError, modelRequestTarget, supportedProtocol } from './modelPolicy';
 import type { ModelSettings } from './types';
 import type { useFontSize } from './useFontSize';
+import { GradingSettings } from './GradingSettings';
 import { FeishuSettings } from './FeishuSettings';
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 
@@ -58,9 +59,9 @@ export function SettingsPage({ model, dataPath, onClose, onSaved, font, blocked 
       </fieldset>{blocked && <p className="muted small">正在生成或切换模型；请先回到对话停止生成，再修改连接。</p>}{error && <div className="inline-error" role="alert">{error}</div>}{result && <p className="settings-result" role="status">{result}</p>}
       <div className="dialog-footer"><button type="button" className="quiet-button" disabled={!!busy || blocked} onClick={() => { void test(); }}>{busy === 'test' ? <><LoaderCircle size={14} className="spin" />正在测试已保存连接…</> : modelAccessReason(model) && !settingsChanged ? '查看本地用途限制' : '测试已保存连接'}</button><button className="primary-button" disabled={!!busy || blocked}>{busy === 'save' ? <><LoaderCircle size={14} className="spin" />正在保存配置…</> : '保存连接设置'}</button></div>
     </form>
-    </div></section><section id="settings-notifications" role="tabpanel" aria-labelledby="settings-tab-notifications" hidden={category !== 'notifications'}><FeishuSettings /></section><section id="settings-appearance" className="appearance-settings" role="tabpanel" aria-labelledby="settings-tab-appearance" hidden={category !== 'appearance'}><h2 className="settings-section-title">外观与阅读</h2>
+    </div><GradingSettings blocked={blocked}/></section><section id="settings-notifications" role="tabpanel" aria-labelledby="settings-tab-notifications" hidden={category !== 'notifications'}><FeishuSettings /></section><section id="settings-appearance" className="appearance-settings" role="tabpanel" aria-labelledby="settings-tab-appearance" hidden={category !== 'appearance'}><h2 className="settings-section-title">外观与阅读</h2>
     <section className="font-settings" aria-label="内容字号设置"><div><strong>内容字号</strong><output aria-live="polite">{font.fontSize}px</output></div><div className="font-controls"><button className="quiet-button" aria-label="减小内容字号" disabled={font.fontSize <= 12} onClick={() => font.setFontSize(font.fontSize - 1)}>A−</button><input aria-label="内容字号" type="range" min="12" max="24" step="1" value={font.fontSize} onChange={event => font.setFontSize(Number(event.target.value))} /><button className="quiet-button" aria-label="增大内容字号" disabled={font.fontSize >= 24} onClick={() => font.setFontSize(font.fontSize + 1)}>A＋</button></div><p>阅读、编辑、对话与复习内容同步调整。{font.status}</p>{font.error && <div className="inline-error" role="alert">字号设置：{font.error}<button onClick={() => { void font.flush().catch(() => undefined); }}>重试保存字号</button><button onClick={() => { void font.retry(); }}>重新读取字号</button></div>}</section>
-    <div className="settings-local"><p>Anki：仅 CSV 导出，未同步</p><strong><FolderOpen size={14} />本机材料目录</strong><p>{dataPath || '由本机服务管理，连接后显示路径'}</p><p>Markdown 是学习内容的原始文件，保存时会检查版本变化。</p></div>
+    <div className="settings-local"><p>Anki：在“复习”中连接本机 AnkiConnect；未连接时可降级导出 CSV</p><strong><FolderOpen size={14} />本机材料目录</strong><p>{dataPath || '由本机服务管理，连接后显示路径'}</p><p>Markdown 是学习内容的原始文件，保存时会检查版本变化。</p></div>
     </section></div></div>
   </section>;
 }

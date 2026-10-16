@@ -23,3 +23,11 @@ pub mod qa;
 
 pub mod exploration;
 pub mod trash;
+
+pub mod grading;
+
+pub mod anki;
+
+pub mod feishu_bot;
+#[path = "../../tools/feishu-bot/bridge.rs"]
+pub mod feishu_ws;

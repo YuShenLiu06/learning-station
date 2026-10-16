@@ -235,3 +235,17 @@ test('create_todo is registered in question mode and its result is consumed with
   const plugin = createLearningPlugin({ requestTool: async () => {}, allowedTools: ['create_todo'] });
   for (const args of [{ title: 'T', reminderEnabled: true }, { title: 'T', sessionId: 'foreign' }, { title: 'T', dueAt: 'tomorrow' }]) assert.throws(() => plugin.validate({ id: 'invalid', name: 'create_todo', arguments: args }));
 });
+
+test('generate_exercises uses the actual SDK tool loop and structured rubric with a durable receipt', {timeout:4000}, async()=>{
+  let turns=0, executions=0;
+  const args={requirements:'生成一道物理解释题',summary:'平均速度',exercises:[{question:'如何求平均速度？',format:'self',answers:['总路程除以总时间'],explanation:'按定义计算',tags:['物理'],sourceIds:['section_physics'],rubric:{criteria:[{id:'definition',label:'定义',description:'说明总路程与总时间',maxPoints:5}]}}]};
+  await withServer((body,res)=>{
+    turns++;assert(body.tools.some(t=>t.function.name==='generate_exercises'));
+    if(turns===1)sse(res,{tool:call('physics-exercise-1','generate_exercises',args)});
+    else{const receipt=JSON.parse(toolMessages(body).at(-1).content);assert.equal(receipt.result.documentId,'exdoc_fixture');sse(res,{text:'练习已按真实回执保存。',final:true});}
+  },async(endpoint)=>{
+    const input=request(endpoint);input.toolPolicy={mode:'question',...MODE_POLICIES.question};
+    const result=await runLearningAgent(input,()=>{},{requestTool:async tool=>{executions++;assert.deepEqual(tool.args,args);return{result:{persisted:true,documentId:'exdoc_fixture',exerciseEntryId:'entry_fixture'}};}});
+    assert.equal(result.output,'练习已按真实回执保存。');
+  });assert.equal(turns,2);assert.equal(executions,1);
+});

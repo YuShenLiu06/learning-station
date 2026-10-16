@@ -181,7 +181,19 @@ fn validate_data(data: &DraftData) -> Result<()> {
 }
 
 fn validate_request_key(key: &str, data: &DraftData) -> Result<()> {
-    if data.request_id.is_some() && key != "exploration-launch" {
+    let grade_key = key.strip_prefix("grade:").is_some_and(|s| {
+        s.split_once(':').is_some_and(|(session, attempt)| {
+            crate::types::valid_id(session)
+                && crate::types::valid_id(attempt)
+                && !attempt.contains(':')
+        })
+    });
+    if data.request_id.is_some()
+        && key != "exploration-launch"
+        && key != "anki-operation"
+        && key != "feishu-test"
+        && !grade_key
+    {
         return Err(invalid_draft());
     }
     Ok(())

@@ -78,6 +78,7 @@ enum Operation {
     Note(CreateNote),
     Todo(CreateTodo),
     Query(QueryKnowledge),
+    Exercises(Value),
 }
 
 /// Synchronous local execution: the caller may put this on spawn_blocking. No
@@ -94,6 +95,17 @@ pub fn execute(
         return Err(limit());
     }
     let operation = match name {
+        "generate_exercises" => {
+            let object = args.as_object().ok_or_else(invalid)?;
+            if object
+                .keys()
+                .any(|k| !["requirements", "exercises", "summary"].contains(&k.as_str()))
+            {
+                return Err(invalid());
+            }
+            bounded(args["requirements"].as_str().ok_or_else(invalid)?, 1, 8000)?;
+            Operation::Exercises(args)
+        }
         "record_question" => {
             let value: RecordQuestion = decode(args)?;
             bounded(&value.question, 1, 8000)?;
@@ -154,6 +166,27 @@ pub fn execute(
         }
         _ => return Err(CoreError::new("TOOL_NOT_ALLOWED", "未启用此学习工具。")),
     };
+    let explicit_run = if scope.section_id.is_empty() && !scope.allowed_ids.is_empty()
+        || name == "generate_exercises"
+    {
+        let all = engine.runs.lock().map_err(|_| out_of_scope())?;
+        let run = all
+            .get(&scope.run_id)
+            .map(|m| m.run.clone())
+            .ok_or_else(out_of_scope)?;
+        if run.session_id != scope.session_id
+            || run.context_snapshot_version != 1
+            || scope
+                .allowed_ids
+                .iter()
+                .any(|id| !run.context_manifest.iter().any(|m| &m.id == id))
+        {
+            return Err(out_of_scope());
+        }
+        Some(run)
+    } else {
+        None
+    };
     let mut core = engine.lock()?;
     let session = sessions::get(&mut core.content, &scope.session_id)?;
     if session.section_id != scope.section_id {
@@ -193,6 +226,37 @@ pub fn execute(
         "pi_tool_{}",
         hash(&serde_json::to_string(&(&scope.run_id, call_id))?)
     );
+    if let Operation::Exercises(args) = &operation {
+        if session.section_id.is_empty() {
+            return Err(CoreError::new(
+                "SOURCE_REQUIRED",
+                "请从普通探索笔记或学习材料生成练习。",
+            ));
+        }
+        let run = explicit_run.as_ref().ok_or_else(out_of_scope)?;
+        if run.session_id != scope.session_id {
+            return Err(out_of_scope());
+        }
+        let mut data = crate::exercises::validate(
+            json!({"exercises":args["exercises"],"summary":args["summary"]}),
+            &run.context_manifest,
+            &request_id,
+        )?;
+        data["contextManifest"] = json!(run.context_manifest);
+        data["runId"] = json!(scope.run_id);
+        data["promptVersion"] = json!("learning-v2");
+        data["requirements"] = args["requirements"].clone();
+        let document = crate::exercises::create(
+            &mut core.content,
+            &session.id,
+            &session.section_id,
+            data,
+            &request_id,
+        )?;
+        return Ok(
+            json!({"persisted":true,"documentId":document.id,"exerciseEntryId":document.metadata.extra.get("exerciseEntryId"),"sessionId":session.id,"sectionId":session.section_id}),
+        );
+    }
     if let Operation::Todo(value) = operation {
         let todo = engine.reminders.create_todo(
             &value.title,
@@ -342,7 +406,7 @@ pub fn execute(
                 data: Some(data),
             }
         }
-        Operation::Query(_) | Operation::Todo(_) => unreachable!(),
+        Operation::Query(_) | Operation::Todo(_) | Operation::Exercises(_) => unreachable!(),
     };
     let saved = sessions::append(
         &mut core.content,
@@ -466,9 +530,6 @@ fn validate_scope(scope: &ToolScope, call_id: &str) -> Result<()> {
         || call_id.chars().any(char::is_control)
     {
         return Err(invalid());
-    }
-    if scope.section_id.is_empty() && !scope.allowed_ids.is_empty() {
-        return Err(out_of_scope());
     }
     Ok(())
 }

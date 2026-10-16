@@ -1,0 +1,9 @@
+{
+  "name": "learning-station-feishu-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24.0.0 <25" },
+  "scripts": { "test": "node --disable-warning=ExperimentalWarning --test test-node.mjs" },
+  "dependencies": { "@larksuiteoapi/node-sdk": "1.76.0" }
+}

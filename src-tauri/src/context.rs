@@ -1,7 +1,90 @@
 //! Linked learning documents are user reference material, never system instructions.
 use crate::content::ContentStore;
 use crate::types::{Context, CoreError, Document, ManifestItem, Result, Session};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContextInjection {
+    pub document_id: String,
+    pub expected_version: String,
+    #[serde(default)]
+    pub selection: Option<String>,
+}
+
+pub fn inject(store: &ContentStore, ctx: &mut Context, inputs: &[ContextInjection]) -> Result<()> {
+    if inputs.len() > 8 {
+        return Err(CoreError::new(
+            "LIMIT_EXCEEDED",
+            "每次最多显式加入8份资料。",
+        ));
+    }
+    let mut docs = Vec::new();
+    let mut seen = BTreeSet::new();
+    for input in inputs {
+        if !crate::types::valid_id(&input.document_id) {
+            return Err(CoreError::new("INVALID_INPUT", "注入资料编号无效。"));
+        }
+        let mut doc = store.read(&input.document_id)?;
+        if store.is_trashed(&doc.id) {
+            return Err(CoreError::new("TRASHED", "注入资料已回收。"));
+        }
+        if doc.version != input.expected_version {
+            return Err(CoreError::new(
+                "CONTEXT_CONFLICT",
+                "注入资料已变化，请重新选择后发送。",
+            ));
+        }
+        if !matches!(
+            doc.metadata.kind.as_str(),
+            "section" | "knowledge" | "exploration"
+        ) {
+            return Err(CoreError::new(
+                "OUT_OF_SCOPE",
+                "只能加入普通学习资料，不能注入练习参考或系统记录。",
+            ));
+        }
+        if let Some(selection) = &input.selection {
+            if selection.is_empty()
+                || selection.chars().count() > 8000
+                || !doc.body.contains(selection)
+            {
+                return Err(CoreError::new(
+                    "CONTEXT_CONFLICT",
+                    "所选原文不在该版本资料中，请重新选择。",
+                ));
+            }
+            doc.content = selection.clone();
+            doc.body = selection.clone();
+        }
+        if seen.insert(doc.id.clone()) {
+            doc.metadata.links.clear();
+            doc.metadata.extra.remove("requiredContextIds");
+            docs.push(doc);
+        }
+    }
+    let mut builder = Builder {
+        store,
+        remaining: MAX_CONTEXT_CHARS.saturating_sub(ctx.text.chars().count()),
+        visited: ctx.manifest.iter().map(|m| m.id.clone()).collect(),
+        active: BTreeSet::new(),
+        reference_attempts: 0,
+        asset_ids: ctx.manifest.iter().map(|m| m.id.clone()).collect(),
+        result: ctx.clone(),
+    };
+    for doc in docs {
+        if builder.visited.contains(&doc.id) {
+            continue;
+        }
+        if builder.result.manifest.len() >= MAX_CONTEXT_DOCUMENTS {
+            builder.truncate("TRUNCATED_DOCUMENTS: 显式资料超出32份预算");
+            break;
+        }
+        builder.visit(doc, 0)?;
+    }
+    *ctx = builder.result;
+    Ok(())
+}
 
 pub const MAX_CONTEXT_CHARS: usize = 60_000;
 pub const MAX_CONTEXT_DOCUMENTS: usize = 32;
@@ -945,5 +1028,76 @@ mod trash_history_tests {
         attach_history(&mut context, &saved, None);
         assert!(!history_is_protected(&context));
         assert_eq!(context.history_manifest.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod injection_tests {
+    use super::*;
+    use crate::app::Engine;
+    use serde_json::json;
+    #[test]
+    fn explicit_selection_deduplicates_and_rejects_stale_or_foreign_text() {
+        let d = tempfile::tempdir().unwrap();
+        let e = Engine::new(d.path().join("lib"), d.path().join("state")).unwrap();
+        let mut c = e.lock().unwrap();
+        let a = c
+            .create_section("物理", "速度等于距离除以时间。", vec![], vec![])
+            .unwrap();
+        let b = c
+            .create_section("数学", "另一个明确加入的公式。", vec![], vec![])
+            .unwrap();
+        let mut ctx = load(&c.content, &a.id, None).unwrap();
+        let selection = "明确加入的公式".to_string();
+        let i = ContextInjection {
+            document_id: b.id.clone(),
+            expected_version: b.version.clone(),
+            selection: Some(selection.clone()),
+        };
+        inject(&c.content, &mut ctx, &[i.clone(), i.clone()]).unwrap();
+        assert_eq!(ctx.manifest.len(), 2);
+        assert_eq!(ctx.text.matches(&selection).count(), 1);
+        assert!(!ctx.text.contains("另一个"));
+        let mut stale = i.clone();
+        stale.expected_version = "stale".into();
+        let before = ctx.text.clone();
+        assert_eq!(
+            inject(&c.content, &mut ctx, &[stale]).unwrap_err().code,
+            "CONTEXT_CONFLICT"
+        );
+        assert_eq!(ctx.text, before);
+        let mut fake = i;
+        fake.selection = Some("不存在的句子".into());
+        assert!(inject(&c.content, &mut ctx, &[fake]).is_err());
+        let _ = json!(ctx.manifest);
+    }
+    #[test]
+    fn independent_context_only_uses_explicit_document_and_shares_budget() {
+        let d = tempfile::tempdir().unwrap();
+        let e = Engine::new(d.path().join("lib"), d.path().join("state")).unwrap();
+        let mut c = e.lock().unwrap();
+        let other = c
+            .create_section("不会暗带", "DO_NOT_INHERIT", vec![], vec![])
+            .unwrap();
+        let (_, mut ctx) = c.start_exploration(Some(&other.id), false, false).unwrap();
+        assert!(ctx.manifest.is_empty());
+        let explicit = c
+            .create_section("明确资料", &"中".repeat(70000), vec![], vec![])
+            .unwrap();
+        inject(
+            &c.content,
+            &mut ctx,
+            &[ContextInjection {
+                document_id: explicit.id.clone(),
+                expected_version: explicit.version,
+                selection: None,
+            }],
+        )
+        .unwrap();
+        assert_eq!(ctx.manifest.len(), 1);
+        assert_eq!(ctx.manifest[0].id, explicit.id);
+        assert!(!ctx.text.contains("DO_NOT_INHERIT"));
+        assert!(ctx.text.chars().count() <= MAX_CONTEXT_CHARS);
+        assert!(ctx.truncated);
     }
 }

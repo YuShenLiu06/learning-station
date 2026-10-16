@@ -1,5 +1,5 @@
 import type { ToolActivity } from './types';
-const titles: Record<string, string> = { query_related_knowledge: '查找相关学习记录', record_question: '记录困惑', create_error: '记录错题', create_review_card: '创建复习卡', create_note: '保存学习笔记', create_todo: '创建待办' };
+const titles: Record<string, string> = { query_related_knowledge: '查找相关学习记录', record_question: '记录困惑', create_error: '记录错题', create_review_card: '创建复习卡', create_note: '保存学习笔记', create_todo: '创建待办', generate_exercises: '生成练习' };
 const safeId = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/u.test(value);
 export function readToolActivity(raw: unknown): ToolActivity | null {
   if (!raw || typeof raw !== 'object') return null;
@@ -7,7 +7,7 @@ export function readToolActivity(raw: unknown): ToolActivity | null {
   if (!safeId(value.id) || !safeId(value.toolCallId) || !safeId(value.runId) || !safeId(value.sessionId) || typeof value.name !== 'string' || !Object.hasOwn(titles, value.name) || !['running', 'succeeded', 'failed'].includes(String(value.status))) return null;
   const result: ToolActivity = { id: value.id, toolCallId: value.toolCallId, runId: value.runId, sessionId: value.sessionId, name: value.name, status: value.status as ToolActivity['status'], title: titles[value.name], summary: '', startedAt: typeof value.startedAt === 'string' ? value.startedAt : '', updatedAt: typeof value.updatedAt === 'string' ? value.updatedAt : '', persisted: value.persisted === true };
   const target = value.object as Record<string, unknown> | undefined;
-  if (target && ['todo', 'learning-entry', 'review-card'].includes(String(target.kind)) && safeId(target.id) && safeId(target.sessionId) && (target.sectionId === '' || safeId(target.sectionId))) result.object = { kind: target.kind as NonNullable<ToolActivity['object']>['kind'], id: target.id, sessionId: target.sessionId, sectionId: target.sectionId };
+  if (target && ['todo', 'learning-entry', 'review-card', 'exercise'].includes(String(target.kind)) && safeId(target.id) && safeId(target.sessionId) && (target.sectionId === '' || safeId(target.sectionId))) result.object = { kind: target.kind as NonNullable<ToolActivity['object']>['kind'], id: target.id, sessionId: target.sessionId, sectionId: target.sectionId };
   if (typeof value.errorCode === 'string' && /^[A-Z_]{1,40}$/u.test(value.errorCode)) result.errorCode = value.errorCode;
   // Only fixed UI summaries are rendered; model arguments, paths and raw output are never copied.
   result.summary = result.status === 'failed' ? '工具未完成，未确认保存成功。' : result.name === 'query_related_knowledge' ? '相关学习记录查询已完成，未写入新内容。' : result.persisted && result.object ? '已收到本机保存回执。' : '等待本机工具结果。';

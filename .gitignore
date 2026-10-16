@@ -13,3 +13,6 @@ src-tauri/gen/
 *.sqlite3-shm
 *.sqlite3-wal
 *.app/
+
+runtime/node
+tests/bridge-harness/target/

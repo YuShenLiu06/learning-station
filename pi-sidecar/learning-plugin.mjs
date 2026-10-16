@@ -2,11 +2,11 @@ import { Type } from 'typebox';
 
 export const LEARNING_PLUGIN = Object.freeze({
   id: 'learning-station.learning', version: '1.1.0',
-  tools: Object.freeze(['record_question', 'create_error', 'query_related_knowledge', 'create_review_card', 'create_note', 'create_todo']),
+  tools: Object.freeze(['record_question', 'create_error', 'query_related_knowledge', 'create_review_card', 'create_note', 'create_todo', 'generate_exercises']),
 });
 export const LEGACY_TOOLS = Object.freeze(LEARNING_PLUGIN.tools.slice(0, 3));
 export const MODE_POLICIES = Object.freeze({
-  question: { allowedTools: ['query_related_knowledge', 'record_question', 'create_note', 'create_todo'], maxCalls: 4 },
+  question: { allowedTools: ['query_related_knowledge', 'record_question', 'create_note', 'create_todo', 'generate_exercises'], maxCalls: 4 },
   explain: { allowedTools: [...LEARNING_PLUGIN.tools], maxCalls: 6 },
   practice: { allowedTools: ['query_related_knowledge'], maxCalls: 2 },
   feedback: { allowedTools: [], maxCalls: 0 },
@@ -45,6 +45,9 @@ function validId(id) { return typeof id === 'string' && id.length > 0 && [...id]
 const string = (maxLength) => Type.String({ minLength: 1, maxLength });
 const optionalString = (maxLength) => Type.Optional(string(maxLength));
 const definitions = [
+  { name: 'generate_exercises', label: '生成练习',
+    description: '依据当前资料和用户自然语言要求生成结构化练习并经Rust校验保存。不要限定学科；开放题self需固定合理量表rubric；参考答案提交前不显示。只有persisted:true和documentId才可称保存，不再调用嵌套模型。',
+    parameters: Type.Object({ requirements: string(8000), summary: Type.String({maxLength:10000}), exercises: Type.Array(Type.Object({ question:string(20000), format:Type.Union([Type.Literal('exact'),Type.Literal('self')]), answers:Type.Array(string(10000),{minItems:1,maxItems:10}), explanation:Type.String({maxLength:20000}), tags:Type.Array(string(64),{maxItems:12}), sourceIds:Type.Array(string(128),{maxItems:32}), rubric:Type.Optional(Type.Object({criteria:Type.Array(Type.Object({id:string(64),label:string(200),description:string(2000),maxPoints:Type.Integer({minimum:1,maximum:100})},{additionalProperties:false}),{minItems:1,maxItems:8})},{additionalProperties:false})) },{additionalProperties:false}),{minItems:1,maxItems:5}) },{additionalProperties:false}) },
   { name: 'record_question', label: '记录疑问',
     description: '记录用户明确提出的学习疑问。只使用当前会话，成功必须以Rust返回的persisted:true与记录ID为依据。',
     parameters: Type.Object({ question: string(8000), selection: Type.Optional(Type.String({ maxLength: 12000 })) }, { additionalProperties: false }) },
@@ -68,6 +71,10 @@ export function validateCall(id, name, args) {
   if (!validId(id) || !known.has(name)) throw new LearningToolError('TOOLS_DISABLED');
   if (!args || typeof args !== 'object' || Array.isArray(args)) throw new LearningToolError('TOOL_PROTOCOL');
   bounded(args);
+  if (name === 'generate_exercises') {
+    if(Object.keys(args).some(k=>!['requirements','exercises','summary'].includes(k)) || typeof args.requirements!=='string'||!args.requirements.trim()||[...args.requirements].length>8000||typeof args.summary!=='string'||args.summary.length>10000||!Array.isArray(args.exercises)||!args.exercises.length||args.exercises.length>5)throw new LearningToolError('TOOL_PROTOCOL');
+    return args;
+  }
   const fields = name === 'record_question' ? { question: 8000, selection: 12000 }
     : name === 'create_error' ? { front: 8000, back: 12000, cause: 4000, exerciseId: 128, tags: 0 }
       : name === 'create_review_card' ? { front: 8000, back: 12000, tags: 0 }
@@ -88,7 +95,7 @@ export function validateToolPolicy(input, legacyEnabled = false, operation = 'ge
   const policy = input ?? { mode: 'legacy', allowedTools: legacyEnabled ? [...LEGACY_TOOLS] : [], maxCalls: legacyEnabled ? 8 : 0 };
   if (!policy || typeof policy !== 'object' || Array.isArray(policy) || Object.keys(policy).some((key) => !['mode', 'allowedTools', 'maxCalls'].includes(key))) throw new LearningToolError('TOOL_PROTOCOL');
   const maximum = MODE_POLICIES[policy.mode];
-  if (!maximum || !Array.isArray(policy.allowedTools) || policy.allowedTools.length > 6 || new Set(policy.allowedTools).size !== policy.allowedTools.length
+  if (!maximum || !Array.isArray(policy.allowedTools) || policy.allowedTools.length > 7 || new Set(policy.allowedTools).size !== policy.allowedTools.length
     || policy.allowedTools.some((name) => !maximum.allowedTools.includes(name)) || !Number.isInteger(policy.maxCalls) || policy.maxCalls < 0 || policy.maxCalls > maximum.maxCalls
     || (policy.maxCalls === 0 && policy.allowedTools.length > 0)) throw new LearningToolError('TOOL_PROTOCOL');
   return { mode: policy.mode, allowedTools: [...policy.allowedTools], maxCalls: policy.maxCalls };

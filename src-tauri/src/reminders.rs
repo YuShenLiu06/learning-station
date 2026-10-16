@@ -102,6 +102,8 @@ impl Ledger {
             .execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
             .map_err(storage_error)?;
         migrate_schema(&mut connection)?;
+        connection.execute_batch("CREATE TABLE IF NOT EXISTS external_notifications(id TEXT PRIMARY KEY,ticket TEXT NOT NULL UNIQUE,message_id TEXT NOT NULL UNIQUE,title TEXT NOT NULL,created_at TEXT NOT NULL,is_read INTEGER NOT NULL DEFAULT 0)").map_err(storage_error)?;
+        connection.execute_batch("CREATE TABLE IF NOT EXISTS reminder_delivery_receipts(notification_id TEXT PRIMARY KEY,message_id TEXT,status TEXT NOT NULL,reason TEXT NOT NULL,updated_at TEXT NOT NULL)").map_err(storage_error)?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -327,6 +329,92 @@ impl Ledger {
         Ok(notifications)
     }
 
+    pub fn pending_deliveries(&self, since: &str) -> Result<Vec<Notification>> {
+        let c = self.lock()?;
+        let mut q=c.prepare("SELECT n.id,n.todo_id,n.title,n.due_at,n.is_read,n.delivery_status FROM reminder_notifications n JOIN reminder_todos t ON t.id=n.todo_id WHERE n.delivery_status='pending' AND n.created_at>=?1 AND t.done=0 AND t.reminder_enabled=1 ORDER BY n.created_at LIMIT 100").map_err(storage_error)?;
+        let rows = q
+            .query_map([since], notification_from_row)
+            .map_err(storage_error)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage_error)
+    }
+    pub fn reserve_delivery(&self, id: &str) -> Result<bool> {
+        let c = self.lock()?;
+        Ok(c.execute("UPDATE reminder_notifications SET delivery_status='unknown' WHERE id=?1 AND delivery_status='pending' AND EXISTS(SELECT 1 FROM reminder_todos t WHERE t.id=reminder_notifications.todo_id AND t.done=0 AND t.reminder_enabled=1)",[id]).map_err(storage_error)?==1)
+    }
+    pub fn finish_delivery(
+        &self,
+        id: &str,
+        outcome: &crate::feishu::DeliveryOutcome,
+    ) -> Result<()> {
+        let status = match outcome.status {
+            crate::feishu::DeliveryState::Sent
+                if outcome
+                    .message_id
+                    .as_ref()
+                    .is_some_and(|s| !s.trim().is_empty()) =>
+            {
+                "sent"
+            }
+            crate::feishu::DeliveryState::Failed | crate::feishu::DeliveryState::Blocked => {
+                "failed"
+            }
+            _ => "unknown",
+        };
+        let mut c = self.lock()?;
+        let tx = c
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        if tx.execute("UPDATE reminder_notifications SET delivery_status=?2 WHERE id=?1 AND delivery_status='unknown'",params![id,status]).map_err(storage_error)?!=1{return Err(CoreError::new("CONFLICT","提醒发送状态已变化，未覆盖回执。"))}
+        tx.execute("INSERT INTO reminder_delivery_receipts(notification_id,message_id,status,reason,updated_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(notification_id) DO UPDATE SET message_id=excluded.message_id,status=excluded.status,reason=excluded.reason,updated_at=excluded.updated_at",params![id,outcome.message_id,status,outcome.reason,crate::types::timestamp()]).map_err(storage_error)?;
+        tx.commit().map_err(storage_error)?;
+        Ok(())
+    }
+    pub fn import_feishu_message(
+        &self,
+        ticket: &str,
+        message_id: &str,
+        text: &str,
+    ) -> Result<(Notification, bool)> {
+        validate_text(ticket, "ticket", 200)?;
+        validate_text(message_id, "messageId", 200)?;
+        validate_text(text, "text", 16000)?;
+        let id = format!(
+            "feishu_{}",
+            crate::types::hash(&format!("{ticket}:{message_id}"))
+        );
+        let mut conn = self.lock()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        if let Some(old)=tx.query_row("SELECT id,'',title,created_at,is_read,'received' FROM external_notifications WHERE ticket=?1 OR message_id=?2",params![ticket,message_id],notification_from_row).optional().map_err(storage_error)?{return Ok((old,false))}
+        let count: i64 = tx
+            .query_row("SELECT COUNT(*) FROM external_notifications", [], |r| {
+                r.get(0)
+            })
+            .map_err(storage_error)?;
+        if count >= 10000 {
+            return Err(CoreError::new(
+                "LIMIT_EXCEEDED",
+                "飞书站内收件箱已满，未确认新事件。",
+            ));
+        }
+        let title = format!("飞书消息：{text}");
+        let stamp = crate::types::timestamp();
+        tx.execute("INSERT INTO external_notifications(id,ticket,message_id,title,created_at) VALUES(?1,?2,?3,?4,?5)",params![id,ticket,message_id,title,stamp]).map_err(storage_error)?;
+        tx.commit().map_err(storage_error)?;
+        Ok((
+            Notification {
+                id,
+                todo_id: String::new(),
+                title,
+                due_at: stamp,
+                read: false,
+                delivery_status: "received".into(),
+            },
+            true,
+        ))
+    }
     pub fn list_notifications(&self) -> Result<Vec<Notification>> {
         let connection = self.lock()?;
         let mut statement = connection
@@ -338,13 +426,42 @@ impl Ledger {
         let rows = statement
             .query_map([], notification_from_row)
             .map_err(storage_error)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(storage_error)
+        let mut all = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage_error)?;
+        let mut external=connection.prepare("SELECT id,'',title,created_at,is_read,'received' FROM external_notifications ORDER BY created_at DESC,id").map_err(storage_error)?;
+        all.extend(
+            external
+                .query_map([], notification_from_row)
+                .map_err(storage_error)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(storage_error)?,
+        );
+        all.sort_by(|a, b| b.due_at.cmp(&a.due_at).then(a.id.cmp(&b.id)));
+        Ok(all)
     }
 
     pub fn mark_read(&self, id: &str) -> Result<Notification> {
         validate_text(id, "id", 200)?;
         let mut connection = self.lock()?;
+        if id.starts_with("feishu_") {
+            let tx = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(storage_error)?;
+            if tx
+                .execute(
+                    "UPDATE external_notifications SET is_read=1 WHERE id=?1",
+                    [id],
+                )
+                .map_err(storage_error)?
+                == 0
+            {
+                return Err(CoreError::new("NOT_FOUND", "找不到站内消息。"));
+            }
+            let n=tx.query_row("SELECT id,'',title,created_at,is_read,'received' FROM external_notifications WHERE id=?1",[id],notification_from_row).map_err(storage_error)?;
+            tx.commit().map_err(storage_error)?;
+            return Ok(n);
+        }
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(storage_error)?;
@@ -1135,5 +1252,70 @@ mod tests {
             ledger.list_notifications().unwrap()[0].delivery_status,
             "pending"
         );
+    }
+}
+
+#[cfg(test)]
+mod bot_integration_tests {
+    use super::*;
+    #[test]
+    fn passive_inbox_is_durable_deduplicated_and_does_not_execute_or_create_todos() {
+        let t = tempfile::tempdir().unwrap();
+        let l = Ledger::new(t.path()).unwrap();
+        let (n, new) = l
+            .import_feishu_message("ticket_1", "om_msg_1", "$(touch /tmp/do-not-run)")
+            .unwrap();
+        assert!(new);
+        assert!(n.todo_id.is_empty());
+        assert_eq!(
+            l.import_feishu_message("ticket_1", "om_msg_1", "$(touch /tmp/do-not-run)")
+                .unwrap()
+                .1,
+            false
+        );
+        assert!(l.list_todos().unwrap().is_empty());
+        assert!(l.mark_read(&n.id).unwrap().read);
+        drop(l);
+        let l = Ledger::new(t.path()).unwrap();
+        assert_eq!(l.list_notifications().unwrap().len(), 1);
+        assert!(l.list_notifications().unwrap()[0].read);
+    }
+    #[test]
+    fn dispatch_reserves_before_transport_and_never_repeats_unknown_or_sends_disabled() {
+        let t = tempfile::tempdir().unwrap();
+        let l = Ledger::new(t.path()).unwrap();
+        let todo = l
+            .create_todo(
+                "到期提醒",
+                Some("2000-01-01T00:00:00Z"),
+                true,
+                None,
+                "bot-reminder-1",
+            )
+            .unwrap();
+        let n = l.tick().unwrap().remove(0);
+        assert!(l.pending_deliveries("2999-01-01").unwrap().is_empty());
+        assert_eq!(l.pending_deliveries("1999-01-01").unwrap().len(), 1);
+        assert!(l.reserve_delivery(&n.id).unwrap());
+        assert!(!l.reserve_delivery(&n.id).unwrap());
+        assert_eq!(
+            l.list_notifications().unwrap()[0].delivery_status,
+            "unknown"
+        );
+        drop(l);
+        let l = Ledger::new(t.path()).unwrap();
+        assert!(l.pending_deliveries("1999").unwrap().is_empty());
+        l.finish_delivery(
+            &n.id,
+            &crate::feishu::DeliveryOutcome {
+                status: crate::feishu::DeliveryState::Sent,
+                message_id: Some("om_confirmed".into()),
+                reason: "confirmed".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(l.list_notifications().unwrap()[0].delivery_status, "sent");
+        l.set_reminder_enabled(&todo.id, false).unwrap();
+        assert!(l.pending_deliveries("1999").unwrap().is_empty());
     }
 }

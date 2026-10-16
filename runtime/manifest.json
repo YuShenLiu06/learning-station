@@ -1,0 +1,8 @@
+{
+  "version": "v24.18.0",
+  "platform": "darwin",
+  "arch": "arm64",
+  "sha256": "ee6fb0e015284d83a91e8ec5213f43a157f8a392b58555301682892ba928c04a",
+  "licenseSha256": "148eacf7863ef4329224a29398623077200a27194aa075569faf4a0a85566ca5",
+  "source": "existing local official Node distribution; no runtime installation"
+}

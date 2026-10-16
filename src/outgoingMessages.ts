@@ -1,5 +1,5 @@
-import type { Message } from './types';
-export type OutgoingMessage = { sendId: string; operationId: string; sessionId: string; sectionId: string; documentId?: string; detached: boolean; mode: string; content: string; selection: string; createdAt: string; userEntryId?: string; stage: 'saving' | 'preparing' | 'generating' | 'failed' | 'done'; failureStage?: 'save' | 'generation' | 'unknown'; error?: string };
+import type { ContextInjection, Message } from './types';
+export type OutgoingMessage = { sendId: string; operationId: string; sessionId: string; sectionId: string; documentId?: string; detached: boolean; mode: string; content: string; selection: string; injections?: ContextInjection[]; createdAt: string; userEntryId?: string; stage: 'saving' | 'preparing' | 'generating' | 'failed' | 'done'; failureStage?: 'save' | 'generation' | 'unknown'; error?: string };
 export type ConversationMessage = Message & { outgoing?: OutgoingMessage };
 export function mergeOutgoing(messages: Message[], outgoing: OutgoingMessage[], sessionId: string): ConversationMessage[] {
   const pending = outgoing.filter(item => item.sessionId === sessionId);

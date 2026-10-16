@@ -225,7 +225,7 @@ struct TestOutboxRecord {
     outcome: DeliveryOutcome,
 }
 
-async fn test_notification_with<F, Fut>(
+pub(crate) async fn test_notification_with<F, Fut>(
     state_dir: &Path,
     request_id: &str,
     send: F,

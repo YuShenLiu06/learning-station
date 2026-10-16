@@ -63,9 +63,11 @@ pub fn validate(mut data: Value, manifest: &[ManifestItem], namespace: &str) -> 
                 "explanation",
                 "tags",
                 "sourceIds",
+                "rubric",
             ],
         )?;
         question["id"] = json!(format!("q_{}_{}", &hash(namespace)[..32], index));
+        question["answerMatch"] = json!("trim");
     }
     validate_stored(&data, manifest, false)?;
     Ok(data)
@@ -82,6 +84,7 @@ fn validate_stored(data: &Value, manifest: &[ManifestItem], legacy: bool) -> Res
             "promptVersion",
             "runId",
             "sourceDocumentId",
+            "requirements",
             "manual",
         ]
     } else {
@@ -92,6 +95,7 @@ fn validate_stored(data: &Value, manifest: &[ManifestItem], legacy: bool) -> Res
             "promptVersion",
             "runId",
             "sourceDocumentId",
+            "requirements",
         ]
     };
     known(data, fields)?;
@@ -124,13 +128,24 @@ fn validate_stored(data: &Value, manifest: &[ManifestItem], legacy: bool) -> Res
                 "explanation",
                 "tags",
                 "sourceIds",
+                "rubric",
+                "answerMatch",
             ],
         )?;
+        if question
+            .get("answerMatch")
+            .is_some_and(|v| v.as_str() != Some("trim"))
+        {
+            return Err(invalid());
+        }
         let id = text(question.get("id"), 1, 128)?;
         if !valid_id(id) || !ids.insert(id) {
             return Err(invalid());
         }
         text(question.get("question"), 1, 20000)?;
+        if let Some(rubric) = question.get("rubric") {
+            crate::grading::validate_rubric(rubric)?;
+        }
         if !matches!(
             question.get("format").and_then(Value::as_str),
             Some("exact" | "self")

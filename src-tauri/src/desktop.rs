@@ -429,11 +429,17 @@ async fn load_session_context(
     state: State<'_, Arc<Engine>>,
     session_id: String,
     selection: Option<String>,
+    injections: Option<Vec<context::ContextInjection>>,
 ) -> Result<Context> {
     work(state.inner().clone(), move |e| {
         let (session, mut context) = e
             .lock()?
             .session_context(&session_id, selection.as_deref())?;
+        context::inject(
+            &e.lock()?.content,
+            &mut context,
+            &injections.unwrap_or_default(),
+        )?;
         crate::context::attach_history(&mut context, &session, None);
         Ok(context)
     })
@@ -510,6 +516,7 @@ async fn start_generation(
     prompt: String,
     request_id: String,
     user_entry_id: Option<String>,
+    injections: Option<Vec<context::ContextInjection>>,
 ) -> Result<Value> {
     let sink: Sink = Arc::new(move |event| {
         let _ = app.emit("generation", event);
@@ -523,6 +530,7 @@ async fn start_generation(
             prompt,
             request_id,
             user_entry_id,
+            injections: injections.unwrap_or_default(),
         },
         sink,
     )
@@ -585,8 +593,10 @@ async fn test_model(state: State<'_, Arc<Engine>>) -> Result<ModelTest> {
     result
 }
 #[tauri::command]
-async fn check_feishu_status() -> crate::feishu::IdentityStatus {
-    crate::feishu::check_status().await
+async fn check_feishu_status(
+    state: State<'_, Arc<Engine>>,
+) -> Result<crate::feishu::IdentityStatus> {
+    work(state.inner().clone(), |e| Ok(e.bot.identity())).await
 }
 #[tauri::command]
 async fn test_feishu_notification(
@@ -594,7 +604,17 @@ async fn test_feishu_notification(
     request_id: String,
 ) -> Result<crate::feishu::DeliveryOutcome> {
     let state_dir = state.lock()?.state_dir.clone();
-    crate::feishu::test_notification(&state_dir, &request_id).await
+    let e = state.inner().clone();
+    crate::feishu::test_notification_with(&state_dir, &request_id, move |text, key| async move {
+        tauri::async_runtime::spawn_blocking(move || e.bot.send(&key, &text))
+            .await
+            .unwrap_or(crate::feishu::DeliveryOutcome {
+                status: crate::feishu::DeliveryState::Unknown,
+                message_id: None,
+                reason: "发送等待已中断，未确认结果；不会自动重发。".into(),
+            })
+    })
+    .await
 }
 #[tauri::command]
 async fn create_todo(
@@ -652,11 +672,16 @@ async fn export_anki_csv(state: State<'_, Arc<Engine>>, session_id: String) -> R
 async fn list_review_items(
     state: State<'_, Arc<Engine>>,
     query: Option<String>,
+    course_id: Option<String>,
 ) -> Result<Vec<Value>> {
     work(state.inner().clone(), move |e| {
         let mut core = e.lock()?;
         core.refresh()?;
-        crate::review::list(&mut core.content, query.as_deref().unwrap_or(""))
+        crate::review::list_for_course(
+            &mut core.content,
+            query.as_deref().unwrap_or(""),
+            course_id.as_deref(),
+        )
     })
     .await
 }
@@ -724,12 +749,136 @@ async fn record_ui_metric(
     }).await
 }
 
+#[tauri::command]
+async fn get_grading_settings(state: State<'_, Arc<Engine>>) -> Result<Value> {
+    crate::grading::settings(state.inner())
+}
+#[tauri::command]
+async fn set_grading_model(state: State<'_, Arc<Engine>>, model: Option<String>) -> Result<Value> {
+    crate::grading::set_model(state.inner(), model)
+}
+#[tauri::command]
+async fn grade_attempt(
+    state: State<'_, Arc<Engine>>,
+    session_id: String,
+    attempt_id: String,
+    request_id: String,
+) -> Result<crate::grading::GradeRun> {
+    crate::grading::start(state.inner().clone(), session_id, attempt_id, request_id).await
+}
+#[tauri::command]
+async fn get_grade_run(
+    state: State<'_, Arc<Engine>>,
+    run_id: String,
+) -> Result<crate::grading::GradeRun> {
+    crate::grading::get(state.inner(), &run_id)
+}
+#[tauri::command]
+async fn cancel_grade_run(
+    state: State<'_, Arc<Engine>>,
+    run_id: String,
+) -> Result<crate::grading::GradeRun> {
+    crate::grading::cancel(state.inner(), &run_id)
+}
+#[tauri::command]
+async fn check_anki_connection(state: State<'_, Arc<Engine>>) -> Result<Value> {
+    Ok(crate::anki::for_engine(state.inner())?.check().await)
+}
+#[tauri::command]
+async fn get_anki_due(state: State<'_, Arc<Engine>>, deck_name: Option<String>) -> Result<Value> {
+    crate::anki::for_engine(state.inner())?
+        .due(deck_name.as_deref())
+        .await
+}
+#[tauri::command]
+async fn reveal_anki_card(
+    state: State<'_, Arc<Engine>>,
+    card_id: u64,
+    review_token: String,
+) -> Result<Value> {
+    crate::anki::for_engine(state.inner())?
+        .reveal(card_id, &review_token)
+        .await
+}
+#[tauri::command]
+async fn answer_anki_card(
+    state: State<'_, Arc<Engine>>,
+    card_id: u64,
+    review_token: String,
+    ease: u8,
+    request_id: String,
+) -> Result<Value> {
+    crate::anki::for_engine(state.inner())?
+        .answer(card_id, &review_token, ease, &request_id)
+        .await
+}
+#[tauri::command]
+async fn get_anki_operation(state: State<'_, Arc<Engine>>, request_id: String) -> Result<Value> {
+    crate::anki::for_engine(state.inner())?.operation(&request_id)
+}
+#[tauri::command]
+async fn add_review_items_to_anki(
+    state: State<'_, Arc<Engine>>,
+    ids: Vec<String>,
+    deck_name: String,
+    request_id: String,
+) -> Result<Value> {
+    crate::anki::add_selected(state.inner(), ids, &deck_name, &request_id).await
+}
+
+#[tauri::command]
+async fn get_feishu_bot_settings(state: State<'_, Arc<Engine>>) -> Result<Value> {
+    work(state.inner().clone(), |e| e.bot.settings()).await
+}
+#[tauri::command]
+async fn configure_feishu_bot(
+    state: State<'_, Arc<Engine>>,
+    app_id: String,
+    owner_open_id: String,
+    chat_id: String,
+    receive_enabled: bool,
+    delivery_enabled: bool,
+    app_secret: Option<String>,
+) -> Result<Value> {
+    work(state.inner().clone(), move |e| {
+        e.bot.configure(
+            crate::feishu_ws::BotConfig {
+                app_id,
+                owner_open_id,
+                chat_id,
+                receive_enabled,
+                delivery_enabled,
+            },
+            app_secret,
+        )
+    })
+    .await
+}
+#[tauri::command]
+async fn start_feishu_bot(state: State<'_, Arc<Engine>>) -> Result<crate::feishu_ws::BotSnapshot> {
+    work(state.inner().clone(), |e| e.bot.start()).await
+}
+#[tauri::command]
+async fn stop_feishu_bot(state: State<'_, Arc<Engine>>) -> Result<crate::feishu_ws::BotSnapshot> {
+    work(state.inner().clone(), |e| e.bot.stop()).await
+}
+#[tauri::command]
+async fn get_feishu_bot_snapshot(
+    state: State<'_, Arc<Engine>>,
+) -> Result<crate::feishu_ws::BotSnapshot> {
+    work(state.inner().clone(), |e| e.bot.snapshot()).await
+}
+
 pub fn run() {
     let _ = RUN_START.set(std::time::Instant::now());
     tauri::Builder::default()
         .setup(|app| {
             #[cfg(not(debug_assertions))]
             crate::model::set_sidecar_dir(app.path().resource_dir()?.join("pi-sidecar"))?;
+            #[cfg(not(debug_assertions))]
+            crate::model::set_node_path(app.path().resource_dir()?.join("runtime/node"))?;
+            #[cfg(not(debug_assertions))]
+            crate::feishu_bot::set_resource_dir(app.path().resource_dir()?.join("feishu-bot"))?;
             let home = std::env::var_os("HOME")
                 .map(std::path::PathBuf::from)
                 .ok_or("无法定位本机用户目录")?;
@@ -755,7 +904,18 @@ pub fn run() {
                 loop {
                     interval.tick().await;
                     let clone = engine.clone();
-                    if let Ok(notifications) = work(clone, |e| e.reminders.tick()).await {
+                    if let Ok(notifications) = work(clone, |e| {
+                        let mut n = e.reminders.tick()?;
+                        if let Ok(inbox) = e.bot.poll(&e.reminders) {
+                            n.extend(inbox)
+                        }
+                        if let Ok(sent) = e.bot.dispatch(&e.reminders) {
+                            n.extend(sent)
+                        }
+                        Ok(n)
+                    })
+                    .await
+                    {
                         for notification in notifications {
                             let _ = handle.emit("notification", notification);
                         }
@@ -803,6 +963,11 @@ pub fn run() {
             get_model_settings,
             configure_model,
             test_model,
+            get_feishu_bot_settings,
+            configure_feishu_bot,
+            start_feishu_bot,
+            stop_feishu_bot,
+            get_feishu_bot_snapshot,
             check_feishu_status,
             test_feishu_notification,
             set_model,
@@ -813,6 +978,17 @@ pub fn run() {
             mark_notification_read,
             export_anki_csv,
             list_review_items,
+            get_grading_settings,
+            set_grading_model,
+            grade_attempt,
+            get_grade_run,
+            cancel_grade_run,
+            check_anki_connection,
+            get_anki_due,
+            reveal_anki_card,
+            answer_anki_card,
+            get_anki_operation,
+            add_review_items_to_anki,
             get_ui_draft,
             save_ui_draft,
             set_todo_reminder,

@@ -45,9 +45,49 @@ fn states(store: &ContentStore) -> Result<BTreeMap<String, Value>> {
     Ok(result)
 }
 pub fn list(store: &mut ContentStore, query: &str) -> Result<Vec<Value>> {
-    let mut items = sessions::review_items(store, query)?;
+    list_for_course(store, query, None)
+}
+pub fn list_for_course(
+    store: &mut ContentStore,
+    query: &str,
+    course_id: Option<&str>,
+) -> Result<Vec<Value>> {
+    if query.len() > 1000 || course_id.is_some_and(|id| !valid_id(id)) {
+        return Err(CoreError::new("INVALID_INPUT", "复习筛选条件无效。"));
+    }
+    let tokens: Vec<_> = query
+        .to_lowercase()
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+    let mut items = all(store)?;
+    items.retain(|item| {
+        course_id.is_none_or(|id| item["courseId"].as_str() == Some(id))
+            && tokens
+                .iter()
+                .all(|t| item.to_string().to_lowercase().contains(t))
+    });
+    items.truncate(200);
+    Ok(items)
+}
+pub fn all(store: &mut ContentStore) -> Result<Vec<Value>> {
+    let mut items = sessions::review_items_all(store)?;
     let state = states(store)?;
+    let tree = crate::library_tree::list(store)?;
     for item in &mut items {
+        let section_id = item["sectionId"].as_str().unwrap_or("").to_string();
+        let node = tree.nodes.iter().find(|n| n.id == section_id);
+        let course = node.and_then(|n| tree.nodes.iter().find(|c| c.id == n.course_id));
+        item["courseId"] = course.map(|n| json!(n.id)).unwrap_or(Value::Null);
+        item["courseTitle"] = course.map(|n| json!(n.title)).unwrap_or(Value::Null);
+        item["sectionTitle"] = node
+            .map(|n| json!(n.title))
+            .unwrap_or_else(|| json!("独立学习记录"));
+        item["sourceDocumentId"] = if section_id.is_empty() {
+            Value::Null
+        } else {
+            json!(section_id)
+        };
         let saved = item["id"].as_str().and_then(|id| state.get(id));
         item["reviewState"] = saved
             .map(|value| json!({"status":value["status"],"reviewedAt":value["reviewedAt"]}))

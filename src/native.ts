@@ -1,8 +1,9 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { Bootstrap, Course, Exercise, LearningSession, ModelSettings, ReviewCard, Section, Source, UiDraft, RequestContext, LibraryNode, LibraryTreeSnapshot } from './types';
+import type { Bootstrap, Course, Exercise, LearningSession, ModelSettings, ReviewCard, Section, Source, UiDraft, RequestContext, LibraryNode, LibraryTreeSnapshot, GradeResult, Rubric } from './types';
 import { StationError } from './types';
 import { sessionMessages } from './sessionMessages';
 import { historicalTools, foldToolActivities } from './toolActivities';
+import { noticeBody } from './noticePolicy';
 import { stableRunId } from './outgoingMessages';
 import type { ToolActivity } from './types';
 
@@ -32,14 +33,14 @@ const cancelled = new Set<string>();
 export type GenerationProgress = { operationId: string; sectionId: string; sessionId: string; content: string; mode?: string; runId?: string; toolCalls?: ToolActivity[]; manifest?: RequestContext['manifest']; context?: RequestContext; contextError?: string };
 const progressListeners = new Set<(progress: GenerationProgress) => void>();
 export function onGenerationProgress(listener: (progress: GenerationProgress) => void) { progressListeners.add(listener); return () => { progressListeners.delete(listener); }; }
-const nativeCommands = new Set(['get_app_state', 'refresh_library', 'create_section', 'import_markdown', 'open_document', 'save_document', 'start_session', 'get_session', 'append_entry', 'load_context', 'start_generation', 'cancel_generation', 'get_run', 'configure_model', 'get_model_settings', 'set_model', 'test_model', 'create_todo', 'list_todos', 'set_todo_done', 'list_notifications', 'mark_notification_read', 'export_anki_csv', 'list_review_items', 'get_ui_draft', 'save_ui_draft', 'set_todo_reminder', 'record_ui_metric', 'get_ui_preferences', 'save_ui_preferences', 'start_exploration', 'load_session_context', 'check_feishu_status', 'test_feishu_notification', 'get_library_tree', 'create_library_node', 'move_library_node', 'get_exercise_document', 'create_manual_exercise', 'materialize_legacy_exercise', 'import_course_asset', 'list_course_assets', 'read_course_asset', 'set_review_state', 'export_review_items', 'set_document_links', 'create_exploration_note', 'preview_library_trash', 'trash_library_node', 'list_library_trash', 'restore_library_node', 'list_sessions']);
+const nativeCommands = new Set(['get_app_state', 'refresh_library', 'create_section', 'import_markdown', 'open_document', 'save_document', 'start_session', 'get_session', 'append_entry', 'load_context', 'start_generation', 'cancel_generation', 'get_run', 'configure_model', 'get_model_settings', 'set_model', 'test_model', 'create_todo', 'list_todos', 'set_todo_done', 'list_notifications', 'mark_notification_read', 'export_anki_csv', 'list_review_items', 'get_ui_draft', 'save_ui_draft', 'set_todo_reminder', 'record_ui_metric', 'get_ui_preferences', 'save_ui_preferences', 'start_exploration', 'load_session_context', 'check_feishu_status', 'test_feishu_notification', 'get_library_tree', 'create_library_node', 'move_library_node', 'get_exercise_document', 'create_manual_exercise', 'materialize_legacy_exercise', 'import_course_asset', 'list_course_assets', 'read_course_asset', 'set_review_state', 'export_review_items', 'set_document_links', 'create_exploration_note', 'preview_library_trash', 'trash_library_node', 'list_library_trash', 'restore_library_node', 'list_sessions', 'get_grading_settings', 'set_grading_model', 'grade_attempt', 'get_grade_run', 'cancel_grade_run', 'check_anki_connection', 'get_anki_due', 'reveal_anki_card', 'answer_anki_card', 'get_anki_operation', 'add_review_items_to_anki', 'get_feishu_bot_settings', 'configure_feishu_bot', 'start_feishu_bot', 'stop_feishu_bot', 'get_feishu_bot_snapshot']);
 async function ipc<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
   if (!nativeCommands.has(command)) throw new StationError('不支持的本机命令。', 'INVALID_COMMAND');
   return invoke<T>(command, args);
 }
 function model(value: NativeModel): ModelSettings { return { ...value, connected: !!value.verified, credentialStored: value.configured }; }
 function section(doc: NativeDoc): Section { documents.set(doc.id, doc); return { id: doc.id, title: doc.metadata.title, courseId: libraryNodes.find(node => node.id === doc.id)?.courseId || doc.id, kind: doc.metadata.kind as Section['kind'], parentId: doc.metadata.parentId, originSessionId: doc.metadata.originSessionId, exerciseEntryId: doc.metadata.exerciseEntryId, links: doc.metadata.links, sourcePath: doc.path, body: doc.body, version: doc.version, updatedAt: typeof doc.metadata.updatedAt === 'string' ? doc.metadata.updatedAt : doc.modifiedAt, createdAt: typeof doc.metadata.createdAt === 'string' ? doc.metadata.createdAt : null, timestampSource: typeof doc.metadata.timestampSource === 'string' ? doc.metadata.timestampSource : undefined }; }
-function courses(items: Summary[]): Course[] { items.forEach(item => summaryTitles.set(item.id, item.title)); return items.length ? [{ id: 'library', title: '我的英语课程', sections: items.filter(item => item.kind === 'section' || item.kind === 'knowledge').map(item => ({ id: item.id, title: item.title })) }] : []; }
+function courses(items: Summary[]): Course[] { items.forEach(item => summaryTitles.set(item.id, item.title)); return items.length ? [{ id: 'library', title: '我的学习材料', sections: items.filter(item => item.kind === 'section' || item.kind === 'knowledge').map(item => ({ id: item.id, title: item.title })) }] : []; }
 function sources(items: Manifest[]): Source[] { return items.map(item => ({ title: documents.get(item.id)?.metadata.title || summaryTitles.get(item.id) || item.path.split('/').pop() || '关联材料', path: item.path })); }
 function learning(value: NativeSession): LearningSession {
   cacheSession(value);
@@ -53,7 +54,7 @@ function learning(value: NativeSession): LearningSession {
       const feedback = attempt && value.entries.filter(item => item.kind === 'feedback' && item.data?.exerciseId === exercise.id && item.data?.attemptId === attempt.id).at(-1);
       const causeEntry = value.entries.filter(item => item.kind === 'error' && item.data?.exerciseId === exercise.id && typeof item.data?.cause === 'string' && item.data.cause).at(-1);
       const cause = causeEntry?.data?.cause;
-      exercises.push({ id: exercise.id, entryId: entry.id, prompt: exercise.question, answer: attempt?.content, feedback: feedback?.content, correct: typeof feedback?.data?.correct === 'boolean' ? feedback.data.correct : undefined, format: (raw as { format?: 'exact' | 'self' }).format, reference: ((raw as { answers?: string[] }).answers || []).join(' / '), explanation: String((raw as { explanation?: string }).explanation || ''), attemptId: attempt?.id, cause: typeof cause === 'string' ? cause : '', causeUpdatedAt: causeEntry?.createdAt });
+      exercises.push({ id: exercise.id, entryId: entry.id, prompt: exercise.question, answer: attempt?.content, feedback: feedback?.content, correct: typeof feedback?.data?.correct === 'boolean' ? feedback.data.correct : undefined, format: (raw as { format?: 'exact' | 'self' }).format === 'exact' ? 'exact' : 'self', reference: ((raw as { answers?: string[] }).answers || []).join(' / '), explanation: String((raw as { explanation?: string }).explanation || ''), attemptId: attempt?.id, rubric: (raw as { rubric?: Rubric }).rubric, aiGrade: feedback?.data?.method === 'ai' && (feedback.data.aiGrade as GradeResult | undefined)?.attemptId === attempt?.id ? feedback.data.aiGrade as GradeResult : undefined, cause: typeof cause === 'string' ? cause : '', causeUpdatedAt: causeEntry?.createdAt });
     }
   }
   const toCard = (entry: Entry): ReviewCard => ({ id: entry.id, sessionId: value.id, sectionId: value.sectionId, front: String(entry.data?.front ?? entry.content), back: String(entry.data?.back ?? ''), source: documents.get(value.sectionId)?.metadata.title || '学习记录' });
@@ -108,7 +109,7 @@ async function generation(payload: Record<string, unknown>, mode: string, prompt
     if (!resumed || recoverSavedOutput) {
       resumed = undefined;
       if (cancelled.has(operationId)) throw new StationError('已停止，问题保存在学习记录中。', 'CANCELLED', { sendStage: 'generation', runId });
-      await ipc('start_generation', { sessionId: value.id, mode, selection: String(payload.selection || ''), prompt, requestId: operationId, userEntryId: payload.userEntryId || undefined });
+      await ipc('start_generation', { sessionId: value.id, mode, selection: String(payload.selection || ''), prompt, requestId: operationId, userEntryId: payload.userEntryId || undefined, injections: payload.injections || [] });
     }
     await ipc<NativeSession>('get_session', { id: value.id }).then(cacheSession).catch(() => undefined);
     if (cancelled.has(operationId)) await ipc('cancel_generation', { runId });
@@ -139,12 +140,13 @@ async function generation(payload: Record<string, unknown>, mode: string, prompt
 
 export async function nativeCall(command: string, payload: Record<string, unknown>): Promise<unknown> {
   switch (command) {
+    case 'get_feishu_bot_settings': case 'configure_feishu_bot': case 'start_feishu_bot': case 'stop_feishu_bot': case 'get_feishu_bot_snapshot': case 'get_grading_settings': case 'set_grading_model': case 'grade_attempt': case 'get_grade_run': case 'cancel_grade_run': case 'check_anki_connection': case 'get_anki_due': case 'reveal_anki_card': case 'answer_anki_card': case 'get_anki_operation': case 'add_review_items_to_anki': return ipc(command, payload);
     case 'run_get': return ipc('get_run', { runId: payload.id });
     case 'preferences_get': return ipc('get_ui_preferences');
     case 'preferences_save': return ipc('save_ui_preferences', { ...(payload.fontSize === undefined ? {} : { fontSize: payload.fontSize }), ...(payload.assistantWidth === undefined ? {} : { assistantWidth: payload.assistantWidth }), ...(payload.sidebarWidth === undefined ? {} : { sidebarWidth: payload.sidebarWidth }), ...(payload.sidebarCollapsed === undefined ? {} : { sidebarCollapsed: payload.sidebarCollapsed }), ...(payload.expandedNodeIds === undefined ? {} : { expandedNodeIds: payload.expandedNodeIds }) });
     case 'exploration_open': { const result = await ipc<{ session: NativeSession; context: unknown; lastRunId?: string }>('start_exploration', { sectionId: payload.sectionId || undefined, associateCurrentSection: payload.associateCurrentSection === true, fresh: false }); return { session: learning(result.session), context: result.context, lastRunId: result.lastRunId }; }
-    case 'context_load': { const session = await sessionFor(String(payload.sectionId || ''), payload.sessionId ? String(payload.sessionId) : undefined); return ipc('load_session_context', { sessionId: session.id, selection: String(payload.selection || '') }); }
-    case 'activity_refresh': { const [tasks, notices] = await Promise.all([ipc<NativeTodo[]>('list_todos'), ipc<NativeNotice[]>('list_notifications')]); return { tasks: tasks.map(item => ({ ...item, completed: item.done })), notices: notices.map(item => ({ ...item, body: item.deliveryStatus === 'disabled' ? '站内提醒 · 飞书未启用' : undefined })) }; }
+    case 'context_load': { const session = await sessionFor(String(payload.sectionId || ''), payload.sessionId ? String(payload.sessionId) : undefined); return ipc('load_session_context', { sessionId: session.id, selection: String(payload.selection || ''), injections: payload.injections || [] }); }
+    case 'activity_refresh': { const [tasks, notices] = await Promise.all([ipc<NativeTodo[]>('list_todos'), ipc<NativeNotice[]>('list_notifications')]); return { tasks: tasks.map(item => ({ ...item, completed: item.done })), notices: notices.map(item => ({ ...item, body: noticeBody(item.deliveryStatus) })) }; }
     case 'metric': return ipc('record_ui_metric', { name: payload.name, valueMs: payload.valueMs });
     case 'draft_get': { draftReadKeys.delete(String(payload.key)); const result = await ipc<UiDraft | null>('get_ui_draft', { key: payload.key }); draftReadKeys.add(String(payload.key)); if (result) draftVersions.set(result.key, result.version); else draftVersions.delete(String(payload.key)); return result; }
     case 'draft_save': { const key = String(payload.key); if (!draftReadKeys.has(key)) throw new StationError('请先成功读取原草稿，当前输入仍保留，未覆盖已有草稿。', 'DRAFT_NOT_LOADED'); const previous = draftQueues.get(key); const next = (previous ? previous.catch(() => undefined) : Promise.resolve()).then(async () => { const result = await ipc<UiDraft>('save_ui_draft', { key, data: payload.data, expectedVersion: draftVersions.get(key) }); draftVersions.set(key, result.version); return result; }); draftQueues.set(key, next); return next; }
@@ -153,7 +155,7 @@ export async function nativeCall(command: string, payload: Record<string, unknow
       const state = await ipc<NativeState>('get_app_state');
       const lastRun = state.lastRunId ? await ipc<Run>('get_run', { runId: state.lastRunId }).catch(() => undefined) : undefined;
       const [todos, notices] = await Promise.all([ipc<NativeTodo[]>('list_todos'), ipc<NativeNotice[]>('list_notifications')]);
-      return { courses: courses(state.documents), lastSectionId: state.activeDocumentId, model: model(state.model), dataPath: state.root, recovery: lastRun && lastRun.status !== 'succeeded' ? { status: lastRun.status, content: lastRun.content, message: typeof lastRun.error === 'string' ? lastRun.error : lastRun.error?.message } : undefined, tasks: todos.map(item => ({ ...item, completed: item.done })), notices: notices.map(item => ({ ...item, body: item.deliveryStatus === 'disabled' ? '站内提醒 · 飞书未启用' : undefined })) } satisfies Bootstrap;
+      return { courses: courses(state.documents), lastSectionId: state.activeDocumentId, model: model(state.model), dataPath: state.root, recovery: lastRun && lastRun.status !== 'succeeded' ? { status: lastRun.status, content: lastRun.content, message: typeof lastRun.error === 'string' ? lastRun.error : lastRun.error?.message } : undefined, tasks: todos.map(item => ({ ...item, completed: item.done })), notices: notices.map(item => ({ ...item, body: noticeBody(item.deliveryStatus) })) } satisfies Bootstrap;
     }
     case 'library_refresh': return courses(await ipc<Summary[]>('refresh_library'));
     case 'library_tree': { const tree = await ipc<LibraryTreeSnapshot>('get_library_tree'); libraryNodes = tree.nodes; return tree; }
@@ -196,6 +198,7 @@ export async function nativeCall(command: string, payload: Record<string, unknow
     case 'feishu_test': return ipc('test_feishu_notification', { requestId: payload.requestId });
     case 'tool_object_open': {
       const kind = String(payload.kind); const id = String(payload.id);
+      if (kind === 'exercise') return section(await ipc<NativeDoc>('open_document', { id }));
       if (kind === 'todo') {
         const task = (await ipc<NativeTodo[]>('list_todos')).find(item => item.id === id);
         if (!task) throw new StationError('对应待办未找到，请刷新学习待办。', 'NOT_FOUND');
@@ -208,7 +211,7 @@ export async function nativeCall(command: string, payload: Record<string, unknow
     }
     case 'question_save': return learning(await append(String(payload.sectionId), 'user', String(payload.question), { mode: 'local', noAi: true }, [], String(payload.selection || ''), payload.sessionId ? String(payload.sessionId) : undefined));
     case 'session_ask': return generation(payload, payload.mode === 'explore' ? 'question' : 'explain', String(payload.question));
-    case 'exercise_generate': return generation(payload, 'practice', '请围绕当前小节和选句生成一道针对理解盲点的英语练习。');
+    case 'exercise_generate': return generation(payload, 'practice', String(payload.prompt || '').trim() || '根据当前材料和学习疑点生成针对练习');
     case 'operation_cancel': { const id = String(payload.operationId); const runId = operationRuns.get(id); cancelled.add(id); if (runId) return ipc('cancel_generation', { runId }); return { status: 'cancelling' }; }
     case 'exercise_create_manual': { const origin = await sessionFor(String(payload.sectionId), payload.sessionId ? String(payload.sessionId) : undefined); const result = await ipc<{ document: NativeDoc; session: NativeSession }>('create_manual_exercise', { sessionId: origin.id, sourceDocumentId: payload.sectionId, input: { question: payload.prompt, format: payload.exact ? 'exact' : 'self', answers: [String(payload.reference)], explanation: String(payload.explanation || '') }, requestId: payload.id }); exerciseSessions.set(result.document.id, cacheSession(result.session)); return { session: learning(result.session), document: section(result.document) }; }
     case 'legacy_manual_entry': { const exercise = { id: 'manual_' + String(payload.id), question: String(payload.prompt), format: payload.exact ? 'exact' : 'self', answers: [String(payload.reference)], explanation: String(payload.explanation || ''), tags: [], sourceIds: [String(payload.sectionId)] }; return learning(await append(String(payload.sectionId), 'exercise', exercise.question, { exercises: [exercise], manual: true })); }
@@ -223,7 +226,7 @@ export async function nativeCall(command: string, payload: Record<string, unknow
       return learning(await append(String(payload.sectionId), 'error', reason, { exerciseId: payload.exerciseId, front: question?.question || payload.question, back: `${reference}\n\n我的错因：${reason}`, referenceBack: reference, cause: reason, causeConfirmed: true, tags: [] }, previous ? [previous.id] : [], undefined, value.id));
     }
     case 'card_create': { const value = await append(String(payload.sectionId), 'note', `${payload.front}\n\n${payload.back || ''}`, { front: payload.front, back: payload.back, tags: [], reviewCard: true }, [], undefined, payload.sessionId ? String(payload.sessionId) : undefined); const result = learning(value); return result.cards.at(-1); }
-    case 'review_list': return ipc('list_review_items', { query: String(payload.query || '') });
+    case 'review_list': return ipc('list_review_items', { query: String(payload.query || ''), courseId: payload.courseId || undefined });
     case 'review_state': return ipc('set_review_state', payload);
     case 'review_export': return ipc('export_review_items', { ids: payload.ids });
     case 'legacy_history_open': { const result = await ipc<{ session: NativeSession }>('start_exploration', { associateCurrentSection: false, fresh: false }); return learning(result.session); }

@@ -104,6 +104,8 @@ pub struct Engine {
     pub model_summary: RwLock<ModelSettings>,
     pub reminders: Ledger,
     pub drafts: crate::drafts::DraftStore,
+    pub bot: crate::feishu_bot::BotManager,
+    pub grades: Mutex<BTreeMap<String, crate::grading::ManagedGrade>>,
     pub runs: Mutex<BTreeMap<String, crate::generation::ManagedRun>>,
 }
 
@@ -167,6 +169,7 @@ impl Engine {
         let settings = model.settings();
         let reminders = Ledger::new(&state_dir)?;
         let drafts = crate::drafts::DraftStore::new(&state_dir)?;
+        let bot = crate::feishu_bot::BotManager::new(state_dir.clone());
         Ok(Arc::new(Self {
             core: Mutex::new(Core {
                 content,
@@ -177,6 +180,8 @@ impl Engine {
             model_summary: RwLock::new(settings),
             reminders,
             drafts,
+            bot,
+            grades: Mutex::new(BTreeMap::new()),
             runs: Mutex::new(BTreeMap::new()),
         }))
     }
@@ -293,8 +298,8 @@ impl Engine {
                 .cloned(),
             model,
             indexing: false,
-            feishu: json!({"enabled":false,"status":"disabled","message":"飞书提醒未启用；应用退出或Mac休眠时不能准时发送。"}),
-            anki: json!({"connected":false,"mode":"csv","message":"仅CSV导出，未同步Anki。"}),
+            feishu: self.bot.settings().map(|mut v|{let snapshot=self.bot.snapshot().ok();v["enabled"]=v["deliveryEnabled"].clone();v["status"]=json!(snapshot.as_ref().map(|s|s.state.as_str()).unwrap_or("failed"));v["message"]=json!(snapshot.as_ref().map(|s|s.reason.as_str()).unwrap_or("机器人状态读取失败；学习记录仍可使用。"));v}).unwrap_or_else(|_|json!({"enabled":false,"status":"failed","message":"机器人配置读取失败，未连接；本机学习功能可继续使用。"})),
+            anki: json!({"connected":false,"mode":"anki","code":"UNCHECKED","message":"请在复习页检查本机Anki连接；CSV仅为备用导出。","decks":[]}),
         })
     }
 }

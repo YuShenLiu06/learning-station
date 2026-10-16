@@ -349,6 +349,14 @@ pub fn set_context_snapshot(
     session_id: &str,
     context: &Context,
 ) -> Result<Session> {
+    set_context_snapshot_explicit(store, session_id, context, false)
+}
+pub fn set_context_snapshot_explicit(
+    store: &mut ContentStore,
+    session_id: &str,
+    context: &Context,
+    explicit: bool,
+) -> Result<Session> {
     let session = get(store, session_id)?;
     let excluded: std::collections::BTreeSet<_> =
         context.excluded_history_source_ids.iter().collect();
@@ -361,7 +369,7 @@ pub fn set_context_snapshot(
             "排除的历史来源编号无效或过多。",
         ));
     }
-    if session.section_id.is_empty() && !context.manifest.is_empty() {
+    if session.section_id.is_empty() && !context.manifest.is_empty() && !explicit {
         return Err(CoreError::new(
             "INVALID_INPUT",
             "独立探索不能写入课程来源。",
@@ -763,6 +771,13 @@ fn normalize(s: &str) -> String {
         .to_string()
 }
 
+fn answer_matches(question: &Value, reference: &str, answer: &str) -> bool {
+    if question["answerMatch"].as_str() == Some("trim") {
+        reference.trim() == answer.trim()
+    } else {
+        normalize(reference) == normalize(answer)
+    }
+}
 fn grade_exact(
     store: &mut ContentStore,
     session_id: &str,
@@ -809,12 +824,16 @@ fn grade_exact(
         })
         .unwrap_or_default();
     let exact = exercise.get("format").and_then(Value::as_str) == Some("exact");
-    let correct = exact.then(|| reference.iter().any(|a| normalize(a) == normalize(answer)));
+    let correct = exact.then(|| {
+        reference
+            .iter()
+            .any(|a| answer_matches(&exercise, a, answer))
+    });
     let explanation = exercise
         .get("explanation")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let content = match correct { Some(true) => format!("答案正确。\n\n{explanation}"), Some(false) => format!("本次答案未匹配参考答案。\n\n参考：{}\n\n{explanation}\n\n错因待本人确认，可补充或修正。", reference.join(" / ")), None => format!("作答已保存，开放题不自动判分。\n\n参考：{}\n\n{explanation}\n\n请对照参考答案与解析，自行记录理解和错因。", reference.join(" / ")) };
+    let content = match correct { Some(true) => format!("答案正确。\n\n{explanation}"), Some(false) => format!("本次答案未匹配参考答案。\n\n参考：{}\n\n{explanation}\n\n错因待本人确认，可补充或修正。", reference.join(" / ")), None => "作答已保存，等待AI批改；尚未判定对错。".into() };
     let feedback = Entry {
         id: String::new(),
         kind: "feedback".into(),
@@ -1558,5 +1577,19 @@ mod fixed_session_tests {
             reopened.read("occupied_document").unwrap().body,
             "Never overwrite."
         );
+    }
+}
+
+#[cfg(test)]
+mod general_exact_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn new_cross_subject_exact_preserves_symbol_case_and_decimal_points() {
+        let q = json!({"answerMatch":"trim"});
+        assert!(!answer_matches(&q, "m", "M"));
+        assert!(!answer_matches(&q, ".5", "5"));
+        assert!(answer_matches(&q, ".5", " .5 "));
+        assert!(answer_matches(&json!({}), "for", "FOR!"));
     }
 }

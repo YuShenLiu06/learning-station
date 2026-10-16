@@ -57,6 +57,8 @@ test('controlled React flow preserves next draft, retries one saved user entry, 
       }
       case 'get_run':if(runs.has(args.runId)){const value=runs.get(args.runId);if(value.content.includes('REFERENCE_MUST_STAY_HIDDEN')&&++practiceReads>1){value.status='failed';value.error={code:'MODEL_RESPONSE',message:'Controlled invalid practice'};}return clone(value);}throw {code:'NOT_FOUND',message:'not found'};
       case 'set_model':Object.assign(model,{model:args.model,verified:false});return clone(model);
+      case 'get_feishu_bot_settings':return {configured:true,appId:'fixture',ownerOpenId:'fixture',chatId:'fixture',receiveEnabled:true,deliveryEnabled:true,secretStored:true,runtimeAvailable:true,runtimeReason:''};
+      case 'get_feishu_bot_snapshot':return {state:'connected',reason:'controlled fixture',counts:{},processExited:false,outputClosed:false};
       case 'check_feishu_status':return {ready:true,reason:'Controlled fake bridge only'};
       case 'test_feishu_notification':return ++feishuCount===1?{status:'unknown',messageId:null,reason:'Controlled unknown result'}:{status:'sent',messageId:'fake_receipt',reason:'Controlled fake receipt'};
       default:throw new Error('Unexpected fake IPC: '+command);
