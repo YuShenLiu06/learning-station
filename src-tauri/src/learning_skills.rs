@@ -366,5 +366,17 @@ mod tests {
                 "SKILL_INVALID"
             );
         }
+        // Oversized guidance is rejected by the same 16KiB budget on demand.
+        write(temp.path(), "learning-review", &"超长指导\n".repeat(3 * 1024));
+        assert_eq!(
+            load_validated(
+                &fs::canonicalize(temp.path()).unwrap(),
+                "learning-review",
+                "on-demand"
+            )
+            .unwrap_err()
+            .code,
+            "SKILL_INVALID"
+        );
     }
 }
