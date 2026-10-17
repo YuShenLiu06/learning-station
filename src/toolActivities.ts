@@ -3,11 +3,11 @@ const titles: Record<string, string> = { query_related_knowledge: '查找相关�
 const safeId = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/u.test(value);
 // Whitelist mirroring the backend exercise validator's field diagnostics exactly:
 // src-tauri/src/exercises.rs field_error builds `练习校验失败：{path} {reason}；收到的内容已保留。`
-// (path vocabulary: schema|summary|exercises[N ≤5] with optional .id|.question|.rubric|.format|.answers[M ≤10]|.explanation|.tags|.sourceIds;
+// (path vocabulary: schema|summary|exercises[N, up to 3 digits because the backend loop can index past 99 before the ≤5 filter] with optional .id|.question|.rubric|.format|.answers[M ≤10, filtered before per-answer validation]|.explanation|.tags|.sourceIds;
 // reasons are a fixed set where only the char-count rule interpolates digits, capped by the 256KiB payload check),
 // plus the single fixed literal of src-tauri/src/generation.rs practice() (field "json"). Fully anchored so raw
 // field values, URLs or arbitrary model/user content can never pass; anything unmatched falls back to fixed copy.
-const FIELD_PATHS = '(?:schema|summary|exercises(?:\\[\\d{1,2}\\](?:\\.(?:id|question|rubric|format|explanation|tags|sourceIds|answers(?:\\[\\d{1,2}\\])?))?)?)';
+const FIELD_PATHS = '(?:schema|summary|exercises(?:\\[\\d{1,3}\\](?:\\.(?:id|question|rubric|format|explanation|tags|sourceIds|answers(?:\\[\\d{1,2}\\])?))?)?)';
 const FIELD_REASONS = '必须是文本|不能为空或只有空白|不能包含空字符|必须是对象且不能包含未声明字段|必须是数组|必须包含1至5道练习|评分标准结构、编号或分值无效|必须是exact或self|必须包含1至10个答案|必须是最多12项的数组|必须是最多32项的数组|来源编号必须是文本|含本轮授权来源清单以外的编号|来源编号重复|共\\d{1,6}个字符，最多(?:64|128|10000|20000)个字符';
 const SAFE_FIELD_DIAGNOSTIC = new RegExp(`^(?:练习校验失败：${FIELD_PATHS} (?:${FIELD_REASONS})；收到的内容已保留。|模型没有返回严格练习 JSON；请仅输出exercises与summary组成的JSON对象，不带代码围栏或说明；收到的内容已保留。)$`, 'u');
 export function readToolActivity(raw: unknown): ToolActivity | null {

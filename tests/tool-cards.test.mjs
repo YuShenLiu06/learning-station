@@ -60,6 +60,7 @@ test('failed exercise cards pass only whitelisted field diagnostics; raw values,
   '练习校验失败：schema 必须是对象且不能包含未声明字段；收到的内容已保留。',
   '练习校验失败：exercises[2].sourceIds 含本轮授权来源清单以外的编号；收到的内容已保留。',
   '练习校验失败：exercises[3].format 必须是exact或self；收到的内容已保留。',
+  '练习校验失败：exercises[100] 必须是对象且不能包含未声明字段；收到的内容已保留。',
   '模型没有返回严格练习 JSON；请仅输出exercises与summary组成的JSON对象，不带代码围栏或说明；收到的内容已保留。'
  ];
  kept.forEach((summary,index)=>{const card=readToolActivity({...base,id:`tool_ok_${index}`,toolCallId:`call_ok_${index}`,summary});assert.ok(card);assert.equal(card.summary,summary);assert.equal(card.errorCode,'INVALID_MODEL_OUTPUT');});
@@ -70,6 +71,11 @@ test('failed exercise cards pass only whitelisted field diagnostics; raw values,
   '练习校验失败：user.name 必须是文本；收到的内容已保留。',
   `练习校验失败：exercises[1].question ${'超'.repeat(120)}；收到的内容已保留。`,
   '练习校验失败：exercises[1].question 不能为空或只有空白；收到的内容已保留。<script>alert(1)</script>',
+  '练习校验失败：exercises[1000] 必须是对象且不能包含未声明字段；收到的内容已保留。',
+  '练习校验失败：exercises[1].answers[100] 必须是文本；收到的内容已保留。',
+  ' 练习校验失败：exercises[1].question 不能为空或只有空白；收到的内容已保留。',
+  '练习校验失败：exercises[1].question 不能包含空字符\u0000；收到的内容已保留。',
+  '练习校验失败：exercises[１] 必须是文本；收到的内容已保留。',
   '工具未确认完成；不会将模型文字当作保存成功。'
  ];
  blocked.forEach((summary,index)=>{const card=readToolActivity({...base,id:`tool_bad_${index}`,toolCallId:`call_bad_${index}`,summary});assert.ok(card);assert.equal(card.summary,generic);});
