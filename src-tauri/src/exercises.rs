@@ -988,3 +988,109 @@ mod issue_four_regression {
             .contains("exercises[2].explanation"));
     }
 }
+
+/// The packaged learning-exercises guidance is a live contract: its fenced practice-output JSON
+/// samples must pass the real model-facing validator, with tool-input pairs staying a distinct shape.
+#[cfg(test)]
+mod skill_sample_contracts {
+    use super::*;
+    use std::{fs, path::Path};
+    fn guidance_json_samples() -> Vec<Value> {
+        let content = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../skills/learning-exercises/SKILL.md"),
+        )
+        .expect("packaged SKILL.md must exist next to the crate");
+        let mut samples = Vec::new();
+        let mut block: Option<String> = None;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if block.is_none() {
+                if trimmed == "```json" {
+                    block = Some(String::new());
+                }
+                continue;
+            }
+            if trimmed == "```" {
+                let text = block.take().expect("closed fence keeps its buffer");
+                samples.push(serde_json::from_str(text.trim()).expect("fenced sample is JSON"));
+                continue;
+            }
+            let buffer = block.as_mut().expect("open fence keeps its buffer");
+            buffer.push_str(line);
+            buffer.push('\n');
+        }
+        assert!(block.is_none(), "SKILL.md leaves no unclosed json fence");
+        samples
+    }
+    #[test]
+    fn practice_output_samples_validate_with_covering_manifest_and_reject_boundary_abuse() {
+        let samples = guidance_json_samples();
+        // Tool inputs carry requirements; practice products must not, proving the pair stays split.
+        let products: Vec<&Value> = samples
+            .iter()
+            .filter(|sample| sample.get("requirements").is_none())
+            .collect();
+        let tool_inputs: Vec<&Value> = samples
+            .iter()
+            .filter(|sample| sample.get("requirements").is_some())
+            .collect();
+        assert_eq!(products.len(), 2);
+        assert_eq!(tool_inputs.len(), 2);
+        assert_eq!(
+            products
+                .iter()
+                .map(|product| product["exercises"][0]["format"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["exact", "self"]
+        );
+        for input in &tool_inputs {
+            assert!(
+                validate((*input).clone(), &[], "skill-sample-contract")
+                    .unwrap_err()
+                    .message
+                    .contains("schema"),
+                "tool input must not double as a practice product"
+            );
+        }
+        // One fixture manifest covers every demo sourceId the samples declare.
+        let mut sources = BTreeSet::new();
+        for product in &products {
+            for question in product["exercises"].as_array().unwrap() {
+                for id in question["sourceIds"].as_array().unwrap() {
+                    sources.insert(id.as_str().unwrap().to_owned());
+                }
+            }
+        }
+        assert!(sources.contains("src_demo_material") && sources.contains("src_demo_note"));
+        let manifest: Vec<ManifestItem> = sources
+            .iter()
+            .map(|id| ManifestItem {
+                id: id.clone(),
+                path: format!("{id}.md"),
+                version: "v1".into(),
+                included_chars: 100,
+            })
+            .collect();
+        for product in &products {
+            let valid = validate((*product).clone(), &manifest, "skill-sample-contract").unwrap();
+            for question in valid["exercises"].as_array().unwrap() {
+                assert!(question["id"].as_str().unwrap().starts_with("q_"));
+                assert_eq!(question["answerMatch"], "trim");
+            }
+        }
+        assert!(products[1]["exercises"][0].get("rubric").is_some());
+        // Boundary abuse is rejected: a source outside this round's authorized manifest...
+        let mut hijacked = (*products[0]).clone();
+        hijacked["exercises"][0]["sourceIds"] = json!(["src_not_in_manifest"]);
+        let error = validate(hijacked, &manifest, "skill-sample-negative").unwrap_err();
+        assert_eq!(error.code, "INVALID_MODEL_OUTPUT");
+        assert!(error.message.contains("sourceIds"));
+        assert!(!error.message.contains("src_not_in_manifest"));
+        // ...and an overlong field beyond the fixed length contract.
+        let mut overlong = (*products[0]).clone();
+        overlong["exercises"][0]["tags"] = json!(["x".repeat(65)]);
+        let error = validate(overlong, &manifest, "skill-sample-negative").unwrap_err();
+        assert_eq!(error.code, "INVALID_MODEL_OUTPUT");
+        assert!(error.message.contains("tags"));
+    }
+}
