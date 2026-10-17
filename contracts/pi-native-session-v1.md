@@ -30,6 +30,8 @@
 
 固定显式 ModelRuntime、内存凭据、`modelsPath=null`、禁止模型目录网络刷新。资源加载器返回空外部扩展/模板/全局指导/Agents文件，应用仅传既有学习指导。基础工具表为空，精确开放当前学习模式允许的工具；`edit/grep/find/ls/powershell`均不注册。`read/write/bash`仅在本机设置的工具授权档位（off/read/write/bash，默认off，仅question/explain模式）开启后受控注册，随toolPolicy.authorization由Rust下发；参数与结果仍由Rust校验，read只读本轮manifest已授权来源或会话工作区文件，write只写会话工作区（路径/配额/符号链接受限），bash只在会话工作区以受限环境执行（固定PATH、无HOME、超时与输出有上限），write/bash以持久回执台账幂等，恢复只读台账不重执行。Node权限模式不允许创建子进程（bash由Rust进程执行，不经Node）。
 
+`list_learning_skills`/`load_learning_skill`是仅question/explain/practice模式注册的只读工具，不挂任何授权档位：它们只读随包 `skills/` 固定允许清单（三个稳定id），复用主动快照同一路径校验（根内canonicalize、拒符号链接、16KiB、frontmatter合法），目录仅返回id/名称/描述不含正文，正文经工具结果通道返回。清单外id是TOOL_SCOPE授权拒绝，不读取任意路径。同run重复load同一指导只返回简短提示（含sha256）；该指导已随模式主动注入时返回"已在指导中"；去重台账按run维度挂Rust，新run可重新取正文。ready事件的learningSkills版本回执语义不变，仍只认主动注入快照，按需加载不进入该回执。
+
 摘要与普通生成走同一受控端点和预算，不跨域、不自动换模型。容量未知保持0，不开启阈值压缩；用户填写容量后使用Pi原生阈值生命周期。正常输出用尽不盲目重发。私有状态目录路径不发给模型，凭据不进原生会话。
 
 ## 限制与恢复
