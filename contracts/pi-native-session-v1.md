@@ -35,3 +35,9 @@
 ## 限制与恢复
 
 原生文件有32MiB读取保护，不静默截断或删除；超过限制需保留原数据后明确处理。业务回执无法确认时会话停在unknown，不能改编号绕过。失败恢复的回滚路径是保留此私有目录、继续使用未改动的原Markdown与旧包；本轮不提供破坏性自动清库按钮。
+
+## 最终练习 JSON 的有界修正
+
+Rust 在 practice 模式显式开启 `outputValidation`，Node 每次完成最终文本后发送只读 `validate_output {id, content}`；Rust 使用原轮冻结 manifest 校验，回复 `tool_result.result={valid,recoverable,message?}`，不保存对象、不增加权限。两端均最多接受三次校验（首次及最多两次修正），沿用原请求超时与工具预算。
+
+可纠正错误通过 `learning-station-output-validation` 原生 custom message 回传 Agent，包含安全字段路径、原因与长度限制，不伪造新用户问题。未知来源或权限错误不可自动修正；失败原文留在私有原生会话，最终失败文本留在Run。仅校验通过才标记原生记录complete；Rust保存前再次校验并沿既有操作编号幂等写入。该私有事件不注册为模型工具或前端IPC。

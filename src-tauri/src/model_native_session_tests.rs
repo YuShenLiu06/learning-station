@@ -214,6 +214,7 @@ async fn real_rust_node_pi_native_restart_roles_tool_pairs_and_course_isolation(
             },
             crate::learning_skills::capture("question", &["create_note".into()]).unwrap(),
             Some(RequestContext {
+                output_validator: None,
                 time: frozen.time,
                 exploration: None,
                 native_session: Some(native),
@@ -346,6 +347,7 @@ async fn real_rust_node_pi_native_restart_roles_tool_pairs_and_course_isolation(
         },
         crate::learning_skills::capture("question", &["create_note".into()]).unwrap(),
         Some(RequestContext {
+            output_validator: None,
             time: frozen.time,
             exploration: None,
             native_session: Some(native),
@@ -408,5 +410,91 @@ async fn real_rust_node_pi_native_restart_roles_tool_pairs_and_course_isolation(
     if let Ok(target) = std::env::var("LEARNING_STATION_NATIVE_EVIDENCE") {
         std::fs::create_dir_all(&target).unwrap();
         std::fs::write(Path::new(&target).join("actual-packets.json"),serde_json::to_vec_pretty(&json!({"syntheticOnly":true,"realRustNodePinnedPi":true,"packets":packets,"manifests":*inventory.lock().unwrap()})).unwrap()).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn rust_node_pi_validates_final_json_and_corrects_before_any_persistence() {
+    for unauthorized in [false, true] {
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        server.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}/v1", server.local_addr().unwrap());
+        let expected = if unauthorized { 1 } else { 2 };
+        let handle = thread::spawn(move || {
+            let mut packets = vec![];
+            for index in 0..expected {
+                let until = std::time::Instant::now() + Duration::from_secs(15);
+                let (mut socket, _) = loop {
+                    match server.accept() {
+                        Ok(v) => break v,
+                        Err(x)
+                            if x.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < until =>
+                        {
+                            thread::sleep(Duration::from_millis(10))
+                        }
+                        Err(x) => panic!("fixture {x}"),
+                    }
+                };
+                packets.push(receive(&mut socket));
+                let content = json!({"summary":"合成练习","exercises":[{"question":if index==0 && !unauthorized {" "} else {"解释概念"},"format":"self","answers":["合成答案"],"tags":[],"sourceIds":if unauthorized {json!(["unauthorized_source"])} else {json!([])}}]}).to_string();
+                let body = format!(
+                    "data: {}\n\ndata: [DONE]\n\n",
+                    json!({"choices":[{"index":0,"delta":{"content":content},"finish_reason":"stop"}]})
+                );
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).unwrap();
+            }
+            packets
+        });
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = checks.clone();
+        let mut context = RequestContext::capture();
+        context.output_validator = Some(Arc::new(move |text| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            let data = serde_json::from_str(text)
+                .map_err(|_| crate::exercises::field_error("json", "必须为JSON"))?;
+            crate::exercises::validate(data, &[], "validation-run").map(|_| ())
+        }));
+        let result = generate_scoped(
+            ModelCredentials::new(
+                ModelSettings {
+                    provider: "custom".into(),
+                    protocol: PROTOCOL.into(),
+                    base_url: endpoint,
+                    model: "fixture-model".into(),
+                    ..ModelSettings::default()
+                },
+                "synthetic-validation-key".into(),
+            )
+            .unwrap(),
+            vec![json!({"role":"user","content":"生成合成练习"})],
+            Arc::new(AtomicBool::new(false)),
+            |_| {},
+            None,
+            ToolPolicy {
+                mode: "practice".into(),
+                allowed_tools: vec![],
+                max_calls: 0,
+            },
+            crate::learning_skills::capture("practice", &[]).unwrap(),
+            Some(context),
+        )
+        .await
+        .unwrap();
+        assert_eq!(checks.load(Ordering::SeqCst), expected);
+        let packets = handle.join().unwrap();
+        if unauthorized {
+            assert!(result.contains("unauthorized_source"));
+        } else {
+            assert!(serde_json::to_string(&packets[1])
+                .unwrap()
+                .contains("exercises[1].question"));
+            assert!(crate::exercises::validate(
+                serde_json::from_str(&result).unwrap(),
+                &[],
+                "final-result"
+            )
+            .is_ok());
+        }
     }
 }

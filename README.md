@@ -30,7 +30,7 @@ npm run tauri -- dev
 
 公开前已有本机 Core、Pi/localhost 和 React/mock IPC 回归；这些不等于本版原生界面或真实账户验收。本次发布没有另跑产品测试。
 
-自动识别当前文档/题目的 focus、通用网络/文件/Bash 权限、AI 内联 HTML 演示，以及笔记内嵌 HTML/网页/视频尚未完成。不保证应用退出或休眠期间及时派发提醒。
+支持 HTML 代码块静态隔离预览，以及笔记中的 HTML/网页/视频链接；HTML 脚本与外部资源禁用，远程站点限制不会绕过。自动识别当前文档/题目的 focus、通用网络/文件/Bash 权限尚未完成。不保证应用退出或休眠期间及时派发提醒。
 
 实现边界见 [架构](docs/architecture.md)、[ContextBridge](docs/context-bridge.md)和[飞书配置](docs/feishu-setup.md)。
 

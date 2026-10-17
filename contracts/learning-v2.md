@@ -54,3 +54,13 @@ ReviewSource={reviewItemId,sessionId,sectionId:null|string,sectionTitle:string,c
 飞书deliveryEnabled的用户可见含义为“发送新到期提醒及手动测试”。tick仍仅入站内库，独立协调器只有机器人已显式启动、发送已启用时才处理启用后新建的到期通知；先持久unknown预占，真实messageId才sent。旧历史不补发，unknown/failed不自动重发；用户关闭提醒/完成todo后不发尚未发送项。应用退出不保证发送，不另建后台服务。草稿feishu-test可携带原测试requestId（同通用草稿先读/版本校验）。
 
 新生成题由Core标记answerMatch=trim，仅去首尾空白后比较，保留大小写/符号/小数点；避免将m/M或.5/5误当相同。需要接受的有限变体列入answers，复杂等价解法用self。旧题无标记时保留旧核对规则，原数据不迁移。
+
+## 练习字段与错误恢复（Issue #3/#4）
+
+最终练习 JSON 仅含 `exercises` 和 `summary`；`generate_exercises` 工具额外要求非空 `requirements`，不可混为同一协议。1–5 题；summary 最多10000个 Unicode scalar value，题干/解析最多20000，单个答案最多10000，标签最多64；32KiB工具参数和256KiB最终响应字节总限额保持不变。
+
+`explanation` 可省略；存在时必须是字符串。缺省仍以缺省保存，阅读时显示“尚未提供解析”，不从答案或 rubric 推造解析。题干、参考答案、格式、标签和来源数组仍按原规则必需。sourceIds 必须来自本轮冻结材料 manifest 且不重复；评分标准结构与分值校验不放宽。
+
+模型字段错误使用 `INVALID_MODEL_OUTPUT` 和安全字段路径（题目/答案序号从1开始）、原因/长度，不回显字段原值或来源ID。Rust校验诊断经工具错误回包送回Pi和活动卡；原问题、引用及私有原生记录保持原生命周期。对已注册练习工具的结构错误，允许SDK返回错误供模型在原预算内修正；权限、未知工具、超预算、未知写入结果仍停止。已保存问题与精确参数绑定的幂等ID不改变。
+
+练习按钮的最终 JSON 也由 Rust 先只读校验，安全字段错误回传 Agent 最多修正两次；来源越界不可自动修正。此过程不写学习对象、不改变原问题/快照/操作编号，成功后才经原保存路径提交。原始中间输出保留在私有 Pi 会话，最终失败输出仍可从现有恢复入口查看。

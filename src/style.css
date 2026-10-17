@@ -127,3 +127,9 @@ label select{display:block;background:#fff;border:1px solid #dce5ce;border-radiu
 
 /* Reply stays in the existing message footer and the existing composer queue. */
 .message-reply{display:inline-flex;align-items:center;gap:5px}.assistant-reply-preview{display:flex;align-items:flex-start;gap:7px;text-align:left;min-width:0;max-width:100%;border:0;border-left:2px solid var(--accent);border-radius:0;background:transparent;padding:3px 5px;color:var(--muted);font:inherit}.assistant-reply-preview>svg{flex-shrink:0;margin-top:2px}.assistant-reply-preview>span{min-width:0;max-width:280px}.assistant-reply-preview small{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;white-space:normal;line-height:1.55;color:var(--ink);font-size:11px;margin-top:3px}.assistant-reply-preview:focus-visible{outline:2px solid var(--accent);outline-offset:3px}.composer-reference:has(.assistant-reply-preview){align-items:flex-start;max-width:330px}.composer-reference .assistant-reply-preview{flex:1;min-width:0}.message-reference .assistant-reply-preview{margin-top:6px;font-size:11px}.assistant-reply-menu button{gap:8px}.reply-source-highlight{outline:2px solid var(--line);outline-offset:7px;border-radius:4px}
+
+.embedded-content { margin: 16px 0; padding: 14px; border: 1px solid var(--border, #d9d4c8); border-radius: 12px; min-width: 0; }
+.embed-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.embed-actions strong, .embed-source { overflow-wrap: anywhere; }
+.embedded-content iframe { width: 100%; min-width: 0; height: 360px; border: 1px solid #ddd7cb; border-radius: 8px; background: white; margin-top: 12px; }
+.embedded-content pre { max-height: 300px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }

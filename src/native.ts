@@ -181,6 +181,7 @@ export async function nativeCall(command: string, payload: Record<string, unknow
     case 'legacy_exercise_open': return section(await ipc<NativeDoc>('materialize_legacy_exercise', payload));
     case 'asset_list': return ipc('list_course_assets', { courseId: payload.courseId });
     case 'asset_import': return ipc('import_course_asset', payload);
+    case 'open_content_url': return ipc('open_content_url', {url:payload.url});
     case 'asset_read': return ipc('read_course_asset', { courseId: payload.courseId, assetId: payload.assetId });
     case 'section_open': { const doc = await ipc<NativeDoc>('open_document', { id: payload.id }); if (doc.metadata.kind === 'exercise') { const result = await ipc<{ session: NativeSession }>('get_exercise_document', { id: payload.id }); exerciseSessions.set(doc.id, cacheSession(result.session)); } return section(doc); }
     case 'section_import': {
