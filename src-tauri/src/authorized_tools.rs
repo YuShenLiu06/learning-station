@@ -78,7 +78,12 @@ pub(crate) fn recover(
     let entry = read_ledger(&ledger_path).map_err(|_| unknown())?;
     let arguments_hash = hash(&serde_json::to_string(&call.args).map_err(|_| unknown())?);
     if entry.name != call.name || entry.arguments_hash != arguments_hash {
-        return Err(unknown());
+        // A ledger exists but for different arguments: that is a conflict with
+        // committed evidence, not an unknown outcome.
+        return Err(CoreError::new(
+            "CONFLICT",
+            "原工具记录与本次参数不一致，未重复执行。",
+        ));
     }
     let mut result = entry.result;
     result["recovered"] = json!(true);
@@ -815,6 +820,83 @@ mod tests {
         let replay = run(&reopened, &scope, "stable-call", "bash", json!({"command": "printf stable"})).unwrap();
         assert_eq!(replay["replayed"], true);
         assert_eq!(replay["stdout"], first["stdout"]);
+    }
+
+    #[test]
+    fn recovery_returns_ledgered_receipt_after_restart_without_reexecuting() {
+        let (directory, engine, scope) = fixture("write");
+        let call = crate::model::ToolCall {
+            id: "stable-recovery".into(),
+            name: "write".into(),
+            args: json!({"path": "draft.md", "content": "first version"}),
+        };
+        let first = run(&engine, &scope, &call.id, "write", call.args.clone()).unwrap();
+        assert_eq!(first["persisted"], true);
+        let target = directory
+            .path()
+            .join("state/workspaces")
+            .join(&scope.session_id)
+            .join("files/draft.md");
+        // A later local edit proves recovery replays the receipt, not the write.
+        std::fs::write(&target, "first version + later edit").unwrap();
+        drop(engine);
+        let reopened = Engine::new(directory.path().join("library"), directory.path().join("state"))
+            .unwrap();
+        let recovered = crate::authorized_tools::recover(
+            &reopened,
+            &scope.session_id,
+            "run_authorized_fixture",
+            &call,
+        )
+        .unwrap();
+        assert_eq!(recovered["recovered"], true);
+        assert_eq!(recovered.get("replayed"), None, "recovery is not a replay");
+        assert_eq!(recovered["path"], "draft.md");
+        assert_eq!(recovered["bytes"], "first version".len());
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "first version + later edit",
+            "the ledgered write must not run again"
+        );
+    }
+
+    #[test]
+    fn recovery_conflicts_on_changed_arguments_and_reports_missing_ledger_honestly() {
+        let (_directory, engine, scope) = fixture("write");
+        let call = crate::model::ToolCall {
+            id: "conflict-op".into(),
+            name: "write".into(),
+            args: json!({"path": "draft.md", "content": "first version"}),
+        };
+        run(&engine, &scope, &call.id, "write", call.args.clone()).unwrap();
+        // Same request ID with different arguments conflicts with the committed record.
+        let mut changed = call.clone();
+        changed.args = json!({"path": "draft.md", "content": "different content"});
+        let error = crate::authorized_tools::recover(
+            &engine,
+            &scope.session_id,
+            "run_authorized_fixture",
+            &changed,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "CONFLICT");
+        // No ledger at all stays an honest unknown, never a guess.
+        let absent = crate::model::ToolCall {
+            id: "never-executed".into(),
+            name: "bash".into(),
+            args: json!({"command": "printf hi"}),
+        };
+        let error = crate::authorized_tools::recover(
+            &engine,
+            &scope.session_id,
+            "run_authorized_fixture",
+            &absent,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "NATIVE_TOOL_UNKNOWN");
+        // Neither path re-executed or touched the ledgered file.
+        let current = run(&engine, &scope, "verify", "read", json!({"path": "draft.md"})).unwrap();
+        assert_eq!(current["content"], "first version");
     }
 
     #[test]
