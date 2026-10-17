@@ -17,6 +17,12 @@ PR 描述须对应明确的提交 SHA，包含：
 
 修复改变 SHA 后同步证据，注明重测范围。不强制所有 PR 跑完整 E2E；按影响选验证，构建成功不代替运行验收，mock 不代替真实外部服务。
 
+CI 判据与堆叠证据：
+
+- 合并判据是 `ci-gate` 必需检查：js-tests-build、rust-core-tests、macos-app-build 全部 success 才通过；failure、cancelled、skipped 一律不算通过。
+- 堆叠 PR 各层的验收证据对应各自 head SHA；rebase 或改基后重新关联，不得沿用旧 SHA。
+- 红灯验证（故意失败被门禁阻断）与绿灯验证分开留档，不用"CI 绿"替代安全审查结论。
+
 ## 收敛与反馈
 
 - 首轮结合需求、完整 PR diff 及相关调用链；第 2/3 轮检查新增 diff、原问题是否解决和影响回归。
