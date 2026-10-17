@@ -61,6 +61,10 @@ jobs:
           cargo --version
       - name: Assert arm64 runner
         run: test "$(uname -m)" = "arm64"
+      - name: Install locked JS dependencies (pi-sidecar, feishu-bot)
+        run: |
+          npm --prefix pi-sidecar ci --ignore-scripts
+          npm --prefix tools/feishu-bot ci --ignore-scripts
       - name: Prepare pinned runtime Node (sha256 verified against runtime/manifest.json)
         run: node scripts/prepare-runtime.mjs
       - name: Core tests (locked)
