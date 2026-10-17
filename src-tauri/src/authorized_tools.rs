@@ -78,11 +78,103 @@ pub(crate) fn recover(
     let entry = read_ledger(&ledger_path).map_err(|_| unknown())?;
     let arguments_hash = hash(&serde_json::to_string(&call.args).map_err(|_| unknown())?);
     if entry.name != call.name || entry.arguments_hash != arguments_hash {
-        return Err(unknown());
+        // A ledger exists but for different arguments: that is a conflict with
+        // committed evidence, not an unknown outcome.
+        return Err(CoreError::new(
+            "CONFLICT",
+            "原工具记录与本次参数不一致，未重复执行。",
+        ));
     }
     let mut result = entry.result;
     result["recovered"] = json!(true);
     Ok(result)
+}
+
+/// Upper bound of receipt summaries one listing returns.
+const MAX_RECEIPT_SUMMARIES: usize = 200;
+
+/// Read-only summary of the durable write/bash receipt ledger of one session's
+/// workspace. Exposes only the stable request ID, tool name, status, timestamp
+/// and the write's relative path; never arguments, command text or file
+/// contents. The workspace is derived from the real session, never a path.
+pub(crate) fn list_receipt_summaries(
+    engine: &crate::app::Engine,
+    session_id: &str,
+) -> Result<Value> {
+    if !crate::types::valid_id(session_id) {
+        return Err(out_of_scope());
+    }
+    let state_dir = {
+        let mut core = engine.lock()?;
+        // Only a real session's own workspace is listable.
+        crate::sessions::get(&mut core.content, session_id)?;
+        core.state_dir.clone()
+    };
+    let receipts_dir = workspace_root(&state_dir, session_id).join("receipts");
+    let directory = match fs::read_dir(&receipts_dir) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // No ledgered tool receipts yet is an honest empty list.
+            return Ok(json!({"sessionId": session_id, "receipts": [], "truncated": false}));
+        }
+        Err(error) => return Err(io(error)),
+    };
+    let mut summaries = Vec::new();
+    for file in directory {
+        let file = file.map_err(io)?;
+        let name = file.file_name();
+        let Some(request_id) = name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".json"))
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        // Structural failures are skipped: an untrusted file must never reach
+        // the UI, and one bad file must not hide the rest of the audit trail.
+        let Ok(entry) = read_ledger(&file.path()) else {
+            continue;
+        };
+        if !matches!(entry.name.as_str(), "write" | "bash")
+            || !crate::types::valid_id(&request_id)
+        {
+            continue;
+        }
+        let status = match entry.name.as_str() {
+            "write" => {
+                if entry.result["persisted"] == json!(true) {
+                    "persisted"
+                } else {
+                    "unverified"
+                }
+            }
+            _ if entry.result["timedOut"] == json!(true) => "timed-out",
+            _ => "completed",
+        };
+        let path = entry
+            .result["path"]
+            .as_str()
+            .filter(|path| valid_relative_path(path));
+        summaries.push(json!({
+            "requestId": request_id,
+            "tool": entry.name,
+            "status": status,
+            "createdAt": entry.created_at,
+            "path": path,
+        }));
+    }
+    summaries.sort_by(|a, b| {
+        let key = |value: &Value| {
+            (
+                value["createdAt"].as_str().unwrap_or("").to_owned(),
+                value["requestId"].as_str().unwrap_or("").to_owned(),
+            )
+        };
+        key(b).cmp(&key(a))
+    });
+    let truncated = summaries.len() > MAX_RECEIPT_SUMMARIES;
+    summaries.truncate(MAX_RECEIPT_SUMMARIES);
+    Ok(json!({"sessionId": session_id, "receipts": summaries, "truncated": truncated}))
 }
 
 #[derive(Deserialize)]
@@ -815,6 +907,179 @@ mod tests {
         let replay = run(&reopened, &scope, "stable-call", "bash", json!({"command": "printf stable"})).unwrap();
         assert_eq!(replay["replayed"], true);
         assert_eq!(replay["stdout"], first["stdout"]);
+    }
+
+    #[test]
+    fn recovery_returns_ledgered_receipt_after_restart_without_reexecuting() {
+        let (directory, engine, scope) = fixture("write");
+        let call = crate::model::ToolCall {
+            id: "stable-recovery".into(),
+            name: "write".into(),
+            args: json!({"path": "draft.md", "content": "first version"}),
+        };
+        let first = run(&engine, &scope, &call.id, "write", call.args.clone()).unwrap();
+        assert_eq!(first["persisted"], true);
+        let target = directory
+            .path()
+            .join("state/workspaces")
+            .join(&scope.session_id)
+            .join("files/draft.md");
+        // A later local edit proves recovery replays the receipt, not the write.
+        std::fs::write(&target, "first version + later edit").unwrap();
+        drop(engine);
+        let reopened = Engine::new(directory.path().join("library"), directory.path().join("state"))
+            .unwrap();
+        let recovered = crate::authorized_tools::recover(
+            &reopened,
+            &scope.session_id,
+            "run_authorized_fixture",
+            &call,
+        )
+        .unwrap();
+        assert_eq!(recovered["recovered"], true);
+        assert_eq!(recovered.get("replayed"), None, "recovery is not a replay");
+        assert_eq!(recovered["path"], "draft.md");
+        assert_eq!(recovered["bytes"], "first version".len());
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "first version + later edit",
+            "the ledgered write must not run again"
+        );
+    }
+
+    #[test]
+    fn recovery_conflicts_on_changed_arguments_and_reports_missing_ledger_honestly() {
+        let (_directory, engine, scope) = fixture("write");
+        let call = crate::model::ToolCall {
+            id: "conflict-op".into(),
+            name: "write".into(),
+            args: json!({"path": "draft.md", "content": "first version"}),
+        };
+        run(&engine, &scope, &call.id, "write", call.args.clone()).unwrap();
+        // Same request ID with different arguments conflicts with the committed record.
+        let mut changed = call.clone();
+        changed.args = json!({"path": "draft.md", "content": "different content"});
+        let error = crate::authorized_tools::recover(
+            &engine,
+            &scope.session_id,
+            "run_authorized_fixture",
+            &changed,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "CONFLICT");
+        // The native session recovery path delegates authorized tools and must
+        // surface the same verdict, not soften it to an unknown.
+        let error = crate::native_session::recover(
+            &engine,
+            &scope.session_id,
+            "run_authorized_fixture",
+            &changed,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "CONFLICT");
+        // No ledger at all stays an honest unknown, never a guess.
+        let absent = crate::model::ToolCall {
+            id: "never-executed".into(),
+            name: "bash".into(),
+            args: json!({"command": "printf hi"}),
+        };
+        let error = crate::authorized_tools::recover(
+            &engine,
+            &scope.session_id,
+            "run_authorized_fixture",
+            &absent,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "NATIVE_TOOL_UNKNOWN");
+        // Neither path re-executed or touched the ledgered file.
+        let current = run(&engine, &scope, "verify", "read", json!({"path": "draft.md"})).unwrap();
+        assert_eq!(current["content"], "first version");
+    }
+
+    #[test]
+    fn receipt_listing_is_read_only_and_shares_no_arguments() {
+        let (_directory, engine, scope) = fixture("bash");
+        run(&engine, &scope, "list-write", "write", json!({"path": "notes/draft.md", "content": "secret scratch"})).unwrap();
+        run(&engine, &scope, "list-bash", "bash", json!({"command": "printf 'hidden command text'"})).unwrap();
+        run(&engine, &scope, "list-read", "read", json!({"path": "notes/draft.md"})).unwrap();
+        let summary = crate::authorized_tools::list_receipt_summaries(&engine, &scope.session_id).unwrap();
+        let receipts = summary["receipts"].as_array().unwrap();
+        assert_eq!(receipts.len(), 2, "read receipts stay out of the write/bash audit list");
+        let text = serde_json::to_string(&receipts).unwrap();
+        assert!(!text.contains("hidden command text"), "command text must never leave the ledger");
+        assert!(!text.contains("secret scratch"), "file content must never leave the ledger");
+        for receipt in receipts {
+            assert!(["write", "bash"].contains(&receipt["tool"].as_str().unwrap()));
+            assert!(crate::types::valid_id(receipt["requestId"].as_str().unwrap()));
+            assert!(receipt["createdAt"].as_str().is_some_and(|t| !t.is_empty()));
+        }
+        let write = receipts.iter().find(|r| r["tool"] == "write").unwrap();
+        assert_eq!(write["path"], "notes/draft.md");
+        assert_eq!(write["status"], "persisted");
+        // A session without tool receipts lists empty, and foreign sessions are rejected.
+        let other = {
+            let mut core = engine.lock().unwrap();
+            crate::sessions::create(&mut core.content, &scope.section_id, &[]).unwrap()
+        };
+        let empty = crate::authorized_tools::list_receipt_summaries(&engine, &other.id).unwrap();
+        assert_eq!(empty["receipts"].as_array().unwrap().len(), 0);
+        assert!(crate::authorized_tools::list_receipt_summaries(&engine, "missing_session").is_err());
+        assert!(crate::authorized_tools::list_receipt_summaries(&engine, "../escape").is_err());
+    }
+
+    #[test]
+    fn receipt_listing_skips_corrupt_or_unsafe_ledger_files() {
+        let (directory, engine, scope) = fixture("write");
+        run(&engine, &scope, "skip-real", "write", json!({"path": "draft.md", "content": "kept"})).unwrap();
+        let receipts = directory
+            .path()
+            .join("state/workspaces")
+            .join(&scope.session_id)
+            .join("receipts");
+        std::fs::write(receipts.join("pi_tool_corrupt.json"), "{ not valid json").unwrap();
+        std::fs::write(receipts.join("not-a-receipt.txt"), "ignored by suffix").unwrap();
+        std::fs::write(receipts.join("pi_tool_oversize.json"), "x".repeat(1024 * 1024 + 1)).unwrap();
+        let outside = directory.path().join("outside-secret.txt");
+        std::fs::write(&outside, "PRIVATE").unwrap();
+        std::os::unix::fs::symlink(&outside, receipts.join("pi_tool_link.json")).unwrap();
+        let summary = crate::authorized_tools::list_receipt_summaries(&engine, &scope.session_id).unwrap();
+        let list = summary["receipts"].as_array().unwrap();
+        assert_eq!(list.len(), 1, "only the structurally valid receipt is listed");
+        assert_eq!(list[0]["path"], "draft.md");
+        assert_eq!(list[0]["status"], "persisted");
+    }
+
+    #[test]
+    fn receipt_listing_caps_at_two_hundred_and_marks_truncation() {
+        let (directory, engine, scope) = fixture("write");
+        let receipts = directory
+            .path()
+            .join("state/workspaces")
+            .join(&scope.session_id)
+            .join("receipts");
+        std::fs::create_dir_all(&receipts).unwrap();
+        for index in 0..201 {
+            let entry = super::LedgerEntry {
+                name: "write".into(),
+                arguments_hash: format!("hash-{index}"),
+                result: json!({"persisted": true, "path": format!("f{index}.md")}),
+                created_at: format!("2026-10-17T{:02}:{:02}:00.000Z", index / 60, index % 60),
+            };
+            crate::app::atomic_json(&receipts.join(format!("pi_tool_cap{index:03}.json")), &entry)
+                .unwrap();
+        }
+        let summary = crate::authorized_tools::list_receipt_summaries(&engine, &scope.session_id).unwrap();
+        let list = summary["receipts"].as_array().unwrap();
+        assert_eq!(list.len(), 200);
+        assert_eq!(summary["truncated"], true);
+        // Newest first; only the oldest entry falls off the cap.
+        assert_eq!(list[0]["createdAt"], "2026-10-17T03:20:00.000Z");
+        assert_eq!(list[0]["path"], "f200.md");
+        assert_eq!(list[199]["createdAt"], "2026-10-17T00:01:00.000Z");
+        assert!(
+            !list.iter().any(|item| item["createdAt"] == "2026-10-17T00:00:00.000Z"),
+            "the oldest receipt is the truncated one"
+        );
     }
 
     #[test]

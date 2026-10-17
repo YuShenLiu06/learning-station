@@ -492,6 +492,18 @@ async fn load_session_context(
 async fn get_ui_preferences(state: State<'_, Arc<Engine>>) -> Result<UiPreferences> {
     work(state.inner().clone(), |e| e.ui_preferences()).await
 }
+// Read-only: durable write/bash receipt summaries of one session workspace.
+// No arguments, command text or file contents ever leave the ledger.
+#[tauri::command]
+async fn list_tool_receipts(
+    state: State<'_, Arc<Engine>>,
+    session_id: String,
+) -> Result<Value> {
+    work(state.inner().clone(), move |e| {
+        crate::authorized_tools::list_receipt_summaries(e, &session_id)
+    })
+    .await
+}
 #[tauri::command]
 async fn save_ui_preferences(
     state: State<'_, Arc<Engine>>,
@@ -1019,6 +1031,7 @@ pub fn run() {
             get_exercise_reference,
             get_ui_preferences,
             save_ui_preferences,
+            list_tool_receipts,
             get_session,
             append_entry,
             load_context,
