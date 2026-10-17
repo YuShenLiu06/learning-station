@@ -652,6 +652,7 @@ async fn rust_node_pi_exercise_tool_receipt_corrects_invalid_output_in_same_nati
             mode: "question".into(),
             allowed_tools: vec!["generate_exercises".into()],
             max_calls: 4,
+            authorization: "off".into(),
         },
         crate::learning_skills::capture("question", &["generate_exercises".into()]).unwrap(),
         Some(RequestContext {
