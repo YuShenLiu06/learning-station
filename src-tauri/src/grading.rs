@@ -474,6 +474,7 @@ pub async fn start(
                     mode: "grading".into(),
                     allowed_tools: vec![],
                     max_calls: 0,
+                    authorization: "off".into(),
                 },
                 vec![],
                 Some(model::RequestContext {

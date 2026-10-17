@@ -34,6 +34,9 @@ const ALL_TOOLS: &[&str] = &[
     "create_todo",
     "generate_exercises",
 ];
+/// User-selectable tool authorization tiers, ordered by strength. The default
+/// is "off": read/write/bash stay unregistered unless the user opts in.
+pub const TOOL_AUTHORIZATION_TIERS: [&str; 4] = ["off", "read", "write", "bash"];
 pub const MAX_OUTPUT_TOKENS: u32 = 131_072;
 pub const MIN_INPUT_RESERVE: u32 = 1_024;
 pub fn default_output_tokens(provider: &str) -> u32 {
@@ -232,6 +235,23 @@ pub struct ToolPolicy {
     pub mode: String,
     pub allowed_tools: Vec<String>,
     pub max_calls: usize,
+    /// User-selected authorization tier carried from local preferences; the
+    /// model side never supplies or raises it.
+    #[serde(default = "default_authorization")]
+    pub authorization: String,
+}
+fn default_authorization() -> String {
+    "off".into()
+}
+/// Cumulative tools unlocked by each authorization tier.
+pub fn authorization_tools(authorization: &str) -> Result<&'static [&'static str]> {
+    Ok(match authorization {
+        "off" => &[],
+        "read" => &["read"],
+        "write" => &["read", "write"],
+        "bash" => &["read", "write", "bash"],
+        _ => return Err(sidecar_error("TOOL_PROTOCOL")),
+    })
 }
 impl ToolPolicy {
     fn legacy(enabled: bool) -> Self {
@@ -243,6 +263,7 @@ impl ToolPolicy {
                 vec![]
             },
             max_calls: if enabled { 8 } else { 0 },
+            authorization: "off".into(),
         }
     }
 }
@@ -264,14 +285,16 @@ fn validate_tool_policy(policy: &ToolPolicy, has_handler: bool) -> Result<()> {
         "legacy" => (&ALL_TOOLS[..3], 8),
         _ => return Err(sidecar_error("TOOL_PROTOCOL")),
     };
+    let authorized = authorization_tools(&policy.authorization)?;
+    // Tier tools ride on top of the interactive exploration modes only.
+    let tier_applies = matches!(policy.mode.as_str(), "question" | "explain");
     let unique: std::collections::BTreeSet<_> = policy.allowed_tools.iter().collect();
     if policy.max_calls > maximum
         || policy.max_calls > MAX_TOOL_CALLS
         || unique.len() != policy.allowed_tools.len()
-        || policy
-            .allowed_tools
-            .iter()
-            .any(|name| !allowed.contains(&name.as_str()))
+        || policy.allowed_tools.iter().any(|name| {
+            !allowed.contains(&name.as_str()) && !(tier_applies && authorized.contains(&name.as_str()))
+        })
         || (!policy.allowed_tools.is_empty() && (policy.max_calls == 0 || !has_handler))
     {
         return Err(sidecar_error("TOOL_PROTOCOL"));
@@ -1240,6 +1263,75 @@ fn validate_tool_call(call: &ToolCall) -> Result<()> {
         }
         return Ok(());
     }
+    if matches!(call.name.as_str(), "read" | "write" | "bash") {
+        // Shape validation only; the authorization tier and workspace
+        // confinement are enforced by authorized_tools at execution.
+        let a = call
+            .args
+            .as_object()
+            .ok_or_else(|| sidecar_error("TOOL_PROTOCOL"))?;
+        if serde_json::to_vec(&call.args)?.len() > MAX_TOOL_BYTES {
+            return Err(sidecar_error("TOOL_LIMIT"));
+        }
+        let text = |key: &str| a.get(key).and_then(Value::as_str);
+        let protocol = || sidecar_error("TOOL_PROTOCOL");
+        match call.name.as_str() {
+            "read" => {
+                if a.keys().any(|k| !["sourceId", "path"].contains(&k.as_str()))
+                    || a.contains_key("sourceId") == a.contains_key("path")
+                {
+                    return Err(protocol());
+                }
+                if let Some(id) = text("sourceId") {
+                    if !crate::types::valid_id(id) {
+                        return Err(protocol());
+                    }
+                }
+                if let Some(path) = text("path") {
+                    if path.is_empty() || path.chars().count() > 128 {
+                        return Err(protocol());
+                    }
+                }
+            }
+            "write" => {
+                if a.keys().any(|k| !["path", "content"].contains(&k.as_str())) {
+                    return Err(protocol());
+                }
+                match (text("path"), text("content")) {
+                    (Some(path), Some(content)) => {
+                        if path.is_empty()
+                            || path.chars().count() > 128
+                            || content.trim().is_empty()
+                            || content.chars().count() > 20000
+                        {
+                            return Err(protocol());
+                        }
+                    }
+                    _ => return Err(protocol()),
+                }
+            }
+            "bash" => {
+                if a.keys().any(|k| !["command", "timeoutMs"].contains(&k.as_str())) {
+                    return Err(protocol());
+                }
+                match text("command") {
+                    Some(command) => {
+                        if command.trim().is_empty() || command.chars().count() > 4000 {
+                            return Err(protocol());
+                        }
+                    }
+                    None => return Err(protocol()),
+                }
+                if let Some(timeout) = a.get("timeoutMs") {
+                    if timeout.as_u64().is_none_or(|ms| !(1000..=30000).contains(&ms)) {
+                        return Err(protocol());
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+        return Ok(());
+    }
     let (fields, required): (&[(&str, usize)], &[&str]) = match call.name.as_str() {
         "record_question" => (&[("question", 8000), ("selection", 12000)], &["question"]),
         "create_error" => (
@@ -1259,7 +1351,12 @@ fn validate_tool_call(call: &ToolCall) -> Result<()> {
         ),
         "create_note" => (&[("content", 12000), ("selection", 12000)], &["content"]),
         "create_todo" => (
-            &[("title", 500), ("dueAt", 64), ("relativeMinutes", 0)],
+            &[
+                ("title", 500),
+                ("dueAt", 64),
+                ("relativeMinutes", 0),
+                ("reminderEnabled", 0),
+            ],
             &["title"],
         ),
         _ => return Err(sidecar_error("TOOLS_DISABLED")),
@@ -1282,6 +1379,10 @@ fn validate_tool_call(call: &ToolCall) -> Result<()> {
             .ok_or_else(|| sidecar_error("TOOL_PROTOCOL"))?;
         if key == "relativeMinutes" {
             if value.as_u64().is_none_or(|n| !(1..=525600).contains(&n)) {
+                return Err(sidecar_error("TOOL_PROTOCOL"));
+            }
+        } else if key == "reminderEnabled" {
+            if value.as_bool().is_none() {
                 return Err(sidecar_error("TOOL_PROTOCOL"));
             }
         } else if key == "tags" {
@@ -1318,6 +1419,10 @@ fn validate_tool_call(call: &ToolCall) -> Result<()> {
         || (call.name == "query_related_knowledge"
             && !args.contains_key("query")
             && !args.contains_key("knowledgeId"))
+        || (call.name == "create_todo"
+            && args.get("reminderEnabled").and_then(Value::as_bool) == Some(true)
+            && !args.contains_key("dueAt")
+            && !args.contains_key("relativeMinutes"))
     {
         return Err(sidecar_error("TOOL_PROTOCOL"));
     }
@@ -1981,6 +2086,205 @@ mod tests {
         assert_eq!(error.code, "MODEL_INCOMPLETE");
     }
     #[tokio::test]
+    async fn authorized_write_tool_round_trips_through_the_real_sidecar_with_tier_notice() {
+        use crate::{
+            app::{Engine, UiPreferences},
+            authorized_tools,
+            learning_tools::ToolScope,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let library = directory.path().join("library");
+        let runtime = directory.path().join("runtime");
+        let engine = Engine::new(library.clone(), runtime.clone()).unwrap();
+        engine
+            .save_ui_preferences(UiPreferences {
+                tool_authorization_tier: "write".into(),
+                ..UiPreferences::default()
+            })
+            .unwrap();
+        let scope = {
+            let mut core = engine.lock().unwrap();
+            let section = core
+                .create_section("受控工具fixture", "Workspace tool fixture body.", vec![], vec![])
+                .unwrap();
+            let (session, context) = core.start_session(&section.id, false).unwrap();
+            ToolScope {
+                session_id: session.id,
+                section_id: section.id,
+                run_id: "run_authorized_wire".into(),
+                allowed_ids: context.manifest.into_iter().map(|item| item.id).collect(),
+            }
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server_session = scope.session_id.clone();
+        let workspace_file = runtime
+            .join("workspaces")
+            .join(&scope.session_id)
+            .join("files/summary.md");
+        let server_workspace_file = workspace_file.clone();
+        let server = thread::spawn(move || {
+            for turn in 0..2 {
+                let deadline = std::time::Instant::now() + Duration::from_secs(8);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(std::time::Instant::now() < deadline);
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => panic!("fixture accept failed"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                while !request.windows(4).any(|v| v == b"\r\n\r\n") {
+                    let count = socket.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let head = request.windows(4).position(|v| v == b"\r\n\r\n").unwrap() + 4;
+                let length = String::from_utf8_lossy(&request[..head])
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':')
+                            .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap();
+                while request.len() < head + length {
+                    let count = socket.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let payload: Value = serde_json::from_slice(&request[head..head + length]).unwrap();
+                let names: Vec<_> = payload["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|tool| tool["function"]["name"].as_str().unwrap())
+                    .collect();
+                // The write tier registers read/write on top of the question set.
+                assert_eq!(
+                    names,
+                    [
+                        "query_related_knowledge",
+                        "record_question",
+                        "create_note",
+                        "create_todo",
+                        "generate_exercises",
+                        "read",
+                        "write"
+                    ]
+                );
+                assert!(payload["messages"][0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("工具授权档位"));
+                let body = if turn == 0 {
+                    let first = json!({"choices":[{"index":0,"delta":{"role":"assistant","content":"我把结论写入工作区。"},"finish_reason":null}]});
+                    let call = json!({"choices":[{"index":0,"delta":{"tool_calls":[
+                        {"index":0,"id":"authorized-write-1","type":"function","function":{"name":"write","arguments":serde_json::to_string(&json!({"path":"summary.md","content":"fixture scratch conclusion"})).unwrap()}}
+                    ]},"finish_reason":null}]});
+                    format!("data: {first}\n\ndata: {call}\n\ndata: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n")
+                } else {
+                    let tool_messages: Vec<_> = payload["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|message| message["role"] == "tool")
+                        .collect();
+                    assert_eq!(tool_messages.len(), 1);
+                    let receipt: Value =
+                        serde_json::from_str(tool_messages[0]["content"].as_str().unwrap()).unwrap();
+                    assert_eq!(receipt["ok"], true);
+                    assert_eq!(receipt["result"]["persisted"], true);
+                    assert_eq!(receipt["result"]["sessionId"], server_session);
+                    assert_eq!(receipt["result"]["path"], "summary.md");
+                    assert_eq!(
+                        std::fs::read_to_string(&server_workspace_file).unwrap(),
+                        "fixture scratch conclusion"
+                    );
+                    let response = json!({"choices":[{"index":0,"delta":{"content":"已写入会话工作区。"},"finish_reason":"stop"}]});
+                    format!("data: {response}\n\ndata: [DONE]\n\n")
+                };
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                socket.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        let handler_engine = engine.clone();
+        let handler_scope = scope.clone();
+        let handler: ToolHandler = Arc::new(move |call| {
+            let engine = handler_engine.clone();
+            let scope = handler_scope.clone();
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || {
+                    // Production dispatch: workspace tools run in their own module.
+                    if matches!(call.name.as_str(), "read" | "write" | "bash") {
+                        authorized_tools::execute(&engine, &scope, &call.id, &call.name, call.args)
+                    } else {
+                        crate::learning_tools::execute(
+                            &engine, &scope, &call.id, &call.name, call.args,
+                        )
+                    }
+                })
+                .await
+                .map_err(|_| CoreError::new("IO", "本地fixture工具执行失败。"))?
+            })
+        });
+        let credentials = ModelCredentials::new(
+            settings(&format!("http://{address}/v1")),
+            "fixture-secret".into(),
+        )
+        .unwrap();
+        let mut partial = String::new();
+        let allowed: Vec<String> = [
+            "query_related_knowledge",
+            "record_question",
+            "create_note",
+            "create_todo",
+            "generate_exercises",
+            "read",
+            "write",
+        ]
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+        let output = generate_scoped(
+            credentials,
+            vec![json!({"role":"user","content":"请把结论写入会话工作区文件。"})],
+            Arc::new(AtomicBool::new(false)),
+            |delta| partial.push_str(delta),
+            Some(handler.clone()),
+            ToolPolicy {
+                mode: "question".into(),
+                allowed_tools: allowed.clone(),
+                max_calls: 4,
+                authorization: "write".into(),
+            },
+            crate::learning_skills::capture("question", &allowed).unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(output, "已写入会话工作区。");
+        assert!(partial.starts_with("我把结论写入工作区。"));
+        assert_eq!(
+            std::fs::read_to_string(&workspace_file).unwrap(),
+            "fixture scratch conclusion"
+        );
+        // The library course itself stays untouched by workspace writes.
+        let mut core = engine.lock().unwrap();
+        assert_eq!(
+            core.content.read(&scope.section_id).unwrap().body,
+            "Workspace tool fixture body."
+        );
+    }
+    #[tokio::test]
     async fn pi_tool_round_trip_persists_real_markdown_and_reopens_without_a_model() {
         use crate::{
             app::Engine,
@@ -2183,7 +2487,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             |delta| partial.push_str(delta),
             Some(handler.clone()),
-            ToolPolicy { mode:"explain".into(), allowed_tools: ALL_TOOLS.iter().map(|name| (*name).into()).collect(), max_calls:6 },
+            ToolPolicy { mode:"explain".into(), allowed_tools: ALL_TOOLS.iter().map(|name| (*name).into()).collect(), max_calls:6, authorization:"off".into() },
             crate::learning_skills::capture("explain", &ALL_TOOLS.iter().map(|name| (*name).into()).collect::<Vec<String>>()).unwrap(),
             None,
         )
@@ -2294,6 +2598,7 @@ mod tests {
                 mode: mode.into(),
                 allowed_tools: allowed.into_iter().map(str::to_owned).collect(),
                 max_calls: maximum,
+                authorization: "off".into(),
             };
             assert!(validate_tool_policy(&policy, true).is_ok());
             policy.max_calls += 1;
@@ -2303,11 +2608,108 @@ mod tests {
             &ToolPolicy {
                 mode: "practice".into(),
                 allowed_tools: vec!["create_review_card".into()],
-                max_calls: 2
+                max_calls: 2,
+                authorization: "off".into()
             },
             true
         )
         .is_err());
+    }
+    #[test]
+    fn authorization_tiers_extend_only_question_and_explain_policies() {
+        let policy = |mode: &str, tools: &[&str], authorization: &str| ToolPolicy {
+            mode: mode.into(),
+            allowed_tools: tools.iter().map(|name| (*name).to_owned()).collect(),
+            max_calls: 4,
+            authorization: authorization.into(),
+        };
+        assert!(validate_tool_policy(&policy("question", &["read"], "read"), true).is_ok());
+        assert!(validate_tool_policy(&policy("explain", &["read", "write", "bash"], "bash"), true).is_ok());
+        assert!(validate_tool_policy(&policy("explain", &["read", "write"], "write"), true).is_ok());
+        // A tier never unlocks stronger tools than selected.
+        assert!(validate_tool_policy(&policy("question", &["write"], "read"), true).is_err());
+        assert!(validate_tool_policy(&policy("explain", &["bash"], "write"), true).is_err());
+        assert!(validate_tool_policy(&policy("question", &["read"], "off"), true).is_err());
+        // Other modes gain nothing from any tier.
+        for mode in ["practice", "review", "feedback", "grading", "legacy"] {
+            assert!(validate_tool_policy(&policy(mode, &["read"], "bash"), true).is_err());
+        }
+        // Unknown tiers are rejected outright.
+        assert!(validate_tool_policy(&policy("question", &[], "shell"), true).is_err());
+    }
+    #[test]
+    fn authorized_tool_calls_pass_shape_validation_with_tier_enforced_elsewhere() {
+        for (name, args) in [
+            ("read", json!({"sourceId":"knowledge_1"})),
+            ("read", json!({"path":"notes/summary.md"})),
+            ("write", json!({"path":"notes/summary.md","content":"hello"})),
+            ("bash", json!({"command":"printf hi"})),
+            ("bash", json!({"command":"printf hi","timeoutMs":1500})),
+        ] {
+            assert!(
+                validate_tool_call(&ToolCall {
+                    id: "call-1".into(),
+                    name: name.into(),
+                    args
+                })
+                .is_ok(),
+                "{name} shape must pass protocol validation"
+            );
+        }
+        for (name, args) in [
+            ("read", json!({})),
+            ("read", json!({"sourceId":"a","path":"b"})),
+            ("read", json!({"sourceId":"../../etc/passwd"})),
+            ("read", json!({"sourceId":"ok","extra":1})),
+            ("write", json!({"path":"a.md"})),
+            ("write", json!({"content":"x"})),
+            ("write", json!({"path":"","content":"x"})),
+            ("bash", json!({"command":"   "})),
+            ("bash", json!({"command":"echo","timeoutMs":100})),
+            ("bash", json!({"command":"echo","timeoutMs":99000})),
+            ("bash", json!({"command":"echo","extra":1})),
+        ] {
+            assert!(
+                validate_tool_call(&ToolCall {
+                    id: "call-1".into(),
+                    name: name.into(),
+                    args
+                })
+                .is_err(),
+                "{name} invalid shape must be rejected"
+            );
+        }
+    }
+    #[test]
+    fn create_todo_reminder_flag_needs_boolean_and_a_time() {
+        for args in [
+            json!({"title":"T","reminderEnabled":false}),
+            json!({"title":"T","dueAt":"2026-10-18T10:00:00+08:00","reminderEnabled":true}),
+            json!({"title":"T","relativeMinutes":5,"reminderEnabled":true}),
+        ] {
+            assert!(
+                validate_tool_call(&ToolCall {
+                    id: "call-1".into(),
+                    name: "create_todo".into(),
+                    args
+                })
+                .is_ok()
+            );
+        }
+        for args in [
+            json!({"title":"T","reminderEnabled":true}),
+            json!({"title":"T","reminderEnabled":"yes"}),
+            json!({"title":"T","reminderEnabled":1}),
+        ] {
+            assert!(
+                validate_tool_call(&ToolCall {
+                    id: "call-1".into(),
+                    name: "create_todo".into(),
+                    args
+                })
+                .is_err()
+            );
+        }
     }
     #[test]
     fn tool_protocol_rejects_scope_fields_unknown_tools_and_large_arguments() {
@@ -2317,7 +2719,7 @@ mod tests {
                 json!({"question":"Q","sessionId":"another"}),
             ),
             ("query_related_knowledge", json!({})),
-            ("bash", json!({"command":"denied"})),
+            ("shell", json!({"command":"denied"})),
         ] {
             assert!(validate_tool_call(&ToolCall {
                 id: "call-1".into(),

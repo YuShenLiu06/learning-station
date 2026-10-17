@@ -18,3 +18,30 @@ test('React tool cards distinguish running, persisted success, handler error and
   const exerciseObject={kind:'exercise',id:'exercise_safe',sessionId:'session_safe',sectionId:'section_safe'};await render({...base,name:'generate_exercises',title:'生成练习',status:'succeeded',persisted:true,object:exerciseObject});assert.equal(document.querySelector('.tool-activity button').textContent,'打开练习');await React.act(async()=>document.querySelector('.tool-activity button').click());assert.deepEqual(opened.at(-1),exerciseObject);
  }finally{await React.act(async()=>root.unmount());dom.window.close();await unlink(filename).catch(()=>{});}
 });
+
+test('authorized workspace tool cards render fixed titles without faking unconfirmed saves',async()=>{
+ const dom=new JSDOM('<div id="root"></div>',{url:'http://127.0.0.1/'});Object.assign(globalThis,{window:dom.window,document:dom.window.document,IS_REACT_ACT_ENVIRONMENT:true});
+ const filename=new URL(`./.tool-cards-auth-${process.pid}.mjs`,import.meta.url);await build({entryPoints:['src/ToolActivityCards.tsx'],outfile:filename.pathname,bundle:true,packages:'external',platform:'node',format:'esm',jsx:'automatic'});
+ const React=await import('react');const {createRoot}=await import('react-dom/client');const {ToolActivityCards}=await import(filename.href);const {readToolActivity,toolState}=await import(await build({entryPoints:['src/toolActivities.ts'],outfile:new URL(`./.tool-activities-auth-${process.pid}.mjs`,import.meta.url).pathname,bundle:true,packages:'external',platform:'node',format:'esm'}).then(async()=>new URL(`./.tool-activities-auth-${process.pid}.mjs`,import.meta.url).href));
+ const root=createRoot(document.getElementById('root'));const opened=[];
+ const base={id:'tool_read_1',toolCallId:'call_read_1',runId:'run_auth',sessionId:'session_auth',startedAt:'2026-10-17T00:00:00Z',updatedAt:'2026-10-17T00:00:01Z'};
+ const read=readToolActivity({...base,name:'read',status:'succeeded',persisted:false});
+ assert.equal(read.title,'受控读取');
+ assert.equal(read.summary,'受控读取已完成，未写入内容。');
+ assert.equal(toolState(read,'run_auth'),'succeeded');
+ const written=readToolActivity({...base,id:'tool_write_1',toolCallId:'call_write_1',name:'write',status:'succeeded',persisted:true});
+ assert.equal(written.title,'受控写入');
+ assert.equal(written.summary,'已收到本机保存回执。');
+ assert.equal(toolState(written,'run_auth'),'succeeded');
+ const unfinished=readToolActivity({...base,id:'tool_write_2',toolCallId:'call_write_2',name:'write',status:'succeeded',persisted:false});
+ assert.equal(toolState(unfinished,'run_auth'),'unconfirmed');
+ const unknown=readToolActivity({...base,name:'shell'});
+ assert.equal(unknown,null,'unregistered tool names are dropped');
+ try{
+  await React.act(async()=>root.render(React.createElement(ToolActivityCards,{items:[read,written],liveRunId:'run_auth',onOpen:value=>opened.push(value)})));
+  assert.ok(document.querySelector('[aria-label="工具调用"] [aria-label="受控读取 · 成功"]'));
+  assert.ok(document.querySelector('[aria-label="受控写入 · 成功"]'));
+  assert.match(document.body.textContent,/受控读取已完成/);
+  assert.equal(document.querySelectorAll('.tool-activity button').length,0,'workspace tools open no library object');
+ }finally{await React.act(async()=>root.unmount());dom.window.close();await unlink(filename).catch(()=>{});await unlink(new URL(`./.tool-activities-auth-${process.pid}.mjs`,import.meta.url).pathname).catch(()=>{});}
+});

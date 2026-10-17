@@ -1,5 +1,5 @@
 import type { ToolActivity } from './types';
-const titles: Record<string, string> = { query_related_knowledge: '查找相关学习记录', record_question: '记录困惑', create_error: '记录错题', create_review_card: '创建复习卡', create_note: '保存学习笔记', create_todo: '创建待办', generate_exercises: '生成练习' };
+const titles: Record<string, string> = { query_related_knowledge: '查找相关学习记录', record_question: '记录困惑', create_error: '记录错题', create_review_card: '创建复习卡', create_note: '保存学习笔记', create_todo: '创建待办', generate_exercises: '生成练习', read: '受控读取', write: '受控写入', bash: '受控命令' };
 const safeId = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/u.test(value);
 export function readToolActivity(raw: unknown): ToolActivity | null {
   if (!raw || typeof raw !== 'object') return null;
@@ -10,7 +10,7 @@ export function readToolActivity(raw: unknown): ToolActivity | null {
   if (target && ['todo', 'learning-entry', 'review-card', 'exercise'].includes(String(target.kind)) && safeId(target.id) && safeId(target.sessionId) && (target.sectionId === '' || safeId(target.sectionId))) result.object = { kind: target.kind as NonNullable<ToolActivity['object']>['kind'], id: target.id, sessionId: target.sessionId, sectionId: target.sectionId };
   if (typeof value.errorCode === 'string' && /^[A-Z_]{1,40}$/u.test(value.errorCode)) result.errorCode = value.errorCode;
   // Only fixed UI summaries are rendered; model arguments, paths and raw output are never copied.
-  result.summary = result.status === 'failed' ? '工具未完成，未确认保存成功。' : result.name === 'query_related_knowledge' ? '相关学习记录查询已完成，未写入新内容。' : result.persisted && result.object ? '已收到本机保存回执。' : '等待本机工具结果。';
+  result.summary = result.status === 'failed' ? '工具未完成，未确认保存成功。' : result.name === 'query_related_knowledge' ? '相关学习记录查询已完成，未写入新内容。' : result.name === 'read' ? '受控读取已完成，未写入内容。' : result.persisted && (result.object || ['write', 'bash'].includes(result.name)) ? '已收到本机保存回执。' : '等待本机工具结果。';
   return result;
 }
 export function foldToolActivities(values: unknown[], sessionId: string) {
@@ -25,7 +25,7 @@ export function foldToolActivities(values: unknown[], sessionId: string) {
 }
 export function toolState(item: ToolActivity, liveRunId?: string): 'running' | 'succeeded' | 'failed' | 'unconfirmed' {
   if (item.status === 'running') return item.runId === liveRunId ? 'running' : 'unconfirmed';
-  if (item.status === 'succeeded' && item.name !== 'query_related_knowledge' && (!item.persisted || !item.object)) return 'unconfirmed';
+  if (item.status === 'succeeded' && item.name !== 'query_related_knowledge' && item.name !== 'read' && (!item.persisted || (!item.object && !['write', 'bash'].includes(item.name)))) return 'unconfirmed';
   return item.status;
 }
 export function historicalTools(entries: { kind: string; data?: Record<string, unknown> }[], sessionId: string) {

@@ -63,6 +63,9 @@ struct CreateTodo {
     due_at: Option<String>,
     #[serde(default)]
     relative_minutes: Option<u32>,
+    /// Optional explicit reminder opt-in; absence keeps reminders off.
+    #[serde(default)]
+    reminder_enabled: Option<bool>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -192,6 +195,15 @@ pub fn execute(
             {
                 return Err(invalid());
             }
+            if value.reminder_enabled == Some(true)
+                && value.due_at.is_none()
+                && value.relative_minutes.is_none()
+            {
+                return Err(CoreError::new(
+                    "INVALID_TOOL_INPUT",
+                    "启用提醒需要同时提供提醒时间。",
+                ));
+            }
             Operation::Todo(value)
         }
         "query_related_knowledge" => {
@@ -231,7 +243,7 @@ pub fn execute(
         None
     };
     let request_clock = if let Operation::Todo(ref value) = operation {
-        if value.relative_minutes.is_some() {
+        if value.relative_minutes.is_some() || value.reminder_enabled == Some(true) {
             let run = crate::generation::get(engine, &scope.run_id)?;
             if run.session_id != scope.session_id {
                 return Err(out_of_scope());
@@ -362,10 +374,30 @@ pub fn execute(
             value.due_at.as_deref(),
             value.relative_minutes,
         )?;
+        let reminder_enabled = value.reminder_enabled.unwrap_or(false);
+        if reminder_enabled {
+            // Validate the reminder time against the durable run clock in the
+            // user's timezone context; a past or unparsable time is rejected.
+            let clock = request_clock.as_ref().ok_or_else(invalid)?;
+            let due_value = chrono::DateTime::parse_from_rfc3339(
+                due.as_deref()
+                    .ok_or_else(|| CoreError::new("INVALID_TOOL_INPUT", "启用提醒需要提醒时间。"))?,
+            )
+            .map_err(|_| invalid())?;
+            let reference =
+                chrono::DateTime::parse_from_rfc3339(clock.reference_time.as_str())
+                    .map_err(|_| invalid())?;
+            if due_value <= reference {
+                return Err(CoreError::new(
+                    "INVALID_TOOL_INPUT",
+                    "提醒时间需要晚于当前时间。",
+                ));
+            }
+        }
         let todo = engine.reminders.create_todo(
             &value.title,
             due.as_deref(),
-            false,
+            reminder_enabled,
             Some(&session.id),
             &request_id,
         )?;
@@ -914,7 +946,6 @@ mod tests {
         let (_directory, engine, scope, _) = fixture();
         for args in [
             json!({"title":"T","reminderEnabled":true}),
-            json!({"title":"T","reminderEnabled":false}),
             json!({"title":"T","sessionId":"another_session"}),
             json!({"title":"T","sectionId":"another_section"}),
             json!({"title":"T","path":"../../outside.md"}),
@@ -930,6 +961,16 @@ mod tests {
                 "INVALID_TOOL_INPUT"
             );
         }
+        // An explicit opt-out is a legitimate legacy-compatible call.
+        let opted_out = execute(
+            &engine,
+            &scope,
+            "explicit-off-todo",
+            "create_todo",
+            json!({"title":"T","reminderEnabled":false}),
+        )
+        .unwrap();
+        assert_eq!(opted_out["todo"]["reminderEnabled"], false);
         let mut foreign = scope.clone();
         foreign.section_id = "unrelated".into();
         assert_eq!(
@@ -954,7 +995,9 @@ mod tests {
             json!({"title":"T"})
         )
         .is_err());
-        assert!(engine.reminders.list_todos().unwrap().is_empty());
+        let todos = engine.reminders.list_todos().unwrap();
+        assert_eq!(todos.len(), 1);
+        assert!(!todos[0].reminder_enabled);
     }
 
     #[test]
@@ -1838,5 +1881,84 @@ mod time_todo_tests {
         )
         .is_err());
         assert_eq!(e.reminders.list_todos().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod todo_reminder_tool_tests {
+    use super::*;
+    fn reminder_fixture() -> (tempfile::TempDir, std::sync::Arc<Engine>, ToolScope) {
+        let d = tempfile::tempdir().unwrap();
+        let e = Engine::new(d.path().join("library"), d.path().join("state")).unwrap();
+        let session = {
+            let mut c = e.lock().unwrap();
+            let doc = c.create_section("fixture", "reminders", vec![], vec![]).unwrap();
+            c.start_session(&doc.id, false).unwrap().0
+        };
+        let run: crate::generation::Run = serde_json::from_value(json!({
+            "id":"run_reminder_tool","sessionId":session.id,"mode":"question","status":"succeeded",
+            "content":"","error":null,"createdAt":"2026-10-16T15:55:00Z","updatedAt":"2026-10-16T15:55:00Z",
+            "requestDigest":"fixture","contextManifest":[],"referenceTime":"2026-10-16T15:55:00Z","timeZone":"Asia/Shanghai"
+        })).unwrap();
+        e.runs.lock().unwrap().insert(run.id.clone(), crate::generation::ManagedRun{
+            run,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        let scope = ToolScope {
+            session_id: session.id,
+            section_id: session.section_id,
+            run_id: "run_reminder_tool".into(),
+            allowed_ids: vec![],
+        };
+        (d, e, scope)
+    }
+
+    #[test]
+    fn todo_reminder_opt_in_schedules_once_and_stays_honest_without_any_delivery() {
+        let (_d, e, scope) = reminder_fixture();
+        // Legacy calls without the flag keep reminders off.
+        let plain = execute(&e, &scope, "legacy-call", "create_todo", json!({"title":"复习"})).unwrap();
+        assert_eq!(plain["todo"]["reminderEnabled"], false);
+        // Explicit opt-in with a relative time uses the durable run clock.
+        let args = json!({"title":"带提醒复习","relativeMinutes":10,"reminderEnabled":true});
+        let timed = execute(&e, &scope, "timed-call", "create_todo", args.clone()).unwrap();
+        assert_eq!(timed["todo"]["reminderEnabled"], true);
+        assert_eq!(timed["dueAt"], "2026-10-16T16:05:00.000000000Z");
+        assert_eq!(timed["referenceTime"], "2026-10-16T15:55:00Z");
+        // Idempotent replay returns the same receipt without a second todo.
+        let replay = execute(&e, &scope, "timed-call", "create_todo", args).unwrap();
+        assert_eq!(replay["todoId"], timed["todoId"]);
+        // The due time has passed the real clock, so scheduling fires exactly once.
+        assert_eq!(e.reminders.tick().unwrap().len(), 1);
+        assert_eq!(e.reminders.tick().unwrap().len(), 0);
+        let notices = e.reminders.list_notifications().unwrap();
+        assert_eq!(notices.len(), 1);
+        // Honest state: scheduled locally as pending, never claimed as sent.
+        assert_eq!(notices[0].delivery_status, "pending");
+        // A failed delivery stays auditable and recoverable; nothing is re-sent here.
+        let pending = e.reminders.pending_deliveries("2000-01-01T00:00:00Z").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(e.reminders.reserve_delivery(&pending[0].id).unwrap());
+        e.reminders.finish_delivery(&pending[0].id, &crate::feishu::DeliveryOutcome {
+            status: crate::feishu::DeliveryState::Failed,
+            message_id: None,
+            reason: "synthetic failure".into(),
+        }).unwrap();
+        let after = e.reminders.list_notifications().unwrap();
+        assert_eq!(after[0].delivery_status, "failed");
+        // Enabling without a time, or with a time already past, is rejected.
+        assert_eq!(
+            execute(&e, &scope, "no-time", "create_todo", json!({"title":"T","reminderEnabled":true})).unwrap_err().code,
+            "INVALID_TOOL_INPUT"
+        );
+        assert_eq!(
+            execute(&e, &scope, "past-time", "create_todo", json!({"title":"T","dueAt":"2026-10-16T15:00:00Z","reminderEnabled":true})).unwrap_err().code,
+            "INVALID_TOOL_INPUT"
+        );
+        // Old behavior is unchanged: a past due time without the flag stays allowed and off.
+        let compat = execute(&e, &scope, "compat-call", "create_todo", json!({"title":"旧调用","dueAt":"2000-01-01T00:00:00Z"})).unwrap();
+        assert_eq!(compat["todo"]["reminderEnabled"], false);
+        assert_eq!(e.reminders.tick().unwrap().len(), 0);
+        assert_eq!(e.reminders.list_todos().unwrap().len(), 3);
     }
 }
