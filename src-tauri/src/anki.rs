@@ -106,18 +106,28 @@ impl Anki {
             .filter_map(|(n, id)| id.as_u64().map(|i| json!({"id":i,"name":n})))
             .collect::<Vec<_>>()))
     }
+    fn offline(e: CoreError) -> Value {
+        // A connection probe carries no write, so the "request not delivered"
+        // wording must not leak into the offline panel.
+        let message = if e.code == "ANKI_UNREACHED" {
+            "无法连接本机Anki，请打开已安装的Anki并确认AnkiConnect运行。"
+        } else {
+            e.message.as_str()
+        };
+        json!({"connected":false,"code":e.code,"message":message,"decks":[]})
+    }
     pub async fn check(&self) -> Value {
         match self.call("version", json!({})).await {
             Ok(version) if version.as_u64().is_some_and(|v| v >= 6) => match self.decks().await {
                 Ok(decks) => {
                     json!({"connected":true,"code":"CONNECTED","message":"已连接本机AnkiConnect。","version":version,"decks":decks})
                 }
-                Err(e) => json!({"connected":false,"code":e.code,"message":e.message,"decks":[]}),
+                Err(e) => Self::offline(e),
             },
             Ok(_) => {
                 json!({"connected":false,"code":"ANKI_VERSION","message":"AnkiConnect版本不兼容。","decks":[]})
             }
-            Err(e) => json!({"connected":false,"code":e.code,"message":e.message,"decks":[]}),
+            Err(e) => Self::offline(e),
         }
     }
     async fn deck(&self, name: &str) -> Result<()> {
@@ -410,12 +420,23 @@ impl Anki {
                 "写入等待超时，部分结果可能已保存；请先核对，系统不自动重发。",
             )),
         };
-        if let Err(e) = attempt {
+        if let Err(mut e) = attempt {
             let unsent = e.code == "ANKI_UNREACHED";
-            op["error"] = json!(e);
             if unsent {
                 op["status"] = json!("failed");
+                if let Some(written) = op["noteIds"]
+                    .as_array()
+                    .filter(|ids| !ids.is_empty())
+                {
+                    // Earlier notes were really written; only the remaining
+                    // requests are definitely undelivered.
+                    e.message = format!(
+                        "与Anki的连接中断，后续请求未送达；已确认写入 {} 条，本次操作未完成。",
+                        written.len()
+                    );
+                }
             }
+            op["error"] = json!(e);
         } else {
             op["status"] = json!("succeeded");
         }
@@ -711,6 +732,55 @@ mod tests {
             op
         );
         assert_eq!(h.join().unwrap()["action"], "deckNamesAndIds");
+    }
+    #[tokio::test]
+    async fn refused_add_after_partial_writes_reports_only_the_rest_unsent() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let h = std::thread::spawn(move || {
+            let script = vec![
+                json!({"Default":159}),
+                json!([MODEL]),
+                json!(["Front", "Back", "Source"]),
+                json!([]),
+                json!(901),
+            ];
+            let last = script.len() - 1;
+            let mut listener = Some(l);
+            let mut calls = vec![];
+            for (i, reply) in script.into_iter().enumerate() {
+                let (mut s, _) = listener.as_ref().unwrap().accept().unwrap();
+                calls.push(read_call(&mut s));
+                if i == last {
+                    listener = None; // the second item's findNotes is refused
+                }
+                respond(&mut s, reply);
+            }
+            calls
+        });
+        let d = tempfile::tempdir().unwrap();
+        let a = Anki::at(d.path(), &url).unwrap();
+        let items = vec![
+            json!({"id":"card_one","front":"F","back":"B"}),
+            json!({"id":"card_two","front":"G","back":"C"}),
+        ];
+        let op = a.add(&items, "Default", "anki-add-partial-1")
+            .await
+            .unwrap();
+        assert_eq!(op["status"], "failed");
+        assert_eq!(op["error"]["code"], "ANKI_UNREACHED");
+        assert_eq!(op["noteIds"], json!([901]));
+        let message = op["error"]["message"].as_str().unwrap();
+        assert!(message.contains("已确认写入 1 条"), "{message}");
+        assert!(message.contains("未送达"), "{message}");
+        assert!(!message.contains("确定未送达"), "{message}");
+        assert_eq!(
+            a.add(&items, "Default", "anki-add-partial-1")
+                .await
+                .unwrap(),
+            op
+        );
+        assert_eq!(h.join().unwrap().len(), 5);
     }
     #[tokio::test]
     async fn unanswered_send_stage_keeps_delivery_unknown() {
