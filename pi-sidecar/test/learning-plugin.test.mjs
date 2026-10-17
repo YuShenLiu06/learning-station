@@ -250,3 +250,44 @@ test('generate_exercises uses the actual SDK tool loop and structured rubric wit
     assert.equal(result.output,'练习已按真实回执保存。');
   });assert.equal(turns,2);assert.equal(executions,1);
 });
+
+test('exercise schema errors return to the actual SDK loop for bounded correction', {timeout:8000}, async()=>{
+  for (const bad of [{requirements:'BST',exercises:[]},{requirements:'BST',summary:'',exercises:Array(6).fill({})},{requirements:'BST',summary:'',exercises:[{}],extra:'denied'}]) {
+    let turns=0,executions=0;
+    const good={requirements:'BST',summary:'汉'.repeat(4000),exercises:[{question:'BST 查找复杂度？',format:'exact',answers:['树高'],explanation:'',tags:[],sourceIds:[]}]};
+    await withServer((body,res)=>{
+      turns++;
+      if(turns===1)sse(res,{tool:call('bad-exercise','generate_exercises',bad)});
+      else if(turns===2){assert(toolMessages(body).length>0);sse(res,{tool:call('fixed-exercise','generate_exercises',good)});}
+      else sse(res,{text:'已保存',final:true});
+    },async endpoint=>{
+      const input=request(endpoint);input.toolPolicy={mode:'question',...MODE_POLICIES.question};
+      await runLearningAgent(input,()=>{},{requestTool:async tool=>{executions++;assert.deepEqual(tool.args,good);return {result:{persisted:true,documentId:'exdoc_synthetic'}};}});
+    });
+    assert.equal(turns,3);assert.equal(executions,1);
+  }
+});
+test('safe Rust field diagnostics reach model correction without leaking generic errors',async()=>{
+  const plugin=createLearningPlugin({allowedTools:['generate_exercises'],maxCalls:4,requestTool:async()=>({error:{code:'INVALID_MODEL_OUTPUT',message:'练习校验失败：exercises[1].sourceIds 来源编号重复'}})});
+  const args={requirements:'BST',summary:'',exercises:[{question:'x',format:'exact',answers:['x'],explanation:'',tags:[],sourceIds:[]}]};
+  const result=await plugin.tools[0].execute('validation-test',args);
+  assert.equal(result.isError,true);assert.match(result.structuredContent.error.message,/sourceIds/);
+});
+
+test('final practice JSON receives safe validator feedback with two corrections maximum and no writes', {timeout:8000}, async()=>{
+  for (const mode of ['repair','exhaust','source']) {
+    let turns=0,validations=0;
+    await withServer((body,res)=>{
+      turns++;if(turns>1)assert(JSON.stringify(body.messages).includes('exercises[1].question'));
+      sse(res,{text:turns===1?'not-json':'{"exercises":[],"summary":"synthetic"}',final:true});
+    },async endpoint=>{
+      const input=request(endpoint);input.toolPolicy={mode:'practice',...MODE_POLICIES.practice};input.outputValidation=true;
+      const result=await runLearningAgent(input,()=>{},{requestTool:async call=>{
+        assert.equal(call.type,'validate_output');validations++;
+        return {result:{valid:mode==='repair'&&validations===2,recoverable:mode!=='source',message:'exercises[1].question 必须是非空文本，最多20000字符'}};
+      }});
+      assert(result.output);
+    });
+    assert.equal(turns,mode==='repair'?2:mode==='source'?1:3);assert.equal(validations,turns);
+  }
+});

@@ -744,6 +744,7 @@ pub async fn generate_with_tools(
 pub type ToolRecoveryHandler = Arc<
     dyn Fn(String, ToolCall) -> Pin<Box<dyn Future<Output = Result<Value>> + Send>> + Send + Sync,
 >;
+pub type OutputValidator = Arc<dyn Fn(&str) -> Result<()> + Send + Sync>;
 pub type ContextObserver = Arc<dyn Fn(Value) -> Result<()> + Send + Sync>;
 #[derive(Clone)]
 pub struct RequestContext {
@@ -752,6 +753,7 @@ pub struct RequestContext {
     pub native_session: Option<crate::native_session::NativeSession>,
     pub context_observer: Option<ContextObserver>,
     pub tool_recovery: Option<ToolRecoveryHandler>,
+    pub output_validator: Option<OutputValidator>,
 }
 impl RequestContext {
     fn capture() -> Self {
@@ -761,6 +763,7 @@ impl RequestContext {
             native_session: None,
             context_observer: None,
             tool_recovery: None,
+            output_validator: None,
         }
     }
 }
@@ -840,6 +843,7 @@ async fn run_sidecar(
         time_context: &'a crate::time_context::TimeContext,
         exploration_context: Option<&'a crate::exploration::ExplorationContext>,
         native_session: Option<&'a crate::native_session::NativeSession>,
+        output_validation: bool,
     }
     let mut input = serde_json::to_vec(&Input {
         protocol: 1,
@@ -855,6 +859,7 @@ async fn run_sidecar(
         time_context: &request_context.time,
         exploration_context: request_context.exploration.as_ref(),
         native_session: request_context.native_session.as_ref(),
+        output_validation: request_context.output_validator.is_some(),
     })
     .map_err(|_| sidecar_error("INVALID_INPUT"))?;
     if input.len() > 4 * MAX_OUTPUT - 1 {
@@ -914,6 +919,7 @@ async fn run_sidecar(
         let mut final_content = None;
         let mut had_response = false;
         let mut tool_attempts = 0usize;
+        let mut output_validations = 0usize;
         let mut tool_cache: std::collections::BTreeMap<String, (String, Value)> =
             std::collections::BTreeMap::new();
         loop {
@@ -1038,6 +1044,19 @@ async fn run_sidecar(
                         await_stage(async{stdin.write_all(&bytes).await.map_err(|_|runtime_error())},&cancel,deadline).await?;
                         had_response=true;
                     }
+                    Some("validate_output") if ready && !settled && policy.mode == "practice" => {
+                        output_validations += 1;
+                        if output_validations > 3 { return Err(sidecar_error("TOOL_LIMIT")); }
+                        let validator = request_context.output_validator.as_ref().ok_or_else(|| sidecar_error("TOOLS_DISABLED"))?;
+                        let id = event["id"].as_str().filter(|s| crate::types::valid_id(s)).ok_or_else(|| sidecar_error("TOOL_PROTOCOL"))?;
+                        let content = event["content"].as_str().filter(|s| s.len() <= 256*1024).ok_or_else(|| sidecar_error("OUTPUT_LIMIT"))?;
+                        let result = match validator(content) {
+                            Ok(()) => json!({"valid":true}),
+                            Err(error) => json!({"valid":false,"recoverable":error.details.as_ref().is_some_and(|d| d["recoverable"]==true),"message":error.message}),
+                        };
+                        let mut bytes = serde_json::to_vec(&json!({"type":"tool_result","id":id,"result":result}))?; bytes.push(b'\n');
+                        await_stage(async {stdin.write_all(&bytes).await.map_err(|_|runtime_error())}, &cancel, deadline).await?;
+                    }
                     Some("context_manifest") if ready && !settled => {
                         let manifest=event.get("manifest").cloned().ok_or_else(||sidecar_error("MODEL_RESPONSE"))?;
                         if manifest["version"]!=1 || manifest["entries"].as_array().is_none_or(|a|a.len()>256) {return Err(sidecar_error("MODEL_RESPONSE"));}
@@ -1096,7 +1115,14 @@ async fn run_sidecar(
                                 {
                                     return Err(sidecar_error(&error.code))
                                 }
-                                Err(error) => tool_failure(&call.id, &error.code),
+                                Err(error) => {
+                                    let mut reply = tool_failure(&call.id, &error.code);
+                                    // Only validator-produced diagnostics: never echo model values or arbitrary IO errors.
+                                    if error.code == "INVALID_MODEL_OUTPUT" && error.details.as_ref().is_some_and(|d| d["field"].is_string()) {
+                                        reply["error"]["message"] = json!(error.message);
+                                    }
+                                    reply
+                                },
                             };
                             if serde_json::to_vec(&reply)
                                 .map_err(|_| sidecar_error("TOOL_PROTOCOL"))?
@@ -1204,7 +1230,7 @@ fn validate_tool_call(call: &ToolCall) -> Result<()> {
                 .is_none_or(|s| s.trim().is_empty() || s.chars().count() > 8000)
             || a.get("summary")
                 .and_then(Value::as_str)
-                .is_none_or(|s| s.len() > 10000)
+                .is_none_or(|s| s.chars().count() > 10000)
             || a.get("exercises")
                 .and_then(Value::as_array)
                 .is_none_or(|a| a.is_empty() || a.len() > 5)
@@ -1575,6 +1601,23 @@ mod tests {
         value.base_url = endpoint.into();
         value.active_profile = profile_id(endpoint).unwrap();
         value
+    }
+    #[test]
+    fn exercise_tool_summary_counts_unicode_characters_not_bytes() {
+        for summary in ["汉".repeat(4000), "🧠".repeat(6000)] {
+            let call = ToolCall {
+                id: "unicode-call".into(),
+                name: "generate_exercises".into(),
+                args: json!({"requirements":"BST", "summary":summary,"exercises":[{}]}),
+            };
+            assert!(validate_tool_call(&call).is_ok());
+        }
+        let call = ToolCall {
+            id: "unicode-call".into(),
+            name: "generate_exercises".into(),
+            args: json!({"requirements":"BST", "summary":"a".repeat(10001),"exercises":[{}]}),
+        };
+        assert!(validate_tool_call(&call).is_err());
     }
     #[test]
     fn defaults_are_unconfigured_custom_without_guessing_endpoint_or_model() {

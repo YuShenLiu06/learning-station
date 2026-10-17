@@ -49,8 +49,8 @@ const string = (maxLength) => Type.String({ minLength: 1, maxLength });
 const optionalString = (maxLength) => Type.Optional(string(maxLength));
 const definitions = [
   { name: 'generate_exercises', label: '生成练习',
-    description: '依据当前资料和用户自然语言要求生成结构化练习并经Rust校验保存。不要限定学科；开放题self需固定合理量表rubric；参考答案提交前不显示。只有persisted:true和documentId才可称保存，不再调用嵌套模型。',
-    parameters: Type.Object({ requirements: string(8000), summary: Type.String({maxLength:10000}), exercises: Type.Array(Type.Object({ question:string(20000), format:Type.Union([Type.Literal('exact'),Type.Literal('self')]), answers:Type.Array(string(10000),{minItems:1,maxItems:10}), explanation:Type.String({maxLength:20000}), tags:Type.Array(string(64),{maxItems:12}), sourceIds:Type.Array(string(128),{maxItems:32}), rubric:Type.Optional(Type.Object({criteria:Type.Array(Type.Object({id:string(64),label:string(200),description:string(2000),maxPoints:Type.Integer({minimum:1,maximum:100})},{additionalProperties:false}),{minItems:1,maxItems:8})},{additionalProperties:false})) },{additionalProperties:false}),{minItems:1,maxItems:5}) },{additionalProperties:false}) },
+    description: '依据当前资料和用户自然语言要求生成结构化练习并经Rust校验保存。解析explanation可省略，省略时显示尚未提供解析，不得将rubric充作解析；文字上限按Unicode字符计，整次工具参数最多32KiB；sourceIds仅可来自本轮manifest且不得重复。不要限定学科；开放题self需固定合理量表rubric；参考答案提交前不显示。只有persisted:true和documentId才可称保存，不再调用嵌套模型。',
+    parameters: Type.Object({ requirements: string(8000), summary: Type.String({maxLength:10000}), exercises: Type.Array(Type.Object({ question:string(20000), format:Type.Union([Type.Literal('exact'),Type.Literal('self')]), answers:Type.Array(string(10000),{minItems:1,maxItems:10}), explanation:Type.Optional(Type.String({maxLength:20000})), tags:Type.Array(string(64),{maxItems:12}), sourceIds:Type.Array(string(128),{maxItems:32}), rubric:Type.Optional(Type.Object({criteria:Type.Array(Type.Object({id:string(64),label:string(200),description:string(2000),maxPoints:Type.Integer({minimum:1,maximum:100})},{additionalProperties:false}),{minItems:1,maxItems:8})},{additionalProperties:false})) },{additionalProperties:false}),{minItems:1,maxItems:5}) },{additionalProperties:false}) },
   { name: 'record_question', label: '记录疑问',
     description: '记录用户明确提出的学习疑问。只使用当前会话，成功必须以Rust返回的persisted:true与记录ID为依据。',
     parameters: Type.Object({ question: string(8000), selection: Type.Optional(Type.String({ maxLength: 12000 })) }, { additionalProperties: false }) },
@@ -75,7 +75,7 @@ export function validateCall(id, name, args) {
   if (!args || typeof args !== 'object' || Array.isArray(args)) throw new LearningToolError('TOOL_PROTOCOL');
   bounded(args);
   if (name === 'generate_exercises') {
-    if(Object.keys(args).some(k=>!['requirements','exercises','summary'].includes(k)) || typeof args.requirements!=='string'||!args.requirements.trim()||[...args.requirements].length>8000||typeof args.summary!=='string'||args.summary.length>10000||!Array.isArray(args.exercises)||!args.exercises.length||args.exercises.length>5)throw new LearningToolError('TOOL_PROTOCOL');
+    if(Object.keys(args).some(k=>!['requirements','exercises','summary'].includes(k)) || typeof args.requirements!=='string'||!args.requirements.trim()||[...args.requirements].length>8000||typeof args.summary!=='string'||[...args.summary].length>10000||!Array.isArray(args.exercises)||!args.exercises.length||args.exercises.length>5)throw new LearningToolError('TOOL_PROTOCOL');
     return args;
   }
   const fields = name === 'record_question' ? { question: 8000, selection: 12000 }
@@ -119,9 +119,9 @@ export function createLearningPlugin({ requestTool, secret = '', fail = () => {}
     return { id, name, args: safeArgs };
   };
   const preflight = (toolCall, args) => {
-    const call = safeCall(toolCall.id, toolCall.name, args);
     attempts++;
     if (attempts > maxCalls) throw new LearningToolError('TOOL_LIMIT');
+    const call = safeCall(toolCall.id, toolCall.name, args);
     const cached = cache.get(call.id);
     if (cached && cached.fingerprint !== fingerprint(call.name, call.args)) throw new LearningToolError('TOOL_PROTOCOL');
     return call;
@@ -154,7 +154,7 @@ export function createLearningPlugin({ requestTool, secret = '', fail = () => {}
       if (Object.hasOwn(reply, 'error')) {
         isError = true;
         const code = typeof reply.error?.code === 'string' && /^[A-Z_]{1,64}$/u.test(reply.error.code) ? reply.error.code : 'TOOL_FAILED';
-        body = { ok: false, error: { code, message: safeMessages.TOOL_FAILED } };
+        body = { ok: false, error: { code, message: code === 'INVALID_MODEL_OUTPUT' && typeof reply.error.message === 'string' && reply.error.message.length < 500 ? reply.error.message : safeMessages.TOOL_FAILED } };
       } else {
         const result = redactStrings(reply.result, secret);
         if (!result || typeof result !== 'object' || Array.isArray(result)) { fail('TOOL_PROTOCOL'); throw new LearningToolError('TOOL_PROTOCOL'); }

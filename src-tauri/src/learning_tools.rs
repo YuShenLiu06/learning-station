@@ -140,7 +140,17 @@ pub fn execute(
             {
                 return Err(invalid());
             }
-            bounded(args["requirements"].as_str().ok_or_else(invalid)?, 1, 8000)?;
+            // The declared schema, the sidecar preflight and the correction notice
+            // sent back to the model all count characters; measuring bytes here
+            // would reject valid Chinese requirements after every character-based
+            // gate already accepted them.
+            let requirements = args["requirements"].as_str().ok_or_else(invalid)?;
+            if requirements.trim().is_empty() {
+                return Err(invalid());
+            }
+            if requirements.chars().count() > 8000 {
+                return Err(limit());
+            }
             Operation::Exercises(args)
         }
         "record_question" => {
@@ -1216,6 +1226,79 @@ mod tests {
                 .entries
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn exercise_requirements_are_counted_in_characters_not_bytes() {
+        let (_directory, engine, scope, _) = fixture();
+        // generate_exercises only runs against a frozen run manifest.
+        {
+            let manifest: Vec<ManifestItem> = scope
+                .allowed_ids
+                .iter()
+                .map(|id| ManifestItem {
+                    id: id.clone(),
+                    path: "fixture.md".into(),
+                    version: "v1".into(),
+                    included_chars: 10,
+                })
+                .collect();
+            let run: crate::generation::Run = serde_json::from_value(json!({
+                "id": scope.run_id, "sessionId": scope.session_id, "mode": "question",
+                "status": "succeeded", "content": "", "error": null,
+                "createdAt": "2026-10-16T15:55:00Z", "updatedAt": "2026-10-16T15:55:00Z",
+                "requestDigest": "fixture", "contextManifest": manifest,
+                "contextSnapshotVersion": 1,
+            }))
+            .unwrap();
+            engine.runs.lock().unwrap().insert(
+                run.id.clone(),
+                crate::generation::ManagedRun {
+                    run,
+                    cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                },
+            );
+        }
+        let args = json!({
+            "requirements": "汉".repeat(4000),
+            "summary": "合成练习摘要",
+            "exercises": [{"question": "合成题目", "format": "exact", "answers": ["合成答案"], "tags": [], "sourceIds": []}],
+        });
+        let saved = execute(
+            &engine,
+            &scope,
+            "chinese-requirements",
+            "generate_exercises",
+            args.clone(),
+        )
+        .unwrap();
+        assert_eq!(saved["persisted"], true);
+        let retried = execute(
+            &engine,
+            &scope,
+            "chinese-requirements",
+            "generate_exercises",
+            args,
+        )
+        .unwrap();
+        assert_eq!(retried["documentId"], saved["documentId"]);
+        let over = json!({
+            "requirements": "汉".repeat(8001),
+            "summary": "合成练习摘要",
+            "exercises": [{"question": "合成题目", "format": "exact", "answers": ["合成答案"], "tags": [], "sourceIds": []}],
+        });
+        assert_eq!(
+            execute(
+                &engine,
+                &scope,
+                "over-long-requirements",
+                "generate_exercises",
+                over
+            )
+            .unwrap_err()
+            .code,
+            "LIMIT_EXCEEDED"
         );
     }
 

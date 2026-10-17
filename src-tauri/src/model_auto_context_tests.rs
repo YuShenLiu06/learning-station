@@ -234,6 +234,7 @@ async fn context_bridge_real_pi_wire_replays_full_diff_once_per_tool_loop_and_fa
             crate::learning_skills::capture("question", &["query_related_knowledge".into()])
                 .unwrap(),
             Some(RequestContext {
+                output_validator: None,
                 native_session: None,
                 context_observer: None,
                 tool_recovery: None,

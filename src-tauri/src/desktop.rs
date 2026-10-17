@@ -19,6 +19,24 @@ async fn work<T: Send + 'static>(
         .await
         .map_err(|_| CoreError::new("INTERNAL", "本次操作中断，输入仍保留，请重试。"))?
 }
+// Only an explicit UI action can open a public HTTPS URL. No shell interpolation.
+#[tauri::command]
+async fn open_content_url(url: String) -> Result<()> {
+    let url = crate::content_url::validate(&url)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let status = std::process::Command::new("/usr/bin/open")
+            .arg(url)
+            .status()
+            .map_err(CoreError::io)?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(CoreError::new("IO", "原链接未能打开，请复制到浏览器。"))
+        }
+    })
+    .await
+    .map_err(|_| CoreError::new("IO", "原链接未能打开。"))?
+}
 #[tauri::command]
 async fn get_app_state(state: State<'_, Arc<Engine>>) -> Result<LibraryState> {
     let e = state.inner().clone();
@@ -968,6 +986,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            open_content_url,
             get_app_state,
             get_library_tree,
             list_sessions,
