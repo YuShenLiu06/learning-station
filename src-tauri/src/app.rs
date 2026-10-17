@@ -47,6 +47,9 @@ pub struct UiPreferences {
     pub sidebar_collapsed: bool,
     #[serde(default)]
     pub expanded_node_ids: Vec<String>,
+    /// User-selected model tool authorization tier. Default and legacy value: off.
+    #[serde(default = "default_tool_authorization_tier")]
+    pub tool_authorization_tier: String,
 }
 impl Default for UiPreferences {
     fn default() -> Self {
@@ -56,8 +59,12 @@ impl Default for UiPreferences {
             sidebar_width: default_sidebar_width(),
             sidebar_collapsed: false,
             expanded_node_ids: vec![],
+            tool_authorization_tier: default_tool_authorization_tier(),
         }
     }
+}
+fn default_tool_authorization_tier() -> String {
+    "off".into()
 }
 fn default_assistant_width() -> u16 {
     346
@@ -92,6 +99,14 @@ impl UiPreferences {
             return Err(CoreError::new(
                 "INVALID_INPUT",
                 "目录展开状态包含无效编号或过多项目。",
+            ));
+        }
+        if !crate::model::TOOL_AUTHORIZATION_TIERS
+            .contains(&self.tool_authorization_tier.as_str())
+        {
+            return Err(CoreError::new(
+                "INVALID_INPUT",
+                "工具授权档位无效，请从设置中重新选择。",
             ));
         }
         Ok(())
@@ -257,7 +272,7 @@ impl Engine {
         font_size: Option<u8>,
         assistant_width: Option<u16>,
     ) -> Result<UiPreferences> {
-        self.patch_all_ui_preferences(font_size, assistant_width, None, None, None)
+        self.patch_all_ui_preferences(font_size, assistant_width, None, None, None, None)
     }
     pub fn patch_all_ui_preferences(
         &self,
@@ -266,6 +281,7 @@ impl Engine {
         sidebar_collapsed: Option<bool>,
         expanded_node_ids: Option<Vec<String>>,
         sidebar_width: Option<u16>,
+        tool_authorization_tier: Option<String>,
     ) -> Result<UiPreferences> {
         let _guard = UI_PREFERENCE_WRITE
             .lock()
@@ -276,8 +292,26 @@ impl Engine {
             && sidebar_collapsed.is_none()
             && expanded_node_ids.is_none()
             && sidebar_width.is_none()
+            && tool_authorization_tier.is_none()
         {
             return Ok(value);
+        }
+        if let Some(tier) = &tool_authorization_tier {
+            // A boundary change must not strand pending tool receipts of a live run.
+            if *tier != value.tool_authorization_tier
+                && self
+                    .runs
+                    .lock()
+                    .map_err(|_| CoreError::new("BUSY", "生成状态暂不可用。"))?
+                    .values()
+                    .any(|run| ["queued", "running"].contains(&run.run.status.as_str()))
+            {
+                return Err(CoreError::new(
+                    "BUSY",
+                    "生成中不能变更工具授权档位，请先停止并核对未决工具回执。",
+                ));
+            }
+            value.tool_authorization_tier = tier.clone();
         }
         if let Some(size) = font_size {
             value.font_size = size;
@@ -1071,6 +1105,7 @@ mod navigation_preferences_tests {
                 Some(true),
                 Some(vec!["course_a".into(), "folder_b".into()]),
                 None,
+                None,
             )
             .unwrap();
         engine.patch_ui_preferences(Some(20), None).unwrap();
@@ -1081,7 +1116,7 @@ mod navigation_preferences_tests {
         assert_eq!(saved.expanded_node_ids.len(), 2);
         let before = fs::read(state.join("ui-preferences.json")).unwrap();
         assert!(engine
-            .patch_all_ui_preferences(None, None, None, Some(vec!["../bad".into()]), None)
+            .patch_all_ui_preferences(None, None, None, Some(vec!["../bad".into()]), None, None)
             .is_err());
         assert_eq!(before, fs::read(state.join("ui-preferences.json")).unwrap());
         drop(engine);
@@ -1111,7 +1146,7 @@ mod sidebar_width_tests {
         let b = engine.clone();
         let font = std::thread::spawn(move || a.patch_ui_preferences(Some(20), None).unwrap());
         let width = std::thread::spawn(move || {
-            b.patch_all_ui_preferences(None, None, None, None, Some(360))
+            b.patch_all_ui_preferences(None, None, None, None, Some(360), None)
                 .unwrap()
         });
         font.join().unwrap();
@@ -1125,7 +1160,7 @@ mod sidebar_width_tests {
         let bytes = fs::read(state.join("ui-preferences.json")).unwrap();
         for invalid in [179, 481] {
             let error = engine
-                .patch_all_ui_preferences(None, None, None, None, Some(invalid))
+                .patch_all_ui_preferences(None, None, None, None, Some(invalid), None)
                 .unwrap_err();
             assert_eq!(error.code, "INVALID_INPUT");
             assert_eq!(fs::read(state.join("ui-preferences.json")).unwrap(), bytes);
@@ -1421,6 +1456,101 @@ mod exploration_and_trash_recovery_tests {
         assert_eq!(
             state.active_session_id.as_deref(),
             Some(session_id.as_str())
+        );
+    }
+}
+
+#[cfg(test)]
+mod tool_authorization_preference_tests {
+    use super::*;
+
+    #[test]
+    fn tool_authorization_tier_defaults_off_and_merges_independently() {
+        let temp = tempfile::tempdir().unwrap();
+        let library = temp.path().join("library");
+        let state = temp.path().join("state");
+        let engine = Engine::new(library.clone(), state.clone()).unwrap();
+        // An old preferences file without the new key keeps its data and stays off.
+        fs::write(
+            state.join("ui-preferences.json"),
+            r#"{"fontSize":18,"assistantWidth":420,"sidebarWidth":300,"sidebarCollapsed":true,"expandedNodeIds":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(engine.ui_preferences().unwrap().tool_authorization_tier, "off");
+        let saved = engine
+            .patch_all_ui_preferences(None, None, None, None, None, Some("bash".into()))
+            .unwrap();
+        assert_eq!(saved.tool_authorization_tier, "bash");
+        assert_eq!(saved.font_size, 18);
+        let reloaded = engine.ui_preferences().unwrap();
+        assert_eq!(reloaded.tool_authorization_tier, "bash");
+        // Other merges do not touch the tier.
+        let font_only = engine
+            .patch_all_ui_preferences(Some(20), None, None, None, None, None)
+            .unwrap();
+        assert_eq!(font_only.tool_authorization_tier, "bash");
+        assert_eq!(font_only.font_size, 20);
+        drop(engine);
+        assert_eq!(
+            Engine::new(library, state)
+                .unwrap()
+                .ui_preferences()
+                .unwrap()
+                .tool_authorization_tier,
+            "bash"
+        );
+    }
+
+    #[test]
+    fn invalid_tool_authorization_tier_is_rejected_without_overwrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = Engine::new(temp.path().join("library"), temp.path().join("state")).unwrap();
+        for invalid in ["shell", "READ", "", "read write", "network"] {
+            let error = engine
+                .patch_all_ui_preferences(None, None, None, None, None, Some(invalid.into()))
+                .unwrap_err();
+            assert_eq!(error.code, "INVALID_INPUT", "tier {invalid:?} must be rejected");
+        }
+        assert_eq!(engine.ui_preferences().unwrap().tool_authorization_tier, "off");
+    }
+
+    #[test]
+    fn tool_authorization_tier_change_waits_for_pending_runs() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = Engine::new(temp.path().join("library"), temp.path().join("state")).unwrap();
+        let run: crate::generation::Run = serde_json::from_value(json!({
+            "id":"run_tier_busy","sessionId":"session_tier","mode":"question","status":"running",
+            "content":"","error":null,"createdAt":"2026-10-17T00:00:00Z","updatedAt":"2026-10-17T00:00:00Z",
+            "requestDigest":"fixture","contextManifest":[]
+        }))
+        .unwrap();
+        engine.runs.lock().unwrap().insert(
+            run.id.clone(),
+            crate::generation::ManagedRun {
+                run,
+                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        );
+        // Unrelated preference saves keep working while a run is active.
+        assert_eq!(
+            engine
+                .patch_all_ui_preferences(Some(18), None, None, None, None, None)
+                .unwrap()
+                .font_size,
+            18
+        );
+        let error = engine
+            .patch_all_ui_preferences(None, None, None, None, None, Some("read".into()))
+            .unwrap_err();
+        assert_eq!(error.code, "BUSY");
+        assert_eq!(engine.ui_preferences().unwrap().tool_authorization_tier, "off");
+        // Re-saving the same tier is not a boundary change.
+        assert_eq!(
+            engine
+                .patch_all_ui_preferences(None, None, None, None, None, Some("off".into()))
+                .unwrap()
+                .tool_authorization_tier,
+            "off"
         );
     }
 }

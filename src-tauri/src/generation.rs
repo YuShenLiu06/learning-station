@@ -322,7 +322,12 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
         (ctx, session, intent, projection)
     };
     // Resolve visible sources and recycle-bin protections before touching this app's credential.
-    let policy = task_tool_policy(&request.mode);
+    // The authorization tier comes only from local user preferences; a read failure stays closed.
+    let authorization = engine
+        .ui_preferences()
+        .map(|preferences| preferences.tool_authorization_tier)
+        .unwrap_or_else(|_| "off".into());
+    let policy = task_tool_policy(&request.mode, &authorization);
     let skills = crate::learning_skills::capture(&policy.mode, &policy.allowed_tools)?;
     let versions = skills
         .iter()
@@ -583,7 +588,7 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
     Ok(returned)
 }
 
-pub(crate) fn task_tool_policy(mode: &str) -> model::ToolPolicy {
+pub(crate) fn task_tool_policy(mode: &str, authorization: &str) -> model::ToolPolicy {
     let (names, max_calls): (&[&str], usize) = match mode {
         "question" => (
             &[
@@ -610,11 +615,23 @@ pub(crate) fn task_tool_policy(mode: &str) -> model::ToolPolicy {
         "practice" | "review" => (&["query_related_knowledge"], 2),
         _ => (&[], 0),
     };
-    model::ToolPolicy {
+    let mut policy = model::ToolPolicy {
         mode: mode.into(),
         allowed_tools: names.iter().map(|name| (*name).to_owned()).collect(),
         max_calls,
+        authorization: authorization.into(),
+    };
+    // Only the interactive exploration modes gain tier-authorized workspace tools.
+    if matches!(mode, "question" | "explain") {
+        if let Ok(extra) = model::authorization_tools(authorization) {
+            for name in extra {
+                if !policy.allowed_tools.iter().any(|tool| tool == name) {
+                    policy.allowed_tools.push((*name).to_owned());
+                }
+            }
+        }
     }
+    policy
 }
 
 fn learning_tool_handler(
@@ -631,9 +648,16 @@ fn learning_tool_handler(
             tokio::task::spawn_blocking(move || {
                 let mut activity = new_tool_activity(&scope, &call.id, &call.name)?;
                 publish_tool_activity(&engine, &activity, &sink)?;
-                let result = crate::learning_tools::execute(
-                    &engine, &scope, &call.id, &call.name, call.args,
-                );
+                // Workspace tools enforce their own tier, confinement and receipts.
+                let result = if matches!(call.name.as_str(), "read" | "write" | "bash") {
+                    crate::authorized_tools::execute(
+                        &engine, &scope, &call.id, &call.name, call.args,
+                    )
+                } else {
+                    crate::learning_tools::execute(
+                        &engine, &scope, &call.id, &call.name, call.args,
+                    )
+                };
                 finish_tool_activity(&mut activity, &scope, &result);
                 let _ = publish_tool_activity(&engine, &activity, &sink);
                 if activity.status == "failed" && result.is_ok() {
@@ -1323,6 +1347,9 @@ fn new_tool_activity(
         "create_todo" => "创建待办",
         "generate_exercises" => "生成练习",
         "query_related_knowledge" => "查找相关材料",
+        "read" => "受控读取",
+        "write" => "受控写入",
+        "bash" => "受控命令",
         _ => return Err(CoreError::new("TOOL_NOT_ALLOWED", "未启用此学习工具。")),
     };
     let id = format!(
@@ -1356,6 +1383,25 @@ fn finish_tool_activity(
         if activity.name == "query_related_knowledge" {
             activity.status = "succeeded".into();
             activity.summary = "已完成授权材料查询，未创建新内容。".into();
+            return;
+        }
+        if activity.name == "read" {
+            activity.status = "succeeded".into();
+            activity.summary = "已完成受控读取，未写入内容。".into();
+            return;
+        }
+        if matches!(activity.name.as_str(), "write" | "bash")
+            && value.get("persisted").and_then(Value::as_bool) == Some(true)
+            && value.get("sessionId").and_then(Value::as_str) == Some(scope.session_id.as_str())
+        {
+            activity.status = "succeeded".into();
+            activity.persisted = true;
+            activity.summary = if activity.name == "write" {
+                "已写入会话工作区并保存回执。"
+            } else {
+                "已在会话工作区执行并保存回执。"
+            }
+            .into();
             return;
         }
         let (field, kind) = if activity.name == "create_todo" {
@@ -2202,10 +2248,35 @@ mod history_audit_tests {
             ("review", 2, vec!["query_related_knowledge"]),
             ("feedback", 0, vec![]),
         ] {
-            let policy = task_tool_policy(mode);
+            let policy = task_tool_policy(mode, "off");
             assert_eq!(policy.max_calls, maximum);
             assert_eq!(policy.allowed_tools, names);
+            assert_eq!(policy.authorization, "off");
         }
+    }
+    #[test]
+    fn task_tool_policy_appends_only_tier_authorized_workspace_tools() {
+        let off = task_tool_policy("question", "off");
+        assert!(off
+            .allowed_tools
+            .iter()
+            .all(|name| !["read", "write", "bash"].contains(&name.as_str())));
+        let read = task_tool_policy("question", "read");
+        assert!(read.allowed_tools.contains(&"read".into()));
+        assert!(!read.allowed_tools.contains(&"write".into()));
+        let write = task_tool_policy("explain", "write");
+        assert!(write.allowed_tools.contains(&"read".into()));
+        assert!(write.allowed_tools.contains(&"write".into()));
+        assert!(!write.allowed_tools.contains(&"bash".into()));
+        let bash = task_tool_policy("explain", "bash");
+        assert!(bash.allowed_tools.contains(&"bash".into()));
+        assert_eq!(bash.authorization, "bash");
+        // Non-exploration modes never gain workspace tools.
+        assert_eq!(
+            task_tool_policy("practice", "bash").allowed_tools,
+            vec!["query_related_knowledge".to_owned()]
+        );
+        assert!(task_tool_policy("feedback", "bash").allowed_tools.is_empty());
     }
 }
 

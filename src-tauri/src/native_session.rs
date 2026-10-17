@@ -159,10 +159,17 @@ pub fn recover(
 ) -> Result<Value> {
     let unknown = || CoreError::new("NATIVE_TOOL_UNKNOWN", "原工具结果尚不可核实；未重复写入。");
     let run = crate::generation::get(engine, run_id)?;
-    if run.session_id != session_id
-        || !crate::generation::task_tool_policy(&run.mode)
-            .allowed_tools
-            .contains(&call.name)
+    if run.session_id != session_id {
+        return Err(unknown());
+    }
+    // Workspace tools recover from their own durable receipt ledger; the ledger
+    // is the proof of the original execution, not the current tier.
+    if crate::authorized_tools::required_rank(&call.name).is_some() {
+        return crate::authorized_tools::recover(engine, session_id, run_id, call);
+    }
+    if !crate::generation::task_tool_policy(&run.mode, "off")
+        .allowed_tools
+        .contains(&call.name)
     {
         return Err(unknown());
     }

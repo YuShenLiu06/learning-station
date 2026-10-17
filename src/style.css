@@ -133,3 +133,9 @@ label select{display:block;background:#fff;border:1px solid #dce5ce;border-radiu
 .embed-actions strong, .embed-source { overflow-wrap: anywhere; }
 .embedded-content iframe { width: 100%; min-width: 0; height: 360px; border: 1px solid #ddd7cb; border-radius: 8px; background: white; margin-top: 12px; }
 .embedded-content pre { max-height: 300px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* Tool authorization tier options reuse the warm paper surfaces. */
+.tool-authorization-settings { max-width: 640px; }
+.tool-authorization-settings .tier-option { display: grid; grid-template-columns: auto auto; align-items: baseline; gap: 4px 10px; padding: 9px 12px; margin: 8px 0; border: 1px solid var(--line); border-radius: 8px; background: #fbfcf8; cursor: pointer; }
+.tool-authorization-settings .tier-option input[type="radio"] { accent-color: var(--green); }
+.tool-authorization-settings .tier-option .label-note { grid-column: 1 / -1; margin: 0; font-size: 11px; color: var(--muted); }

@@ -1,5 +1,6 @@
 pub mod app;
 pub mod assistant_references;
+pub mod authorized_tools;
 pub mod automatic_context;
 pub mod content;
 pub mod content_url;

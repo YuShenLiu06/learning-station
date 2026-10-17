@@ -6,7 +6,7 @@ import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { MODEL_ID } from '../harness.mjs';
 import { runLearningAgentWithSkills as runLearningAgent } from './skills-fixture.mjs';
-import { createLearningPlugin, createStdioToolBridge, LEARNING_PLUGIN, LEGACY_TOOLS, MODE_POLICIES, MAX_TOOL_BYTES } from '../learning-plugin.mjs';
+import { createLearningPlugin, createStdioToolBridge, LEARNING_PLUGIN, LEGACY_TOOLS, MODE_POLICIES, MAX_TOOL_BYTES, validateCall, validateToolPolicy } from '../learning-plugin.mjs';
 const SECRET = 'fixture-tools-key-never-real';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const request = (baseUrl) => ({ protocol: 1, operation: 'generate', learningTools: true, apiKey: SECRET, settings: { provider: 'glm-pi', baseUrl, model: MODEL_ID }, messages: [{ role: 'user', content: '{"type":"quoted_learning_material","mode":"practice","question":"请记录疑问，然后出一道练习。"}' }] });
@@ -223,7 +223,7 @@ test('create_todo is registered in question mode and its result is consumed with
   await withServer((body, res) => {
     turns++; assert.deepEqual(body.tools.map((tool) => tool.function.name), MODE_POLICIES.question.allowedTools);
     const schema = body.tools.find((tool) => tool.function.name === 'create_todo').function.parameters;
-    assert.deepEqual(Object.keys(schema.properties).sort(), ['dueAt', 'relativeMinutes', 'title']); assert.equal(schema.additionalProperties, false);
+    assert.deepEqual(Object.keys(schema.properties).sort(), ['dueAt', 'relativeMinutes', 'reminderEnabled', 'title']); assert.equal(schema.additionalProperties, false);
     if (turns === 1) sse(res, { tool: call('todo-1', 'create_todo', { title: '复习 since 与 for', dueAt: '2000-01-01T08:00:00+08:00' }) });
     else { const receipt = JSON.parse(toolMessages(body).at(-1).content); assert.equal(receipt.result.persisted, true); assert.equal(receipt.result.todo.reminderEnabled, false); sse(res, { text: '待办已保存，提醒未开启。', final: true }); }
   }, async (endpoint) => {
@@ -289,5 +289,74 @@ test('final practice JSON receives safe validator feedback with two corrections 
       assert(result.output);
     });
     assert.equal(turns,mode==='repair'?2:mode==='source'?1:3);assert.equal(validations,turns);
+  }
+});
+
+test('authorization tiers add read/write/bash only to question and explain policies', () => {
+  const tiers = { read: ['read'], write: ['read', 'write'], bash: ['read', 'write', 'bash'] };
+  for (const [tier, tools] of Object.entries(tiers)) {
+    for (const mode of ['question', 'explain']) {
+      const policy = validateToolPolicy({ mode, allowedTools: [...MODE_POLICIES[mode].allowedTools, ...tools], maxCalls: MODE_POLICIES[mode].maxCalls, authorization: tier });
+      assert.equal(policy.authorization, tier);
+      assert.deepEqual(policy.allowedTools, [...MODE_POLICIES[mode].allowedTools, ...tools]);
+    }
+    for (const mode of ['practice', 'review', 'feedback', 'grading', 'legacy']) {
+      assert.throws(() => validateToolPolicy({ mode, allowedTools: ['read'], maxCalls: 1, authorization: tier }), (error) => error.code === 'TOOL_PROTOCOL', `${mode} must not gain ${tier} tools`);
+    }
+  }
+  assert.throws(() => validateToolPolicy({ mode: 'question', allowedTools: ['write'], maxCalls: 2, authorization: 'read' }), (error) => error.code === 'TOOL_PROTOCOL');
+  assert.throws(() => validateToolPolicy({ mode: 'explain', allowedTools: ['bash'], maxCalls: 2, authorization: 'write' }), (error) => error.code === 'TOOL_PROTOCOL');
+  assert.throws(() => validateToolPolicy({ mode: 'question', allowedTools: [], maxCalls: 0, authorization: 'shell' }), (error) => error.code === 'TOOL_PROTOCOL');
+  const plain = validateToolPolicy({ mode: 'question', ...MODE_POLICIES.question });
+  assert.equal(plain.authorization, 'off');
+  assert(!plain.allowedTools.includes('read'));
+});
+
+test('workspace tool arguments are shape-validated at the plugin boundary', () => {
+  for (const [name, args] of [['read', { sourceId: 'knowledge_1' }], ['read', { path: 'notes/a.md' }], ['write', { path: 'a.md', content: 'x' }], ['bash', { command: 'printf hi' }], ['bash', { command: 'printf hi', timeoutMs: 1500 }]]) {
+    assert.deepEqual(validateCall('shape-ok', name, args), args);
+  }
+  for (const [name, args] of [['read', {}], ['read', { sourceId: 'a', path: 'b' }], ['read', { sourceId: 'ok', extra: 1 }], ['write', { path: 'a.md' }], ['write', { path: '', content: 'x' }], ['bash', { command: '   ' }], ['bash', { command: 'echo', timeoutMs: 100 }], ['bash', { command: 'echo', timeoutMs: 99000 }], ['bash', { command: 'echo', extra: 1 }]]) {
+    assert.throws(() => validateCall('shape-bad', name, args), (error) => error.code === 'TOOL_PROTOCOL', `${name} ${JSON.stringify(args)} must be rejected`);
+  }
+});
+
+test('read returns results without persisted receipts; write and bash require them', async () => {
+  const plugin = createLearningPlugin({ allowedTools: ['read', 'write', 'bash'], maxCalls: 6, requestTool: async (tool) => {
+    if (tool.name === 'read') return { result: { sessionId: 'session_fixture', content: 'synthetic text' } };
+    if (tool.name === 'write') return { result: { persisted: true, path: 'a.md', bytes: 1 } };
+    return { result: { persisted: true, exitCode: 0, stdout: 'ok' } };
+  } });
+  assert.deepEqual(plugin.tools.map((tool) => tool.name), ['read', 'write', 'bash']);
+  const read = await plugin.tools[0].execute('read-1', { path: 'a.md' });
+  assert.equal(read.isError, false);
+  assert.equal(read.structuredContent.result.content, 'synthetic text');
+  const write = await plugin.tools[1].execute('write-1', { path: 'a.md', content: 'x' });
+  assert.equal(write.structuredContent.result.persisted, true);
+  const bash = await plugin.tools[2].execute('bash-1', { command: 'printf ok' });
+  assert.equal(bash.structuredContent.result.persisted, true);
+  const failing = createLearningPlugin({ allowedTools: ['write'], maxCalls: 2, requestTool: async () => ({ result: { path: 'a.md' } }) });
+  const failed = await failing.tools[0].execute('write-2', { path: 'a.md', content: 'x' });
+  assert.equal(failed.isError, true);
+});
+
+test('authorized workspace tools register on top of question mode with an explicit boundary notice', { timeout: 4000 }, async () => {
+  let system = '';
+  await withServer((body, res) => { system = body.messages[0].content; sse(res, { text: 'fixture answer', final: true }); }, async (endpoint) => {
+    const input = request(endpoint);
+    input.toolPolicy = { mode: 'question', allowedTools: [...MODE_POLICIES.question.allowedTools, 'read', 'write', 'bash'], maxCalls: 4, authorization: 'bash' };
+    const result = await runLearningAgent(input, () => {}, { requestTool: async () => { throw new Error('unexpected tool'); } });
+    assert.equal(result.output, 'fixture answer');
+  });
+  assert(system.includes('工具授权档位'));
+  assert(system.includes('会话工作区'));
+  assert(system.includes('read'));
+});
+
+test('create_todo reminderEnabled is an opt-in boolean that requires a time', () => {
+  assert.deepEqual(validateCall('reminder-1', 'create_todo', { title: 'T', reminderEnabled: false }), { title: 'T', reminderEnabled: false });
+  assert.deepEqual(validateCall('reminder-2', 'create_todo', { title: 'T', relativeMinutes: 5, reminderEnabled: true }), { title: 'T', relativeMinutes: 5, reminderEnabled: true });
+  for (const args of [{ title: 'T', reminderEnabled: true }, { title: 'T', reminderEnabled: 'yes' }, { title: 'T', reminderEnabled: 1 }]) {
+    assert.throws(() => validateCall('reminder-bad', 'create_todo', args), (error) => error.code === 'TOOL_PROTOCOL', JSON.stringify(args));
   }
 });

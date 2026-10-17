@@ -500,6 +500,7 @@ async fn save_ui_preferences(
     sidebar_collapsed: Option<bool>,
     expanded_node_ids: Option<Vec<String>>,
     sidebar_width: Option<u16>,
+    tool_authorization_tier: Option<String>,
 ) -> Result<UiPreferences> {
     work(state.inner().clone(), move |e| {
         e.patch_all_ui_preferences(
@@ -508,6 +509,7 @@ async fn save_ui_preferences(
             sidebar_collapsed,
             expanded_node_ids,
             sidebar_width,
+            tool_authorization_tier,
         )
     })
     .await

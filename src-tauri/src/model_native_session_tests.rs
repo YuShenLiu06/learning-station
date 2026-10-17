@@ -211,6 +211,7 @@ async fn real_rust_node_pi_native_restart_roles_tool_pairs_and_course_isolation(
                 mode: "question".into(),
                 allowed_tools: vec!["create_note".into()],
                 max_calls: 2,
+                authorization: "off".into(),
             },
             crate::learning_skills::capture("question", &["create_note".into()]).unwrap(),
             Some(RequestContext {
@@ -344,6 +345,7 @@ async fn real_rust_node_pi_native_restart_roles_tool_pairs_and_course_isolation(
             mode: "question".into(),
             allowed_tools: vec!["create_note".into()],
             max_calls: 2,
+            authorization: "off".into(),
         },
         crate::learning_skills::capture("question", &["create_note".into()]).unwrap(),
         Some(RequestContext {
@@ -475,6 +477,7 @@ async fn rust_node_pi_validates_final_json_and_corrects_before_any_persistence()
                 mode: "practice".into(),
                 allowed_tools: vec![],
                 max_calls: 0,
+                authorization: "off".into(),
             },
             crate::learning_skills::capture("practice", &[]).unwrap(),
             Some(context),
