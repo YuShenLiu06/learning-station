@@ -967,6 +967,16 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code, "CONFLICT");
+        // The native session recovery path delegates authorized tools and must
+        // surface the same verdict, not soften it to an unknown.
+        let error = crate::native_session::recover(
+            &engine,
+            &scope.session_id,
+            "run_authorized_fixture",
+            &changed,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "CONFLICT");
         // No ledger at all stays an honest unknown, never a guess.
         let absent = crate::model::ToolCall {
             id: "never-executed".into(),
@@ -1015,6 +1025,61 @@ mod tests {
         assert_eq!(empty["receipts"].as_array().unwrap().len(), 0);
         assert!(crate::authorized_tools::list_receipt_summaries(&engine, "missing_session").is_err());
         assert!(crate::authorized_tools::list_receipt_summaries(&engine, "../escape").is_err());
+    }
+
+    #[test]
+    fn receipt_listing_skips_corrupt_or_unsafe_ledger_files() {
+        let (directory, engine, scope) = fixture("write");
+        run(&engine, &scope, "skip-real", "write", json!({"path": "draft.md", "content": "kept"})).unwrap();
+        let receipts = directory
+            .path()
+            .join("state/workspaces")
+            .join(&scope.session_id)
+            .join("receipts");
+        std::fs::write(receipts.join("pi_tool_corrupt.json"), "{ not valid json").unwrap();
+        std::fs::write(receipts.join("not-a-receipt.txt"), "ignored by suffix").unwrap();
+        std::fs::write(receipts.join("pi_tool_oversize.json"), "x".repeat(1024 * 1024 + 1)).unwrap();
+        let outside = directory.path().join("outside-secret.txt");
+        std::fs::write(&outside, "PRIVATE").unwrap();
+        std::os::unix::fs::symlink(&outside, receipts.join("pi_tool_link.json")).unwrap();
+        let summary = crate::authorized_tools::list_receipt_summaries(&engine, &scope.session_id).unwrap();
+        let list = summary["receipts"].as_array().unwrap();
+        assert_eq!(list.len(), 1, "only the structurally valid receipt is listed");
+        assert_eq!(list[0]["path"], "draft.md");
+        assert_eq!(list[0]["status"], "persisted");
+    }
+
+    #[test]
+    fn receipt_listing_caps_at_two_hundred_and_marks_truncation() {
+        let (directory, engine, scope) = fixture("write");
+        let receipts = directory
+            .path()
+            .join("state/workspaces")
+            .join(&scope.session_id)
+            .join("receipts");
+        std::fs::create_dir_all(&receipts).unwrap();
+        for index in 0..201 {
+            let entry = super::LedgerEntry {
+                name: "write".into(),
+                arguments_hash: format!("hash-{index}"),
+                result: json!({"persisted": true, "path": format!("f{index}.md")}),
+                created_at: format!("2026-10-17T{:02}:{:02}:00.000Z", index / 60, index % 60),
+            };
+            crate::app::atomic_json(&receipts.join(format!("pi_tool_cap{index:03}.json")), &entry)
+                .unwrap();
+        }
+        let summary = crate::authorized_tools::list_receipt_summaries(&engine, &scope.session_id).unwrap();
+        let list = summary["receipts"].as_array().unwrap();
+        assert_eq!(list.len(), 200);
+        assert_eq!(summary["truncated"], true);
+        // Newest first; only the oldest entry falls off the cap.
+        assert_eq!(list[0]["createdAt"], "2026-10-17T03:20:00.000Z");
+        assert_eq!(list[0]["path"], "f200.md");
+        assert_eq!(list[199]["createdAt"], "2026-10-17T00:01:00.000Z");
+        assert!(
+            !list.iter().any(|item| item["createdAt"] == "2026-10-17T00:00:00.000Z"),
+            "the oldest receipt is the truncated one"
+        );
     }
 
     #[test]
