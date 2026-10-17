@@ -9,6 +9,9 @@ use std::{
 
 static SKILL_DIR: OnceLock<PathBuf> = OnceLock::new();
 const MAX_SKILL_BYTES: u64 = 16 * 1024;
+/// The fixed bundled allowlist. On-demand listing/loading never discovers other
+/// directories; an id outside this list is an authorization rejection.
+pub const KNOWN_IDS: &[&str] = &["learning-explore", "learning-exercises", "learning-review"];
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -34,6 +37,14 @@ impl SkillSnapshot {
         }
     }
 }
+/// Frontmatter metadata only; the on-demand list tool never returns bodies.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillListing {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+}
 
 pub fn set_resource_dir(path: PathBuf) -> Result<()> {
     SKILL_DIR
@@ -55,7 +66,7 @@ fn required(mode: &str, tools: &[String]) -> Result<Vec<(&'static str, &'static 
     }
     Ok(items)
 }
-fn validate_content(id: &str, content: &str) -> Result<()> {
+fn validate_content(id: &str, content: &str) -> Result<(String, String)> {
     let invalid = || {
         CoreError::new(
             "SKILL_INVALID",
@@ -82,20 +93,55 @@ fn validate_content(id: &str, content: &str) -> Result<()> {
             return Err(invalid());
         }
     }
-    if name != Some(id)
-        || description.is_none_or(|value| value.trim().is_empty())
-        || body.trim().is_empty()
-    {
-        return Err(invalid());
+    let description = description.filter(|value| !value.trim().is_empty());
+    match (name, description) {
+        (Some(name), Some(description)) if name == id && !body.trim().is_empty() => {
+            Ok((name.to_owned(), description.to_owned()))
+        }
+        _ => Err(invalid()),
     }
-    Ok(())
 }
 pub fn capture(mode: &str, tools: &[String]) -> Result<Vec<SkillSnapshot>> {
-    let directory = SKILL_DIR
+    capture_from(&bundled_dir(), mode, tools)
+}
+fn bundled_dir() -> PathBuf {
+    SKILL_DIR
         .get()
         .cloned()
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../skills"));
-    capture_from(&directory, mode, tools)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../skills"))
+}
+/// The single path-and-format gate shared by proactive capture and on-demand load.
+fn load_validated(root: &Path, id: &str, scope: &str) -> Result<SkillSnapshot> {
+    let path = root.join(id).join("SKILL.md");
+    let meta = fs::symlink_metadata(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            CoreError::new(
+                "SKILL_MISSING",
+                "本次需要的学习指导文件缺失，未发送模型请求。",
+            )
+        } else {
+            CoreError::new("SKILL_IO", "学习指导文件暂时无法读取，未发送模型请求。")
+        }
+    })?;
+    if !meta.is_file()
+        || meta.file_type().is_symlink()
+        || meta.len() > MAX_SKILL_BYTES
+        || !fs::canonicalize(&path).is_ok_and(|resolved| resolved.starts_with(&root))
+    {
+        return Err(CoreError::new(
+            "SKILL_INVALID",
+            "学习指导文件不是有效的随包文本。",
+        ));
+    }
+    let content = fs::read_to_string(path)
+        .map_err(|_| CoreError::new("SKILL_IO", "学习指导文件暂时无法读取，未发送模型请求。"))?;
+    validate_content(id, &content)?;
+    Ok(SkillSnapshot {
+        id: id.into(),
+        sha256: hash(&content),
+        scope: scope.into(),
+        content,
+    })
 }
 pub fn capture_from(directory: &Path, mode: &str, tools: &[String]) -> Result<Vec<SkillSnapshot>> {
     let required = required(mode, tools)?;
@@ -110,40 +156,40 @@ pub fn capture_from(directory: &Path, mode: &str, tools: &[String]) -> Result<Ve
     })?;
     required
         .into_iter()
-        .map(|(id, scope)| {
-            let path = root.join(id).join("SKILL.md");
-            let meta = fs::symlink_metadata(&path).map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    CoreError::new(
-                        "SKILL_MISSING",
-                        "本次需要的学习指导文件缺失，未发送模型请求。",
-                    )
-                } else {
-                    CoreError::new("SKILL_IO", "学习指导文件暂时无法读取，未发送模型请求。")
-                }
-            })?;
-            if !meta.is_file()
-                || meta.file_type().is_symlink()
-                || meta.len() > MAX_SKILL_BYTES
-                || !fs::canonicalize(&path).is_ok_and(|resolved| resolved.starts_with(&root))
-            {
-                return Err(CoreError::new(
-                    "SKILL_INVALID",
-                    "学习指导文件不是有效的随包文本。",
-                ));
-            }
-            let content = fs::read_to_string(path).map_err(|_| {
-                CoreError::new("SKILL_IO", "学习指导文件暂时无法读取，未发送模型请求。")
-            })?;
-            validate_content(id, &content)?;
-            Ok(SkillSnapshot {
-                id: id.into(),
-                sha256: hash(&content),
-                scope: scope.into(),
-                content,
+        .map(|(id, scope)| load_validated(&root, id, scope))
+        .collect()
+}
+/// On-demand metadata for the fixed allowlist. Entries failing the shared gate
+/// are omitted, so the listing only advertises guidance that can be loaded.
+pub fn catalog_from(directory: &Path) -> Vec<SkillListing> {
+    let Ok(root) = fs::canonicalize(directory) else {
+        return vec![];
+    };
+    KNOWN_IDS
+        .iter()
+        .filter_map(|id| {
+            let snapshot = load_validated(&root, id, "on-demand").ok()?;
+            let (name, description) = validate_content(id, &snapshot.content).ok()?;
+            Some(SkillListing {
+                id: (*id).into(),
+                name,
+                description,
             })
         })
         .collect()
+}
+pub fn catalog() -> Vec<SkillListing> {
+    catalog_from(&bundled_dir())
+}
+/// On-demand body for one allowlisted id; identical checks to proactive capture.
+pub fn load(id: &str) -> Result<SkillSnapshot> {
+    let root = fs::canonicalize(bundled_dir()).map_err(|_| {
+        CoreError::new(
+            "SKILL_MISSING",
+            "本次需要的学习指导文件缺失，未发送模型请求。",
+        )
+    })?;
+    load_validated(&root, id, "on-demand")
 }
 pub fn validate(mode: &str, tools: &[String], snapshots: &[SkillSnapshot]) -> Result<()> {
     let required = required(mode, tools)?;
@@ -261,6 +307,76 @@ mod tests {
         assert_eq!(
             validate("question", &[], &duplicate).unwrap_err().code,
             "SKILL_MISSING"
+        );
+    }
+    #[test]
+    fn catalog_lists_only_allowlisted_metadata_without_bodies() {
+        let temp = tempfile::tempdir().unwrap();
+        for id in KNOWN_IDS {
+            write(temp.path(), id, "指导正文");
+        }
+        // An id outside the fixed allowlist is never listed even when present.
+        write(temp.path(), "rogue-skill", "未列入清单的内容");
+        let listed = catalog_from(temp.path());
+        assert_eq!(
+            listed.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(),
+            KNOWN_IDS
+        );
+        for item in &listed {
+            assert_eq!(item.name, item.id);
+            assert!(!item.description.trim().is_empty());
+        }
+        assert!(!format!("{listed:?}").contains("指导正文"));
+        fs::remove_file(temp.path().join("learning-review/SKILL.md")).unwrap();
+        assert_eq!(
+            catalog_from(temp.path())
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["learning-explore", "learning-exercises"]
+        );
+        assert!(catalog_from(Path::new("/not-a-skill-root")).is_empty());
+    }
+    #[test]
+    fn on_demand_load_reuses_the_same_gate_as_proactive_capture() {
+        let temp = tempfile::tempdir().unwrap();
+        write(temp.path(), "learning-explore", "按需正文");
+        let snapshot = capture_from(temp.path(), "question", &[]).unwrap()[0].clone();
+        let loaded = load_validated(
+            &fs::canonicalize(temp.path()).unwrap(),
+            "learning-explore",
+            "on-demand",
+        )
+        .unwrap();
+        assert_eq!(loaded.content, snapshot.content);
+        assert_eq!(loaded.sha256, snapshot.sha256);
+        #[cfg(unix)]
+        {
+            fs::remove_file(temp.path().join("learning-explore/SKILL.md")).unwrap();
+            std::os::unix::fs::symlink("/etc/hosts", temp.path().join("learning-explore/SKILL.md"))
+                .unwrap();
+            assert_eq!(
+                load_validated(
+                    &fs::canonicalize(temp.path()).unwrap(),
+                    "learning-explore",
+                    "on-demand"
+                )
+                .unwrap_err()
+                .code,
+                "SKILL_INVALID"
+            );
+        }
+        // Oversized guidance is rejected by the same 16KiB budget on demand.
+        write(temp.path(), "learning-review", &"超长指导\n".repeat(3 * 1024));
+        assert_eq!(
+            load_validated(
+                &fs::canonicalize(temp.path()).unwrap(),
+                "learning-review",
+                "on-demand"
+            )
+            .unwrap_err()
+            .code,
+            "SKILL_INVALID"
         );
     }
 }

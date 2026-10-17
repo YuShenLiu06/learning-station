@@ -1,5 +1,6 @@
 import type { ToolActivity } from './types';
-const titles: Record<string, string> = { query_related_knowledge: '查找相关学习记录', record_question: '记录困惑', create_error: '记录错题', create_review_card: '创建复习卡', create_note: '保存学习笔记', create_todo: '创建待办', generate_exercises: '生成练习', read: '受控读取', write: '受控写入', bash: '受控命令' };
+const titles: Record<string, string> = { query_related_knowledge: '查找相关学习记录', record_question: '记录困惑', create_error: '记录错题', create_review_card: '创建复习卡', create_note: '保存学习笔记', create_todo: '创建待办', generate_exercises: '生成练习', list_learning_skills: '查看学习指导目录', load_learning_skill: '加载学习指导', read: '受控读取', write: '受控写入', bash: '受控命令' };
+const readOnlyTool = (name: string) => name === 'query_related_knowledge' || name === 'list_learning_skills' || name === 'load_learning_skill' || name === 'read';
 const safeId = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/u.test(value);
 // Whitelist mirroring the backend exercise validator's field diagnostics exactly:
 // src-tauri/src/exercises.rs field_error builds `练习校验失败：{path} {reason}；收到的内容已保留。`
@@ -22,7 +23,7 @@ export function readToolActivity(raw: unknown): ToolActivity | null {
   // INVALID_MODEL_OUTPUT diagnostic that passes SAFE_FIELD_DIAGNOSTIC (strict whitelist above);
   // overlong or off-vocabulary text falls back. Model arguments and raw output are never rendered.
   const diagnostic = result.status === 'failed' && result.errorCode === 'INVALID_MODEL_OUTPUT' && typeof value.summary === 'string' && value.summary.length <= 80 && SAFE_FIELD_DIAGNOSTIC.test(value.summary) ? value.summary : '';
-  result.summary = result.status === 'failed' ? (diagnostic || '工具未完成，未确认保存成功。') : result.name === 'query_related_knowledge' ? '相关学习记录查询已完成，未写入新内容。' : result.name === 'read' ? '受控读取已完成，未写入内容。' : result.persisted && (result.object || ['write', 'bash'].includes(result.name)) ? '已收到本机保存回执。' : '等待本机工具结果。';
+  result.summary = result.status === 'failed' ? (diagnostic || '工具未完成，未确认保存成功。') : result.name === 'query_related_knowledge' ? '相关学习记录查询已完成，未写入新内容。' : result.name === 'read' ? '受控读取已完成，未写入内容。' : ['list_learning_skills', 'load_learning_skill'].includes(result.name) ? '内置学习指导读取已完成，未写入内容。' : result.persisted && (result.object || ['write', 'bash'].includes(result.name)) ? '已收到本机保存回执。' : '等待本机工具结果。';
   return result;
 }
 export function foldToolActivities(values: unknown[], sessionId: string) {
@@ -37,7 +38,7 @@ export function foldToolActivities(values: unknown[], sessionId: string) {
 }
 export function toolState(item: ToolActivity, liveRunId?: string): 'running' | 'succeeded' | 'failed' | 'unconfirmed' {
   if (item.status === 'running') return item.runId === liveRunId ? 'running' : 'unconfirmed';
-  if (item.status === 'succeeded' && item.name !== 'query_related_knowledge' && item.name !== 'read' && (!item.persisted || (!item.object && !['write', 'bash'].includes(item.name)))) return 'unconfirmed';
+  if (item.status === 'succeeded' && !readOnlyTool(item.name) && (!item.persisted || (!item.object && !['write', 'bash'].includes(item.name)))) return 'unconfirmed';
   return item.status;
 }
 export function historicalTools(entries: { kind: string; data?: Record<string, unknown> }[], sessionId: string) {

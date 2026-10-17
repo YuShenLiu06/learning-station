@@ -292,6 +292,63 @@ test('final practice JSON receives safe validator feedback with two corrections 
   }
 });
 
+test('guidance catalog and load register only in question, explain and practice with read-only semantics', async () => {
+  for (const mode of ['question', 'explain', 'practice']) {
+    for (const name of ['list_learning_skills', 'load_learning_skill']) {
+      assert.ok(MODE_POLICIES[mode].allowedTools.includes(name), `${mode} must register ${name}`);
+    }
+    const policy = validateToolPolicy({ mode, ...MODE_POLICIES[mode] });
+    assert.deepEqual(policy.allowedTools, MODE_POLICIES[mode].allowedTools);
+  }
+  for (const mode of ['review', 'feedback', 'grading', 'legacy']) {
+    assert.ok(!MODE_POLICIES[mode].allowedTools.includes('load_learning_skill'));
+    assert.throws(() => validateToolPolicy({ mode, allowedTools: ['load_learning_skill'], maxCalls: 2 }), (error) => error.code === 'TOOL_PROTOCOL');
+  }
+  assert.deepEqual(validateCall('list-ok', 'list_learning_skills', {}), {});
+  assert.throws(() => validateCall('list-bad', 'list_learning_skills', { path: 'x' }), (error) => error.code === 'TOOL_PROTOCOL');
+  assert.deepEqual(validateCall('load-ok', 'load_learning_skill', { skillId: 'learning-review' }), { skillId: 'learning-review' });
+  for (const args of [{}, { skillId: '' }, { skillId: 'x', extra: 1 }, { skillId: 7 }]) {
+    assert.throws(() => validateCall('load-bad', 'load_learning_skill', args), (error) => error.code === 'TOOL_PROTOCOL', JSON.stringify(args));
+  }
+  // Read-only tools need no persisted receipt and replay safely.
+  const plugin = createLearningPlugin({ allowedTools: ['list_learning_skills', 'load_learning_skill'], maxCalls: 2, requestTool: async (tool) => tool.name === 'list_learning_skills'
+    ? { result: { sessionId: 'session_fixture', skills: [{ id: 'learning-review', name: 'learning-review', description: '复习指导' }] } }
+    : { result: { sessionId: 'session_fixture', skillId: 'learning-review', sha256: 'a'.repeat(64), content: '---\nname: learning-review\n---\n复习指导正文' } } });
+  assert.deepEqual(plugin.tools.map((tool) => tool.replay), ['safe', 'safe']);
+  const list = await plugin.tools[0].execute('list-1', {});
+  assert.equal(list.isError, false);
+  assert.equal(list.structuredContent.result.skills[0].id, 'learning-review');
+  const load = await plugin.tools[1].execute('load-1', { skillId: 'learning-review' });
+  assert.equal(load.isError, false);
+  assert.ok(load.structuredContent.result.content.includes('复习指导正文'));
+  const failing = createLearningPlugin({ allowedTools: ['load_learning_skill'], maxCalls: 2, requestTool: async () => ({ result: { skillId: 'learning-review', alreadyLoaded: true } }) });
+  const dedup = await failing.tools[0].execute('load-2', { skillId: 'learning-review' });
+  assert.equal(dedup.isError, false);
+});
+
+test('question mode loads guidance through the real tool channel without persistence claims', { timeout: 4000 }, async () => {
+  let turns = 0;
+  await withServer((body, res) => {
+    turns++;
+    const names = (body.tools ?? []).map((tool) => tool.function.name);
+    assert.ok(names.includes('list_learning_skills') && names.includes('load_learning_skill'));
+    if (turns === 1) sse(res, { tool: call('skill-1', 'load_learning_skill', { skillId: 'learning-review' }) });
+    else {
+      const result = JSON.parse(toolMessages(body).at(-1).content);
+      assert.equal(result.ok, true);
+      assert.equal(result.result.skillId, 'learning-review');
+      assert.ok(result.result.content.startsWith('---\nname: learning-review'));
+      sse(res, { text: '指导正文已收到。', final: true });
+    }
+  }, async (endpoint) => {
+    const input = request(endpoint);
+    input.toolPolicy = { mode: 'question', ...MODE_POLICIES.question };
+    const result = await runLearningAgent(input, () => {}, { requestTool: async () => ({ result: { sessionId: 'session_fixture', skillId: 'learning-review', sha256: 'f'.repeat(64), content: '---\nname: learning-review\ndescription: 复习\n---\n复习指导正文' } }) });
+    assert.equal(result.output, '指导正文已收到。');
+  });
+  assert.equal(turns, 2);
+});
+
 test('authorization tiers add read/write/bash only to question and explain policies', () => {
   const tiers = { read: ['read'], write: ['read', 'write'], bash: ['read', 'write', 'bash'] };
   for (const [tier, tools] of Object.entries(tiers)) {

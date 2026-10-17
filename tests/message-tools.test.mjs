@@ -35,6 +35,9 @@ test('tool success requires a real persisted object, while query success does no
   assert.equal(toolState(receipt),'succeeded');
   const query=readToolActivity({...tool,name:'query_related_knowledge',status:'succeeded'});
   assert.equal(toolState(query),'succeeded');assert.equal(query.persisted,false);assert.match(query.summary,/未写入/);
+  const loaded=readToolActivity({...tool,name:'load_learning_skill',status:'succeeded'});
+  assert.equal(loaded.title,'加载学习指导');assert.equal(toolState(loaded),'succeeded');assert.match(loaded.summary,/未写入/);
+  assert.equal(readToolActivity({...tool,name:'list_learning_skills',status:'succeeded'}).title,'查看学习指导目录');
   assert.equal(toolState(readToolActivity(tool)),'unconfirmed');
   assert.equal(toolState(readToolActivity(tool),'run_a'),'running');
 });
