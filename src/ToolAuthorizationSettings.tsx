@@ -1,7 +1,5 @@
-import { useEffect, useRef, useState } from 'react';
+import { useState } from 'react';
 import { call } from './api';
-import { normalizeToolAuthorizationTier, TIER_DESCRIPTIONS, TIER_LABELS, TOOL_AUTHORIZATION_TIERS } from './toolAuthorization';
-import type { ToolAuthorizationTier } from './toolAuthorization';
 
 type ToolReceiptSummary = { requestId: string; tool: string; status: string; createdAt: string; path?: string | null };
 const RECEIPT_TOOL_LABELS: Record<string, string> = { write: '写入', bash: '命令' };
@@ -9,26 +7,10 @@ const RECEIPT_STATUS_LABELS: Record<string, string> = { persisted: '已写入', 
 function receiptTime(value: string) { const time = new Date(value); return Number.isNaN(time.getTime()) ? value : time.toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }); }
 
 export function ToolAuthorizationSettings({ blocked, sessionId }: { blocked: boolean; sessionId: string }) {
-  const [saved, setSaved] = useState<ToolAuthorizationTier | null>(null);
-  const [choice, setChoice] = useState<ToolAuthorizationTier>('off');
-  const [error, setError] = useState('');
-  const [result, setResult] = useState('');
-  const [busy, setBusy] = useState(false);
   const [receiptsOpen, setReceiptsOpen] = useState(false);
   const [receipts, setReceipts] = useState<ToolReceiptSummary[] | null>(null);
   const [receiptsTruncated, setReceiptsTruncated] = useState(false);
   const [receiptsError, setReceiptsError] = useState('');
-  const lock = useRef(false);
-  async function load() {
-    try {
-      const value = await call<{ toolAuthorizationTier?: unknown }>('preferences_get');
-      const tier = normalizeToolAuthorizationTier(value.toolAuthorizationTier);
-      setSaved(tier); setChoice(tier); setError('');
-    } catch (error) {
-      setError(error instanceof Error ? error.message : String(error));
-    }
-  }
-  useEffect(() => { void load(); }, []);
   async function loadReceipts() {
     if (!sessionId) return;
     setReceiptsError(''); setReceipts(null);
@@ -46,32 +28,8 @@ export function ToolAuthorizationSettings({ blocked, sessionId }: { blocked: boo
     setReceiptsOpen(next);
     if (next) { setReceipts(null); setReceiptsError(''); void loadReceipts(); }
   }
-  async function save(event: React.FormEvent) {
-    event.preventDefault();
-    if (lock.current || blocked || saved === null) return;
-    lock.current = true; setBusy(true); setError(''); setResult('');
-    try {
-      const value = await call<{ toolAuthorizationTier?: unknown }>('preferences_save', { toolAuthorizationTier: choice });
-      const tier = normalizeToolAuthorizationTier(value.toolAuthorizationTier);
-      setSaved(tier); setChoice(tier);
-      setResult(tier === 'off' ? '已保存：工具授权保持关闭。' : `已保存：${TIER_LABELS[tier]}。新请求按此档位注册工具。`);
-    } catch (error) {
-      setError(error instanceof Error ? error.message : String(error));
-    } finally {
-      lock.current = false; setBusy(false);
-    }
-  }
-  return <section className="tool-authorization-settings" aria-label="工具授权档位"><h2 className="settings-section-title">工具授权</h2>
-    <p className="muted small">由本人在此选择模型可用的文件与命令档位；默认关闭，不会替你开启。生成进行中不能变更档位。</p>
-    <form onSubmit={event => { void save(event); }}>
-      <fieldset className="provider-fields" disabled={!saved || busy || blocked}>
-        {TOOL_AUTHORIZATION_TIERS.map(tier => <label key={tier} className="tier-option"><input type="radio" name="tool-authorization-tier" value={tier} checked={choice === tier} onChange={() => setChoice(tier)} />{TIER_LABELS[tier]}<span className="label-note">{TIER_DESCRIPTIONS[tier]}</span></label>)}
-      </fieldset>
-      {blocked && <p className="muted small">正在生成；请先停止生成，并可在下方核对未决工具回执。</p>}
-      {error && <div className="inline-error" role="alert">{error}{saved === null && <button onClick={() => { void load(); }}>重试读取</button>}</div>}
-      {result && <p className="settings-result" role="status">{result}</p>}
-      <div className="dialog-footer"><button className="quiet-button" type="submit" disabled={!saved || busy || blocked}>{busy ? '正在保存…' : '保存授权档位'}</button></div>
-    </form>
+  return <section className="tool-authorization-settings" aria-label="工具授权与回执"><h2 className="settings-section-title">工具授权</h2>
+    <p className="muted small">档位在输入框左下角随取随选（关闭/受控读取/受控读写/受控命令），默认关闭，不会替你开启。{blocked ? '当前正在生成，不能变更档位。' : '生成进行中不能变更档位。'}此处核对已落账的工具回执。</p>
     <div>
       <button className="quiet-button" type="button" aria-expanded={receiptsOpen} onClick={toggleReceipts} disabled={!sessionId}>{receiptsOpen ? '收起本会话工具回执' : '查看本会话工具回执'}</button>
       {!sessionId && <p className="muted small">先打开一个学习会话，才能查看它的工具回执。</p>}

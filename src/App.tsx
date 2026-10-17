@@ -10,6 +10,7 @@ import { ReviewPage } from './ReviewPage';
 import { addContextInjection, freezeInjections } from './contextInjection';
 import { SettingsPage } from './SettingsPage';
 import { ChatModelPicker } from './ChatModelPicker';
+import { ComposerToolTierPicker } from './ComposerToolTierPicker';
 import { mergeOutgoing, reconcileOutgoing, retryOperation, sendStageLabel, stableRunId } from './outgoingMessages';
 import type { OutgoingMessage } from './outgoingMessages';
 import { foldToolActivities } from './toolActivities';
@@ -155,7 +156,6 @@ export function App() {
   }
   const [injectionMenu,setInjectionMenu]=useState<{id:string;selection?:string;x:number;y:number;exercise?:{sessionId:string;questionId:string;part:ExerciseReferencePart;entryId?:string}}|null>(null);
   const [question, setQuestion] = useState('');
-  const [localQuestionSaving, setLocalQuestionSaving] = useState(false);
   const [busyId, setBusyId] = useState('');
   const [partial, setPartial] = useState<GenerationProgress | null>(null);
   const [outgoing, setOutgoing] = useState<OutgoingMessage[]>([]);
@@ -445,14 +445,6 @@ export function App() {
       const locate=()=>{const target=Array.from(document.querySelectorAll<HTMLElement>('[data-assistant-entry]')).find(element=>element.dataset.assistantEntry===item.entryId&&element.dataset.assistantSession===item.sessionId&&!element.closest('[hidden]'));if(target){target.scrollIntoView?.({block:'center',behavior:'auto'});target.focus();target.classList.add('reply-source-highlight');setTimeout(()=>target.classList.remove('reply-source-highlight'),1300);}return !!target;};
       if(!locate()){setHistorySession(source);setHistoryError('');switchView('history');requestAnimationFrame(locate);}
     } catch(error){if(sequence===assistantQuoteSequence.current&&intent===navigationIntent.current)notify(errorText(error));}
-  }
-  async function saveLocalQuestion() {
-    const value = composerQuestion.trim(); if (!value || localQuestionSaving) return;
-    if (!canCompose || !session.id) { setAiError('学习会话尚未就绪，请稍候或重试打开。'); return; }
-    const target = session; const documentId = activeId; const detached = false; setLocalQuestionSaving(true);
-    try { const result = await call<LearningSession>('question_save', { sectionId: target.sectionId, sessionId: target.id, question: value, selection: requestSelection }); updateTargetSession(result, detached); if (activeIdRef.current === documentId) setQuestion(old => old.trim() === value ? '' : old); notify('困惑已保存在学习记录中，未请求AI。'); }
-    catch (error) { setAiError(`困惑尚未保存，输入仍保留：${errorText(error)}`); }
-    finally { setLocalQuestionSaving(false); }
   }
   async function executeSend(item: OutgoingMessage, operationId: string) {
     const target = { id: item.sessionId, sectionId: item.sectionId } as LearningSession;
@@ -756,7 +748,7 @@ export function App() {
         <ToolActivityCards items={toolCalls.filter(item=>!repliedRuns.has(item.runId))} liveRunId={busyId ? activeRunId : undefined} onOpen={object => { void openToolObject(object); }} />
         {partial && partial.mode !== 'practice' && partial.sessionId === session.id && busyId && <article className="message assistant partial-message"><div className="message-label"><Sparkles size={12} />正在回复</div><Markdown text={partial.content} /></article>}{partial?.mode === 'practice' && partial.sessionId === session.id && !busyId && aiError && <details className="recovery-message"><summary>查看练习模型原返回（含参考）</summary><pre>{partial.content}</pre></details>}{busyId && <div className="generating" role="status"><LoaderCircle size={15} className="spin" /><div>{partial?.mode === 'practice' ? '正在接收、校验并保存练习…' : '正在等待模型回复…'}<small>来源以核对后的实际清单为准</small></div></div>}{aiError && <div className="inline-error" role="alert"><strong>这次没有得到回复</strong><p>{aiError}</p><span>输入仍保留，可以修改后重试。</span>{practiceFailure?.sourceId === activeId && <button className="quiet-button" disabled={!!busyId} onClick={()=>{void generateExercise(true);}}>{practiceFailure.unknown ? practiceFailure.recovery ? '继续完成保存' : '核对上次练习生成' : '重试生成练习'}</button>}</div>}<div ref={chatEnd} />
       </div>
-      <div className="composer-area"><div className="composer"><ComposerReferenceChips references={composerRefs} busy={!!busyId} onRemove={removeComposerReference} onOpenAssistant={item=>{void openAssistantQuote(item);}}/><textarea ref={questionRef} aria-label="向学习助手提问" placeholder={current ? '写下问题，或生成练习的要求…' : '先打开一份材料或探索'} value={composerQuestion} disabled={!canCompose} rows={3} onChange={event => updateComposer(event.target.value)} onCompositionStart={() => { cancelAnimationFrame(composerCommitFrame.current); composerComposing.current = true; }} onCompositionEnd={() => { composerCommitFrame.current = requestAnimationFrame(() => { composerComposing.current = false; }); }} onBlur={() => { cancelAnimationFrame(composerCommitFrame.current); composerComposing.current = false; }} onKeyDown={event => { const action = composerKeyAction(event.nativeEvent, composerComposing.current); if (action === 'native') return; event.preventDefault(); if (action === 'send') void ask(); }} /><div className="composer-bottom"><button type="button" className="save-question" disabled={!composerQuestion.trim() || localQuestionSaving} onClick={() => { void saveLocalQuestion(); }}>{localQuestionSaving ? <LoaderCircle size={11} className="spin" /> : <Plus size={11} />}保存困惑</button><ChatModelPicker model={boot.model} busy={!!busyId || modelChanging} onApply={changeModel} onSettings={openSettings} /><button type="button" onClick={()=>{if(busyId)void cancel();else void ask();}} className="send-button" aria-label={busyId ? '停止生成' : modelReady ? '发送问题' : '配置模型后提问'} disabled={!busyId && (!composerQuestion.trim() || modelChanging)}>{busyId ? <Square size={15} /> : <ArrowUp size={17} />}</button></div></div></div>
+      <div className="composer-area"><div className="composer"><ComposerReferenceChips references={composerRefs} busy={!!busyId} onRemove={removeComposerReference} onOpenAssistant={item=>{void openAssistantQuote(item);}}/><textarea ref={questionRef} aria-label="向学习助手提问" placeholder={current ? '写下问题，或生成练习的要求…' : '先打开一份材料或探索'} value={composerQuestion} disabled={!canCompose} rows={3} onChange={event => updateComposer(event.target.value)} onCompositionStart={() => { cancelAnimationFrame(composerCommitFrame.current); composerComposing.current = true; }} onCompositionEnd={() => { composerCommitFrame.current = requestAnimationFrame(() => { composerComposing.current = false; }); }} onBlur={() => { cancelAnimationFrame(composerCommitFrame.current); composerComposing.current = false; }} onKeyDown={event => { const action = composerKeyAction(event.nativeEvent, composerComposing.current); if (action === 'native') return; event.preventDefault(); if (action === 'send') void ask(); }} /><div className="composer-bottom"><ComposerToolTierPicker busy={!!busyId} /><ChatModelPicker model={boot.model} busy={!!busyId || modelChanging} onApply={changeModel} onSettings={openSettings} /><button type="button" onClick={()=>{if(busyId)void cancel();else void ask();}} className="send-button" aria-label={busyId ? '停止生成' : modelReady ? '发送问题' : '配置模型后提问'} disabled={!busyId && (!composerQuestion.trim() || modelChanging)}>{busyId ? <Square size={15} /> : <ArrowUp size={17} />}</button></div></div></div>
     </aside>}
 
     {exerciseQuote && <Dialog title="引用练习分区" description="从当前题的规范原文选择连续内容，不切换编辑页面。" onClose={()=>{exerciseQuoteSequence.current++;setExerciseQuote(null);}}><ExerciseQuote source={exerciseQuote} onAdd={selected=>addExerciseQuote(exerciseQuote,selected)}/></Dialog>}

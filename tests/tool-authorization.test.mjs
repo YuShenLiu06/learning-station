@@ -20,7 +20,7 @@ test('tool authorization tiers are ordered, labeled and normalized closed', asyn
   } finally { await unlink(filename).catch(() => {}); }
 });
 
-test('settings panel keeps tier off by default, saves the explicit user choice and surfaces busy boundaries', async () => {
+test('composer tier pill loads the saved tier, writes the explicit choice and surfaces busy boundaries', async () => {
   const dom = new JSDOM('<div id="root"></div>', { url: 'http://127.0.0.1/' });
   Object.assign(globalThis, { window: dom.window, document: dom.window.document, isTauri: true, IS_REACT_ACT_ENVIRONMENT: true });
   Object.defineProperty(globalThis, 'navigator', { configurable: true, value: dom.window.navigator });
@@ -38,28 +38,36 @@ test('settings panel keeps tier off by default, saves the explicit user choice a
     throw Error('Unexpected mock IPC ' + command);
   });
   const filename = new URL(`./.tool-authorization-ui-${process.pid}.mjs`, import.meta.url);
-  await build({ stdin: { contents: "export {ToolAuthorizationSettings} from './src/ToolAuthorizationSettings';", resolveDir: process.cwd(), loader: 'tsx' }, outfile: filename.pathname, bundle: true, packages: 'external', platform: 'node', format: 'esm', jsx: 'automatic', define: { 'import.meta.env.DEV': 'false' } });
+  await build({ stdin: { contents: "export {ComposerToolTierPicker} from './src/ComposerToolTierPicker';", resolveDir: process.cwd(), loader: 'tsx' }, outfile: filename.pathname, bundle: true, packages: 'external', platform: 'node', format: 'esm', jsx: 'automatic', define: { 'import.meta.env.DEV': 'false' } });
   const React = await import('react');
   const { createRoot } = await import('react-dom/client');
-  const { ToolAuthorizationSettings } = await import(filename.href);
+  const { ComposerToolTierPicker } = await import(filename.href);
   const root = createRoot(document.getElementById('root'));
   const act = React.act;
-  const selected = () => document.querySelector('input[name="tool-authorization-tier"]:checked')?.value;
+  const pill = () => document.querySelector('.tier-pill');
+  const items = () => [...document.querySelectorAll('.tier-menu>button[role="menuitemradio"]')];
   try {
-    await act(async () => root.render(React.createElement(ToolAuthorizationSettings, { blocked: false, sessionId: 'session_prefs' })));
-    assert.equal(selected(), 'off', 'a missing stored tier renders as off');
-    assert.match(document.body.textContent, /默认/);
-    await act(async () => { (document.querySelector('input[name="tool-authorization-tier"][value="bash"]')).click(); });
-    await act(async () => { document.querySelector('button[type="submit"]').click(); });
+    await act(async () => root.render(React.createElement(ComposerToolTierPicker, { busy: false })));
+    assert.match(pill().textContent, /关闭/, 'a missing stored tier renders as off');
+    await act(async () => { pill().click(); });
+    assert.equal(items().length, 4, 'all four tiers are listed');
+    assert.match(document.body.textContent, /仅读取本轮已授权来源/, 'each option carries its one-line description');
+    assert.match(items().find(item => item.getAttribute('aria-checked') === 'true').textContent, /关闭/, 'the saved tier is checked');
+    await act(async () => { items().find(item => item.textContent.includes('受控命令')).click(); });
     assert.deepEqual(writes, [{ toolAuthorizationTier: 'bash' }]);
-    assert.match(document.body.textContent, /已保存/);
-    // A busy boundary error stays visible and does not fake success.
+    assert.equal(document.querySelector('.tier-menu'), null, 'menu closes after the save is confirmed');
+    assert.match(pill().textContent, /受控命令/);
+    // A busy boundary error stays visible, writes nothing and keeps the pill honest.
+    await act(async () => { pill().click(); });
     busyOnce = true;
-    await act(async () => { (document.querySelector('input[name="tool-authorization-tier"][value="read"]')).click(); });
-    await act(async () => { document.querySelector('button[type="submit"]').click(); });
+    await act(async () => { items().find(item => item.textContent.includes('受控读取')).click(); });
     assert.equal(writes.length, 1, 'rejected save writes nothing');
     assert.match(document.body.textContent, /生成中不能变更工具授权档位/);
-    assert.equal(selected(), 'read', 'the attempted choice stays in the form');
+    assert.match(pill().textContent, /受控命令/, 'the saved tier stays applied');
+    // While a generation runs the pill is disabled and opens nothing.
+    await act(async () => root.render(React.createElement(ComposerToolTierPicker, { busy: true })));
+    assert.equal(pill().disabled, true);
+    assert.equal(document.querySelector('.tier-menu'), null);
   } finally {
     await act(async () => root.unmount());
     clearMocks(); dom.window.close(); await unlink(filename).catch(() => {});
