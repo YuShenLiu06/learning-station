@@ -597,6 +597,8 @@ pub(crate) fn task_tool_policy(mode: &str, authorization: &str) -> model::ToolPo
                 "create_note",
                 "create_todo",
                 "generate_exercises",
+                "list_learning_skills",
+                "load_learning_skill",
             ],
             4,
         ),
@@ -609,10 +611,21 @@ pub(crate) fn task_tool_policy(mode: &str, authorization: &str) -> model::ToolPo
                 "create_note",
                 "create_todo",
                 "generate_exercises",
+                "list_learning_skills",
+                "load_learning_skill",
             ],
             6,
         ),
-        "practice" | "review" => (&["query_related_knowledge"], 2),
+        // Practice keeps its small budget; only guidance listing/loading joins it.
+        "practice" => (
+            &[
+                "query_related_knowledge",
+                "list_learning_skills",
+                "load_learning_skill",
+            ],
+            2,
+        ),
+        "review" => (&["query_related_knowledge"], 2),
         _ => (&[], 0),
     };
     let mut policy = model::ToolPolicy {
@@ -1347,6 +1360,8 @@ fn new_tool_activity(
         "create_todo" => "创建待办",
         "generate_exercises" => "生成练习",
         "query_related_knowledge" => "查找相关材料",
+        "list_learning_skills" => "查看学习指导目录",
+        "load_learning_skill" => "加载学习指导",
         "read" => "受控读取",
         "write" => "受控写入",
         "bash" => "受控命令",
@@ -1383,6 +1398,14 @@ fn finish_tool_activity(
         if activity.name == "query_related_knowledge" {
             activity.status = "succeeded".into();
             activity.summary = "已完成授权材料查询，未创建新内容。".into();
+            return;
+        }
+        if matches!(
+            activity.name.as_str(),
+            "list_learning_skills" | "load_learning_skill"
+        ) {
+            activity.status = "succeeded".into();
+            activity.summary = "已返回内置学习指导内容，未创建新内容。".into();
             return;
         }
         if activity.name == "read" {
@@ -2229,6 +2252,8 @@ mod history_audit_tests {
                     "create_note",
                     "create_todo",
                     "generate_exercises",
+                    "list_learning_skills",
+                    "load_learning_skill",
                 ],
             ),
             (
@@ -2242,9 +2267,19 @@ mod history_audit_tests {
                     "create_note",
                     "create_todo",
                     "generate_exercises",
+                    "list_learning_skills",
+                    "load_learning_skill",
                 ],
             ),
-            ("practice", 2, vec!["query_related_knowledge"]),
+            (
+                "practice",
+                2,
+                vec![
+                    "query_related_knowledge",
+                    "list_learning_skills",
+                    "load_learning_skill",
+                ],
+            ),
             ("review", 2, vec!["query_related_knowledge"]),
             ("feedback", 0, vec![]),
         ] {
@@ -2274,7 +2309,11 @@ mod history_audit_tests {
         // Non-exploration modes never gain workspace tools.
         assert_eq!(
             task_tool_policy("practice", "bash").allowed_tools,
-            vec!["query_related_knowledge".to_owned()]
+            vec![
+                "query_related_knowledge".to_owned(),
+                "list_learning_skills".to_owned(),
+                "load_learning_skill".to_owned()
+            ]
         );
         assert!(task_tool_policy("feedback", "bash").allowed_tools.is_empty());
     }

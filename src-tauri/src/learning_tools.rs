@@ -75,6 +75,11 @@ struct QueryKnowledge {
     #[serde(default)]
     knowledge_id: Option<String>,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct LoadSkill {
+    skill_id: String,
+}
 
 enum Operation {
     Record(RecordQuestion),
@@ -84,6 +89,8 @@ enum Operation {
     Todo(CreateTodo),
     Query(QueryKnowledge),
     Exercises(Value),
+    ListSkills,
+    LoadSkill(String),
 }
 
 /// A model can retry a write with a new run/call ID after interruption. Anchor
@@ -229,8 +236,29 @@ pub fn execute(
             }
             Operation::Query(value)
         }
+        "list_learning_skills" => {
+            // No parameters and no path surface: the catalog is fixed and bundled.
+            if !args.as_object().is_some_and(|object| object.is_empty()) {
+                return Err(invalid());
+            }
+            Operation::ListSkills
+        }
+        "load_learning_skill" => {
+            let value: LoadSkill = decode(args)?;
+            if !valid_id(&value.skill_id) {
+                return Err(invalid());
+            }
+            Operation::LoadSkill(value.skill_id)
+        }
         _ => return Err(CoreError::new("TOOL_NOT_ALLOWED", "未启用此学习工具。")),
     };
+    if let Operation::ListSkills = operation {
+        return Ok(json!({"sessionId":scope.session_id,"runId":scope.run_id,
+            "skills":crate::learning_skills::catalog()}));
+    }
+    if let Operation::LoadSkill(id) = &operation {
+        return load_skill(engine, scope, id);
+    }
     let explicit_run = if scope.section_id.is_empty() && !scope.allowed_ids.is_empty()
         || name == "generate_exercises"
     {
@@ -552,7 +580,8 @@ pub fn execute(
                 data: Some(data),
             }
         }
-        Operation::Query(_) | Operation::Todo(_) | Operation::Exercises(_) => unreachable!(),
+        Operation::Query(_) | Operation::Todo(_) | Operation::Exercises(_)
+        | Operation::ListSkills | Operation::LoadSkill(_) => unreachable!(),
     };
     if let Some(user) = &business_user {
         let data = entry.data.as_mut().ok_or_else(invalid)?;
@@ -581,6 +610,47 @@ pub fn execute(
         receipt["existingErrorId"] = json!(source_id);
     }
     Ok(receipt)
+}
+
+/// On-demand guidance loading. Only the fixed bundled allowlist is readable;
+/// anything else is an authorization rejection without touching the disk. The
+/// dedup ledger hangs on the current run: a repeated load returns a short
+/// summary instead of a second body, while a new run loads the full text again.
+fn load_skill(engine: &Engine, scope: &ToolScope, id: &str) -> Result<Value> {
+    if !crate::learning_skills::KNOWN_IDS.contains(&id) {
+        return Err(out_of_scope());
+    }
+    // Guidance already injected proactively for this run's mode needs no reload.
+    if let Ok(run) = crate::generation::get(engine, &scope.run_id) {
+        if let Some(version) = run
+            .learning_skills
+            .iter()
+            .find(|version| version.id == id && version.scope == "mode")
+        {
+            return Ok(json!({"sessionId":scope.session_id,"runId":scope.run_id,"skillId":id,
+                "sha256":version.sha256,"alreadyInjected":true,
+                "notice":"该学习指导已随本次模式注入系统指导，正文无需重复加载。"}));
+        }
+    }
+    let mut loaded = engine
+        .run_loaded_skills
+        .lock()
+        .map_err(|_| out_of_scope())?;
+    if let Some(sha256) = loaded
+        .get(&scope.run_id)
+        .and_then(|skills| skills.get(id))
+    {
+        return Ok(json!({"sessionId":scope.session_id,"runId":scope.run_id,"skillId":id,
+            "sha256":sha256,"alreadyLoaded":true,
+            "notice":"该学习指导本轮已加载，正文见先前的工具结果。"}));
+    }
+    let snapshot = crate::learning_skills::load(id)?;
+    loaded
+        .entry(scope.run_id.clone())
+        .or_default()
+        .insert(id.to_owned(), snapshot.sha256.clone());
+    Ok(json!({"sessionId":scope.session_id,"runId":scope.run_id,"skillId":id,
+        "sha256":snapshot.sha256,"content":snapshot.content}))
 }
 
 fn query_knowledge(
@@ -2120,6 +2190,10 @@ mod tests {
             ),
             ("query_related_knowledge", json!({"path":"/tmp/private"})),
             ("record_question", json!({"question":"Q","apiKey":"secret"})),
+            ("list_learning_skills", json!({"path":"/tmp/private"})),
+            ("load_learning_skill", json!({})),
+            ("load_learning_skill", json!({"skillId":"../../skills/secret"})),
+            ("load_learning_skill", json!({"skillId":"ok","extra":1})),
         ] {
             assert_eq!(
                 execute(&engine, &scope, "malicious-call", name, args)
@@ -2175,6 +2249,150 @@ mod tests {
             .unwrap()
             .entries
             .is_empty());
+    }
+
+    #[test]
+    fn skill_catalog_lists_only_allowlisted_metadata_without_bodies() {
+        let (_directory, engine, scope, _) = fixture();
+        let listed = execute(
+            &engine,
+            &scope,
+            "list-call",
+            "list_learning_skills",
+            json!({}),
+        )
+        .unwrap();
+        let skills = listed["skills"].as_array().unwrap();
+        assert_eq!(
+            skills
+                .iter()
+                .map(|item| item["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            crate::learning_skills::KNOWN_IDS
+        );
+        for item in skills {
+            assert_eq!(item["name"].as_str().unwrap(), item["id"].as_str().unwrap());
+            assert!(!item["description"].as_str().unwrap().trim().is_empty());
+        }
+        // Metadata only: no frontmatter or body may leak through the listing.
+        assert!(!listed.to_string().contains("---\\n"));
+        assert!(!listed.to_string().contains("正文"));
+    }
+
+    #[test]
+    fn skill_load_returns_the_body_and_out_of_list_ids_are_authorization_rejections() {
+        let (_directory, engine, scope, _) = fixture();
+        let loaded = execute(
+            &engine,
+            &scope,
+            "load-call",
+            "load_learning_skill",
+            json!({"skillId":"learning-review"}),
+        )
+        .unwrap();
+        let content = loaded["content"].as_str().unwrap();
+        assert!(content.starts_with("---\nname: learning-review\n"));
+        assert_eq!(loaded["sha256"].as_str().unwrap(), hash(content));
+        assert_eq!(loaded["skillId"], "learning-review");
+        // An id outside the fixed allowlist never reaches the disk.
+        for (id, code) in [
+            ("not-a-skill", "TOOL_SCOPE"),
+            ("learning-explore/../learning-review", "INVALID_TOOL_INPUT"),
+            ("Skills", "TOOL_SCOPE"),
+        ] {
+            assert_eq!(
+                execute(
+                    &engine,
+                    &scope,
+                    "load-out",
+                    "load_learning_skill",
+                    json!({"skillId":id})
+                )
+                .unwrap_err()
+                .code,
+                code,
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_load_in_one_run_returns_a_notice_but_a_new_run_loads_again() {
+        let (_directory, engine, scope, _) = fixture();
+        let first = execute(
+            &engine,
+            &scope,
+            "first-load",
+            "load_learning_skill",
+            json!({"skillId":"learning-explore"}),
+        )
+        .unwrap();
+        assert!(first["content"].is_string());
+        let second = execute(
+            &engine,
+            &scope,
+            "second-load",
+            "load_learning_skill",
+            json!({"skillId":"learning-explore"}),
+        )
+        .unwrap();
+        assert_eq!(second["alreadyLoaded"], true);
+        assert_eq!(second["sha256"], first["sha256"]);
+        assert!(second.get("content").is_none());
+        // A different run is fresh effective context and gets the body again.
+        let mut fresh = scope.clone();
+        fresh.run_id = "run_skill_reload".into();
+        let third = execute(
+            &engine,
+            &fresh,
+            "third-load",
+            "load_learning_skill",
+            json!({"skillId":"learning-explore"}),
+        )
+        .unwrap();
+        assert!(third["content"].is_string());
+        assert_eq!(third["sha256"], first["sha256"]);
+    }
+
+    #[test]
+    fn guidance_already_injected_for_the_mode_is_not_loaded_again() {
+        let (_directory, engine, scope, _) = fixture();
+        let run: crate::generation::Run = serde_json::from_value(json!({
+            "id": scope.run_id, "sessionId": scope.session_id, "mode": "question",
+            "status": "running", "content": "", "error": null,
+            "createdAt": "2026-10-17T00:00:00Z", "updatedAt": "2026-10-17T00:00:00Z",
+            "requestDigest": "fixture", "contextManifest": [], "contextSnapshotVersion": 1,
+            "learningSkills": [{"id":"learning-explore","sha256":"ab".repeat(32),"scope":"mode"}],
+        }))
+        .unwrap();
+        engine.runs.lock().unwrap().insert(
+            run.id.clone(),
+            crate::generation::ManagedRun {
+                run,
+                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        );
+        let loaded = execute(
+            &engine,
+            &scope,
+            "injected-load",
+            "load_learning_skill",
+            json!({"skillId":"learning-explore"}),
+        )
+        .unwrap();
+        assert_eq!(loaded["alreadyInjected"], true);
+        assert_eq!(loaded["sha256"], "ab".repeat(32));
+        assert!(loaded.get("content").is_none());
+        // Tool-scoped exercise guidance is not system-injected and still loads.
+        let exercises = execute(
+            &engine,
+            &scope,
+            "exercises-load",
+            "load_learning_skill",
+            json!({"skillId":"learning-exercises"}),
+        )
+        .unwrap();
+        assert!(exercises["content"].is_string());
     }
 }
 #[cfg(test)]

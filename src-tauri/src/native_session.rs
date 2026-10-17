@@ -197,7 +197,11 @@ pub fn recover(
             json!({"persisted":true,"todoId":todo.id,"sessionId":session_id,"sectionId":session.section_id,"todo":todo,"recovered":true}),
         );
     }
-    if call.name == "query_related_knowledge" {
+    if matches!(
+        call.name.as_str(),
+        "query_related_knowledge" | "list_learning_skills" | "load_learning_skill"
+    ) {
+        // Read-only calls have no durable business object to recover.
         return Err(unknown());
     }
     let id = format!("entry_{}", &hash(&request)[..32]);

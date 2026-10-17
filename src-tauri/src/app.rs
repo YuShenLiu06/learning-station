@@ -122,6 +122,10 @@ pub struct Engine {
     pub bot: crate::feishu_bot::BotManager,
     pub grades: Mutex<BTreeMap<String, crate::grading::ManagedGrade>>,
     pub runs: Mutex<BTreeMap<String, crate::generation::ManagedRun>>,
+    /// Per-run on-demand skill loads (run id -> skill id -> sha256). Keyed by
+    /// the current run so dedup never outlives that run's effective context.
+    pub run_loaded_skills:
+        Mutex<BTreeMap<String, BTreeMap<String, String>>>,
 }
 
 impl Engine {
@@ -229,6 +233,7 @@ impl Engine {
             bot,
             grades: Mutex::new(BTreeMap::new()),
             runs: Mutex::new(BTreeMap::new()),
+            run_loaded_skills: Mutex::new(BTreeMap::new()),
         }))
     }
     pub fn lock(&self) -> Result<MutexGuard<'_, Core>> {

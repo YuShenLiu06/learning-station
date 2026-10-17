@@ -33,6 +33,8 @@ const ALL_TOOLS: &[&str] = &[
     "create_note",
     "create_todo",
     "generate_exercises",
+    "list_learning_skills",
+    "load_learning_skill",
 ];
 /// User-selectable tool authorization tiers, ordered by strength. The default
 /// is "off": read/write/bash stay unregistered unless the user opts in.
@@ -276,11 +278,23 @@ fn validate_tool_policy(policy: &ToolPolicy, has_handler: bool) -> Result<()> {
                 "create_note",
                 "create_todo",
                 "generate_exercises",
+                "list_learning_skills",
+                "load_learning_skill",
             ],
             4,
         ),
         "explain" => (ALL_TOOLS, 6),
-        "practice" | "review" => (&["query_related_knowledge"], 2),
+        // Only practice may pull extra guidance on demand; review keeps its
+        // fixed injected guidance without widening the tool surface.
+        "practice" => (
+            &[
+                "query_related_knowledge",
+                "list_learning_skills",
+                "load_learning_skill",
+            ],
+            2,
+        ),
+        "review" => (&["query_related_knowledge"], 2),
         "feedback" | "grading" => (&[], 0),
         "legacy" => (&ALL_TOOLS[..3], 8),
         _ => return Err(sidecar_error("TOOL_PROTOCOL")),
@@ -1013,7 +1027,7 @@ async fn run_sidecar(
                                         plugin.get("id").and_then(Value::as_str)
                                             == Some("learning-station.learning")
                                             && plugin.get("version").and_then(Value::as_str)
-                                                == Some("1.1.0")
+                                                == Some("1.2.0")
                                             && plugin.get("tools") == Some(&expected)
                                     })
                                 });
@@ -1240,6 +1254,31 @@ fn validate_tool_call(call: &ToolCall) -> Result<()> {
     if call.id.is_empty() || call.id.chars().count() > 256 || call.id.chars().any(char::is_control)
     {
         return Err(sidecar_error("TOOL_PROTOCOL"));
+    }
+    if call.name == "list_learning_skills" {
+        if !call
+            .args
+            .as_object()
+            .is_some_and(|object| object.is_empty())
+        {
+            return Err(sidecar_error("TOOL_PROTOCOL"));
+        }
+        return Ok(());
+    }
+    if call.name == "load_learning_skill" {
+        let a = call
+            .args
+            .as_object()
+            .ok_or_else(|| sidecar_error("TOOL_PROTOCOL"))?;
+        if a.keys().any(|k| k != "skillId")
+            || a.len() != 1
+            || a.get("skillId")
+                .and_then(Value::as_str)
+                .is_none_or(|id| id.is_empty() || id.chars().count() > 128)
+        {
+            return Err(sidecar_error("TOOL_PROTOCOL"));
+        }
+        return Ok(());
     }
     if call.name == "generate_exercises" {
         let a = call
@@ -2585,11 +2624,21 @@ mod tests {
                     "create_note",
                     "create_todo",
                     "generate_exercises",
+                    "list_learning_skills",
+                    "load_learning_skill",
                 ],
                 4,
             ),
             ("explain", ALL_TOOLS.to_vec(), 6),
-            ("practice", vec!["query_related_knowledge"], 2),
+            (
+                "practice",
+                vec![
+                    "query_related_knowledge",
+                    "list_learning_skills",
+                    "load_learning_skill",
+                ],
+                2,
+            ),
             ("review", vec!["query_related_knowledge"], 2),
             ("feedback", vec![], 0),
             ("grading", vec![], 0),

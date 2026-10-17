@@ -2,8 +2,8 @@ import {freezeTodoTime} from './time-context.mjs';
 import { Type } from 'typebox';
 
 export const LEARNING_PLUGIN = Object.freeze({
-  id: 'learning-station.learning', version: '1.1.0',
-  tools: Object.freeze(['record_question', 'create_error', 'query_related_knowledge', 'create_review_card', 'create_note', 'create_todo', 'generate_exercises']),
+  id: 'learning-station.learning', version: '1.2.0',
+  tools: Object.freeze(['record_question', 'create_error', 'query_related_knowledge', 'create_review_card', 'create_note', 'create_todo', 'generate_exercises', 'list_learning_skills', 'load_learning_skill']),
 });
 export const LEGACY_TOOLS = Object.freeze(LEARNING_PLUGIN.tools.slice(0, 3));
 /** Cumulative workspace tools unlocked by each user-selected authorization tier. */
@@ -14,9 +14,9 @@ export const AUTHORIZATION_TOOLS = Object.freeze({
   bash: Object.freeze(['read', 'write', 'bash']),
 });
 export const MODE_POLICIES = Object.freeze({
-  question: { allowedTools: ['query_related_knowledge', 'record_question', 'create_note', 'create_todo', 'generate_exercises'], maxCalls: 4 },
+  question: { allowedTools: ['query_related_knowledge', 'record_question', 'create_note', 'create_todo', 'generate_exercises', 'list_learning_skills', 'load_learning_skill'], maxCalls: 4 },
   explain: { allowedTools: [...LEARNING_PLUGIN.tools], maxCalls: 6 },
-  practice: { allowedTools: ['query_related_knowledge'], maxCalls: 2 },
+  practice: { allowedTools: ['query_related_knowledge', 'list_learning_skills', 'load_learning_skill'], maxCalls: 2 },
   feedback: { allowedTools: [], maxCalls: 0 },
   grading: { allowedTools: [], maxCalls: 0 },
   review: { allowedTools: ['query_related_knowledge'], maxCalls: 2 },
@@ -67,6 +67,12 @@ const definitions = [
   { name: 'query_related_knowledge', label: '查询关联知识',
     description: '经Rust查询当前会话允许范围内的关联知识，query和knowledgeId至少提供一项。不接受文件路径、会话ID或任意访问范围。',
     parameters: Type.Object({ query: optionalString(500), knowledgeId: optionalString(128) }, { additionalProperties: false }) },
+  { name: 'list_learning_skills', label: '查看学习指导目录',
+    description: '列出本应用内置学习指导的id、名称与描述，不含正文，也没有任何参数或路径。需要正文时用load_learning_skill按id加载。',
+    parameters: Type.Object({}, { additionalProperties: false }) },
+  { name: 'load_learning_skill', label: '加载学习指导',
+    description: '按id返回一条内置学习指导的完整正文，经工具结果通道提供，不进入系统提示。skillId只能来自list_learning_skills返回的目录，不接受路径。本轮已加载或已随模式注入的指导只返回简短提示，不重复正文。',
+    parameters: Type.Object({ skillId: string(128) }, { additionalProperties: false }) },
   { name: 'create_review_card', label: '创建复习卡片',
     description: '按用户明确要求，把正反面内容保存为当前会话的复习卡片；只有Rust返回persisted:true才算成功。',
     parameters: Type.Object({ front: string(8000), back: string(12000), tags: Type.Optional(Type.Array(string(64), { maxItems: 12 })) }, { additionalProperties: false }) },
@@ -108,7 +114,8 @@ export function validateCall(id, name, args) {
   const fields = name === 'record_question' ? { question: 8000, selection: 12000 }
     : name === 'create_error' ? { front: 8000, back: 12000, cause: 4000, exerciseId: 128, tags: 0 }
       : name === 'create_review_card' ? { front: 8000, back: 12000, tags: 0 }
-        : name === 'create_note' ? { content: 12000, selection: 12000 } : name === 'create_todo' ? { title: 500, dueAt: 64, relativeMinutes: 0, reminderEnabled: 0 } : { query: 500, knowledgeId: 128 };
+        : name === 'create_note' ? { content: 12000, selection: 12000 } : name === 'create_todo' ? { title: 500, dueAt: 64, relativeMinutes: 0, reminderEnabled: 0 }
+          : name === 'list_learning_skills' ? {} : name === 'load_learning_skill' ? { skillId: 128 } : { query: 500, knowledgeId: 128 };
   for (const [key, value] of Object.entries(args)) {
     if (!Object.hasOwn(fields, key)) throw new LearningToolError('TOOL_PROTOCOL');
     if(key==='relativeMinutes'){if(!Number.isInteger(value)||value<1||value>525600)throw new LearningToolError('TOOL_PROTOCOL');}
@@ -118,7 +125,7 @@ export function validateCall(id, name, args) {
     } else if (typeof value !== 'string' || (!['selection', 'cause'].includes(key) && !value.trim()) || [...value].length > fields[key]) throw new LearningToolError('TOOL_PROTOCOL');
   }
   if (args.dueAt !== undefined && (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u.test(args.dueAt) || !Number.isFinite(Date.parse(args.dueAt)))) throw new LearningToolError('TOOL_PROTOCOL');
-  const required = name === 'create_todo' ? ['title'] : name === 'record_question' ? ['question'] : ['create_error', 'create_review_card'].includes(name) ? ['front', 'back'] : name === 'create_note' ? ['content'] : [];
+  const required = name === 'create_todo' ? ['title'] : name === 'record_question' ? ['question'] : ['create_error', 'create_review_card'].includes(name) ? ['front', 'back'] : name === 'create_note' ? ['content'] : name === 'load_learning_skill' ? ['skillId'] : [];
   if (required.some((key) => typeof args[key] !== 'string') || (name === 'query_related_knowledge' && !args.query && !args.knowledgeId)
     || (name === 'create_todo' && args.reminderEnabled === true && args.dueAt === undefined && args.relativeMinutes === undefined)) throw new LearningToolError('TOOL_PROTOCOL');
   return args;
@@ -195,7 +202,7 @@ export function createLearningPlugin({ requestTool, secret = '', fail = () => {}
         const result = redactStrings(reply.result, secret);
         if (!result || typeof result !== 'object' || Array.isArray(result)) { fail('TOOL_PROTOCOL'); throw new LearningToolError('TOOL_PROTOCOL'); }
         // Markdown prose is not durable execution evidence. Writes require Rust's explicit receipt.
-        if (!['query_related_knowledge', 'read'].includes(name) && result.persisted !== true) {
+        if (!['query_related_knowledge', 'list_learning_skills', 'load_learning_skill', 'read'].includes(name) && result.persisted !== true) {
           isError = true; body = { ok: false, error: { code: 'TOOL_FAILED', message: safeMessages.TOOL_FAILED } };
         } else body = { ok: true, result };
       }
@@ -210,7 +217,7 @@ export function createLearningPlugin({ requestTool, secret = '', fail = () => {}
     id: LEARNING_PLUGIN.id, version: LEARNING_PLUGIN.version,
     preflight,
     validate: (call) => safeCall(call.id, call.name, call.arguments),
-    tools: allowedTools.map((name) => definitions.find((definition) => definition.name === name)).map((definition) => ({ ...definition, description: definition.description + (definition.name === 'generate_exercises' && exerciseGuidance ? `\n\n${exerciseGuidance}` : ''), executionMode: 'sequential', replay: ['query_related_knowledge', 'read'].includes(definition.name) ? 'safe' : 'never',
+    tools: allowedTools.map((name) => definitions.find((definition) => definition.name === name)).map((definition) => ({ ...definition, description: definition.description + (definition.name === 'generate_exercises' && exerciseGuidance ? `\n\n${exerciseGuidance}` : ''), executionMode: 'sequential', replay: ['query_related_knowledge', 'list_learning_skills', 'load_learning_skill', 'read'].includes(definition.name) ? 'safe' : 'never',
       execute: (id, args, signal) => execute(definition.name, id, args, signal) })),
     stats: () => ({ attempts, executed }),
   };
