@@ -113,7 +113,7 @@ Tauri devUrl约定 `http://127.0.0.1:1420`，release嵌入 `dist/`。命令snake
 | `append_entry` | 发送原问题data可含`{clientMessageId:sendId,mode}`；同requestId幂等，expectedVersion防覆盖。未配置/gate前置失败不假送达；本地append成功与模型失败分开显示，失败不覆盖后来输入的新草稿。 |
 | `get_ui_preferences` | `{fontSize,assistantWidth,sidebarWidth,sidebarCollapsed,expandedNodeIds,toolAuthorizationTier}`。字号12–24默认16；右宽280–960默认346；左宽180–480默认240；折叠默认false、展开ID默认[]；工具授权档位off/read/write/bash默认off，旧文件缺字段补默认off。 |
 | `save_ui_preferences({fontSize?,assistantWidth?,sidebarWidth?,sidebarCollapsed?,expandedNodeIds?,toolAuthorizationTier?})` | 同一锁内原子合并，缺省字段保持，全部缺省只读；旧文件缺字段时补默认。非法值不写盘。toolAuthorizationTier仅接受四档枚举，变更档位时如有queued/running的Run返回BUSY（先核对未决工具回执），同值重存不拦截。小窗口只夹紧实际渲染宽度，折叠不覆盖宽度偏好。 |
-| `list_tool_receipts({sessionId})` | 只读列出该会话工作区已落账的 write/bash 回执摘要（requestId、tool、status、createdAt、write 的相对路径），不含命令原文、参数或文件内容；会话不存在或编号无效拒绝，无台账返回空列表。 |
+| `list_tool_receipts({sessionId})` | 只读列出该会话工作区已落账的 write/bash 回执摘要（requestId、tool、status、createdAt、write 的相对路径），不含命令原文、参数或文件内容；会话不存在或编号无效拒绝，无台账返回空列表。按 createdAt 降序最多返回 200 条，超出时 `truncated:true`（另有损坏/符号链接/超限台账文件跳过不展示）。 |
 | `check_feishu_status()` | `{ready,reason}`，只读已验证本人通道，不登录、不发送、不返回凭据或收件人参数。 |
 | `test_feishu_notification({requestId})` | `{status:sent|blocked|failed|unknown,messageId:string|null,reason}`。ID为8–128字母数字/下划线/连字符；正文固定测试通知，用户点击才发。发前私有原子Unknown占位；同ID重开/超时均不重发；仅真实成功+messageId才sent。不会启用全部提醒。 |
 
