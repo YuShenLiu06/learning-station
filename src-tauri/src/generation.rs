@@ -2595,6 +2595,90 @@ mod learning_v2_tests {
     use super::*;
     use crate::learning_tools::{self, ToolScope};
     #[test]
+    fn exercise_tool_invalid_output_surfaces_safe_field_diagnostics_on_activity_card() {
+        let d = tempfile::tempdir().unwrap();
+        let e = Engine::new(d.path().join("lib"), d.path().join("state")).unwrap();
+        let (session, ctx) = {
+            let mut c = e.lock().unwrap();
+            let source = c
+                .create_section("合成来源", "SYNTHETIC_MATERIAL_STABLE", vec![], vec![])
+                .unwrap();
+            c.start_session(&source.id, false).unwrap()
+        };
+        let run: Run = serde_json::from_value(json!({"id":"run_activity_diagnostics","sessionId":session.id,"mode":"question","status":"running","content":"","error":null,"createdAt":timestamp(),"updatedAt":timestamp(),"requestDigest":"fixture","contextManifest":ctx.manifest,"contextSnapshotVersion":1})).unwrap();
+        e.runs.lock().unwrap().insert(
+            run.id.clone(),
+            ManagedRun {
+                run,
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        let scope = ToolScope {
+            session_id: session.id.clone(),
+            section_id: session.section_id.clone(),
+            run_id: "run_activity_diagnostics".into(),
+            allowed_ids: ctx.manifest.iter().map(|m| m.id.clone()).collect(),
+        };
+        // Whitespace-only question text passes the declared schema and preflight,
+        // so only Rust's validator rejects it — with a field-level diagnostic.
+        let invalid_args = json!({"requirements":"合成要求","summary":"合成总结","exercises":[{
+            "question":"   ","format":"exact","answers":["合成参考答案 PRIVATE_RAW_VALUE"],"tags":[],"sourceIds":[session.section_id]
+        }]});
+        let invalid = learning_tools::execute(
+            &e,
+            &scope,
+            "activity-bad-call",
+            "generate_exercises",
+            invalid_args,
+        )
+        .unwrap_err();
+        assert_eq!(invalid.code, "INVALID_MODEL_OUTPUT");
+        assert!(invalid.message.contains("exercises[1].question"));
+        let mut activity =
+            new_tool_activity(&scope, "activity-bad-call", "generate_exercises").unwrap();
+        finish_tool_activity(&mut activity, &scope, &Err(invalid));
+        assert_eq!(activity.status, "failed");
+        assert!(!activity.persisted);
+        assert_eq!(
+            activity.error_code.as_deref(),
+            Some("INVALID_MODEL_OUTPUT")
+        );
+        assert!(activity.summary.contains("exercises[1].question"));
+        assert!(!activity.summary.contains("PRIVATE_RAW_VALUE"));
+        // Authorization failures keep the generic card text; no retryable diagnostics.
+        let foreign_scope = ToolScope {
+            session_id: session.id.clone(),
+            section_id: session.section_id.clone(),
+            run_id: "run_activity_diagnostics".into(),
+            allowed_ids: vec![session.section_id.clone(), "foreign_source".into()],
+        };
+        let denied = learning_tools::execute(
+            &e,
+            &foreign_scope,
+            "activity-scope-call",
+            "generate_exercises",
+            json!({"requirements":"合成要求","summary":"合成总结","exercises":[{
+                "question":"解释概念","format":"exact","answers":["合成参考答案"],"tags":[],"sourceIds":[session.section_id]
+            }]}),
+        )
+        .unwrap_err();
+        assert_eq!(denied.code, "TOOL_SCOPE");
+        let mut generic =
+            new_tool_activity(&scope, "activity-scope-call", "generate_exercises").unwrap();
+        finish_tool_activity(&mut generic, &scope, &Err(denied));
+        assert_eq!(generic.error_code.as_deref(), Some("TOOL_SCOPE"));
+        assert_eq!(
+            generic.summary,
+            "工具未确认完成；不会将模型文字当作保存成功。"
+        );
+        let mut c = e.lock().unwrap();
+        assert!(sessions::get(&mut c.content, &session.id)
+            .unwrap()
+            .entries
+            .iter()
+            .all(|entry| entry.kind != "exercise"));
+    }
+    #[test]
     fn pi_exercise_tool_and_button_share_validated_durable_service() {
         let d = tempfile::tempdir().unwrap();
         let e = Engine::new(d.path().join("lib"), d.path().join("state")).unwrap();

@@ -498,3 +498,212 @@ async fn rust_node_pi_validates_final_json_and_corrects_before_any_persistence()
         }
     }
 }
+
+/// Issue 3/4 at the real Rust↔Node wire: an invalid generate_exercises call gets an
+/// INVALID_MODEL_OUTPUT field receipt inside the same native Agent loop, the model
+/// corrects once, and exactly one durable exercise write survives.
+#[tokio::test]
+async fn rust_node_pi_exercise_tool_receipt_corrects_invalid_output_in_same_native_loop() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = Engine::new(dir.path().join("lib"), dir.path().join("state")).unwrap();
+    let (s, ctx, user, md, state) = {
+        let mut c = e.lock().unwrap();
+        let d = c
+            .create_section("Synthetic source", "SYNTHETIC_MATERIAL_STABLE", vec![], vec![])
+            .unwrap();
+        let (s, ctx) = c.start_session(&d.id, false).unwrap();
+        let saved = sessions::append(
+            &mut c.content,
+            &s.id,
+            Entry {
+                id: String::new(),
+                kind: "user".into(),
+                content: "请生成一道合成练习".into(),
+                created_at: timestamp(),
+                selection: None,
+                related_ids: vec![],
+                data: None,
+            },
+            None,
+            "exercise_wire_user",
+        )
+        .unwrap();
+        let user = saved.entries.last().unwrap().id.clone();
+        let md = c.content.read(&s.id).unwrap().content;
+        (s, ctx, user, md, c.state_dir.clone())
+    };
+    let sid = s.id.clone();
+    let run_id = "exercise_wire_run";
+    let tracked: crate::generation::Run = serde_json::from_value(json!({"id":run_id,"sessionId":sid,"userEntryId":user,"mode":"question","status":"succeeded","content":"fixture","error":null,"createdAt":timestamp(),"updatedAt":timestamp(),"requestDigest":"exercise-fixture","contextManifest":ctx.manifest,"contextSnapshotVersion":1})).unwrap();
+    std::fs::create_dir_all(state.join("runs")).unwrap();
+    crate::app::atomic_json(&state.join("runs").join(format!("{run_id}.json")), &tracked).unwrap();
+    e.runs.lock().unwrap().insert(
+        run_id.into(),
+        crate::generation::ManagedRun {
+            run: tracked,
+            cancel: Arc::new(AtomicBool::new(false)),
+        },
+    );
+    let authorized: Vec<String> = ctx.manifest.iter().map(|m| m.id.clone()).collect();
+    let native =
+        crate::native_session::prepare(&state, &s, run_id, &user, authorized.clone(), false, vec![], &md)
+            .unwrap();
+    let projection = {
+        let c = e.lock().unwrap();
+        ContextBridge::snapshot(&state, &c.content, &s, &ctx).unwrap()
+    };
+    let request = GenerationRequest {
+        session_id: sid.clone(),
+        mode: "question".into(),
+        selection: String::new(),
+        prompt: "请生成一道合成练习".into(),
+        request_id: "exercise_wire_op".into(),
+        user_entry_id: Some(user),
+        injections: vec![],
+        assistant_references: vec![],
+        exercise_references: vec![],
+    };
+    let frozen =
+        ContextBridge::freeze(&request, &ctx, &s, None, &projection, crate::time_context::TimeContext::capture())
+            .unwrap();
+    let server = TcpListener::bind("127.0.0.1:0").unwrap();
+    server.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}/v1", server.local_addr().unwrap());
+    let wire_section = authorized[0].clone();
+    let handle = thread::spawn(move || {
+        let mut packets = vec![];
+        for index in 0..3 {
+            let until = std::time::Instant::now() + Duration::from_secs(45);
+            let (mut socket, _) = loop {
+                match server.accept() {
+                    Ok(v) => break v,
+                    Err(x)
+                        if x.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < until =>
+                    {
+                        thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(x) => panic!("fixture {x}"),
+                }
+            };
+            packets.push(receive(&mut socket));
+            // Whitespace-only question text passes every schema and preflight gate;
+            // only Rust's validator rejects it with a field-level diagnostic.
+            let exercise_call = |id: &str, question: &str| {
+                json!({"tool_calls":[{"index":0,"id":id,"type":"function","function":{
+                    "name":"generate_exercises",
+                    "arguments":serde_json::to_string(&json!({"requirements":"合成练习要求","summary":"合成总结","exercises":[{
+                        "question":question,"format":"exact","answers":["合成参考答案"],"tags":[],"sourceIds":[wire_section]
+                    }]})).unwrap()
+                }}]})
+            };
+            let (delta, finish_reason) = if index == 0 {
+                (exercise_call("exercise_bad", "   "), "tool_calls")
+            } else if index == 1 {
+                let seen = serde_json::to_string(&packets).unwrap();
+                assert!(seen.contains("INVALID_MODEL_OUTPUT"));
+                assert!(seen.contains("exercises[1].question"), "diagnostic missing");
+                (exercise_call("exercise_good", "解释合成概念"), "tool_calls")
+            } else {
+                let seen = serde_json::to_string(&packets).unwrap();
+                assert!(seen.contains("exdoc_"), "persisted receipt missing");
+                (json!({"content":"已按真实回执保存合成练习。"}), "stop")
+            };
+            let payload = json!({"choices":[{"index":0,"delta":delta,"finish_reason":finish_reason}]});
+            let body = format!("data: {payload}\n\ndata: [DONE]\n\n");
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).unwrap();
+        }
+        packets
+    });
+    let scope = ToolScope {
+        session_id: sid.clone(),
+        section_id: s.section_id.clone(),
+        run_id: run_id.into(),
+        allowed_ids: authorized,
+    };
+    let e2 = e.clone();
+    let handler: ToolHandler = Arc::new(move |call| {
+        let e = e2.clone();
+        let scope = scope.clone();
+        Box::pin(
+            async move { learning_tools::execute(&e, &scope, &call.id, &call.name, call.args) },
+        )
+    });
+    let output = generate_scoped(
+        ModelCredentials::new(
+            ModelSettings {
+                provider: "custom".into(),
+                protocol: PROTOCOL.into(),
+                base_url: endpoint,
+                model: "fixture-model".into(),
+                ..ModelSettings::default()
+            },
+            "synthetic-exercise-key-not-real".into(),
+        )
+        .unwrap(),
+        frozen.messages,
+        Arc::new(AtomicBool::new(false)),
+        |_| {},
+        Some(handler),
+        ToolPolicy {
+            mode: "question".into(),
+            allowed_tools: vec!["generate_exercises".into()],
+            max_calls: 4,
+        },
+        crate::learning_skills::capture("question", &["generate_exercises".into()]).unwrap(),
+        Some(RequestContext {
+            output_validator: None,
+            time: frozen.time,
+            exploration: None,
+            native_session: Some(native.clone()),
+            context_observer: None,
+            tool_recovery: None,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(output, "已按真实回执保存合成练习。");
+    let packets = handle.join().unwrap();
+    for packet in &packets {
+        let wire = serde_json::to_string(packet).unwrap();
+        assert!(!wire.contains("synthetic-exercise-key-not-real"));
+        for tool in packet["tools"].as_array().unwrap() {
+            assert_eq!(tool["function"]["name"], "generate_exercises");
+        }
+    }
+    let receipt = |call_id: &str| {
+        serde_json::from_str::<Value>(&std::fs::read_to_string(native.directory.join(format!(
+            "tool-{}.json",
+            hash(&serde_json::to_string(&json!([run_id, call_id])).unwrap())
+        )))
+        .unwrap())
+        .unwrap()
+    };
+    let bad = receipt("exercise_bad");
+    assert_eq!(bad["reply"]["error"]["code"], "INVALID_MODEL_OUTPUT");
+    assert!(bad["reply"]["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("exercises[1].question"));
+    let good = receipt("exercise_good");
+    assert_eq!(good["reply"]["result"]["persisted"], true);
+    let document_id = good["reply"]["result"]["documentId"].as_str().unwrap().to_owned();
+    assert!(document_id.starts_with("exdoc_"));
+    let mut c = e.lock().unwrap();
+    let saved = sessions::get(&mut c.content, &sid).unwrap();
+    let exercise_entries: Vec<_> = saved
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == "exercise")
+        .collect();
+    assert_eq!(exercise_entries.len(), 1, "failed call must not persist");
+    let data = exercise_entries[0].data.as_ref().unwrap();
+    assert_eq!(data["requirements"], "合成练习要求");
+    assert!(data["exercises"][0].get("explanation").is_none());
+    assert!(crate::exercises::get(&mut c.content, &document_id)
+        .unwrap()
+        .document
+        .body
+        .contains("尚未提供解析。"));
+}
+
