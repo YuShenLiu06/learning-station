@@ -63,6 +63,9 @@ struct CreateTodo {
     due_at: Option<String>,
     #[serde(default)]
     relative_minutes: Option<u32>,
+    /// Optional explicit reminder opt-in; absence keeps reminders off.
+    #[serde(default)]
+    reminder_enabled: Option<bool>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -71,6 +74,11 @@ struct QueryKnowledge {
     query: Option<String>,
     #[serde(default)]
     knowledge_id: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct LoadSkill {
+    skill_id: String,
 }
 
 enum Operation {
@@ -81,6 +89,8 @@ enum Operation {
     Todo(CreateTodo),
     Query(QueryKnowledge),
     Exercises(Value),
+    ListSkills,
+    LoadSkill(String),
 }
 
 /// A model can retry a write with a new run/call ID after interruption. Anchor
@@ -140,7 +150,17 @@ pub fn execute(
             {
                 return Err(invalid());
             }
-            bounded(args["requirements"].as_str().ok_or_else(invalid)?, 1, 8000)?;
+            // The declared schema, the sidecar preflight and the correction notice
+            // sent back to the model all count characters; measuring bytes here
+            // would reject valid Chinese requirements after every character-based
+            // gate already accepted them.
+            let requirements = args["requirements"].as_str().ok_or_else(invalid)?;
+            if requirements.trim().is_empty() {
+                return Err(invalid());
+            }
+            if requirements.chars().count() > 8000 {
+                return Err(limit());
+            }
             Operation::Exercises(args)
         }
         "record_question" => {
@@ -173,7 +193,7 @@ pub fn execute(
         }
         "create_note" => {
             let value: CreateNote = decode(args)?;
-            bounded(&value.content, 1, 20000)?;
+            bounded(&value.content, 1, 12000)?;
             if let Some(selection) = &value.selection {
                 bounded(selection, 0, 12000)?;
             }
@@ -181,7 +201,7 @@ pub fn execute(
         }
         "create_todo" => {
             let value: CreateTodo = decode(args)?;
-            bounded(&value.title, 1, 2000)?;
+            bounded(&value.title, 1, 500)?;
             if let Some(due_at) = &value.due_at {
                 bounded(due_at, 1, 64)?;
                 chrono::DateTime::parse_from_rfc3339(due_at).map_err(|_| invalid())?;
@@ -191,6 +211,15 @@ pub fn execute(
                 .is_some_and(|n| !(1..=525600).contains(&n))
             {
                 return Err(invalid());
+            }
+            if value.reminder_enabled == Some(true)
+                && value.due_at.is_none()
+                && value.relative_minutes.is_none()
+            {
+                return Err(CoreError::new(
+                    "INVALID_TOOL_INPUT",
+                    "启用提醒需要同时提供提醒时间。",
+                ));
             }
             Operation::Todo(value)
         }
@@ -207,8 +236,31 @@ pub fn execute(
             }
             Operation::Query(value)
         }
+        "list_learning_skills" => {
+            // No parameters and no path surface: the catalog is fixed and bundled.
+            if !args.as_object().is_some_and(|object| object.is_empty()) {
+                return Err(invalid());
+            }
+            Operation::ListSkills
+        }
+        "load_learning_skill" => {
+            let value: LoadSkill = decode(args)?;
+            if !valid_id(&value.skill_id) {
+                return Err(invalid());
+            }
+            Operation::LoadSkill(value.skill_id)
+        }
         _ => return Err(CoreError::new("TOOL_NOT_ALLOWED", "未启用此学习工具。")),
     };
+    // Guidance tools are read-only: the idempotency ledger lookup above has no
+    // bearing on them, so they return before any business write path.
+    if let Operation::ListSkills = operation {
+        return Ok(json!({"sessionId":scope.session_id,"runId":scope.run_id,
+            "skills":crate::learning_skills::catalog()}));
+    }
+    if let Operation::LoadSkill(id) = &operation {
+        return load_skill(engine, scope, id);
+    }
     let explicit_run = if scope.section_id.is_empty() && !scope.allowed_ids.is_empty()
         || name == "generate_exercises"
     {
@@ -231,7 +283,7 @@ pub fn execute(
         None
     };
     let request_clock = if let Operation::Todo(ref value) = operation {
-        if value.relative_minutes.is_some() {
+        if value.relative_minutes.is_some() || value.reminder_enabled == Some(true) {
             let run = crate::generation::get(engine, &scope.run_id)?;
             if run.session_id != scope.session_id {
                 return Err(out_of_scope());
@@ -362,10 +414,30 @@ pub fn execute(
             value.due_at.as_deref(),
             value.relative_minutes,
         )?;
+        let reminder_enabled = value.reminder_enabled.unwrap_or(false);
+        if reminder_enabled {
+            // Validate the reminder time against the durable run clock in the
+            // user's timezone context; a past or unparsable time is rejected.
+            let clock = request_clock.as_ref().ok_or_else(invalid)?;
+            let due_value = chrono::DateTime::parse_from_rfc3339(
+                due.as_deref()
+                    .ok_or_else(|| CoreError::new("INVALID_TOOL_INPUT", "启用提醒需要提醒时间。"))?,
+            )
+            .map_err(|_| invalid())?;
+            let reference =
+                chrono::DateTime::parse_from_rfc3339(clock.reference_time.as_str())
+                    .map_err(|_| invalid())?;
+            if due_value <= reference {
+                return Err(CoreError::new(
+                    "INVALID_TOOL_INPUT",
+                    "提醒时间需要晚于当前时间。",
+                ));
+            }
+        }
         let todo = engine.reminders.create_todo(
             &value.title,
             due.as_deref(),
-            false,
+            reminder_enabled,
             Some(&session.id),
             &request_id,
         )?;
@@ -510,7 +582,8 @@ pub fn execute(
                 data: Some(data),
             }
         }
-        Operation::Query(_) | Operation::Todo(_) | Operation::Exercises(_) => unreachable!(),
+        Operation::Query(_) | Operation::Todo(_) | Operation::Exercises(_)
+        | Operation::ListSkills | Operation::LoadSkill(_) => unreachable!(),
     };
     if let Some(user) = &business_user {
         let data = entry.data.as_mut().ok_or_else(invalid)?;
@@ -539,6 +612,58 @@ pub fn execute(
         receipt["existingErrorId"] = json!(source_id);
     }
     Ok(receipt)
+}
+
+/// JSON escaping can inflate control characters roughly six-fold, so a 16KiB
+/// body could burst the 32KiB wire budget. Measure the serialized reply with a
+/// headroom for the tool_result envelope; an oversized body fails this one
+/// call honestly instead of tripping the whole-run TOOL_LIMIT afterwards.
+fn within_result_budget(reply: &Value) -> bool {
+    serde_json::to_vec(reply).is_ok_and(|bytes| bytes.len() + 1024 <= MAX_TOOL_RESULT_BYTES)
+}
+/// On-demand guidance loading. Only the fixed bundled allowlist is readable;
+/// anything else is an authorization rejection without touching the disk. The
+/// dedup ledger hangs on the current run: a repeated load returns a short
+/// summary instead of a second body, while a new run loads the full text again.
+fn load_skill(engine: &Engine, scope: &ToolScope, id: &str) -> Result<Value> {
+    if !crate::learning_skills::KNOWN_IDS.contains(&id) {
+        return Err(out_of_scope());
+    }
+    // Guidance already delivered for this run — mode-injected into the system
+    // prompt or tool-scoped into a tool description — needs no second body.
+    if let Ok(run) = crate::generation::get(engine, &scope.run_id) {
+        if let Some(version) = run.learning_skills.iter().find(|version| version.id == id) {
+            return Ok(json!({"sessionId":scope.session_id,"runId":scope.run_id,"skillId":id,
+                "sha256":version.sha256,"alreadyInjected":true,
+                "notice":"该学习指导已随本次模式或工具注册注入指导，正文无需重复加载。"}));
+        }
+    }
+    let mut loaded = engine
+        .run_loaded_skills
+        .lock()
+        .map_err(|_| out_of_scope())?;
+    if let Some(sha256) = loaded
+        .get(&scope.run_id)
+        .and_then(|skills| skills.get(id))
+    {
+        return Ok(json!({"sessionId":scope.session_id,"runId":scope.run_id,"skillId":id,
+            "sha256":sha256,"alreadyLoaded":true,
+            "notice":"该学习指导本轮已加载，正文见先前的工具结果。"}));
+    }
+    let snapshot = crate::learning_skills::load(id)?;
+    let reply = json!({"sessionId":scope.session_id,"runId":scope.run_id,"skillId":id,
+        "sha256":snapshot.sha256,"content":snapshot.content});
+    if !within_result_budget(&reply) {
+        return Err(CoreError::new(
+            "SKILL_INVALID",
+            "学习指导正文超出工具结果预算，本次未返回。",
+        ));
+    }
+    loaded
+        .entry(scope.run_id.clone())
+        .or_default()
+        .insert(id.to_owned(), snapshot.sha256.clone());
+    Ok(reply)
 }
 
 fn query_knowledge(
@@ -635,7 +760,7 @@ fn validate_scope(scope: &ToolScope, call_id: &str) -> Result<()> {
         || scope.allowed_ids.len() > 32
         || scope.allowed_ids.iter().any(|id| !valid_id(id))
         || call_id.is_empty()
-        || call_id.len() > 128
+        || call_id.chars().count() > 256
         || call_id.chars().any(char::is_control)
     {
         return Err(invalid());
@@ -655,10 +780,13 @@ fn validate_tags(tags: &[String]) -> Result<()> {
     Ok(())
 }
 fn bounded(value: &str, minimum: usize, maximum: usize) -> Result<()> {
-    if value.len() > maximum {
+    // The declared schema, the sidecar preflight and the model-side validation
+    // all count Unicode characters; measuring bytes here would reject long
+    // Chinese content after every character-based gate already accepted it.
+    if value.chars().count() > maximum {
         return Err(limit());
     }
-    if minimum > 0 && value.trim().len() < minimum {
+    if minimum > 0 && value.trim().chars().count() < minimum {
         return Err(invalid());
     }
     Ok(())
@@ -914,7 +1042,6 @@ mod tests {
         let (_directory, engine, scope, _) = fixture();
         for args in [
             json!({"title":"T","reminderEnabled":true}),
-            json!({"title":"T","reminderEnabled":false}),
             json!({"title":"T","sessionId":"another_session"}),
             json!({"title":"T","sectionId":"another_section"}),
             json!({"title":"T","path":"../../outside.md"}),
@@ -930,6 +1057,16 @@ mod tests {
                 "INVALID_TOOL_INPUT"
             );
         }
+        // An explicit opt-out is a legitimate legacy-compatible call.
+        let opted_out = execute(
+            &engine,
+            &scope,
+            "explicit-off-todo",
+            "create_todo",
+            json!({"title":"T","reminderEnabled":false}),
+        )
+        .unwrap();
+        assert_eq!(opted_out["todo"]["reminderEnabled"], false);
         let mut foreign = scope.clone();
         foreign.section_id = "unrelated".into();
         assert_eq!(
@@ -954,7 +1091,9 @@ mod tests {
             json!({"title":"T"})
         )
         .is_err());
-        assert!(engine.reminders.list_todos().unwrap().is_empty());
+        let todos = engine.reminders.list_todos().unwrap();
+        assert_eq!(todos.len(), 1);
+        assert!(!todos[0].reminder_enabled);
     }
 
     #[test]
@@ -1216,6 +1355,338 @@ mod tests {
                 .entries
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn exercise_requirements_are_counted_in_characters_not_bytes() {
+        let (_directory, engine, scope, _) = fixture();
+        // generate_exercises only runs against a frozen run manifest.
+        {
+            let manifest: Vec<ManifestItem> = scope
+                .allowed_ids
+                .iter()
+                .map(|id| ManifestItem {
+                    id: id.clone(),
+                    path: "fixture.md".into(),
+                    version: "v1".into(),
+                    included_chars: 10,
+                })
+                .collect();
+            let run: crate::generation::Run = serde_json::from_value(json!({
+                "id": scope.run_id, "sessionId": scope.session_id, "mode": "question",
+                "status": "succeeded", "content": "", "error": null,
+                "createdAt": "2026-10-16T15:55:00Z", "updatedAt": "2026-10-16T15:55:00Z",
+                "requestDigest": "fixture", "contextManifest": manifest,
+                "contextSnapshotVersion": 1,
+            }))
+            .unwrap();
+            engine.runs.lock().unwrap().insert(
+                run.id.clone(),
+                crate::generation::ManagedRun {
+                    run,
+                    cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                },
+            );
+        }
+        let args = json!({
+            "requirements": "汉".repeat(4000),
+            "summary": "合成练习摘要",
+            "exercises": [{"question": "合成题目", "format": "exact", "answers": ["合成答案"], "tags": [], "sourceIds": []}],
+        });
+        let saved = execute(
+            &engine,
+            &scope,
+            "chinese-requirements",
+            "generate_exercises",
+            args.clone(),
+        )
+        .unwrap();
+        assert_eq!(saved["persisted"], true);
+        let retried = execute(
+            &engine,
+            &scope,
+            "chinese-requirements",
+            "generate_exercises",
+            args,
+        )
+        .unwrap();
+        assert_eq!(retried["documentId"], saved["documentId"]);
+        let over = json!({
+            "requirements": "汉".repeat(8001),
+            "summary": "合成练习摘要",
+            "exercises": [{"question": "合成题目", "format": "exact", "answers": ["合成答案"], "tags": [], "sourceIds": []}],
+        });
+        assert_eq!(
+            execute(
+                &engine,
+                &scope,
+                "over-long-requirements",
+                "generate_exercises",
+                over
+            )
+            .unwrap_err()
+            .code,
+            "LIMIT_EXCEEDED"
+        );
+    }
+
+    #[test]
+    fn record_question_fields_are_counted_in_characters_not_bytes() {
+        let (_directory, engine, scope, _) = fixture();
+        // 8000 Chinese characters pass every character-based gate but weigh
+        // 24000 UTF-8 bytes, which the old byte measurement rejected.
+        let saved = execute(
+            &engine,
+            &scope,
+            "chinese-question",
+            "record_question",
+            json!({"question": "问".repeat(8000)}),
+        )
+        .unwrap();
+        assert_eq!(saved["persisted"], true);
+        let with_selection = execute(
+            &engine,
+            &scope,
+            "chinese-selection",
+            "record_question",
+            json!({"question": "短问题", "selection": "选".repeat(9000)}),
+        )
+        .unwrap();
+        assert_eq!(with_selection["persisted"], true);
+        assert_eq!(
+            execute(
+                &engine,
+                &scope,
+                "over-long-question",
+                "record_question",
+                json!({"question": "问".repeat(8001)})
+            )
+            .unwrap_err()
+            .code,
+            "LIMIT_EXCEEDED"
+        );
+        assert_eq!(
+            execute(
+                &engine,
+                &scope,
+                "over-long-selection",
+                "record_question",
+                json!({"question": "Q", "selection": "s".repeat(12001)})
+            )
+            .unwrap_err()
+            .code,
+            "LIMIT_EXCEEDED"
+        );
+    }
+
+    #[test]
+    fn create_error_fields_are_counted_in_characters_not_bytes() {
+        let (_directory, engine, scope, _) = fixture();
+        let saved = execute(
+            &engine,
+            &scope,
+            "chinese-error",
+            "create_error",
+            json!({
+                "front": "题".repeat(2700),
+                "back": "解".repeat(3000),
+                "cause": "因".repeat(1400),
+                "tags": ["时间", "标".repeat(22)],
+            }),
+        )
+        .unwrap();
+        assert_eq!(saved["persisted"], true);
+        assert_eq!(
+            execute(
+                &engine,
+                &scope,
+                "over-long-error-front",
+                "create_error",
+                json!({"front": "题".repeat(8001), "back": "解"})
+            )
+            .unwrap_err()
+            .code,
+            "LIMIT_EXCEEDED"
+        );
+        assert_eq!(
+            execute(
+                &engine,
+                &scope,
+                "over-long-error-cause",
+                "create_error",
+                json!({"front": "题", "back": "解", "cause": "因".repeat(4001)})
+            )
+            .unwrap_err()
+            .code,
+            "LIMIT_EXCEEDED"
+        );
+        assert_eq!(
+            execute(
+                &engine,
+                &scope,
+                "over-long-error-tag",
+                "create_error",
+                json!({"front": "题", "back": "解", "tags": ["标".repeat(65)]})
+            )
+            .unwrap_err()
+            .code,
+            "LIMIT_EXCEEDED"
+        );
+    }
+
+    #[test]
+    fn review_card_fields_are_counted_in_characters_not_bytes() {
+        let (_directory, engine, scope, _) = fixture();
+        let saved = execute(
+            &engine,
+            &scope,
+            "chinese-card",
+            "create_review_card",
+            json!({
+                "front": "面".repeat(2700),
+                "back": "背".repeat(3000),
+                "tags": ["标".repeat(22)],
+            }),
+        )
+        .unwrap();
+        assert_eq!(saved["persisted"], true);
+        assert_eq!(
+            execute(
+                &engine,
+                &scope,
+                "over-long-card-back",
+                "create_review_card",
+                json!({"front": "面", "back": "b".repeat(12001)})
+            )
+            .unwrap_err()
+            .code,
+            "LIMIT_EXCEEDED"
+        );
+    }
+
+    #[test]
+    fn note_fields_are_counted_in_characters_not_bytes() {
+        let (_directory, engine, scope, _) = fixture();
+        // The schema layer caps content at 12000 characters while execution
+        // used a 20000-byte budget, so this note cleared every character
+        // gate and still hit a generic LIMIT_EXCEEDED.
+        let saved = execute(
+            &engine,
+            &scope,
+            "chinese-note",
+            "create_note",
+            json!({"content": "笔".repeat(10000)}),
+        )
+        .unwrap();
+        assert_eq!(saved["persisted"], true);
+        assert_eq!(
+            execute(
+                &engine,
+                &scope,
+                "over-long-note",
+                "create_note",
+                json!({"content": "n".repeat(12001)})
+            )
+            .unwrap_err()
+            .code,
+            "LIMIT_EXCEEDED"
+        );
+    }
+
+    #[test]
+    fn todo_title_and_due_at_are_counted_in_characters() {
+        let (_directory, engine, scope, _) = fixture();
+        // The schema caps titles at 500 characters; execution used to keep a
+        // wider 2000-byte budget, so the boundary must follow the schema.
+        let saved = execute(
+            &engine,
+            &scope,
+            "chinese-todo",
+            "create_todo",
+            json!({"title": "办".repeat(500)}),
+        )
+        .unwrap();
+        assert_eq!(saved["persisted"], true);
+        assert_eq!(
+            execute(
+                &engine,
+                &scope,
+                "over-long-todo-title",
+                "create_todo",
+                json!({"title": "办".repeat(501)})
+            )
+            .unwrap_err()
+            .code,
+            "LIMIT_EXCEEDED"
+        );
+        assert_eq!(
+            execute(
+                &engine,
+                &scope,
+                "over-long-todo-due-at",
+                "create_todo",
+                json!({"title": "办", "dueAt": "x".repeat(65)})
+            )
+            .unwrap_err()
+            .code,
+            "LIMIT_EXCEEDED"
+        );
+    }
+
+    #[test]
+    fn knowledge_query_is_counted_in_characters_not_bytes() {
+        let (_directory, engine, scope, _) = fixture();
+        // 500 Chinese characters are 1500 bytes; the old byte budget
+        // rejected them after every character gate accepted the call.
+        let found = execute(
+            &engine,
+            &scope,
+            "chinese-query",
+            "query_related_knowledge",
+            json!({"query": "查".repeat(500)}),
+        )
+        .unwrap();
+        assert!(found["results"].is_array());
+        assert_eq!(
+            execute(
+                &engine,
+                &scope,
+                "over-long-query",
+                "query_related_knowledge",
+                json!({"query": "查".repeat(501)})
+            )
+            .unwrap_err()
+            .code,
+            "LIMIT_EXCEEDED"
+        );
+    }
+
+    #[test]
+    fn call_id_length_is_counted_in_characters_not_bytes() {
+        let (_directory, engine, scope, _) = fixture();
+        // The wire preflight accepts call IDs up to 256 characters; the old
+        // 128-byte execution gate rejected longer opaque IDs afterwards.
+        let saved = execute(
+            &engine,
+            &scope,
+            &"调".repeat(200),
+            "record_question",
+            json!({"question": "长编号调用"}),
+        )
+        .unwrap();
+        assert_eq!(saved["persisted"], true);
+        assert_eq!(
+            execute(
+                &engine,
+                &scope,
+                &"x".repeat(257),
+                "record_question",
+                json!({"question": "超长编号调用"})
+            )
+            .unwrap_err()
+            .code,
+            "INVALID_TOOL_INPUT"
         );
     }
 
@@ -1732,6 +2203,10 @@ mod tests {
             ),
             ("query_related_knowledge", json!({"path":"/tmp/private"})),
             ("record_question", json!({"question":"Q","apiKey":"secret"})),
+            ("list_learning_skills", json!({"path":"/tmp/private"})),
+            ("load_learning_skill", json!({})),
+            ("load_learning_skill", json!({"skillId":"../../skills/secret"})),
+            ("load_learning_skill", json!({"skillId":"ok","extra":1})),
         ] {
             assert_eq!(
                 execute(&engine, &scope, "malicious-call", name, args)
@@ -1750,7 +2225,7 @@ mod tests {
             execute(
                 &engine,
                 &scope,
-                &"x".repeat(129),
+                &"x".repeat(257),
                 "record_question",
                 json!({"question":"Q"})
             )
@@ -1787,6 +2262,219 @@ mod tests {
             .unwrap()
             .entries
             .is_empty());
+    }
+
+    #[test]
+    fn skill_catalog_lists_only_allowlisted_metadata_without_bodies() {
+        let (_directory, engine, scope, _) = fixture();
+        let listed = execute(
+            &engine,
+            &scope,
+            "list-call",
+            "list_learning_skills",
+            json!({}),
+        )
+        .unwrap();
+        let skills = listed["skills"].as_array().unwrap();
+        assert_eq!(
+            skills
+                .iter()
+                .map(|item| item["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            crate::learning_skills::KNOWN_IDS
+        );
+        for item in skills {
+            assert_eq!(item["name"].as_str().unwrap(), item["id"].as_str().unwrap());
+            assert!(!item["description"].as_str().unwrap().trim().is_empty());
+        }
+        // Metadata only: no frontmatter or body may leak through the listing.
+        assert!(!listed.to_string().contains("---\\n"));
+        assert!(!listed.to_string().contains("正文"));
+    }
+
+    #[test]
+    fn skill_load_returns_the_body_and_out_of_list_ids_are_authorization_rejections() {
+        let (_directory, engine, scope, _) = fixture();
+        let loaded = execute(
+            &engine,
+            &scope,
+            "load-call",
+            "load_learning_skill",
+            json!({"skillId":"learning-review"}),
+        )
+        .unwrap();
+        let content = loaded["content"].as_str().unwrap();
+        assert!(content.starts_with("---\nname: learning-review\n"));
+        assert_eq!(loaded["sha256"].as_str().unwrap(), hash(content));
+        assert_eq!(loaded["skillId"], "learning-review");
+        // An id outside the fixed allowlist never reaches the disk.
+        for (id, code) in [
+            ("not-a-skill", "TOOL_SCOPE"),
+            ("learning-explore/../learning-review", "INVALID_TOOL_INPUT"),
+            ("Skills", "TOOL_SCOPE"),
+        ] {
+            assert_eq!(
+                execute(
+                    &engine,
+                    &scope,
+                    "load-out",
+                    "load_learning_skill",
+                    json!({"skillId":id})
+                )
+                .unwrap_err()
+                .code,
+                code,
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_load_in_one_run_returns_a_notice_but_a_new_run_loads_again() {
+        let (_directory, engine, scope, _) = fixture();
+        let first = execute(
+            &engine,
+            &scope,
+            "first-load",
+            "load_learning_skill",
+            json!({"skillId":"learning-explore"}),
+        )
+        .unwrap();
+        assert!(first["content"].is_string());
+        let second = execute(
+            &engine,
+            &scope,
+            "second-load",
+            "load_learning_skill",
+            json!({"skillId":"learning-explore"}),
+        )
+        .unwrap();
+        assert_eq!(second["alreadyLoaded"], true);
+        assert_eq!(second["sha256"], first["sha256"]);
+        assert!(second.get("content").is_none());
+        // A different run is fresh effective context and gets the body again.
+        let mut fresh = scope.clone();
+        fresh.run_id = "run_skill_reload".into();
+        let third = execute(
+            &engine,
+            &fresh,
+            "third-load",
+            "load_learning_skill",
+            json!({"skillId":"learning-explore"}),
+        )
+        .unwrap();
+        assert!(third["content"].is_string());
+        assert_eq!(third["sha256"], first["sha256"]);
+    }
+
+    #[test]
+    fn guidance_already_injected_for_the_mode_is_not_loaded_again() {
+        let (_directory, engine, scope, _) = fixture();
+        let run: crate::generation::Run = serde_json::from_value(json!({
+            "id": scope.run_id, "sessionId": scope.session_id, "mode": "question",
+            "status": "running", "content": "", "error": null,
+            "createdAt": "2026-10-17T00:00:00Z", "updatedAt": "2026-10-17T00:00:00Z",
+            "requestDigest": "fixture", "contextManifest": [], "contextSnapshotVersion": 1,
+            "learningSkills": [
+                {"id":"learning-explore","sha256":"ab".repeat(32),"scope":"mode"},
+                {"id":"learning-exercises","sha256":"cd".repeat(32),"scope":"tool:generate_exercises"}
+            ],
+        }))
+        .unwrap();
+        engine.runs.lock().unwrap().insert(
+            run.id.clone(),
+            crate::generation::ManagedRun {
+                run,
+                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        );
+        let loaded = execute(
+            &engine,
+            &scope,
+            "injected-load",
+            "load_learning_skill",
+            json!({"skillId":"learning-explore"}),
+        )
+        .unwrap();
+        assert_eq!(loaded["alreadyInjected"], true);
+        assert_eq!(loaded["sha256"], "ab".repeat(32));
+        assert!(loaded.get("content").is_none());
+        // Tool-scoped guidance rides in the tool description every turn, so a
+        // second body would duplicate the text already in effective context.
+        let exercises = execute(
+            &engine,
+            &scope,
+            "exercises-load",
+            "load_learning_skill",
+            json!({"skillId":"learning-exercises"}),
+        )
+        .unwrap();
+        assert_eq!(exercises["alreadyInjected"], true);
+        assert_eq!(exercises["sha256"], "cd".repeat(32));
+        assert!(exercises.get("content").is_none());
+        // Guidance the run never received still loads its full body.
+        let review = execute(
+            &engine,
+            &scope,
+            "review-load",
+            "load_learning_skill",
+            json!({"skillId":"learning-review"}),
+        )
+        .unwrap();
+        assert!(review["content"].is_string());
+    }
+
+    #[test]
+    fn compaction_clears_the_run_dedup_ledger_so_guidance_loads_again() {
+        let (_directory, engine, scope, _) = fixture();
+        let first = execute(
+            &engine,
+            &scope,
+            "pre-compaction-load",
+            "load_learning_skill",
+            json!({"skillId":"learning-explore"}),
+        )
+        .unwrap();
+        assert!(first["content"].is_string());
+        let notice = execute(
+            &engine,
+            &scope,
+            "repeat-load",
+            "load_learning_skill",
+            json!({"skillId":"learning-explore"}),
+        )
+        .unwrap();
+        assert_eq!(notice["alreadyLoaded"], true);
+        // This mirrors the compaction observer wired in generation.rs: a
+        // completed compaction may drop earlier tool results, so the ledger
+        // must stop pointing the model at bodies it can no longer see.
+        engine
+            .run_loaded_skills
+            .lock()
+            .unwrap()
+            .remove(&scope.run_id);
+        let after = execute(
+            &engine,
+            &scope,
+            "post-compaction-load",
+            "load_learning_skill",
+            json!({"skillId":"learning-explore"}),
+        )
+        .unwrap();
+        assert!(after["content"].is_string());
+        assert_eq!(after["sha256"], first["sha256"]);
+    }
+
+    #[test]
+    fn control_character_inflation_stays_inside_the_tool_result_budget() {
+        // A 16KiB body of control characters is legal on disk yet serializes
+        // to roughly six times its size; the gate must fail this single call
+        // honestly instead of letting the wire budget abort the whole run.
+        let inflated = json!({"content": "\u{1}".repeat(16 * 1024)});
+        assert!(serde_json::to_vec(&inflated).unwrap().len() > MAX_TOOL_RESULT_BYTES);
+        assert!(!within_result_budget(&inflated));
+        let normal = json!({"content": "普通指导正文"});
+        assert!(within_result_budget(&normal));
     }
 }
 #[cfg(test)]
@@ -1838,5 +2526,84 @@ mod time_todo_tests {
         )
         .is_err());
         assert_eq!(e.reminders.list_todos().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod todo_reminder_tool_tests {
+    use super::*;
+    fn reminder_fixture() -> (tempfile::TempDir, std::sync::Arc<Engine>, ToolScope) {
+        let d = tempfile::tempdir().unwrap();
+        let e = Engine::new(d.path().join("library"), d.path().join("state")).unwrap();
+        let session = {
+            let mut c = e.lock().unwrap();
+            let doc = c.create_section("fixture", "reminders", vec![], vec![]).unwrap();
+            c.start_session(&doc.id, false).unwrap().0
+        };
+        let run: crate::generation::Run = serde_json::from_value(json!({
+            "id":"run_reminder_tool","sessionId":session.id,"mode":"question","status":"succeeded",
+            "content":"","error":null,"createdAt":"2026-10-16T15:55:00Z","updatedAt":"2026-10-16T15:55:00Z",
+            "requestDigest":"fixture","contextManifest":[],"referenceTime":"2026-10-16T15:55:00Z","timeZone":"Asia/Shanghai"
+        })).unwrap();
+        e.runs.lock().unwrap().insert(run.id.clone(), crate::generation::ManagedRun{
+            run,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        let scope = ToolScope {
+            session_id: session.id,
+            section_id: session.section_id,
+            run_id: "run_reminder_tool".into(),
+            allowed_ids: vec![],
+        };
+        (d, e, scope)
+    }
+
+    #[test]
+    fn todo_reminder_opt_in_schedules_once_and_stays_honest_without_any_delivery() {
+        let (_d, e, scope) = reminder_fixture();
+        // Legacy calls without the flag keep reminders off.
+        let plain = execute(&e, &scope, "legacy-call", "create_todo", json!({"title":"复习"})).unwrap();
+        assert_eq!(plain["todo"]["reminderEnabled"], false);
+        // Explicit opt-in with a relative time uses the durable run clock.
+        let args = json!({"title":"带提醒复习","relativeMinutes":10,"reminderEnabled":true});
+        let timed = execute(&e, &scope, "timed-call", "create_todo", args.clone()).unwrap();
+        assert_eq!(timed["todo"]["reminderEnabled"], true);
+        assert_eq!(timed["dueAt"], "2026-10-16T16:05:00.000000000Z");
+        assert_eq!(timed["referenceTime"], "2026-10-16T15:55:00Z");
+        // Idempotent replay returns the same receipt without a second todo.
+        let replay = execute(&e, &scope, "timed-call", "create_todo", args).unwrap();
+        assert_eq!(replay["todoId"], timed["todoId"]);
+        // The due time has passed the real clock, so scheduling fires exactly once.
+        assert_eq!(e.reminders.tick().unwrap().len(), 1);
+        assert_eq!(e.reminders.tick().unwrap().len(), 0);
+        let notices = e.reminders.list_notifications().unwrap();
+        assert_eq!(notices.len(), 1);
+        // Honest state: scheduled locally as pending, never claimed as sent.
+        assert_eq!(notices[0].delivery_status, "pending");
+        // A failed delivery stays auditable and recoverable; nothing is re-sent here.
+        let pending = e.reminders.pending_deliveries("2000-01-01T00:00:00Z").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(e.reminders.reserve_delivery(&pending[0].id).unwrap());
+        e.reminders.finish_delivery(&pending[0].id, &crate::feishu::DeliveryOutcome {
+            status: crate::feishu::DeliveryState::Failed,
+            message_id: None,
+            reason: "synthetic failure".into(),
+        }).unwrap();
+        let after = e.reminders.list_notifications().unwrap();
+        assert_eq!(after[0].delivery_status, "failed");
+        // Enabling without a time, or with a time already past, is rejected.
+        assert_eq!(
+            execute(&e, &scope, "no-time", "create_todo", json!({"title":"T","reminderEnabled":true})).unwrap_err().code,
+            "INVALID_TOOL_INPUT"
+        );
+        assert_eq!(
+            execute(&e, &scope, "past-time", "create_todo", json!({"title":"T","dueAt":"2026-10-16T15:00:00Z","reminderEnabled":true})).unwrap_err().code,
+            "INVALID_TOOL_INPUT"
+        );
+        // Old behavior is unchanged: a past due time without the flag stays allowed and off.
+        let compat = execute(&e, &scope, "compat-call", "create_todo", json!({"title":"旧调用","dueAt":"2000-01-01T00:00:00Z"})).unwrap();
+        assert_eq!(compat["todo"]["reminderEnabled"], false);
+        assert_eq!(e.reminders.tick().unwrap().len(), 0);
+        assert_eq!(e.reminders.list_todos().unwrap().len(), 3);
     }
 }

@@ -28,18 +28,43 @@ fn invalid() -> CoreError {
 fn conflict() -> CoreError {
     CoreError::new("CONFLICT", "请求编号已关联另一份练习，未覆盖原记录。")
 }
-fn text(value: Option<&Value>, minimum: usize, maximum: usize) -> Result<&str> {
-    value
+pub(crate) fn field_error(path: &str, reason: &str) -> CoreError {
+    CoreError::new(
+        "INVALID_MODEL_OUTPUT",
+        format!("练习校验失败：{path} {reason}；收到的内容已保留。"),
+    )
+    .details(json!({"field":path,"reason":reason,"recoverable":!reason.contains("本轮授权")}))
+}
+fn text<'a>(
+    value: Option<&'a Value>,
+    minimum: usize,
+    maximum: usize,
+    path: &str,
+) -> Result<&'a str> {
+    let s = value
         .and_then(Value::as_str)
-        .filter(|s| s.trim().len() >= minimum && s.len() <= maximum && !s.contains('\0'))
-        .ok_or_else(invalid)
+        .ok_or_else(|| field_error(path, "必须是文本"))?;
+    let count = s.chars().count();
+    if s.trim().chars().count() < minimum {
+        return Err(field_error(path, "不能为空或只有空白"));
+    }
+    if count > maximum {
+        return Err(field_error(
+            path,
+            &format!("共{count}个字符，最多{maximum}个字符"),
+        ));
+    }
+    if s.contains('\0') {
+        return Err(field_error(path, "不能包含空字符"));
+    }
+    Ok(s)
 }
 fn known(value: &Value, fields: &[&str]) -> Result<()> {
     if value
         .as_object()
         .is_none_or(|object| object.keys().any(|key| !fields.contains(&key.as_str())))
     {
-        return Err(invalid());
+        return Err(field_error("schema", "必须是对象且不能包含未声明字段"));
     }
     Ok(())
 }
@@ -52,7 +77,7 @@ pub fn validate(mut data: Value, manifest: &[ManifestItem], namespace: &str) -> 
     let list = data
         .get_mut("exercises")
         .and_then(Value::as_array_mut)
-        .ok_or_else(invalid)?;
+        .ok_or_else(|| field_error("exercises", "必须是数组"))?;
     for (index, question) in list.iter_mut().enumerate() {
         known(
             question,
@@ -65,7 +90,13 @@ pub fn validate(mut data: Value, manifest: &[ManifestItem], namespace: &str) -> 
                 "sourceIds",
                 "rubric",
             ],
-        )?;
+        )
+        .map_err(|_| {
+            field_error(
+                &format!("exercises[{}]", index + 1),
+                "必须是对象且不能包含未声明字段",
+            )
+        })?;
         question["id"] = json!(format!("q_{}_{}", &hash(namespace)[..32], index));
         question["answerMatch"] = json!("trim");
     }
@@ -107,9 +138,9 @@ fn validate_stored(data: &Value, manifest: &[ManifestItem], legacy: bool) -> Res
         return Err(invalid());
     }
     if !legacy {
-        text(data.get("summary"), 0, 10000)?;
+        text(data.get("summary"), 0, 10000, "summary")?;
     } else if data.get("summary").is_some() {
-        text(data.get("summary"), 0, 10000)?;
+        text(data.get("summary"), 0, 10000, "summary")?;
     }
     let sources: BTreeSet<_> = manifest.iter().map(|item| item.id.as_str()).collect();
     if sources.len() != manifest.len() || sources.iter().any(|id| !valid_id(id)) {
@@ -119,9 +150,10 @@ fn validate_stored(data: &Value, manifest: &[ManifestItem], legacy: bool) -> Res
         .get("exercises")
         .and_then(Value::as_array)
         .filter(|list| !list.is_empty() && list.len() <= 5)
-        .ok_or_else(invalid)?;
+        .ok_or_else(|| field_error("exercises", "必须包含1至5道练习"))?;
     let mut ids = BTreeSet::new();
-    for question in list {
+    for (index, question) in list.iter().enumerate() {
+        let path = format!("exercises[{}]", index + 1);
         known(
             question,
             &[
@@ -142,42 +174,56 @@ fn validate_stored(data: &Value, manifest: &[ManifestItem], legacy: bool) -> Res
         {
             return Err(invalid());
         }
-        let id = text(question.get("id"), 1, 128)?;
+        let id = text(question.get("id"), 1, 128, &format!("{path}.id"))?;
         if !valid_id(id) || !ids.insert(id) {
             return Err(invalid());
         }
-        text(question.get("question"), 1, 20000)?;
+        text(
+            question.get("question"),
+            1,
+            20000,
+            &format!("{path}.question"),
+        )?;
         if let Some(rubric) = question.get("rubric") {
-            crate::grading::validate_rubric(rubric)?;
+            crate::grading::validate_rubric(rubric).map_err(|_| {
+                field_error(&format!("{path}.rubric"), "评分标准结构、编号或分值无效")
+            })?;
         }
         if !matches!(
             question.get("format").and_then(Value::as_str),
             Some("exact" | "self")
         ) {
-            return Err(invalid());
+            return Err(field_error(&format!("{path}.format"), "必须是exact或self"));
         }
         let answers = question
             .get("answers")
             .and_then(Value::as_array)
             .filter(|list| !list.is_empty() && list.len() <= 10)
-            .ok_or_else(invalid)?;
-        for answer in answers {
-            text(Some(answer), 1, 10000)?;
+            .ok_or_else(|| field_error(&format!("{path}.answers"), "必须包含1至10个答案"))?;
+        for (answer_index, answer) in answers.iter().enumerate() {
+            text(
+                Some(answer),
+                1,
+                10000,
+                &format!("{path}.answers[{}]", answer_index + 1),
+            )?;
         }
-        if !legacy || question.get("explanation").is_some() {
-            text(question.get("explanation"), 0, 20000)?;
+        if question.get("explanation").is_some() {
+            text(
+                question.get("explanation"),
+                0,
+                20000,
+                &format!("{path}.explanation"),
+            )?;
         }
         if !legacy || question.get("tags").is_some() {
             let tags = question
                 .get("tags")
                 .and_then(Value::as_array)
                 .filter(|list| list.len() <= 12)
-                .ok_or_else(invalid)?;
+                .ok_or_else(|| field_error(&format!("{path}.tags"), "必须是最多12项的数组"))?;
             for tag in tags {
-                text(Some(tag), 1, 256)?;
-                if tag.as_str().unwrap().chars().count() > 64 {
-                    return Err(invalid());
-                }
+                text(Some(tag), 1, 64, &format!("{path}.tags"))?;
             }
         }
         if !legacy || question.get("sourceIds").is_some() {
@@ -185,12 +231,20 @@ fn validate_stored(data: &Value, manifest: &[ManifestItem], legacy: bool) -> Res
                 .get("sourceIds")
                 .and_then(Value::as_array)
                 .filter(|list| list.len() <= 32)
-                .ok_or_else(invalid)?;
+                .ok_or_else(|| field_error(&format!("{path}.sourceIds"), "必须是最多32项的数组"))?;
             let mut unique = BTreeSet::new();
             for id in ids {
-                let id = id.as_str().ok_or_else(invalid)?;
-                if !sources.contains(id) || !unique.insert(id) {
-                    return Err(invalid());
+                let id = id.as_str().ok_or_else(|| {
+                    field_error(&format!("{path}.sourceIds"), "来源编号必须是文本")
+                })?;
+                if !sources.contains(id) {
+                    return Err(field_error(
+                        &format!("{path}.sourceIds"),
+                        "含本轮授权来源清单以外的编号",
+                    ));
+                }
+                if !unique.insert(id) {
+                    return Err(field_error(&format!("{path}.sourceIds"), "来源编号重复"));
                 }
             }
         }
@@ -597,6 +651,52 @@ mod tests {
         validate(raw(), &session.context_manifest, namespace).unwrap()
     }
     #[test]
+    fn unicode_contract_and_safe_field_diagnostics() {
+        let (_directory, mut store, session, source) = fixture();
+        for (index, text) in ["汉".repeat(4000), "🧠".repeat(6000), "a".repeat(10000)]
+            .iter()
+            .enumerate()
+        {
+            let mut data = raw();
+            data["summary"] = json!(text);
+            data["exercises"][0]["answers"] = json!([text]);
+            let request = format!("unicode-request-{index}");
+            let valid = validate(data, &session.context_manifest, &request).unwrap();
+            let first =
+                create(&mut store, &session.id, &source.id, valid.clone(), &request).unwrap();
+            let retry = create(&mut store, &session.id, &source.id, valid, &request).unwrap();
+            assert_eq!(first.id, retry.id);
+        }
+        for (field, value, expected) in [
+            ("answers", json!(["汉".repeat(10001)]), "answers[1]"),
+            ("question", json!("  \n  "), "question"),
+            (
+                "sourceIds",
+                json!(["private-source-not-to-echo"]),
+                "sourceIds",
+            ),
+            (
+                "sourceIds",
+                json!(["section_ex", "section_ex"]),
+                "sourceIds",
+            ),
+        ] {
+            let mut data = raw();
+            data["exercises"][0][field] = value;
+            let error = validate(data, &session.context_manifest, "diagnostic-run").unwrap_err();
+            assert_eq!(error.code, "INVALID_MODEL_OUTPUT");
+            assert!(error.message.contains(expected));
+            assert!(!error.message.contains("private-source-not-to-echo"));
+        }
+        assert_eq!(
+            sessions::get(&mut store, &session.id)
+                .unwrap()
+                .entries
+                .len(),
+            3
+        );
+    }
+    #[test]
     fn strict_structure_rejects_unknown_fields_lengths_and_untrusted_sources_before_write() {
         let (_directory, mut store, session, source) = fixture();
         for change in 0..9 {
@@ -850,5 +950,147 @@ mod tests {
                 .len(),
             2
         );
+    }
+}
+
+#[cfg(test)]
+mod issue_four_regression {
+    use super::*;
+    #[test]
+    fn three_questions_with_two_missing_explanations_preserve_absence_and_validate_sources() {
+        // Synthetic text with the reported structure; no private course text or source ID.
+        let source = "synthetic_dialectic";
+        let manifest = vec![ManifestItem {
+            id: source.into(),
+            path: "synthetic.md".into(),
+            version: "v1".into(),
+            included_chars: 10,
+        }];
+        let criteria = |points: [u32; 4]| json!({"criteria": points.iter().enumerate().map(|(i,p)| json!({"id":format!("c{i}"),"label":"概念", "description":"说明判断依据", "maxPoints":p})).collect::<Vec<_>>()});
+        let data = json!({"summary":"概念练习","exercises":[
+            {"question":"概念辨析", "format":"exact", "answers":["保留与克服"],"explanation":"合成解析", "tags":[],"sourceIds":[source]},
+            {"question":"解释概念", "format":"self", "answers":["合成参考"],"rubric":criteria([20,30,30,20]),"tags":[],"sourceIds":[source]},
+            {"question":"迁移应用", "format":"self", "answers":["合成参考"],"rubric":criteria([25,25,25,25]),"tags":[],"sourceIds":[source]}
+        ]});
+        let valid = validate(data.clone(), &manifest, "reported-shape").unwrap();
+        assert!(valid["exercises"][1].get("explanation").is_none());
+        assert!(valid["exercises"][2].get("explanation").is_none());
+        assert_eq!(render(&valid).unwrap().matches("尚未提供解析。").count(), 2);
+        assert!(validate(data.clone(), &[], "no-authorization")
+            .unwrap_err()
+            .message
+            .contains("sourceIds"));
+        let mut wrong = data;
+        wrong["exercises"][1]["explanation"] = json!(42);
+        assert!(validate(wrong, &manifest, "bad-type")
+            .unwrap_err()
+            .message
+            .contains("exercises[2].explanation"));
+    }
+}
+
+/// The packaged learning-exercises guidance is a live contract: its fenced practice-output JSON
+/// samples must pass the real model-facing validator, with tool-input pairs staying a distinct shape.
+#[cfg(test)]
+mod skill_sample_contracts {
+    use super::*;
+    use std::{fs, path::Path};
+    fn guidance_json_samples() -> Vec<Value> {
+        let content = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../skills/learning-exercises/SKILL.md"),
+        )
+        .expect("packaged SKILL.md must exist next to the crate");
+        let mut samples = Vec::new();
+        let mut block: Option<String> = None;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if block.is_none() {
+                if trimmed == "```json" {
+                    block = Some(String::new());
+                }
+                continue;
+            }
+            if trimmed == "```" {
+                let text = block.take().expect("closed fence keeps its buffer");
+                samples.push(serde_json::from_str(text.trim()).expect("fenced sample is JSON"));
+                continue;
+            }
+            let buffer = block.as_mut().expect("open fence keeps its buffer");
+            buffer.push_str(line);
+            buffer.push('\n');
+        }
+        assert!(block.is_none(), "SKILL.md leaves no unclosed json fence");
+        samples
+    }
+    #[test]
+    fn practice_output_samples_validate_with_covering_manifest_and_reject_boundary_abuse() {
+        let samples = guidance_json_samples();
+        // Tool inputs carry requirements; practice products must not, proving the pair stays split.
+        let products: Vec<&Value> = samples
+            .iter()
+            .filter(|sample| sample.get("requirements").is_none())
+            .collect();
+        let tool_inputs: Vec<&Value> = samples
+            .iter()
+            .filter(|sample| sample.get("requirements").is_some())
+            .collect();
+        assert_eq!(products.len(), 2);
+        assert_eq!(tool_inputs.len(), 2);
+        assert_eq!(
+            products
+                .iter()
+                .map(|product| product["exercises"][0]["format"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["exact", "self"]
+        );
+        for input in &tool_inputs {
+            assert!(
+                validate((*input).clone(), &[], "skill-sample-contract")
+                    .unwrap_err()
+                    .message
+                    .contains("schema"),
+                "tool input must not double as a practice product"
+            );
+        }
+        // One fixture manifest covers every demo sourceId the samples declare.
+        let mut sources = BTreeSet::new();
+        for product in &products {
+            for question in product["exercises"].as_array().unwrap() {
+                for id in question["sourceIds"].as_array().unwrap() {
+                    sources.insert(id.as_str().unwrap().to_owned());
+                }
+            }
+        }
+        assert!(sources.contains("src_demo_material") && sources.contains("src_demo_note"));
+        let manifest: Vec<ManifestItem> = sources
+            .iter()
+            .map(|id| ManifestItem {
+                id: id.clone(),
+                path: format!("{id}.md"),
+                version: "v1".into(),
+                included_chars: 100,
+            })
+            .collect();
+        for product in &products {
+            let valid = validate((*product).clone(), &manifest, "skill-sample-contract").unwrap();
+            for question in valid["exercises"].as_array().unwrap() {
+                assert!(question["id"].as_str().unwrap().starts_with("q_"));
+                assert_eq!(question["answerMatch"], "trim");
+            }
+        }
+        assert!(products[1]["exercises"][0].get("rubric").is_some());
+        // Boundary abuse is rejected: a source outside this round's authorized manifest...
+        let mut hijacked = (*products[0]).clone();
+        hijacked["exercises"][0]["sourceIds"] = json!(["src_not_in_manifest"]);
+        let error = validate(hijacked, &manifest, "skill-sample-negative").unwrap_err();
+        assert_eq!(error.code, "INVALID_MODEL_OUTPUT");
+        assert!(error.message.contains("sourceIds"));
+        assert!(!error.message.contains("src_not_in_manifest"));
+        // ...and an overlong field beyond the fixed length contract.
+        let mut overlong = (*products[0]).clone();
+        overlong["exercises"][0]["tags"] = json!(["x".repeat(65)]);
+        let error = validate(overlong, &manifest, "skill-sample-negative").unwrap_err();
+        assert_eq!(error.code, "INVALID_MODEL_OUTPUT");
+        assert!(error.message.contains("tags"));
     }
 }

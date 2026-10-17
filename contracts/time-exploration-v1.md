@@ -6,7 +6,7 @@
 
 Run/GradeRun 持久 referenceTime 与 timeZone，Run 另存 explorationContext；旧记录不伪造。state/time-anchors 按真实 userEntryId（无 entry 时按请求 ID）固定解析锚点，跨 run 的同问题重试继续使用；新的用户问题采用新时钟。损坏/不可读不能当缺失重建。Pi ready 回执须确认同一时间锚点。
 
-create_todo 增可选 relativeMinutes（1–525600 整数），优先用于“10 分钟后”等经过时长。Pi 按固定锚点和 IANA 生成带偏移的 dueAt，Rust 独立重算绝对时刻并核验两者相等，不一致不写入；回执含 dueAt/referenceTime/timeZone，原“打开待办”入口可核对真实截止时间。绝对 dueAt 仍须合法 RFC3339 时区/偏移；提醒默认关闭，不由模型自行开启。
+create_todo 增可选 relativeMinutes（1–525600 整数），优先用于“10 分钟后”等经过时长。Pi 按固定锚点和 IANA 生成带偏移的 dueAt，Rust 独立重算绝对时刻并核验两者相等，不一致不写入；回执含 dueAt/referenceTime/timeZone，原“打开待办”入口可核对真实截止时间。绝对 dueAt 仍须合法 RFC3339 时区/偏移。提醒默认关闭；仅当本轮用户明确要求提醒时模型可传 reminderEnabled=true，启用必须带提醒时间且晚于本轮 referenceTime，缺失/非法/过去时间拒绝，回执的 todo.reminderEnabled 反映实际调度状态。
 
 飞书到期消息仅在原调度到点后，用纯代码组成“小主人，你的任务「标题」到时间啦，记得处理哦。\n到期时间：当地日期时间及偏移”。不新增提前提醒，不称“即将到期”。测试消息保持独立测试文案；标题、通知编号和 unknown 去重不变。用户已确认旧包固定测试消息与到期待办链路成功，不能替代本版模板和 WS 入站的真实验证。
 

@@ -211,6 +211,10 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
         }
         await agent.waitForIdle();await pendingProjection;return {};
       },
+      async correctOutput(message){
+        await session.sendCustomMessage({customType:'learning-station-output-validation',content:message,display:false,details:{userEntryId:spec.userEntryId}},{triggerTurn:true});
+        await agent.waitForIdle();await pendingProjection;await checkpoint();
+      },
       async complete(finalContent){await pendingProjection;record.status='complete';record.finalContent=finalContent;persist(record);await checkpoint();},
       close(){unsub();userUnsub();close();},
     };

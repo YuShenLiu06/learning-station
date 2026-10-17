@@ -159,10 +159,17 @@ pub fn recover(
 ) -> Result<Value> {
     let unknown = || CoreError::new("NATIVE_TOOL_UNKNOWN", "原工具结果尚不可核实；未重复写入。");
     let run = crate::generation::get(engine, run_id)?;
-    if run.session_id != session_id
-        || !crate::generation::task_tool_policy(&run.mode)
-            .allowed_tools
-            .contains(&call.name)
+    if run.session_id != session_id {
+        return Err(unknown());
+    }
+    // Workspace tools recover from their own durable receipt ledger; the ledger
+    // is the proof of the original execution, not the current tier.
+    if crate::authorized_tools::required_rank(&call.name).is_some() {
+        return crate::authorized_tools::recover(engine, session_id, run_id, call);
+    }
+    if !crate::generation::task_tool_policy(&run.mode, "off")
+        .allowed_tools
+        .contains(&call.name)
     {
         return Err(unknown());
     }
@@ -190,7 +197,11 @@ pub fn recover(
             json!({"persisted":true,"todoId":todo.id,"sessionId":session_id,"sectionId":session.section_id,"todo":todo,"recovered":true}),
         );
     }
-    if call.name == "query_related_knowledge" {
+    if matches!(
+        call.name.as_str(),
+        "query_related_knowledge" | "list_learning_skills" | "load_learning_skill"
+    ) {
+        // Read-only calls have no durable business object to recover.
         return Err(unknown());
     }
     let id = format!("entry_{}", &hash(&request)[..32]);

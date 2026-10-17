@@ -22,16 +22,24 @@
 | `session_sync {id}` | Rust同步当前已绑定目录中的普通文件和目录；同id `tool_result.result.synced=true`后继续；无路径参数 |
 | `context_manifest {manifest}` | 实际原生材料投影的清单；写入当前Run，随后该assistant自身快照 |
 | `session_lifecycle {event,reason,aborted}` | 压缩开始/结束的安全状态，无消息正文或凭据 |
-| `tool_recover {id,name,args,recoveryRunId}` | 核对同学习会话原run、原操作ID和已提交对象，只读，不执行原工具；无证据返回unknown |
+| `tool_recover {id,name,args,recoveryRunId}` | 核对同学习会话原run、原操作ID和已提交对象，只读，不执行原工具；无证据返回unknown，有台账但工具或参数不一致返回CONFLICT |
 
 普通 `tool_request/tool_result/delta/done` 继续原协议。工具结果未回到 Pi 不代表业务未执行。Rust 在发送回包前持久化 `tool-sha256([runId,callId]).json`；恢复优先用原回包，必要时查询真实业务对象。新业务操作 ID 取 `sha256([saved-question-v1,sessionId,userEntryId,toolName,canonicalArgs])`，同一问题换 run/call 重试仍返回原对象；旧无 userEntryId 的记录沿原 run/call ID。原生已接受用户问题按 `userEntryId` 登记实际 native entry ID，失败重试不重复用户原话。
 
 ## 模型及资源
 
-固定显式 ModelRuntime、内存凭据、`modelsPath=null`、禁止模型目录网络刷新。资源加载器返回空外部扩展/模板/全局指导/Agents文件，应用仅传既有学习指导。基础工具表为空，精确开放当前学习模式允许的工具；`read/bash/edit/write/grep/find/ls/powershell`均不注册。Node权限模式不允许创建子进程。
+固定显式 ModelRuntime、内存凭据、`modelsPath=null`、禁止模型目录网络刷新。资源加载器返回空外部扩展/模板/全局指导/Agents文件，应用仅传既有学习指导。基础工具表为空，精确开放当前学习模式允许的工具；`edit/grep/find/ls/powershell`均不注册。`read/write/bash`仅在本机设置的工具授权档位（off/read/write/bash，默认off，仅question/explain模式）开启后受控注册，随toolPolicy.authorization由Rust下发；参数与结果仍由Rust校验，read只读本轮manifest已授权来源或会话工作区文件，write只写会话工作区（路径/配额/符号链接受限），bash只在会话工作区以受限环境执行（固定PATH、无HOME、超时与输出有上限），write/bash以持久回执台账幂等，恢复只读台账不重执行。Node权限模式不允许创建子进程（bash由Rust进程执行，不经Node）。
+
+`list_learning_skills`/`load_learning_skill`是仅question/explain/practice模式注册的只读工具，不挂任何授权档位：它们只读随包 `skills/` 固定允许清单（三个稳定id），复用主动快照同一路径校验（根内canonicalize、拒符号链接、16KiB、frontmatter合法），目录仅返回id/名称/描述不含正文，正文经工具结果通道返回且受工具结果预算约束，超出按SKILL_INVALID单工具拒绝。清单外或含路径成分的 id 分别以 TOOL_SCOPE／INVALID_TOOL_INPUT 拒绝，均不触盘。同run重复load同一指导只返回简短提示（含sha256）；该指导已随模式或工具注册注入时返回"已在指导中"，不重复正文；去重台账按run维度挂Rust，新run或该run压缩完成后可重新取正文。ready事件的learningSkills版本回执语义不变，仍只认主动注入快照，按需加载不进入该回执。
 
 摘要与普通生成走同一受控端点和预算，不跨域、不自动换模型。容量未知保持0，不开启阈值压缩；用户填写容量后使用Pi原生阈值生命周期。正常输出用尽不盲目重发。私有状态目录路径不发给模型，凭据不进原生会话。
 
 ## 限制与恢复
 
 原生文件有32MiB读取保护，不静默截断或删除；超过限制需保留原数据后明确处理。业务回执无法确认时会话停在unknown，不能改编号绕过。失败恢复的回滚路径是保留此私有目录、继续使用未改动的原Markdown与旧包；本轮不提供破坏性自动清库按钮。
+
+## 最终练习 JSON 的有界修正
+
+Rust 在 practice 模式显式开启 `outputValidation`，Node 每次完成最终文本后发送只读 `validate_output {id, content}`；Rust 使用原轮冻结 manifest 校验，回复 `tool_result.result={valid,recoverable,message?}`，不保存对象、不增加权限。两端均最多接受三次校验（首次及最多两次修正），沿用原请求超时与工具预算。
+
+可纠正错误通过 `learning-station-output-validation` 原生 custom message 回传 Agent，包含安全字段路径、原因与长度限制，不伪造新用户问题。未知来源或权限错误不可自动修正；失败原文留在私有原生会话，最终失败文本留在Run。仅校验通过才标记原生记录complete；Rust保存前再次校验并沿既有操作编号幂等写入。该私有事件不注册为模型工具或前端IPC。

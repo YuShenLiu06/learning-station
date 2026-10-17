@@ -19,6 +19,24 @@ async fn work<T: Send + 'static>(
         .await
         .map_err(|_| CoreError::new("INTERNAL", "本次操作中断，输入仍保留，请重试。"))?
 }
+// Only an explicit UI action can open a public HTTPS URL. No shell interpolation.
+#[tauri::command]
+async fn open_content_url(url: String) -> Result<()> {
+    let url = crate::content_url::validate(&url)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let status = std::process::Command::new("/usr/bin/open")
+            .arg(url)
+            .status()
+            .map_err(CoreError::io)?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(CoreError::new("IO", "原链接未能打开，请复制到浏览器。"))
+        }
+    })
+    .await
+    .map_err(|_| CoreError::new("IO", "原链接未能打开。"))?
+}
 #[tauri::command]
 async fn get_app_state(state: State<'_, Arc<Engine>>) -> Result<LibraryState> {
     let e = state.inner().clone();
@@ -474,6 +492,18 @@ async fn load_session_context(
 async fn get_ui_preferences(state: State<'_, Arc<Engine>>) -> Result<UiPreferences> {
     work(state.inner().clone(), |e| e.ui_preferences()).await
 }
+// Read-only: durable write/bash receipt summaries of one session workspace.
+// No arguments, command text or file contents ever leave the ledger.
+#[tauri::command]
+async fn list_tool_receipts(
+    state: State<'_, Arc<Engine>>,
+    session_id: String,
+) -> Result<Value> {
+    work(state.inner().clone(), move |e| {
+        crate::authorized_tools::list_receipt_summaries(e, &session_id)
+    })
+    .await
+}
 #[tauri::command]
 async fn save_ui_preferences(
     state: State<'_, Arc<Engine>>,
@@ -482,6 +512,7 @@ async fn save_ui_preferences(
     sidebar_collapsed: Option<bool>,
     expanded_node_ids: Option<Vec<String>>,
     sidebar_width: Option<u16>,
+    tool_authorization_tier: Option<String>,
 ) -> Result<UiPreferences> {
     work(state.inner().clone(), move |e| {
         e.patch_all_ui_preferences(
@@ -490,6 +521,7 @@ async fn save_ui_preferences(
             sidebar_collapsed,
             expanded_node_ids,
             sidebar_width,
+            tool_authorization_tier,
         )
     })
     .await
@@ -968,6 +1000,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            open_content_url,
             get_app_state,
             get_library_tree,
             list_sessions,
@@ -998,6 +1031,7 @@ pub fn run() {
             get_exercise_reference,
             get_ui_preferences,
             save_ui_preferences,
+            list_tool_receipts,
             get_session,
             append_entry,
             load_context,
