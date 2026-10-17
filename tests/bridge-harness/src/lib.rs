@@ -49,6 +49,15 @@ pub mod reminders {
         fn availability(&self) -> ChannelAvailability;
         fn deliver(&self, notification: &Notification) -> Result<DeliveryReceipt>;
     }
+    /// Offline mirror of the host contract only; the real formatting lives in
+    /// src-tauri reminders.rs (stub notifications carry no due time, so this
+    /// always renders the unreadable-due-time fallback the host defines).
+    pub fn due_notification_text(notification: &Notification) -> String {
+        format!(
+            "小主人，你的任务「{}」到时间啦，记得处理哦。\n到期时间：未能读取到期时间，请在学习站核对",
+            notification.title
+        )
+    }
 }
 #[path = "../../../tools/feishu-bot/bridge.rs"]
 pub mod bridge;
@@ -92,7 +101,10 @@ mod tests {
             "offline_fixture_only".into(),
         )
         .unwrap();
-        let end = Instant::now() + Duration::from_secs(4);
+        // Cold CI runners can need well over 4s for the first worker spawn
+        // (node cold start plus module resolution); 15s still fails fast on a
+        // real hang while tolerating slow first boots.
+        let end = Instant::now() + Duration::from_secs(15);
         while matches!(worker.snapshot().state.as_str(),""|"starting") && Instant::now() < end {
             std::thread::sleep(Duration::from_millis(10));
         }

@@ -1,0 +1,146 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  js-tests-build:
+    name: js-tests-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Set up Node 24.18.0
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24.18.0
+      - name: Install locked dependencies (root, pi-sidecar, feishu-bot)
+        run: |
+          npm ci --ignore-scripts
+          npm --prefix pi-sidecar ci --ignore-scripts
+          npm --prefix tools/feishu-bot ci --ignore-scripts
+      - name: Root tests
+        run: npm test
+      - name: pi-sidecar tests
+        run: npm --prefix pi-sidecar test
+      - name: feishu-bot tests
+        run: npm --prefix tools/feishu-bot test
+      - name: Frontend build (tsc + vite)
+        run: npm run build
+
+  rust-core-tests:
+    name: rust-core-tests
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Set up Node 24.18.0
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24.18.0
+      - name: Pin Rust 1.97.1
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
+          cargo --version
+      - name: Assert arm64 runner
+        run: test "$(uname -m)" = "arm64"
+      - name: Install locked JS dependencies (pi-sidecar, feishu-bot)
+        run: |
+          npm --prefix pi-sidecar ci --ignore-scripts
+          npm --prefix tools/feishu-bot ci --ignore-scripts
+      - name: Prepare pinned runtime Node (sha256 verified against runtime/manifest.json)
+        run: node scripts/prepare-runtime.mjs
+      - name: Core tests (locked)
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --no-default-features
+      - name: Bridge harness tests (locked)
+        run: cargo test --locked --manifest-path tests/bridge-harness/Cargo.toml
+
+  macos-app-build:
+    name: macos-app-build
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Set up Node 24.18.0
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24.18.0
+      - name: Pin Rust 1.97.1
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
+          cargo --version
+      - name: Assert arm64 runner
+        run: test "$(uname -m)" = "arm64"
+      - name: Install locked dependencies (root, pi-sidecar, feishu-bot)
+        run: |
+          npm ci --ignore-scripts
+          npm --prefix pi-sidecar ci --ignore-scripts
+          npm --prefix tools/feishu-bot ci --ignore-scripts
+      - name: Build app bundle (local development build, unsigned)
+        run: npm run tauri build
+      - name: Verify bundle
+        run: |
+          set -eu
+          APP='src-tauri/target/release/bundle/macos/学习站.app'
+          test -d "$APP"
+          test -x runtime/node
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$APP/Contents/Info.plist" | grep -qx 'icon.icns'
+          cmp "$APP/Contents/Resources/icon.icns" src-tauri/icons/icon.icns
+          file "$APP/Contents/MacOS/learning-station" | grep -q arm64
+          ditto -c -k --sequesterRsrc --keepParent "$APP" learning-station-devbuild.zip
+          shasum -a 256 learning-station-devbuild.zip | tee checksum.txt
+          {
+            echo '## 开发构建产物（未签名/未公证）'
+            echo '- SHA: '"$GITHUB_SHA"
+            echo '- 构建机架构: arm64 (macos-15)'
+            echo '- zip sha256: '`cut -d" " -f1 checksum.txt`
+            echo '- 保留 7 天，不含任何用户资料、密钥或本地缓存。'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload dev build artifact
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: learning-station-devbuild-${{ github.sha }}
+          path: |
+            learning-station-devbuild.zip
+            checksum.txt
+          retention-days: 7
+          if-no-files-found: error
+
+  ci-gate:
+    name: ci-gate
+    needs: [js-tests-build, rust-core-tests, macos-app-build]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Every required job must have succeeded
+        run: |
+          set -eu
+          results="${{ needs.js-tests-build.result }}|${{ needs.rust-core-tests.result }}|${{ needs.macos-app-build.result }}"
+          echo "required job results: $results"
+          if [ "$results" != "success|success|success" ]; then
+            echo "::error::ci-gate requires success on every required job; got: $results (failure/cancelled/skipped are all rejected)"
+            exit 1
+          fi
+          echo "all required jobs succeeded"
