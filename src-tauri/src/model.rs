@@ -783,6 +783,7 @@ pub type ToolRecoveryHandler = Arc<
 >;
 pub type OutputValidator = Arc<dyn Fn(&str) -> Result<()> + Send + Sync>;
 pub type ContextObserver = Arc<dyn Fn(Value) -> Result<()> + Send + Sync>;
+pub type CompactionObserver = Arc<dyn Fn() + Send + Sync>;
 #[derive(Clone)]
 pub struct RequestContext {
     pub time: crate::time_context::TimeContext,
@@ -791,6 +792,7 @@ pub struct RequestContext {
     pub context_observer: Option<ContextObserver>,
     pub tool_recovery: Option<ToolRecoveryHandler>,
     pub output_validator: Option<OutputValidator>,
+    pub compaction_observer: Option<CompactionObserver>,
 }
 impl RequestContext {
     fn capture() -> Self {
@@ -801,8 +803,16 @@ impl RequestContext {
             context_observer: None,
             tool_recovery: None,
             output_validator: None,
+            compaction_observer: None,
         }
     }
+}
+/// A completed, non-aborted compaction may have dropped earlier tool results
+/// from the effective context; per-run guidance dedup must not keep pointing
+/// at bodies the model can no longer see.
+fn compaction_clears_dedup(event: &Value) -> bool {
+    event.get("event").and_then(Value::as_str) == Some("compaction_end")
+        && event.get("aborted").and_then(Value::as_bool) != Some(true)
 }
 /// The caller supplies a fixed mode policy; Rust and Pi independently enforce its subset.
 pub async fn generate_scoped(
@@ -1101,6 +1111,9 @@ async fn run_sidecar(
                     }
                     Some("session_lifecycle") if ready && !settled => {
                         if !matches!(event["event"].as_str(),Some("compaction_start"|"compaction_end")){return Err(sidecar_error("MODEL_RESPONSE"));}
+                        if compaction_clears_dedup(&event) {
+                            if let Some(observer)=&request_context.compaction_observer {observer();}
+                        }
                     }
                     Some("tool_request") if ready && !settled => {
                         let handler = tool_handler
@@ -1737,6 +1750,15 @@ mod tests {
         net::TcpListener,
         thread,
     };
+
+    #[test]
+    fn only_completed_compaction_clears_guidance_dedup() {
+        assert!(compaction_clears_dedup(&json!({"event":"compaction_end"})));
+        assert!(!compaction_clears_dedup(&json!({"event":"compaction_end","aborted":true})));
+        assert!(!compaction_clears_dedup(&json!({"event":"compaction_start"})));
+        assert!(!compaction_clears_dedup(&json!({"event":"tool_request"})));
+        assert!(!compaction_clears_dedup(&json!({})));
+    }
     fn settings(endpoint: &str) -> ModelSettings {
         let mut value = ModelSettings::default();
         value.configured = true;

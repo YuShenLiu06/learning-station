@@ -528,6 +528,17 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
                         persist(&engine, &managed.run)
                     })
                 }),
+                compaction_observer: Some({
+                    let engine = engine.clone();
+                    let id = id.clone();
+                    Arc::new(move || {
+                        engine
+                            .run_loaded_skills
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&id);
+                    })
+                }),
             }),
         )
         .await;

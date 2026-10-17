@@ -252,6 +252,8 @@ pub fn execute(
         }
         _ => return Err(CoreError::new("TOOL_NOT_ALLOWED", "未启用此学习工具。")),
     };
+    // Guidance tools are read-only: the idempotency ledger lookup above has no
+    // bearing on them, so they return before any business write path.
     if let Operation::ListSkills = operation {
         return Ok(json!({"sessionId":scope.session_id,"runId":scope.run_id,
             "skills":crate::learning_skills::catalog()}));
@@ -612,6 +614,13 @@ pub fn execute(
     Ok(receipt)
 }
 
+/// JSON escaping can inflate control characters roughly six-fold, so a 16KiB
+/// body could burst the 32KiB wire budget. Measure the serialized reply with a
+/// headroom for the tool_result envelope; an oversized body fails this one
+/// call honestly instead of tripping the whole-run TOOL_LIMIT afterwards.
+fn within_result_budget(reply: &Value) -> bool {
+    serde_json::to_vec(reply).is_ok_and(|bytes| bytes.len() + 1024 <= MAX_TOOL_RESULT_BYTES)
+}
 /// On-demand guidance loading. Only the fixed bundled allowlist is readable;
 /// anything else is an authorization rejection without touching the disk. The
 /// dedup ledger hangs on the current run: a repeated load returns a short
@@ -620,16 +629,13 @@ fn load_skill(engine: &Engine, scope: &ToolScope, id: &str) -> Result<Value> {
     if !crate::learning_skills::KNOWN_IDS.contains(&id) {
         return Err(out_of_scope());
     }
-    // Guidance already injected proactively for this run's mode needs no reload.
+    // Guidance already delivered for this run — mode-injected into the system
+    // prompt or tool-scoped into a tool description — needs no second body.
     if let Ok(run) = crate::generation::get(engine, &scope.run_id) {
-        if let Some(version) = run
-            .learning_skills
-            .iter()
-            .find(|version| version.id == id && version.scope == "mode")
-        {
+        if let Some(version) = run.learning_skills.iter().find(|version| version.id == id) {
             return Ok(json!({"sessionId":scope.session_id,"runId":scope.run_id,"skillId":id,
                 "sha256":version.sha256,"alreadyInjected":true,
-                "notice":"该学习指导已随本次模式注入系统指导，正文无需重复加载。"}));
+                "notice":"该学习指导已随本次模式或工具注册注入指导，正文无需重复加载。"}));
         }
     }
     let mut loaded = engine
@@ -645,12 +651,19 @@ fn load_skill(engine: &Engine, scope: &ToolScope, id: &str) -> Result<Value> {
             "notice":"该学习指导本轮已加载，正文见先前的工具结果。"}));
     }
     let snapshot = crate::learning_skills::load(id)?;
+    let reply = json!({"sessionId":scope.session_id,"runId":scope.run_id,"skillId":id,
+        "sha256":snapshot.sha256,"content":snapshot.content});
+    if !within_result_budget(&reply) {
+        return Err(CoreError::new(
+            "SKILL_INVALID",
+            "学习指导正文超出工具结果预算，本次未返回。",
+        ));
+    }
     loaded
         .entry(scope.run_id.clone())
         .or_default()
         .insert(id.to_owned(), snapshot.sha256.clone());
-    Ok(json!({"sessionId":scope.session_id,"runId":scope.run_id,"skillId":id,
-        "sha256":snapshot.sha256,"content":snapshot.content}))
+    Ok(reply)
 }
 
 fn query_knowledge(
@@ -2362,7 +2375,10 @@ mod tests {
             "status": "running", "content": "", "error": null,
             "createdAt": "2026-10-17T00:00:00Z", "updatedAt": "2026-10-17T00:00:00Z",
             "requestDigest": "fixture", "contextManifest": [], "contextSnapshotVersion": 1,
-            "learningSkills": [{"id":"learning-explore","sha256":"ab".repeat(32),"scope":"mode"}],
+            "learningSkills": [
+                {"id":"learning-explore","sha256":"ab".repeat(32),"scope":"mode"},
+                {"id":"learning-exercises","sha256":"cd".repeat(32),"scope":"tool:generate_exercises"}
+            ],
         }))
         .unwrap();
         engine.runs.lock().unwrap().insert(
@@ -2383,7 +2399,8 @@ mod tests {
         assert_eq!(loaded["alreadyInjected"], true);
         assert_eq!(loaded["sha256"], "ab".repeat(32));
         assert!(loaded.get("content").is_none());
-        // Tool-scoped exercise guidance is not system-injected and still loads.
+        // Tool-scoped guidance rides in the tool description every turn, so a
+        // second body would duplicate the text already in effective context.
         let exercises = execute(
             &engine,
             &scope,
@@ -2392,7 +2409,72 @@ mod tests {
             json!({"skillId":"learning-exercises"}),
         )
         .unwrap();
-        assert!(exercises["content"].is_string());
+        assert_eq!(exercises["alreadyInjected"], true);
+        assert_eq!(exercises["sha256"], "cd".repeat(32));
+        assert!(exercises.get("content").is_none());
+        // Guidance the run never received still loads its full body.
+        let review = execute(
+            &engine,
+            &scope,
+            "review-load",
+            "load_learning_skill",
+            json!({"skillId":"learning-review"}),
+        )
+        .unwrap();
+        assert!(review["content"].is_string());
+    }
+
+    #[test]
+    fn compaction_clears_the_run_dedup_ledger_so_guidance_loads_again() {
+        let (_directory, engine, scope, _) = fixture();
+        let first = execute(
+            &engine,
+            &scope,
+            "pre-compaction-load",
+            "load_learning_skill",
+            json!({"skillId":"learning-explore"}),
+        )
+        .unwrap();
+        assert!(first["content"].is_string());
+        let notice = execute(
+            &engine,
+            &scope,
+            "repeat-load",
+            "load_learning_skill",
+            json!({"skillId":"learning-explore"}),
+        )
+        .unwrap();
+        assert_eq!(notice["alreadyLoaded"], true);
+        // This mirrors the compaction observer wired in generation.rs: a
+        // completed compaction may drop earlier tool results, so the ledger
+        // must stop pointing the model at bodies it can no longer see.
+        engine
+            .run_loaded_skills
+            .lock()
+            .unwrap()
+            .remove(&scope.run_id);
+        let after = execute(
+            &engine,
+            &scope,
+            "post-compaction-load",
+            "load_learning_skill",
+            json!({"skillId":"learning-explore"}),
+        )
+        .unwrap();
+        assert!(after["content"].is_string());
+        assert_eq!(after["sha256"], first["sha256"]);
+    }
+
+    #[test]
+    fn control_character_inflation_stays_inside_the_tool_result_budget() {
+        // A 16KiB body of control characters is legal on disk yet serializes
+        // to roughly six times its size; the gate must fail this single call
+        // honestly instead of letting the wire budget abort the whole run.
+        let inflated = json!({"content": "\u{1}".repeat(16 * 1024)});
+        assert!(serde_json::to_vec(&inflated).unwrap().len() > MAX_TOOL_RESULT_BYTES);
+        assert!(!within_result_budget(&inflated));
+        let normal = json!({"content": "普通指导正文"});
+        assert!(within_result_budget(&normal));
     }
 }
 #[cfg(test)]

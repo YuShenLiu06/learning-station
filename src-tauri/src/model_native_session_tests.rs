@@ -224,6 +224,7 @@ async fn real_rust_node_pi_native_restart_roles_tool_pairs_and_course_isolation(
                     Ok(())
                 })),
                 tool_recovery: None,
+                compaction_observer: None,
             }),
         )
         .await
@@ -355,6 +356,7 @@ async fn real_rust_node_pi_native_restart_roles_tool_pairs_and_course_isolation(
             native_session: Some(native),
             context_observer: None,
             tool_recovery: Some(recovery),
+            compaction_observer: None,
         }),
     )
     .await
@@ -662,6 +664,7 @@ async fn rust_node_pi_exercise_tool_receipt_corrects_invalid_output_in_same_nati
             native_session: Some(native.clone()),
             context_observer: None,
             tool_recovery: None,
+            compaction_observer: None,
         }),
     )
     .await
