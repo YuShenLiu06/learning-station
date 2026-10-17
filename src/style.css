@@ -139,3 +139,5 @@ label select{display:block;background:#fff;border:1px solid #dce5ce;border-radiu
 .tool-authorization-settings .tier-option { display: grid; grid-template-columns: auto auto; align-items: baseline; gap: 4px 10px; padding: 9px 12px; margin: 8px 0; border: 1px solid var(--line); border-radius: 8px; background: #fbfcf8; cursor: pointer; }
 .tool-authorization-settings .tier-option input[type="radio"] { accent-color: var(--green); }
 .tool-authorization-settings .tier-option .label-note { grid-column: 1 / -1; margin: 0; font-size: 11px; color: var(--muted); }
+/* The read-only receipt audit reuses task-list/task-item; a semantic ul needs the same flat look. */
+.tool-authorization-settings ul.task-list { list-style: none; padding: 0; margin: 10px 0 0; }
