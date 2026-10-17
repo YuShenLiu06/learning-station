@@ -186,7 +186,7 @@ pub fn execute(
         }
         "create_note" => {
             let value: CreateNote = decode(args)?;
-            bounded(&value.content, 1, 20000)?;
+            bounded(&value.content, 1, 12000)?;
             if let Some(selection) = &value.selection {
                 bounded(selection, 0, 12000)?;
             }
@@ -194,7 +194,7 @@ pub fn execute(
         }
         "create_todo" => {
             let value: CreateTodo = decode(args)?;
-            bounded(&value.title, 1, 2000)?;
+            bounded(&value.title, 1, 500)?;
             if let Some(due_at) = &value.due_at {
                 bounded(due_at, 1, 64)?;
                 chrono::DateTime::parse_from_rfc3339(due_at).map_err(|_| invalid())?;
@@ -677,7 +677,7 @@ fn validate_scope(scope: &ToolScope, call_id: &str) -> Result<()> {
         || scope.allowed_ids.len() > 32
         || scope.allowed_ids.iter().any(|id| !valid_id(id))
         || call_id.is_empty()
-        || call_id.len() > 128
+        || call_id.chars().count() > 256
         || call_id.chars().any(char::is_control)
     {
         return Err(invalid());
@@ -697,10 +697,13 @@ fn validate_tags(tags: &[String]) -> Result<()> {
     Ok(())
 }
 fn bounded(value: &str, minimum: usize, maximum: usize) -> Result<()> {
-    if value.len() > maximum {
+    // The declared schema, the sidecar preflight and the model-side validation
+    // all count Unicode characters; measuring bytes here would reject long
+    // Chinese content after every character-based gate already accepted it.
+    if value.chars().count() > maximum {
         return Err(limit());
     }
-    if minimum > 0 && value.trim().len() < minimum {
+    if minimum > 0 && value.trim().chars().count() < minimum {
         return Err(invalid());
     }
     Ok(())
@@ -1346,6 +1349,265 @@ mod tests {
     }
 
     #[test]
+    fn record_question_fields_are_counted_in_characters_not_bytes() {
+        let (_directory, engine, scope, _) = fixture();
+        // 8000 Chinese characters pass every character-based gate but weigh
+        // 24000 UTF-8 bytes, which the old byte measurement rejected.
+        let saved = execute(
+            &engine,
+            &scope,
+            "chinese-question",
+            "record_question",
+            json!({"question": "问".repeat(8000)}),
+        )
+        .unwrap();
+        assert_eq!(saved["persisted"], true);
+        let with_selection = execute(
+            &engine,
+            &scope,
+            "chinese-selection",
+            "record_question",
+            json!({"question": "短问题", "selection": "选".repeat(9000)}),
+        )
+        .unwrap();
+        assert_eq!(with_selection["persisted"], true);
+        assert_eq!(
+            execute(
+                &engine,
+                &scope,
+                "over-long-question",
+                "record_question",
+                json!({"question": "问".repeat(8001)})
+            )
+            .unwrap_err()
+            .code,
+            "LIMIT_EXCEEDED"
+        );
+        assert_eq!(
+            execute(
+                &engine,
+                &scope,
+                "over-long-selection",
+                "record_question",
+                json!({"question": "Q", "selection": "s".repeat(12001)})
+            )
+            .unwrap_err()
+            .code,
+            "LIMIT_EXCEEDED"
+        );
+    }
+
+    #[test]
+    fn create_error_fields_are_counted_in_characters_not_bytes() {
+        let (_directory, engine, scope, _) = fixture();
+        let saved = execute(
+            &engine,
+            &scope,
+            "chinese-error",
+            "create_error",
+            json!({
+                "front": "题".repeat(2700),
+                "back": "解".repeat(3000),
+                "cause": "因".repeat(1400),
+                "tags": ["时间", "标".repeat(22)],
+            }),
+        )
+        .unwrap();
+        assert_eq!(saved["persisted"], true);
+        assert_eq!(
+            execute(
+                &engine,
+                &scope,
+                "over-long-error-front",
+                "create_error",
+                json!({"front": "题".repeat(8001), "back": "解"})
+            )
+            .unwrap_err()
+            .code,
+            "LIMIT_EXCEEDED"
+        );
+        assert_eq!(
+            execute(
+                &engine,
+                &scope,
+                "over-long-error-cause",
+                "create_error",
+                json!({"front": "题", "back": "解", "cause": "因".repeat(4001)})
+            )
+            .unwrap_err()
+            .code,
+            "LIMIT_EXCEEDED"
+        );
+        assert_eq!(
+            execute(
+                &engine,
+                &scope,
+                "over-long-error-tag",
+                "create_error",
+                json!({"front": "题", "back": "解", "tags": ["标".repeat(65)]})
+            )
+            .unwrap_err()
+            .code,
+            "LIMIT_EXCEEDED"
+        );
+    }
+
+    #[test]
+    fn review_card_fields_are_counted_in_characters_not_bytes() {
+        let (_directory, engine, scope, _) = fixture();
+        let saved = execute(
+            &engine,
+            &scope,
+            "chinese-card",
+            "create_review_card",
+            json!({
+                "front": "面".repeat(2700),
+                "back": "背".repeat(3000),
+                "tags": ["标".repeat(22)],
+            }),
+        )
+        .unwrap();
+        assert_eq!(saved["persisted"], true);
+        assert_eq!(
+            execute(
+                &engine,
+                &scope,
+                "over-long-card-back",
+                "create_review_card",
+                json!({"front": "面", "back": "b".repeat(12001)})
+            )
+            .unwrap_err()
+            .code,
+            "LIMIT_EXCEEDED"
+        );
+    }
+
+    #[test]
+    fn note_fields_are_counted_in_characters_not_bytes() {
+        let (_directory, engine, scope, _) = fixture();
+        // The schema layer caps content at 12000 characters while execution
+        // used a 20000-byte budget, so this note cleared every character
+        // gate and still hit a generic LIMIT_EXCEEDED.
+        let saved = execute(
+            &engine,
+            &scope,
+            "chinese-note",
+            "create_note",
+            json!({"content": "笔".repeat(10000)}),
+        )
+        .unwrap();
+        assert_eq!(saved["persisted"], true);
+        assert_eq!(
+            execute(
+                &engine,
+                &scope,
+                "over-long-note",
+                "create_note",
+                json!({"content": "n".repeat(12001)})
+            )
+            .unwrap_err()
+            .code,
+            "LIMIT_EXCEEDED"
+        );
+    }
+
+    #[test]
+    fn todo_title_and_due_at_are_counted_in_characters() {
+        let (_directory, engine, scope, _) = fixture();
+        // The schema caps titles at 500 characters; execution used to keep a
+        // wider 2000-byte budget, so the boundary must follow the schema.
+        let saved = execute(
+            &engine,
+            &scope,
+            "chinese-todo",
+            "create_todo",
+            json!({"title": "办".repeat(500)}),
+        )
+        .unwrap();
+        assert_eq!(saved["persisted"], true);
+        assert_eq!(
+            execute(
+                &engine,
+                &scope,
+                "over-long-todo-title",
+                "create_todo",
+                json!({"title": "办".repeat(501)})
+            )
+            .unwrap_err()
+            .code,
+            "LIMIT_EXCEEDED"
+        );
+        assert_eq!(
+            execute(
+                &engine,
+                &scope,
+                "over-long-todo-due-at",
+                "create_todo",
+                json!({"title": "办", "dueAt": "x".repeat(65)})
+            )
+            .unwrap_err()
+            .code,
+            "LIMIT_EXCEEDED"
+        );
+    }
+
+    #[test]
+    fn knowledge_query_is_counted_in_characters_not_bytes() {
+        let (_directory, engine, scope, _) = fixture();
+        // 500 Chinese characters are 1500 bytes; the old byte budget
+        // rejected them after every character gate accepted the call.
+        let found = execute(
+            &engine,
+            &scope,
+            "chinese-query",
+            "query_related_knowledge",
+            json!({"query": "查".repeat(500)}),
+        )
+        .unwrap();
+        assert!(found["results"].is_array());
+        assert_eq!(
+            execute(
+                &engine,
+                &scope,
+                "over-long-query",
+                "query_related_knowledge",
+                json!({"query": "查".repeat(501)})
+            )
+            .unwrap_err()
+            .code,
+            "LIMIT_EXCEEDED"
+        );
+    }
+
+    #[test]
+    fn call_id_length_is_counted_in_characters_not_bytes() {
+        let (_directory, engine, scope, _) = fixture();
+        // The wire preflight accepts call IDs up to 256 characters; the old
+        // 128-byte execution gate rejected longer opaque IDs afterwards.
+        let saved = execute(
+            &engine,
+            &scope,
+            &"调".repeat(200),
+            "record_question",
+            json!({"question": "长编号调用"}),
+        )
+        .unwrap();
+        assert_eq!(saved["persisted"], true);
+        assert_eq!(
+            execute(
+                &engine,
+                &scope,
+                &"x".repeat(257),
+                "record_question",
+                json!({"question": "超长编号调用"})
+            )
+            .unwrap_err()
+            .code,
+            "INVALID_TOOL_INPUT"
+        );
+    }
+
+    #[test]
     fn cross_section_scope_and_foreign_exercise_are_rejected() {
         let (_directory, engine, scope, _) = fixture();
         let mut foreign_scope = scope.clone();
@@ -1876,7 +2138,7 @@ mod tests {
             execute(
                 &engine,
                 &scope,
-                &"x".repeat(129),
+                &"x".repeat(257),
                 "record_question",
                 json!({"question":"Q"})
             )
