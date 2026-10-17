@@ -12,6 +12,6 @@
 
 `Run.skillSnapshotVersion=1`，`Run.learningSkills=[{id,sha256,scope}]`；scope 为 `mode` 或 `tool:generate_exercises`。同一 run 不再读取当前文件；旧 run 缺字段按未记录处理，恢复不伪造版本。必需文件缺失、不可读、格式或哈希不符分别报 SKILL_MISSING／SKILL_IO／SKILL_INVALID，不能静默继续。出题指导按 ID 去重，不把三份指导注入每次请求。
 
-模型可在 question/explain/practice 模式用 `list_learning_skills`/`load_learning_skill` 按需取同一允许清单：目录只含 id/名称/描述，正文经工具结果通道（不进系统提示）返回，路径校验与主动快照完全同一套。清单外 id 报 TOOL_SCOPE；同 run 重复 load 只返回简短提示，已随模式注入的指导提示"已在指导中"；去重按 run 挂 Rust 内存台账，不跨 run 缓存，新 run 或压缩后新请求可重新取正文。按需加载不改变 `Run.learningSkills` 与 ready 回执，二者仍只记录主动注入。
+模型可在 question/explain/practice 模式用 `list_learning_skills`/`load_learning_skill` 按需取同一允许清单：目录只含 id/名称/描述，正文经工具结果通道（不进系统提示）返回，路径校验与主动快照完全同一套，正文受工具结果预算约束。清单外或含路径成分的 id 分别报 TOOL_SCOPE／INVALID_TOOL_INPUT，均不触盘；同 run 重复 load 只返回简短提示，已随模式或工具注册注入的指导提示"已在指导中"；去重按 run 挂 Rust 内存台账，不跨 run 缓存，新 run 或该 run 压缩完成后可重新取正文。按需加载不改变 `Run.learningSkills` 与 ready 回执，二者仍只记录主动注入。
 
 单条用户记录可保存 `data.requestedContext={documentId,selection,injections}`：仅冻结请求意图，不证明模型实际使用。documentId 绑定该 session.sectionId，独立会话为空且 selection 为空；selection 等于 entry.selection，injections 沿用 ContextInjection 且最多8份、stable ID唯一、选段最多8000字符。字段白名单与长度受核心校验，真实文件、版本和权限仍由生成前 context::inject 校核。幂等命中返回原条目，不因之后资料改变而重复写入。模型历史正文不重复投影此 metadata；实际来源继续取各 Run 或 assistant entry 自身快照。
