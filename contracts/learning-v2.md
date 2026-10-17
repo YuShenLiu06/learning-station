@@ -57,7 +57,7 @@ ReviewSource={reviewItemId,sessionId,sectionId:null|string,sectionTitle:string,c
 
 ## 练习字段与错误恢复（Issue #3/#4）
 
-最终练习 JSON 仅含 `exercises` 和 `summary`；`generate_exercises` 工具额外要求非空 `requirements`，不可混为同一协议。1–5 题；summary 最多10000个 Unicode scalar value，题干/解析最多20000，单个答案最多10000，标签最多64；32KiB工具参数和256KiB最终响应字节总限额保持不变。
+最终练习 JSON 仅含 `exercises` 和 `summary`；`generate_exercises` 工具额外要求非空 `requirements`（最多8000个 Unicode scalar value），不可混为同一协议。1–5 题；summary 最多10000个 Unicode scalar value，题干/解析最多20000，单个答案最多10000，标签最多64；32KiB工具参数和256KiB最终响应字节总限额保持不变。
 
 `explanation` 可省略；存在时必须是字符串。缺省仍以缺省保存，阅读时显示“尚未提供解析”，不从答案或 rubric 推造解析。题干、参考答案、格式、标签和来源数组仍按原规则必需。sourceIds 必须来自本轮冻结材料 manifest 且不重复；评分标准结构与分值校验不放宽。
 
