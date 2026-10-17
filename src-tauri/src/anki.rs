@@ -45,11 +45,21 @@ impl Anki {
             .json(&json!({"action":action,"version":6,"params":params}))
             .send()
             .await
-            .map_err(|_| {
-                err(
-                    "ANKI_OFFLINE",
-                    "未连接本机Anki。请打开已安装的Anki并确认AnkiConnect运行，再点击重试。",
-                )
+            .map_err(|e| {
+                // Connection establishment failed without a timeout: the request
+                // was never delivered to Anki. Anything else (timeouts, broken
+                // responses) keeps the delivery status unknown.
+                if e.is_connect() && !e.is_timeout() {
+                    err(
+                        "ANKI_UNREACHED",
+                        "本机Anki连接未建立，该请求确定未送达。请打开已安装的Anki并确认AnkiConnect运行。",
+                    )
+                } else {
+                    err(
+                        "ANKI_OFFLINE",
+                        "未连接本机Anki。请打开已安装的Anki并确认AnkiConnect运行，再点击重试。",
+                    )
+                }
             })?;
         if !response.status().is_success() {
             return Err(err("ANKI_HTTP", "AnkiConnect未接受请求，未确认操作。"));
@@ -357,7 +367,13 @@ impl Anki {
                 op["status"] = json!("failed");
                 op["error"] = json!({"code":"ANKI_REJECTED","message":"Anki未确认本次复习。"});
             }
-            Err(e) => op["error"] = json!(e),
+            Err(e) => {
+                let unsent = e.code == "ANKI_UNREACHED";
+                op["error"] = json!(e);
+                if unsent {
+                    op["status"] = json!("failed");
+                }
+            }
         }
         self.save_op(request, &op)?;
         Ok(op)
@@ -395,7 +411,11 @@ impl Anki {
             )),
         };
         if let Err(e) = attempt {
+            let unsent = e.code == "ANKI_UNREACHED";
             op["error"] = json!(e);
+            if unsent {
+                op["status"] = json!("failed");
+            }
         } else {
             op["status"] = json!("succeeded");
         }
@@ -533,6 +553,44 @@ mod tests {
         io::{Read, Write},
         net::TcpListener,
     };
+    fn read_call(s: &mut std::net::TcpStream) -> Value {
+        let mut raw = vec![];
+        let end;
+        loop {
+            let mut b = [0; 1024];
+            let n = s.read(&mut b).unwrap();
+            raw.extend_from_slice(&b[..n]);
+            if let Some(p) = raw.windows(4).position(|p| p == b"\r\n\r\n") {
+                end = p + 4;
+                break;
+            }
+        }
+        let header = String::from_utf8_lossy(&raw[..end]);
+        let n = header
+            .lines()
+            .find_map(|l| {
+                l.to_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(|s| s.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+        while raw.len() < end + n {
+            let mut b = [0; 1024];
+            let k = s.read(&mut b).unwrap();
+            raw.extend_from_slice(&b[..k]);
+        }
+        serde_json::from_slice(&raw[end..end + n]).unwrap()
+    }
+    fn respond(s: &mut std::net::TcpStream, value: Value) {
+        let body = json!({"result":value,"error":null}).to_string();
+        write!(
+            s,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    }
     fn server(replies: Vec<Value>) -> (String, std::thread::JoinHandle<Vec<Value>>) {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", l.local_addr().unwrap());
@@ -540,40 +598,8 @@ mod tests {
             let mut calls = vec![];
             for reply in replies {
                 let (mut s, _) = l.accept().unwrap();
-                let mut raw = vec![];
-                let end;
-                loop {
-                    let mut b = [0; 1024];
-                    let n = s.read(&mut b).unwrap();
-                    raw.extend_from_slice(&b[..n]);
-                    if let Some(p) = raw.windows(4).position(|p| p == b"\r\n\r\n") {
-                        end = p + 4;
-                        break;
-                    }
-                }
-                let header = String::from_utf8_lossy(&raw[..end]);
-                let n = header
-                    .lines()
-                    .find_map(|l| {
-                        l.to_lowercase()
-                            .strip_prefix("content-length:")
-                            .map(|s| s.trim().parse::<usize>().unwrap())
-                    })
-                    .unwrap();
-                while raw.len() < end + n {
-                    let mut b = [0; 1024];
-                    let k = s.read(&mut b).unwrap();
-                    raw.extend_from_slice(&b[..k]);
-                }
-                calls.push(serde_json::from_slice(&raw[end..end + n]).unwrap());
-                let body = json!({"result":reply,"error":null}).to_string();
-                write!(
-                    s,
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                )
-                .unwrap();
+                calls.push(read_call(&mut s));
+                respond(&mut s, reply);
             }
             calls
         });
@@ -631,6 +657,91 @@ mod tests {
             a.answer(1, "token", 3, "unknown-op-1").await.unwrap()["status"],
             "unknown"
         );
+    }
+    #[tokio::test]
+    async fn refused_send_stage_is_failed_not_unknown_and_stays_idempotent() {
+        let c = card();
+        let t = Anki::token(&c);
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let h = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let asked = read_call(&mut s);
+            drop(l); // further connections are definitely refused, never delivered
+            respond(&mut s, json!([c]));
+            asked
+        });
+        let d = tempfile::tempdir().unwrap();
+        let a = Anki::at(d.path(), &url).unwrap();
+        atomic_json(
+            &d.path().join("anki").join("revealed").join(format!("{t}.json")),
+            &json!({"cardId":1,"token":t}),
+        )
+        .unwrap();
+        let op = a.answer(1, &t, 3, "anki-refused-0001").await.unwrap();
+        assert_eq!(op["status"], "failed");
+        assert_eq!(op["error"]["code"], "ANKI_UNREACHED");
+        assert_eq!(a.answer(1, &t, 3, "anki-refused-0001").await.unwrap(), op);
+        assert_eq!(h.join().unwrap()["action"], "cardsInfo");
+    }
+    #[tokio::test]
+    async fn refused_add_send_stage_is_failed_without_invented_notes() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let h = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let asked = read_call(&mut s);
+            drop(l); // modelNames and every later call are refused
+            respond(&mut s, json!({"Default":159}));
+            asked
+        });
+        let d = tempfile::tempdir().unwrap();
+        let a = Anki::at(d.path(), &url).unwrap();
+        let items = vec![json!({"id":"card_one","front":"F","back":"B"})];
+        let op = a.add(&items, "Default", "anki-add-refused-1")
+            .await
+            .unwrap();
+        assert_eq!(op["status"], "failed");
+        assert_eq!(op["error"]["code"], "ANKI_UNREACHED");
+        assert_eq!(op["noteIds"], json!([]));
+        assert_eq!(
+            a.add(&items, "Default", "anki-add-refused-1")
+                .await
+                .unwrap(),
+            op
+        );
+        assert_eq!(h.join().unwrap()["action"], "deckNamesAndIds");
+    }
+    #[tokio::test]
+    async fn unanswered_send_stage_keeps_delivery_unknown() {
+        let c = card();
+        let t = Anki::token(&c);
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let (release, answered) = std::sync::mpsc::channel::<()>();
+        let hold = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let asked = read_call(&mut s);
+            respond(&mut s, json!([c]));
+            assert_eq!(asked["action"], "cardsInfo");
+            // answerCards is never answered: the client can only time out and
+            // whether the write reached Anki stays unknown.
+            let _ = answered.recv_timeout(Duration::from_secs(60));
+        });
+        let d = tempfile::tempdir().unwrap();
+        let a = Anki::at(d.path(), &url).unwrap();
+        atomic_json(
+            &d.path().join("anki").join("revealed").join(format!("{t}.json")),
+            &json!({"cardId":1,"token":t}),
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let op = a.answer(1, &t, 3, "anki-hung-0001").await.unwrap();
+        assert_eq!(op["status"], "unknown");
+        assert_eq!(op["error"]["code"], "ANKI_OFFLINE");
+        assert!(started.elapsed() >= Duration::from_secs(5));
+        drop(release);
+        hold.join().unwrap();
     }
     #[test]
     fn template_fields_escape_untrusted_html() {
