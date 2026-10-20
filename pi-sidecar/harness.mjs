@@ -37,6 +37,8 @@ export const SAFE_MESSAGES = Object.freeze({
   MODEL_THINKING_ONLY: '模型仅返回思考内容，没有最终正文；思考内容未当作学习答案。',
   MODEL_EMPTY: '模型声明结束，但没有返回有效正文。',
   OUTPUT_LIMIT: '模型输出超过限制，已停止；已收到的内容已保留。',
+  LIMIT_EXCEEDED: '完整材料变化及必要正文超过发送容量；未截断，原问题与版本保留。',
+  CONTEXT_CONFLICT: '聚焦正文与固定材料类型不一致，正文未发送；请保留原问题并重新核对聚焦材料。',
   TOOL_LIMIT: '学习工具调用超过本次预算，已停止。',
   TOOL_PROTOCOL: '学习工具协议或参数无效，已停止。',
   TOOL_FAILED: '学习工具执行失败，未确认完成。',
@@ -317,7 +319,7 @@ export async function runLearningAgent(request, emit, { signal, streamFn: fixtur
   };
   if(request.nativeSession && request.operation==='generate'){
     const systemPrompt=agentOptions.initialState.systemPrompt;
-    native=await openNativeSession(request.nativeSession,{model,systemPrompt,tools:plugin?.tools??[],streamFn:agentOptions.streamFn,apiKey:request.apiKey,thinkingLevel:glm?'max':'off',beforeToolCall:agentOptions.beforeToolCall,finishTurn:agentOptions.finishTurn,requestTool,checkpoint:async()=>{const reply=await requestTool({type:'session_sync',id:'sync_'+randomUUID()});if(reply?.result?.synced!==true)throw new SafeError('NATIVE_SESSION_INVALID');},onManifest:manifest=>{const write=emit({type:'context_manifest',manifest});manifestWrites.push(write);return write;},onLifecycle:event=>{const write=emit({type:'session_lifecycle',event:event.type,reason:event.reason,aborted:event.aborted});manifestWrites.push(write);return write;}});
+    native=await openNativeSession(request.nativeSession,{model,systemPrompt,tools:plugin?.tools??[],streamFn:agentOptions.streamFn,apiKey:request.apiKey,thinkingLevel:glm?'max':'off',beforeToolCall:agentOptions.beforeToolCall,finishTurn:agentOptions.finishTurn,requestTool,loadChanges:async ({baseCommitOid,focusBaseCommitOid})=>{const reply=await requestTool({type:'material_changes',id:'changes_'+randomUUID(),baseCommitOid,focusBaseCommitOid});if(!reply?.result)throw new SafeError(reply?.error?.code??'TOOL_PROTOCOL');return reply.result;},checkpoint:async()=>{const reply=await requestTool({type:'session_sync',id:'sync_'+randomUUID()});if(reply?.result?.synced!==true)throw new SafeError('NATIVE_SESSION_INVALID');},onManifest:manifest=>{const write=emit({type:'context_manifest',manifest});manifestWrites.push(write);return write;},onLifecycle:event=>{const write=emit({type:'session_lifecycle',event:event.type,reason:event.reason,aborted:event.aborted});manifestWrites.push(write);return write;}});
     agent=native.agent;
   }else agent=new Agent(agentOptions);
   const unsubscribe = agent.subscribe(async (event) => {

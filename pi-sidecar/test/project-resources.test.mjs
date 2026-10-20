@@ -122,6 +122,15 @@ if(process.argv[2]==='fixture'){
     try{await native.applyContext(envelope);await native.prompt(question);await native.complete('Synthetic reply');}finally{native.close();}
     native=await open(s);
     try{await assert.rejects(native.prompt('/skill:course-a Changed input'),e=>e.code==='NATIVE_SESSION_INVALID');assert.deepEqual(await native.prompt(question),{cached:'Synthetic reply'});}finally{native.close();}
+  }else if(scenario==='focus'){
+    const first='1'.repeat(40),second='2'.repeat(40),tree='a'.repeat(40);let commit=first,body='AUTOMATIC_FOCUS_FULL_FIRST';
+    const focused=()=>({id:'doc_1',path:'documents/doc_1.md',gitCommitOid:commit,gitBlobOid:sha(body),version:sha(body),textHash:sha(body),text:body,range:{startChar:0,endChar:body.length,complete:true,totalBytes:body.length},...(commit===second?{gitChange:{baseCommitOid:first,baseBlobOid:sha('AUTOMATIC_FOCUS_FULL_FIRST'),unifiedDiff:'FIXED_FOCUS_COMPLETE_GIT_DIFF'}}:{})});
+    const request=()=>({...envelope,focus:{courseId:'course_a',documentId:'doc_1',path:'documents/doc_1.md',type:'markdown',commitHash:commit,materialTreeOid:tree,paragraphs:[{start:0,end:body.length,text:body}]}});
+    const loadChanges=async r=>({checkpoint:{courseId:'course_a',checkpointCommitOid:commit,materialTreeOid:tree,excludedFiles:[]},baseCommitOid:r.baseCommitOid,initial:r.baseCommitOid===null,changes:[{path:'documents/doc_1.md',status:'M'}],exclusionsChanged:false,focused:focused(),complete:true});
+    const s={...makeSpec('session_auto_focus'),authorizedSourceIds:['doc_1']};let native=await openNativeSession(s,{...options,loadChanges});
+    try{await native.applyContext(request());await native.prompt('First Focus');assert(JSON.stringify(observed).includes(body));assert(JSON.stringify(observed).includes('PARENT_STUDENT_PROFILE'));}finally{native.close();}
+    commit=second;body='AUTOMATIC_FOCUS_NEXT_BODY_NOT_DUPLICATED';native=await openNativeSession({...s,runId:'run_changed',userEntryId:'user_changed'},{...options,loadChanges});
+    try{await native.applyContext(request());await native.prompt('Changed Focus');const wire=JSON.stringify(observed);assert(wire.includes('FIXED_FOCUS_COMPLETE_GIT_DIFF'));assert(!wire.includes(body));assert.equal(native.manager.getCwd(),projectRoot);}finally{native.close();}
   }else throw new Error('Unknown scenario');
 }else{
   function run(scenario){
@@ -143,4 +152,5 @@ if(process.argv[2]==='fixture'){
   test('explicit quotations remain supplied when ordinary note bodies are absent',()=>run('citation'));
   test('project adoption excludes automatic body projections, preserves raw/user history and rejects new automatic bodies',()=>run('retire-automatic'));
   test('completed native skill request cannot be replayed with changed original input',()=>run('changed-input'));
+  test('automatic Focus uses fixed full/diff projection alongside native course resources',()=>run('focus'));
 }

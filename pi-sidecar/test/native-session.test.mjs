@@ -45,3 +45,119 @@ test('output correction is a program custom message and never duplicates the ori
  assert.equal(calls,2);assert.equal(entries.filter(e=>e.type==='message'&&e.message.role==='user'&&text(e.message)==='First question').length,1);
  assert(entries.some(e=>e.type==='custom_message'&&e.customType==='learning-station-output-validation'));
 });
+
+// Synthetic Git identities; the Rust material_changes tests exercise real Git.
+const cp1='1'.repeat(40),cp2='2'.repeat(40),tree='a'.repeat(40);
+function focused(id,body,commit=cp1,base){return {id,path:`documents/${id}.md`,text:body,textHash:hash(body),version:hash(body),range:{startChar:0,endChar:[...body].length,complete:true,totalBytes:Buffer.byteLength(body)},gitCommitOid:commit,gitBlobOid:hash(body),...(base?{gitChange:{baseCommitOid:base.commit,baseBlobOid:hash(base.body),unifiedDiff:base.patch}}:{})};}
+function changesEnvelope(id='doc_1',commit=cp1){return {...envelope,focus:{courseId:'course_fixture',documentId:id,path:`documents/${id}.md`,commitHash:commit,materialTreeOid:tree}};}
+function changeReply(base,source,changes=[],extra={}){return {checkpoint:{courseId:'course_fixture',checkpointCommitOid:source?.gitCommitOid??cp1,materialTreeOid:tree,excludedFiles:[]},baseCommitOid:base,initial:base===null,changes,exclusionsChanged:base===null,focused:source,complete:true,...extra};}
+const materialEntries=n=>n.manager.getEntries().filter(e=>e.type==='custom_message'&&e.customType==='learning-station-material');
+const changeEntries=n=>n.manager.getEntries().filter(e=>e.type==='custom_message'&&e.customType==='learning-station-changes');
+test('Changes summaries never establish B body; switching focus adds B full before any diff',async()=>{
+ const s={...spec(),authorizedSourceIds:['doc_1','doc_b']};let n=await openNativeSession(s,{...options(),loadChanges:async({baseCommitOid})=>changeReply(baseCommitOid,focused('doc_1','A body'),[{path:'documents/doc_b.md',status:'A',added:111,deleted:0,binary:false,patch:null}])});
+ await n.applyContext(changesEnvelope());await n.prompt('First question');n.close();
+ let base;n=await openNativeSession({...s,runId:'run_focus_b',userEntryId:'user_focus_b'},{...options(),loadChanges:async r=>{base=r.baseCommitOid;return changeReply(base,focused('doc_b','B complete body',cp2,{commit:cp1,body:'B unseen old',patch:'complete native patch'}),[{path:'documents/doc_b.md',status:'M',added:1,deleted:1,patch:'complete native patch'}]);}});
+ await n.applyContext(changesEnvelope('doc_b',cp2));assert.equal(base,cp1);
+ const b=materialEntries(n).filter(e=>e.details.sourceId==='doc_b');assert.equal(b.length,1);assert.equal(JSON.parse(b[0].content).frames[0].kind,'full');assert(JSON.parse(b[0].content).frames[0].text.includes('B complete body'));n.close();
+});
+test('verified Git patch uses actual full chain; unchanged request adds neither body nor Changes',async()=>{
+ const s=spec();let n=await openNativeSession(s,{...options(),loadChanges:async r=>changeReply(r.baseCommitOid,focused('doc_1','first'),[{path:'documents/doc_1.md',status:'A'}])});await n.applyContext(changesEnvelope());await n.prompt('First question');n.close();
+ const source=focused('doc_1','second',cp2,{commit:cp1,body:'first',patch:'FULL_NATIVE_GIT_PATCH'});
+ n=await openNativeSession({...s,runId:'run_git_diff',userEntryId:'user_git_diff'},{...options(),loadChanges:async r=>changeReply(r.baseCommitOid,source,[{path:source.path,status:'M',patch:'FULL_NATIVE_GIT_PATCH'}],{exclusionsChanged:false})});await n.applyContext(changesEnvelope('doc_1',cp2));await n.prompt('Second question');
+ assert.equal(JSON.parse(materialEntries(n).at(-1).content).frames[0].kind,'diff');assert.equal(JSON.parse(materialEntries(n).at(-1).content).frames[0].unifiedDiff,'FULL_NATIVE_GIT_PATCH');n.close();
+ n=await openNativeSession({...s,runId:'run_unchanged',userEntryId:'user_unchanged'},{...options(),loadChanges:async r=>{assert.equal(r.baseCommitOid,cp2);return changeReply(r.baseCommitOid,source,[],{exclusionsChanged:false});}});const before=[materialEntries(n).length,changeEntries(n).length];await n.applyContext(changesEnvelope('doc_1',cp2));assert.deepEqual([materialEntries(n).length,changeEntries(n).length],before);n.close();
+});
+test('compaction retaining only a Git diff reloads full and never trusts a summary as body',async()=>{
+ const s=spec();let n=await openNativeSession(s,options());await n.applyContext(envelope);await n.prompt('First question');
+ const full=materialEntries(n)[0];n.manager.appendContextEdit(full.id,null);
+ const summary=n.manager.appendCustomMessageEntry('learning-station-changes','B.txt +111',false,{courseId:'course_fixture',checkpointCommitOid:cp1,userEntryId:s.userEntryId});
+ n.manager.appendCompaction('Summary is not a full baseline',summary,100);n.close();
+ n=await openNativeSession({...s,runId:'run_compact_git',userEntryId:'user_compact_git'},{...options(),loadChanges:async r=>changeReply(r.baseCommitOid,focused('doc_1','Material changed',cp2,{commit:cp1,body:'Material',patch:'delta only'}))});await n.applyContext(changesEnvelope('doc_1',cp2));assert.equal(JSON.parse(materialEntries(n).at(-1).content).frames[0].kind,'full');n.close();
+});
+test('unaccepted original request has no checkpoint receipt; a failed accepted request reconciles same user identity',async()=>{
+ const s=spec();let n=await openNativeSession(s,{...options(),loadChanges:async r=>{assert.equal(r.baseCommitOid,null);return changeReply(null,focused('doc_1','first'),[{path:'documents/doc_1.md',status:'A'}]);}});await n.applyContext(changesEnvelope());n.close();
+ n=await openNativeSession(s,{...options(()=>{throw Error('synthetic cancelled/failed transport');}),loadChanges:async r=>{assert.equal(r.baseCommitOid,null);return changeReply(null,focused('doc_1','first'),[{path:'documents/doc_1.md',status:'A'}]);}});await n.applyContext(changesEnvelope());await n.prompt('First question').catch(()=>{});assert(n.record.userNativeId);assert.equal(n.record.status,'pending');n.close();
+ n=await openNativeSession(s,{...options(),loadChanges:async r=>{assert.equal(r.baseCommitOid,cp1);return changeReply(cp1,focused('doc_1','first'),[],{exclusionsChanged:false});}});await n.applyContext(changesEnvelope());await n.prompt('First question');assert.equal(n.manager.getEntries().filter(e=>e.type==='message'&&e.message.role==='user').length,1);n.close();
+});
+test('partial full frame is not a complete baseline even when its hash matches',async()=>{
+ const s=spec();let n=await openNativeSession(s,options());const partial=structuredClone(envelope);partial.nativeMaterials[0].range.complete=false;await n.applyContext(partial);await n.prompt('First question');n.close();
+ n=await openNativeSession({...s,runId:'run_complete',userEntryId:'user_complete'},options());await n.applyContext(envelope);assert.equal(materialEntries(n).length,2);assert.equal(JSON.parse(materialEntries(n).at(-1).content).frames[0].kind,'full');n.close();
+});
+test('non UTF8 stays explicit, includes fixed object identity, and contributes no lossy body',async()=>{
+ const s=spec();let manifest;const source={id:'doc_1',path:'documents/doc_1.md',gitCommitOid:cp1,gitBlobOid:'b'.repeat(40),textUnavailable:'non_utf8'};
+ const n=await openNativeSession(s,{...options(),onManifest:m=>manifest=m,loadChanges:async r=>changeReply(r.baseCommitOid,source,[{path:source.path,status:'M',patch:null,patchUnavailable:'non_utf8',patchByteLength:100}])});await n.applyContext(changesEnvelope());assert.equal(materialEntries(n).length,0);const item=manifest.entries.find(e=>e.reason==='text_unavailable:non_utf8');assert.equal(item.fixedVersion.checkpointCommitOid,cp1);assert.equal(item.fixedVersion.path,source.path);assert(!JSON.stringify(manifest).includes('�'));n.close();
+});
+test('over capacity or mismatched course fails before recording a Changes receipt',async()=>{
+ for(const bad of ['budget','course']){const s=spec();const n=await openNativeSession(s,{...options(),loadChanges:async r=>changeReply(r.baseCommitOid,focused('doc_1','first'),[{path:'file',patch:'x'.repeat(bad==='budget'?513*1024:1)}],bad==='course'?{checkpoint:{courseId:'other',checkpointCommitOid:cp1,materialTreeOid:tree}}:{})});await assert.rejects(n.applyContext(changesEnvelope()),e=>e.code===(bad==='budget'?'LIMIT_EXCEEDED':'NATIVE_SESSION_INVALID'));assert.equal(changeEntries(n).length,0);n.close();}
+});
+
+test('actual native cancellation reconciles its original request; an unstarted retry cannot advance it',async()=>{
+ const s=spec();let started;const requestStarted=new Promise(resolve=>started=resolve);
+ const abortedStream=(m,c,o)=>{const stream=createAssistantMessageEventStream();const stop=()=>{const error={role:'assistant',content:[],api:m.api,provider:m.provider,model:m.id,usage:{input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}},stopReason:'aborted',errorMessage:'Synthetic cancellation',timestamp:Date.now()};stream.push({type:'error',reason:'aborted',error});stream.end();};o.signal.addEventListener('abort',stop,{once:true});started();return stream;};
+ let n=await openNativeSession(s,{...options(abortedStream),loadChanges:async r=>changeReply(r.baseCommitOid,focused('doc_1','first'),[{path:'documents/doc_1.md',status:'A'}])});
+ await n.applyContext(changesEnvelope());const pending=n.prompt('First question');await requestStarted;await n.session.abort();await pending.catch(()=>{});assert(n.record.userNativeId);assert.equal(n.record.status,'pending');n.close();
+ // This retry reuses the accepted user but is cancelled before a prepared request.
+ n=await openNativeSession({...s,runId:'run_unstarted_retry'},{...options(),loadChanges:async r=>{assert.equal(r.baseCommitOid,cp1);return changeReply(cp1,focused('doc_1','unstarted version',cp2),[{path:'documents/doc_1.md',status:'M'}]);}});await n.applyContext(changesEnvelope('doc_1',cp2));n.close();
+ n=await openNativeSession({...s,runId:'run_after_unstarted'},{...options(),loadChanges:async r=>{assert.equal(r.baseCommitOid,cp1);return changeReply(cp1,focused('doc_1','first'),[],{exclusionsChanged:false});}});await n.applyContext(changesEnvelope());await n.prompt('First question');assert.equal(n.manager.getEntries().filter(e=>e.type==='message'&&e.message.role==='user').length,1);n.close();
+});
+test('automatic native compaction awaits the fixed Changes reload before the next model request',async()=>{
+ const s=spec(),lifecycle=[];let reloads=0,after=0;
+ const stream=eventsStream((c,o)=>{if(lifecycle.some(e=>e.type==='compaction_end')&&o.sessionId===hash(s.learningSessionId)){assert(JSON.stringify(c.messages).includes('FIXED_FULL_AFTER_COMPACTION'));after++;}return [{type:'text',text:o.sessionId?'Answer text':'Native summary'}];},7600);
+ for(let i=0;i<3;i++){const n=await openNativeSession({...s,runId:'run_git_long_'+i,userEntryId:'user_git_long_'+i},{...options(stream),model:{...model,contextWindow:8192},loadChanges:async r=>{reloads++;return changeReply(r.baseCommitOid,focused('doc_1','FIXED_FULL_AFTER_COMPACTION'),r.baseCommitOid?[]:[{path:'documents/doc_1.md',status:'A'}],{exclusionsChanged:r.baseCommitOid===null});},onLifecycle:async e=>{lifecycle.push(e);}});await n.applyContext(changesEnvelope());await n.prompt('Long Git question '+i+' '+('x'.repeat(7000)));await n.complete('Answer text');n.close();}
+ assert(lifecycle.some(e=>e.type==='compaction_end'&&!e.aborted));assert(reloads>3);assert(after>0);
+});
+test('a focused path identity change reloads even when body bytes are equal',async()=>{
+ const s=spec();let source=focused('doc_1','equal bytes');let n=await openNativeSession(s,{...options(),loadChanges:async r=>changeReply(r.baseCommitOid,source,[{path:source.path,status:'A'}])});await n.applyContext(changesEnvelope());await n.prompt('First question');n.close();
+ source={...source,path:'attachments/same_id/renamed.txt',gitCommitOid:cp2};n=await openNativeSession({...s,runId:'run_rename',userEntryId:'user_rename'},{...options(),loadChanges:async r=>changeReply(r.baseCommitOid,source,[{path:source.path,status:'A'}])});const next=changesEnvelope('doc_1',cp2);next.focus.path=source.path;await n.applyContext(next);const actual=materialEntries(n).at(-1);assert.equal(actual.details.path,source.path);assert.equal(JSON.parse(actual.content).frames[0].kind,'full');assert.equal(materialEntries(n).length,2);n.close();
+});
+test('focused attachments preserve real identity, content version and full range across reopen and equal-content peers',async()=>{
+ const ids=['asset_'+('a'.repeat(32)),'asset_'+('b'.repeat(32))],body='FOCUSED_ATTACHMENT😀\r\n';const s={...spec(),authorizedSourceIds:['doc_1',...ids]};
+ for(const [i,id] of [ids[0],ids[0],ids[1]].entries()){
+  const source={...focused(id,body),path:`attachments/${id}/lesson%3Aone.txt`,gitBlobOid:'c'.repeat(40)};let manifest;
+  const n=await openNativeSession({...s,runId:'run_asset_'+i,userEntryId:'user_asset_'+i},{...options(),onManifest:m=>manifest=m,loadChanges:async r=>changeReply(r.baseCommitOid,source,r.baseCommitOid?[]:[{path:source.path,status:'A'}],{exclusionsChanged:r.baseCommitOid===null})});
+  const next=changesEnvelope();next.focus={...next.focus,type:'text',view:'asset',path:source.path,documentVersion:hash(body),asset:{id,mime:'text/plain',size:Buffer.byteLength(body)}};
+  if(i===1){next.nativeReferences='Explicit same attachment reference';next.contextBridgeManifest.entries.push({id:'explicit-asset',kind:'reference',status:'added',sourceId:id,version:hash(body),includedChars:3,reason:'explicit_one_shot'});}
+  await n.applyContext(next);await n.prompt('Asset question '+i);
+  const materials=manifest.entries.filter(e=>e.kind==='material'&&e.sourceId===id);assert.equal(materials.length,1);assert.equal(materials[0].path,source.path);assert.equal(materials[0].version,hash(body));assert.equal(materials[0].includedChars,[...body].length);assert.equal(materials[0].range.complete,true);
+  assert.equal(materialEntries(n).filter(e=>e.details.sourceId===id).length,1);assert.equal(materialEntries(n).length,i===2?2:1);n.close();
+ }
+});
+test('binary asset Focus retains genuine metadata provenance without inventing a body',async()=>{
+ const id='asset_'+('d'.repeat(32)),s={...spec(),authorizedSourceIds:[id]};let manifest;
+ const n=await openNativeSession(s,{...options(),onManifest:m=>manifest=m,loadChanges:async r=>changeReply(r.baseCommitOid,null,[{path:`attachments/${id}/image.png`,status:'A',binary:true}])});
+ const next=changesEnvelope();next.focus={...next.focus,type:'image',view:'asset',path:`attachments/${id}/image.png`,documentVersion:hash('binary fixture'),asset:{id,mime:'image/png',size:8}};
+ await n.applyContext(next);const item=manifest.entries.find(e=>e.sourceId===id);assert.equal(item.reason,'focus_metadata_only');assert.equal(item.path,next.focus.path);assert.equal(item.version,next.focus.documentVersion);assert.equal(item.includedChars,0);assert.equal(item.range,undefined);assert.equal(materialEntries(n).length,0);n.close();
+ let called=false;const denied=await openNativeSession(spec(),{...options(),loadChanges:async()=>{called=true;throw Error('must not load unauthorized asset');}});await assert.rejects(denied.applyContext(next),e=>e.code==='NATIVE_SESSION_INVALID');assert.equal(called,false);assert.equal(materialEntries(denied).length,0);denied.close();
+});
+test('inconsistent binary or image Focus cannot bypass metadata-only through visible paragraphs',async()=>{
+ for(const kind of ['binary','image']){
+  const s=spec();let calls=0;const n=await openNativeSession(s,{...options(fixture(()=>calls++)),loadChanges:async r=>changeReply(r.baseCommitOid,kind==='binary'?{id:'doc_1',textUnavailable:'binary'}:null,[])});
+  const next=changesEnvelope();next.focus={...next.focus,type:kind==='image'?'image':'markdown',paragraphs:[{text:'SYNTHETIC_BINARY_BODY_MUST_NOT_SEND'}]};
+  await assert.rejects(n.applyContext(next),e=>e.code==='CONTEXT_CONFLICT');assert.equal(changeEntries(n).length,0);assert.equal(materialEntries(n).length,0);assert.equal(calls,0);assert(!fs.readFileSync(path.join(s.directory,'transcript.jsonl'),'utf8').includes('SYNTHETIC_BINARY_BODY_MUST_NOT_SEND'));n.close();
+ }
+});
+
+test('automatic Focus body uses one native full-to-Git-diff projection without repeating visible text in turn metadata',async()=>{
+ const s=spec(),body='FOCUS_FIRST_FULL_BODY',nextBody='FOCUS_NEXT_COMPLETE_BODY';let source=focused('doc_1',body),seen;
+ const opts=()=>({...options(fixture(c=>seen=c)),loadChanges:async r=>changeReply(r.baseCommitOid,source,r.baseCommitOid===source.gitCommitOid?[]:[{path:source.path,status:r.baseCommitOid?'M':'A',...(source.gitChange?{patch:source.gitChange.unifiedDiff}:{})}],{exclusionsChanged:r.baseCommitOid===null})});
+ const turn=()=>({...changesEnvelope('doc_1',source.gitCommitOid),focus:{...changesEnvelope('doc_1',source.gitCommitOid).focus,paragraphs:[{start:0,end:[...source.text].length,text:source.text}]}});
+ const assertMetadata=n=>{const e=n.manager.buildSessionProjection().entries.find(e=>e.messages.length&&e.sourceEntry.customType==='learning-station-turn');const f=JSON.parse(e.sourceEntry.content).focus;assert.equal(f.commitHash,source.gitCommitOid);assert.deepEqual(f.paragraphs,[{start:0,end:[...source.text].length}]);};
+ let n=await openNativeSession(s,opts());const frozen=turn();await n.applyContext(frozen);assert.equal(frozen.focus.paragraphs[0].text,body);assertMetadata(n);await n.prompt('First Focus');assert(JSON.stringify(seen.messages).includes(body));assert.equal(JSON.parse(materialEntries(n).at(-1).content).frames[0].kind,'full');n.close();
+ source=focused('doc_1',nextBody,cp2,{commit:cp1,body,patch:'FIXED_OLD_NEW_COMPLETE_GIT_DIFF'});
+ n=await openNativeSession({...s,runId:'run_focus_second',userEntryId:'user_focus_second'},opts());await n.applyContext(turn());assertMetadata(n);await n.prompt('Changed Focus');const frame=JSON.parse(materialEntries(n).at(-1).content).frames[0];assert.equal(frame.kind,'diff');assert.equal(frame.unifiedDiff,'FIXED_OLD_NEW_COMPLETE_GIT_DIFF');assert(!JSON.stringify(seen.messages).includes(nextBody));n.close();
+ n=await openNativeSession({...s,runId:'run_focus_same',userEntryId:'user_focus_same'},opts());const count=materialEntries(n).length;await n.applyContext(turn());assertMetadata(n);await n.prompt('Same Focus');assert.equal(materialEntries(n).length,count);assert(!JSON.stringify(seen.messages).includes(nextBody));n.close();
+});
+test('same-course sessions independently require an actual full Focus baseline',async()=>{
+ const source=focused('doc_1','SHARED_COURSE_MATERIAL');
+ for(const id of ['session_course_a','session_course_b']){const s={...spec(),learningSessionId:id};fs.writeFileSync(path.join(s.directory,'binding.json'),JSON.stringify({version:1,learningSessionId:id,transcript:'transcript.jsonl',initialized:false}));let seen;
+  const n=await openNativeSession(s,{...options(fixture(c=>seen=c)),loadChanges:async r=>{assert.equal(r.baseCommitOid,null);return changeReply(null,source,[{path:source.path,status:'A'}]);}});await n.applyContext(changesEnvelope());await n.prompt('Course Focus');assert.equal(JSON.parse(materialEntries(n)[0].content).frames[0].kind,'full');assert(JSON.stringify(seen.messages).includes(source.text));n.close();
+ }
+});
+test('interleaved Focus sends its effective body OLD separately from the last course notification',async()=>{
+ const s={...spec(),authorizedSourceIds:['doc_1','doc_b']},cp3='3'.repeat(40);
+ for(const [i,id,commit,body,expectedOld] of [[0,'doc_1',cp1,'A first',null],[1,'doc_b',cp2,'B first',null],[2,'doc_1',cp3,'A changed',cp1]]){
+  const source=focused(id,body,commit,expectedOld?{commit:expectedOld,body:'A first',patch:'A_FIXED_OLD_NEW_GIT_DIFF'}:undefined);
+  const n=await openNativeSession({...s,runId:'interleave_'+i,userEntryId:'interleave_user_'+i},{...options(),loadChanges:async r=>{assert.equal(r.baseCommitOid,[null,cp1,cp2][i]);assert.equal(r.focusBaseCommitOid,expectedOld);return changeReply(r.baseCommitOid,source,[{path:source.path,status:'M'}]);}});
+  await n.applyContext(changesEnvelope(id,commit));await n.prompt('Focus '+id);const frame=JSON.parse(materialEntries(n).at(-1).content).frames[0];assert.equal(frame.kind,i===2?'diff':'full');if(i===2)assert.equal(frame.unifiedDiff,'A_FIXED_OLD_NEW_GIT_DIFF');n.close();
+ }
+});
