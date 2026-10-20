@@ -104,18 +104,28 @@ if(process.argv[2]==='fixture'){
   }else if(scenario==='citation'){
     const native=await open(makeSpec('session_citation'));
     try{await native.applyContext({...envelope,nativeReferences:'EXPLICIT_USER_QUOTE'});await native.prompt('Explain my quotation');assert(JSON.stringify(observed).includes('EXPLICIT_USER_QUOTE'));assert(!JSON.stringify(observed).includes('PRIVATE_A_NOTE_BODY'));}finally{native.close();}
-  }else if(scenario==='retire-automatic'){
-    const s=makeSpec('session_old');
+  }else if(scenario==='focus-baseline'){
+    const s={...makeSpec('session_focus'),authorizedSourceIds:['note_a']};
+    const body='FOCUS_BODY_V1',full={kind:'full',version:'v1',textHash:sha(body),text:body};
+    const source={id:'note_a',version:'v1',textHash:sha(body),text:body,range:{startChar:0,endChar:body.length,complete:true,totalBytes:Buffer.byteLength(body)},frames:[full]};
+    const focused={...envelope,nativeMaterials:[source],contextBridgeManifest:{version:1,entries:[{id:'material:note_a',kind:'material',sourceId:'note_a'}]}};
     let native=await open(s);
-    native.manager.appendCustomMessageEntry('learning-station-material','OLD_AUTOMATIC_NOTE_BODY',false,{sourceId:'note_a'});
-    native.manager.appendMessage({role:'user',content:[{type:'text',text:'EXISTING_REAL_USER_QUESTION'}],timestamp:Date.now()});
-    native.close();native=await open({...s,runId:'run_project'});
+    try{await native.applyContext(focused);await native.prompt('First focus');assert(JSON.stringify(observed).includes(body));}finally{native.close();}
+    native=await open({...s,runId:'run_unchanged',userEntryId:'user_unchanged'});
     try{
-      await assert.rejects(native.applyContext({...envelope,nativeMaterials:[{id:'note_a'}]}),e=>e.code==='NATIVE_SESSION_INVALID');
-      await native.applyContext(envelope);await native.prompt('Project question');
-      const wire=JSON.stringify(observed);assert(!wire.includes('OLD_AUTOMATIC_NOTE_BODY'));assert(wire.includes('EXISTING_REAL_USER_QUESTION'));
-      assert(fs.readFileSync(path.join(s.directory,'transcript.jsonl'),'utf8').includes('OLD_AUTOMATIC_NOTE_BODY'));
+      await native.applyContext(focused);
+      assert.equal(native.manager.getEntries().filter(e=>e.type==='custom_message'&&e.customType==='learning-station-material').length,1);
+      const next='FOCUS_BODY_V2',diff={kind:'diff',version:'v2',baseHash:sha(body),textHash:sha(next),unifiedDiff:'@@ -1 +1 @@\n-FOCUS_BODY_V1\n+FOCUS_BODY_V2\n'};
+      const changed={...focused,nativeMaterials:[{...source,version:'v2',text:next,textHash:sha(next),frames:[full,diff]}]};
+      await native.applyContext(changed);
+      const entry=native.manager.getEntries().filter(e=>e.type==='custom_message'&&e.customType==='learning-station-material').at(-1);
+      assert.equal(JSON.parse(entry.content).frames[0].kind,'diff');
+      native.manager.appendCompaction('Summary is not a full text baseline',entry.id,1000);
+      await native.applyContext(changed);
+      assert.equal(JSON.parse(native.manager.getEntries().filter(e=>e.type==='custom_message'&&e.customType==='learning-station-material').at(-1).content).frames[0].kind,'full');
     }finally{native.close();}
+    native=await open({...makeSpec('session_focus_new'),authorizedSourceIds:['note_a']});
+    try{await native.applyContext(focused);assert.equal(JSON.parse(native.manager.getEntries().find(e=>e.type==='custom_message'&&e.customType==='learning-station-material').content).frames[0].kind,'full');}finally{native.close();}
   }else if(scenario==='changed-input'){
     const s=makeSpec('session_identity'),question='/skill:course-a Original input';
     let native=await open(s);
@@ -150,7 +160,7 @@ if(process.argv[2]==='fixture'){
   test('native skill expansion survives a retry without rereading changed skill body or duplicating the saved user',()=>run('skill-retry'));
   test('two sessions share a course cwd while preserving independent native transcripts',()=>run('sessions'));
   test('explicit quotations remain supplied when ordinary note bodies are absent',()=>run('citation'));
-  test('project adoption excludes automatic body projections, preserves raw/user history and rejects new automatic bodies',()=>run('retire-automatic'));
+  test('focused project text retains its session baseline, uses diff only while full survives and reloads after compaction',()=>run('focus-baseline'));
   test('completed native skill request cannot be replayed with changed original input',()=>run('changed-input'));
   test('automatic Focus uses fixed full/diff projection alongside native course resources',()=>run('focus'));
 }

@@ -47,6 +47,9 @@ pub struct Run {
     pub updated_at: String,
     pub request_digest: String,
     pub context_manifest: Vec<ManifestItem>,
+    /// Frozen authorization/version metadata only; never sent-body or session-read evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub course_read_manifest: Option<Vec<ManifestItem>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_bridge_manifest: Option<Value>,
     #[serde(default)]
@@ -114,6 +117,13 @@ pub struct ToolActivity {
 pub struct ManagedRun {
     pub run: Run,
     pub cancel: Arc<AtomicBool>,
+}
+impl Run {
+    pub(crate) fn read_scope_manifest(&self) -> &[ManifestItem] {
+        self.course_read_manifest
+            .as_deref()
+            .unwrap_or(&self.context_manifest)
+    }
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -255,13 +265,43 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
     // Serialize source validation and queued-run reservation with recycle/restore operations.
     // Taking this mutex does not read a Keychain item; credentials are resolved only after context.
     let model_store = engine.model.lock().await;
-    let (ctx, session, exploration_context, projection, source_id) = {
+    let (ctx, session, exploration_context, projection, source_id, course_read_manifest) = {
         let mut core = engine.lock()?;
-        let (session, mut ctx) =
-            core.session_context_for(&request.session_id, request.document_id.as_deref(), Some(&request.selection))?;
-        let source_id = crate::course_sessions::source(&core.content, &session, crate::course_sessions::request_document(&session, request.document_id.as_deref()))?;
+        let session = sessions::get (& mut
+            core.content,&request.session_id)?;
+        let source_id = crate::course_sessions::source(&core.content, &session, crate::course_sessions::request_document(&session, request.document_id.as_deref()),)?;
         if request.mode == "practice" && source_id.is_empty() {
-            return Err(CoreError::new("SOURCE_REQUIRED", "请先选择本课程材料再生成练习；普通对话没有默认材料来源。"));
+            return Err(CoreError::new("SOURCE_REQUIRED", "请先选择本课程材料再生成练习；普通对话没有默认材料来源。",));
+        }
+        let (_, mut ctx) = if session.course_id.is_some() {
+            // Reading position is not a request to traverse the notebook body.
+            // Future Focus ranges have their own provider; explicit Citation stays intact.
+            if source_id.is_empty() && !request.selection.is_empty() {
+                return Err(CoreError::new("INVALID_INPUT", "请先选择选句所属材料。"));
+            }
+            let result = core.session_context_for(&session.id, Some(""), None)?;
+            result
+        } else {
+            core.session_context_for(
+                &session.id,
+                request.document_id.as_deref(),
+                Some(&request.selection),
+            )?
+        };
+        if session.course_id.is_some()
+            && (request.mode == "practice" || !request.selection.is_empty())
+        {
+            let document = core.content.read(&source_id)?;
+            context::inject(
+                &core.content,
+                &mut ctx,
+                &[context::ContextInjection {
+                    document_id: source_id.clone(),
+                    expected_version: document.version,
+                    selection: (!request.selection.is_empty()).then(|| request.selection.clone()),
+                    locator: None,
+                }],
+            )?;
         }
         if let Some(entry_id) = &request.user_entry_id {
             validate_reused_user(
@@ -306,6 +346,23 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
             &request.assistant_references,
             &request.exercise_references,
         )?;
+        let course_read_manifest = session
+            .course_id
+            .as_deref()
+            .map(|owner| context::course_read_manifest(&core.content, owner))
+            .transpose()?;
+        if let Some(readable) = &course_read_manifest {
+            if ctx.manifest.iter().any(|item| {
+                !readable
+                    .iter()
+                    .any(|source| source.id == item.id && source.version == item.version)
+            }) {
+                return Err(CoreError::new(
+                    "CONTEXT_CONFLICT",
+                    "引用来源与本次课程版本不一致，请重新选择。",
+                ));
+            }
+        }
         // Native Pi owns model history. Rust retains business records without clipping them into the prompt.
         ctx.history_manifest.clear();
         ctx.warnings.retain(|w| !w.starts_with("TRUNCATED_HISTORY"));
@@ -331,7 +388,8 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
         } else {
             None
         };
-        (ctx, session, intent, projection, source_id)
+        (ctx, session, intent, projection, source_id,
+            course_read_manifest,)
     };
     // Resolve visible sources and recycle-bin protections before touching this app's credential.
     // The authorization tier comes only from local user preferences; a read failure stays closed.
@@ -372,6 +430,7 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
     let native_session = {
         let core = engine.lock()?;
         let markdown = core.content.read(&session.id)?.content;
+        let mut native =
         crate::native_session::prepare(
             &core.state_dir,
             &session,
@@ -381,12 +440,15 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
             context::history_is_protected(&ctx),
             native_legacy_records(&session, Some(&native_user_id)),
             &markdown,
-        )?
+        )?;
+        native.project_root = crate::native_session::project_root(&core.content, &session)?;
+        native
     };
     let credentials = model_store.credentials()?;
     let stamp = timestamp();
     let run = Run {
         source_document_id: Some(source_id.clone()),
+        course_read_manifest: course_read_manifest.clone(),
         id: id.clone(),
         session_id: request.session_id.clone(),
         mode: request.mode.clone(),
@@ -465,7 +527,7 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
         session_id: session.id.clone(),
         section_id: source_id,
         run_id: id.clone(),
-        allowed_ids: ctx.manifest.iter().map(|item| item.id.clone()).collect(),
+        allowed_ids: run.read_scope_manifest().iter().map(|item| item.id.clone()).collect(),
     };
     let returned = run.clone();
     tokio::spawn(async move {
@@ -1036,6 +1098,10 @@ pub(crate) fn messages_current(
         json!({"role":"user","content":serde_json::to_string(&json!({"type":"learning_request","explorationContext":intent,"context":ctx.text,"manifest":ctx.manifest,"assistantReferenceManifest":ctx.assistant_reference_manifest,"exerciseReferenceManifest":ctx.exercise_reference_manifest,"warnings":ctx.warnings.iter().filter(|w|!w.starts_with("TRUNCATED_HISTORY")).collect::<Vec<_>>(),"selectedText":request.selection,"question":if request.prompt.trim().is_empty(){default_request(&request.mode)}else{&request.prompt},"mode":request.mode})).unwrap_or_default()}),
     ]
 }
+
+#[cfg(test)]
+#[path = "generation_project_tests.rs"]
+mod project_context_tests;
 fn native_legacy_records(session: &Session, exclude: Option<&str>) -> Vec<Value> {
     session.entries.iter().filter(|e|included_history(e,exclude)).map(|entry|json!({"id":entry.id,"kind":entry.kind,"origin":history_origin(entry),"content":if entry.kind=="exercise"{exercise_history(entry)}else{entry.content.clone()},"isUserStatement":entry.kind=="user","notice":"旧业务记录引用，未还原缺失工具消息"})).collect()
 }
@@ -1268,6 +1334,7 @@ mod prestart_tests {
         let id = "run_prestart_test";
         let run = Run {
             source_document_id: None,
+            course_read_manifest: None,
             id: id.into(),
             session_id: session.id.clone(),
             mode: "explain".into(),
@@ -1585,6 +1652,7 @@ mod lifecycle_tests {
     fn run(session_id: &str) -> Run {
         Run {
             source_document_id: None,
+            course_read_manifest: None,
             id: "run_lifecycle".into(),
             session_id: session_id.into(),
             mode: "question".into(),
@@ -2040,6 +2108,7 @@ mod exercise_repair_tests {
         fs::remove_dir(&child_path).unwrap();
         let old = Run {
             source_document_id: None,
+            course_read_manifest: None,
             id: id.clone(),
             session_id: session.id.clone(),
             mode: "practice".into(),
@@ -2677,6 +2746,7 @@ mod recycle_integration_tests {
         let id = format!("run_{}", &hash(&request.request_id)[..32]);
         let old = Run {
             source_document_id: None,
+            course_read_manifest: None,
             id: id.clone(),
             session_id: session.id.clone(),
             mode: "practice".into(),
