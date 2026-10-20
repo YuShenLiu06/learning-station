@@ -138,7 +138,7 @@ fn native_patch_is_complete_and_budget_failure_does_not_silently_clip() {
     let path = format!("documents/{}.md", f.a.id);
     let first = f.checkpoint(None);
     let id = f.a.id.clone();
-    f.save(&id, &"changed 🧪\n".repeat(6000));
+    f.save(&id, &"changed 🧪\n".repeat(17000));
     let second = f.checkpoint(Some(&first.checkpoint_commit_oid));
     let native = f
         .git
@@ -152,8 +152,9 @@ fn native_patch_is_complete_and_budget_failure_does_not_silently_clip() {
     let value = f
         .project(&second, Some(&first), Some((&f.a.id, &path)), BUDGET)
         .unwrap();
-    assert_eq!(value["changes"][0]["patch"], json!(native.changes[0].patch));
-    assert!(value["changes"][0]["patch"]
+    assert_eq!(value["focused"]["gitChange"]["unifiedDiff"], json!(native.changes[0].patch));
+    assert!(value["changes"][0].get("patch").is_none());
+    assert!(value["focused"]["gitChange"]["unifiedDiff"]
         .as_str()
         .unwrap()
         .contains("+changed 🧪"));
@@ -327,7 +328,8 @@ fn course_notification_old_and_focus_body_old_compare_independently() {
     assert_eq!(value["baseCommitOid"], second.checkpoint_commit_oid);
     assert_eq!(value["focused"]["gitChange"]["baseCommitOid"], first.checkpoint_commit_oid);
     assert_eq!(value["changes"][0]["patchBaseCommitOid"], first.checkpoint_commit_oid);
-    assert_eq!(value["changes"][0]["patch"], json!(native.changes[0].patch));
+    assert_eq!(value["focused"]["gitChange"]["unifiedDiff"], json!(native.changes[0].patch));
+    assert!(value["changes"][0].get("patch").is_none());
     let missing = prepare(&f.git, &f.course.id, &third.checkpoint_commit_oid, Some(&second.checkpoint_commit_oid), None, Some((&f.a.id, &path)), BUDGET).unwrap();
     assert!(missing["focused"]["gitChange"].is_null());
     assert!(missing["changes"][0]["patch"].is_null());

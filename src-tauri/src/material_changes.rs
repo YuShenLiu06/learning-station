@@ -71,6 +71,9 @@ pub fn prepare(
             json!({"courseId":course,"checkpointCommitOid":readable_commit,"path":change.path});
         if focus.is_some_and(|(_, path)| path == change.path) && (change.patch.is_some() || change.patch_bytes.is_some()) {
             value["patchBaseCommitOid"] = json!(focus_previous);
+            // Complete text patches belong to the verified material frame below.
+            // The notification keeps file statistics and its independent OLD.
+            value.as_object_mut().unwrap().remove("patch");
         }
         changes.push(value);
     }

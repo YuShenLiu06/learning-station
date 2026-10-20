@@ -431,8 +431,14 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
         }
     }
     let packets = server.join().unwrap();
+    if let Some(folder)=std::env::var_os("LS_CHANGES_WIRE_EVIDENCE") { let folder=std::path::PathBuf::from(folder);std::fs::create_dir_all(&folder).unwrap();std::fs::write(folder.join("requests.json"),serde_json::to_vec_pretty(&packets).unwrap()).unwrap(); }
+
     for (round,packet) in packets.iter().enumerate() {
         let payloads:Vec<Value>=packet["messages"].as_array().unwrap().iter().filter_map(|m| {let text=m["content"].as_str().map(str::to_owned).unwrap_or_else(||m["content"].as_array().into_iter().flatten().filter_map(|p|p["text"].as_str()).collect::<String>());serde_json::from_str(&text).ok()}).collect();
+        for patch in payloads.iter().flat_map(|p|p["frames"].as_array().into_iter().flatten()).filter_map(|f|f["unifiedDiff"].as_str()) {
+            let encoded=serde_json::to_string(patch).unwrap();
+            assert_eq!(serde_json::to_string(&payloads).unwrap().matches(&encoded).count(),1,"round {round}: complete patch must occur once in the entire request");
+        }
         let turn=payloads.iter().find(|p|p["focus"].is_object()).unwrap();
         assert!(turn["focus"]["paragraphs"].as_array().unwrap().iter().all(|p|p.get("text").is_none()));
         assert!(turn["context"].as_str().unwrap().contains("materialRange"));
