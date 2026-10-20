@@ -449,9 +449,14 @@ pub fn validate(
     for (saved, now) in frozen.references.iter().zip(current.references) {
         let origin = if saved.exercise_state.is_some() {
             let path = saved.source.path.split('/').collect::<Vec<_>>();
-            let reference = exercise.iter().find(|r| path.len() == 5 && r.document_id == path[1] && r.question_id == path[2]).ok_or_else(conflict)?;
+            let reference = exercise
+                .iter()
+                .find(|r| path.len() == 5 && r.document_id == path[1] && r.question_id == path[2])
+                .ok_or_else(conflict)?;
             Some(crate::sessions::get(store, &reference.session_id)?)
-        } else { None };
+        } else {
+            None
+        };
         let source_session = origin.as_ref().unwrap_or(session);
         if saved.supplemental_context.len() > context::MAX_CONTEXT_DOCUMENTS
             || saved.quoted_text.chars().count()
@@ -552,34 +557,69 @@ pub fn validate(
             }
         }
         if let Some(state) = &saved.exercise_state {
-            let path = saved.source.path.split('/').collect::<Vec<_>>();
-            if path.len() != 5
-                || path[2] != state.question_id
-                || !matches!(state.status.as_str(), "unanswered" | "submitted" | "graded")
-                || (state.status == "unanswered") != state.attempt_id.is_none()
-                || (state.status == "graded") != state.feedback_entry_id.is_some()
-            {
-                return Err(conflict());
-            }
-            if let Some(id) = &state.attempt_id {
-                exercises::project(store, source_session, path[1], path[2], "attempt", Some(id))?;
-            } else if state.status != "unanswered" {
-                return Err(conflict());
-            }
-            if let Some(id) = &state.feedback_entry_id {
-                let entry = source_session
-                    .entries
-                    .iter()
-                    .find(|e| &e.id == id)
-                    .ok_or_else(conflict)?;
-                if entry.data.as_ref().and_then(|d| d["attemptId"].as_str())
-                    != state.attempt_id.as_deref()
-                {
-                    return Err(conflict());
-                }
-                exercises::project(store, source_session, path[1], path[2], "feedback", Some(id))?;
-            }
+            validate_exercise_state(store, source_session, &saved.source, state)?;
         }
+    }
+    Ok(())
+}
+/// A private Focus fingerprint proves the saved bytes, but cannot grant access
+/// to an auxiliary attempt/feedback that has since disappeared or been revoked.
+/// Quoted references have already passed their existing authority checks.
+pub(crate) fn validate_frozen_visibility(
+    store: &mut ContentStore,
+    frozen: &CitationContext,
+    references: &[exercises::ExerciseReference],
+) -> Result<()> {
+    for snapshot in &frozen.references {
+        let Some(state) = &snapshot.exercise_state else {
+            continue;
+        };
+        let reference = references
+            .iter()
+            .find(|r| {
+                snapshot.source.path
+                    == format!(
+                        "exercise-part/{}/{}/{}/{}",
+                        r.document_id, r.question_id, r.part, r.entry_id
+                    )
+            })
+            .ok_or_else(conflict)?;
+        let origin = crate::sessions::get(store, &reference.session_id)?;
+        validate_exercise_state(store, &origin, &snapshot.source, state)?;
+    }
+    Ok(())
+}
+fn validate_exercise_state(
+    store: &mut ContentStore,
+    session: &Session,
+    source: &ManifestItem,
+    state: &ExerciseState,
+) -> Result<()> {
+    let path = source.path.split('/').collect::<Vec<_>>();
+    if path.len() != 5
+        || path[2] != state.question_id
+        || !matches!(state.status.as_str(), "unanswered" | "submitted" | "graded")
+        || (state.status == "unanswered") != state.attempt_id.is_none()
+        || (state.status == "graded") != state.feedback_entry_id.is_some()
+    {
+        return Err(conflict());
+    }
+    if let Some(id) = &state.attempt_id {
+        exercises::project(store, session, path[1], path[2], "attempt", Some(id))?;
+    } else if state.status != "unanswered" {
+        return Err(conflict());
+    }
+    if let Some(id) = &state.feedback_entry_id {
+        let entry = session
+            .entries
+            .iter()
+            .find(|e| &e.id == id)
+            .ok_or_else(conflict)?;
+        if entry.data.as_ref().and_then(|d| d["attemptId"].as_str()) != state.attempt_id.as_deref()
+        {
+            return Err(conflict());
+        }
+        exercises::project(store, session, path[1], path[2], "feedback", Some(id))?;
     }
     Ok(())
 }

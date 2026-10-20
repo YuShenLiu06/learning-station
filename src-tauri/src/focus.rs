@@ -210,6 +210,7 @@ pub fn load(core: &mut Core, session: &Session, focus: &Focus) -> Result<Frozen>
     }
     crate::assistant_references::validate_references(&core.content, session, &record.requested.assistant_references)?;
     crate::exercise_references::validate_references(&mut core.content, session, &record.requested.exercise_references)?;
+    if let Some(citation) = &record.context.citation_context { crate::citation_context::validate_frozen_visibility(&mut core.content, citation, &record.requested.exercise_references)?; }
     if let Some(asset) = &focus.asset {
         if !crate::assets::list(&core.content, &focus.course_id)?.iter().any(|a| Some(a.id.as_str()) == asset["id"].as_str()) { return Err(conflict()); }
     }
@@ -362,6 +363,11 @@ mod tests {
         let text = serde_json::to_string(new_snapshot).unwrap();
         assert!(text.contains("SAVED_ANSWER")); assert!(text.contains("HIDDEN_KEY"));
         assert_eq!(load(&mut c, &target, &before).unwrap().context.citation_context.unwrap().references[0].exercise_state.as_ref().unwrap().status, "unanswered");
+        let attempt_id = new_snapshot.references[0].exercise_state.as_ref().unwrap().attempt_id.as_ref().unwrap();
+        let attempt = c.content.read(attempt_id).unwrap();
+        fs::remove_file(c.content.root().join(attempt.path)).unwrap();
+        assert!(load(&mut c, &target, &after).is_err(), "a missing auxiliary attempt must revoke its submitted answer context");
+        assert!(load(&mut c, &target, &before).is_ok(), "the original unanswered snapshot does not borrow later answers");
     }
     #[test]
     fn fixed_read_and_query_use_the_same_run_checkpoint_after_workspace_edits() {

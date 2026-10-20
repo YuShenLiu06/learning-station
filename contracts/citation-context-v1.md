@@ -41,6 +41,7 @@ type CitationContext = { version: 1; references: Array<{
 - 模型侧去重只改变投影：原快照保留quotedText/text，模型已覆盖部分以 `quotedTextProjection` 或补充项 `projection` 的 `{range,textFrom:{provider,sourceId,citationId,version}}` 指向真实材料/更早引用；未覆盖部分仍发text。保留Focus/材料清单与Citation清单两种来源标记，不能仅留下引用指针却丢失正文。
 - `citation_context::quote`按同次真实范围去重并裁补充；桥应将补充source/range/truncation列入实际清单，实际Pi manifest回执继续落到Run/该assistant自身，不从最新Session回填旧消息。
 - **Focus集成必须复用同一冻结值**：`freeze_focus`的Core锁内先校验/生成CitationContext并纳入私有`Frozen.context`指纹和固定检查点。保存user走服务端已验证的 `focus::load(...).context.citation_context` → `sessions::append_citation`，不信客户端快照，也不再次从工作区采样。generation加载同一Frozen并核user快照一致；固定OID内容来源验证交既有Focus/Git适配器，不能用之后工作区正文替代。
+- 私有指纹不授予已撤权来源：load还核对补充中的原attempt/feedback稳定ID仍可读且属于同题；消失或回收即拒绝，不借用新作答恢复资格。该可见性校验不重新扩段或改写历史原文/状态。
 - live无Focus兼容路径使用现有store身份/版本校验；组合后应注入已验证固定来源视图，禁止为了通过校验重绑最新版。课程root/multi-session只沿 #54 真实session/source解析，不复制其未提交接口。
 
 ## 必须验证
