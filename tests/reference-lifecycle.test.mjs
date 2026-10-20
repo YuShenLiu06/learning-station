@@ -36,18 +36,26 @@ async function fixture(run){
  case 'get_app_state':return {root:'/tmp/mock-reference-only',activeDocumentId:id,documents:[...docs.values()].map(d=>({id:d.id,title:d.metadata.title,kind:'section',path:d.path,version:d.version})),model:{configured:true,provider:'custom',protocol:'openai-completions',baseUrl:'http://127.0.0.1/mock-only',model:'fixture',usageGate:''}};
  case 'get_library_tree':return {nodes:[...docs.values()].map(d=>({id:d.id,title:d.metadata.title,kind:'section',parentId:null,path:d.path,version:d.version})),warnings:[]};
  case 'get_ui_preferences':return {fontSize:16,assistantWidth:346,sidebarWidth:240,sidebarCollapsed:false,expandedNodeIds:[]};case 'save_ui_preferences':return args;
- case 'get_ui_draft':return null;case 'save_ui_draft':return {key:args.key,data:args.data,version:'draft_'+state.calls.length,updatedAt:'fixture'};
+ case 'get_ui_draft':return state.readDraft?state.readDraft(args):null;case 'save_ui_draft':return {key:args.key,data:args.data,version:'draft_'+state.calls.length,updatedAt:'fixture'};
  case 'record_ui_metric':return null;case 'list_todos':case 'list_notifications':return [];
- case 'open_document':return clone(docs.get(args.id));case 'start_session':return {session:clone(session)};case 'get_session':return clone(session);
- case 'load_session_context':return {text:'',manifest:[{id,path:docs.get(id).path,version:'v1',includedChars:30}],historyManifest:[],warnings:[],truncated:false};
+ case 'open_document':{const value=clone(docs.get(args.id));if(state.afterRead)await state.afterRead(args);return value;}
+ case 'save_document':{if(state.saveGate)await state.saveGate.promise;if(state.saveFail)throw {code:'IO',message:'Controlled save failure'};const saved=docs.get(args.id);assert.equal(args.expectedVersion,saved.version);saved.body=args.content.replace(/^```json\n[\s\S]*?\n```\n\n/,'');saved.version='v'+(Number(saved.version.slice(1))+1);return clone(saved);}case 'start_session':return {session:clone(session)};case 'get_session':return clone(session);
+ case 'load_session_context':if(state.contextGate)await state.contextGate.promise;if(state.validateSources)for(const ref of args.injections||[])assert.equal(ref.expectedVersion,docs.get(ref.documentId).version);return {text:'',manifest:[{id,path:docs.get(id).path,version:'v1',includedChars:30}],historyManifest:[],warnings:[],truncated:false};
  case 'append_entry':{if(state.appendGate)await state.appendGate.promise;if(state.appendFail)throw {code:'IO',message:'Controlled write not confirmed'};if(!session.entries.some(x=>x.data?.clientMessageId===args.entry.data?.clientMessageId))session.entries.push({...clone(args.entry),id:'user_'+n+'_'+session.entries.filter(x=>x.kind==='user').length,createdAt:'fixture'});session.version+='x';return clone(session);}
  case 'start_generation':{const runId='run_'+hash(args.requestId).slice(0,32);let userEntryId=args.userEntryId;if(args.mode==='practice'){userEntryId=args.userEntryId||'user_'+runId;if(!state.practiceMissingUser&&!args.userEntryId)session.entries.push({id:userEntryId,kind:'user',content:args.prompt,selection:args.selection,createdAt:'fixture',data:{mode:'practice',runId,requestedContext:{documentId:id,selection:args.selection,injections:args.injections,...(args.assistantReferences?.length?{assistantReferences:args.assistantReferences}:{})}}});}else assert.equal(session.entries.find(x=>x.id===args.userEntryId)?.content,args.prompt);const run={id:runId,sessionId:sid,userEntryId,status:state.modelFail?'failed':'succeeded',content:state.modelFail?'':'Fixture reply',error:state.modelFail?{code:'MODEL_RESPONSE',message:'Controlled model failure'}:undefined,contextSnapshotVersion:1,contextManifest:[],toolCalls:[]};state.runs.set(runId,run);if(!state.modelFail)session.entries.push({id:'assistant_'+runId,kind:'assistant',content:'Fixture reply',createdAt:'fixture',data:{runId,contextManifest:[]}});return {runId};}
- case 'get_run':if(!state.runs.has(args.runId))throw {code:'NOT_FOUND',message:'No fixture run'};return clone(state.runs.get(args.runId));
+ case 'get_run':if(state.runReadFail)throw {code:'IO',message:'Controlled unknown result'};if(!state.runs.has(args.runId))throw {code:'NOT_FOUND',message:'No fixture run'};return clone(state.runs.get(args.runId));
  default:throw Error('Unexpected fixture IPC '+command);
  }},{shouldMockEvents:true});
  const root=createRoot(document.getElementById('root'));const render=element=>React.act(async()=>root.render(element));
  try{await render(React.createElement(ui.App));await wait(()=>document.querySelector('[aria-label="向学习助手提问"]')?.disabled===false);await run(state,render);}finally{await React.act(async()=>root.unmount());clearMocks();window.getSelection().removeAllRanges();}
 }
+
+async function editSelection(text='新写的合成句。') {
+ await click(button('编辑',document.querySelector('.segmented')));await wait(()=>document.querySelector('.document-editor:not([hidden]) .cm-editor'));
+ const {EditorView}=await import('@codemirror/view');const view=EditorView.findFromDOM(document.querySelector('.document-editor:not([hidden]) .cm-editor'));
+ const start=view.state.doc.length+1;await React.act(async()=>view.dispatch({changes:{from:view.state.doc.length,insert:'\n'+text},selection:{anchor:start,head:start+text.length}}));await wait(()=>document.querySelector('.selection-tray'));return view;
+}
+const submitMode=async mode=>click(mode==='send'?document.querySelector('[aria-label="发送问题"]'):button('生成练习子文档',document.querySelector('.document-actions')));
 
 test('assistant reference hash covers exact UTF-8; selection/combined limits and frozen metadata remain distinct from documents',async()=>{
  const text='**回答😀**\n原文';assert.equal(await ui.assistantTextHash(text),hash(text));assert.throws(()=>ui.validateAssistantSelection(text,'回答😀\n原文'),/原文/);assert.throws(()=>ui.validateAssistantSelection('😀'.repeat(8000),'😀'.repeat(8000)),/30000/);
@@ -74,6 +82,65 @@ test('assistant rendered selection replies directly through the same queue and f
 
 test('material history preserves the selected old version and refuses silently reopening a changed version',async()=>{
  await fixture(async h=>{await select(document.querySelector('.reading-content p'));await input('冻结原文');await click(document.querySelector('[aria-label="发送问题"]'));await wait(()=>h.calls.some(x=>x.command==='start_generation'));await wait(()=>!document.querySelector('.generating'));const original=clone(h.session.entries.find(x=>x.kind==='user').data.requestedContext.injections[0]);assert.equal(original.expectedVersion,'v1');assert.equal(original.selection,'同一个原文选句。');h.docs.get(h.id).version='v2';h.docs.get(h.id).body='后来改写的正文';const opens=h.calls.filter(x=>x.command==='open_document').length;await click(document.querySelector('.message.user .message-references button'));await wait(()=>document.querySelector('.toast')?.textContent.includes('版本已变化'));assert.equal(h.calls.filter(x=>x.command==='open_document').length,opens+1);assert.match(document.querySelector('.message.user .message-references').textContent,/同一个原文选句/);assert.deepEqual(h.session.entries.find(x=>x.kind==='user').data.requestedContext.injections[0],original);});
+});
+
+test('edited selected text freezes the acknowledged body/version for immediate send, autosave and practice',async()=>{
+ for(const mode of ['send','practice'])for(const autosave of [false,true])await fixture(async h=>{
+  h.validateSources=true;await editSelection();if(autosave)await tick(1150);await input('解释刚写的新句');await submitMode(mode);await wait(()=>h.calls.some(x=>x.command==='start_generation'));await wait(()=>!document.querySelector('.generating'));
+  const request=h.calls.find(x=>x.command==='start_generation').args,ref=request.injections[0];assert.equal(ref.expectedVersion,h.docs.get(h.id).version);assert.equal(ref.selection,'新写的合成句。');assert.equal(Array.from(h.docs.get(h.id).body).slice(ref.locator.startChar,ref.locator.endChar).join(''),ref.selection);assert.equal(h.session.entries.filter(x=>x.kind==='user').length,1);assert.equal(document.querySelector('.composer-reference'),null);
+ });
+});
+test('editor right-click addition binds the same selected draft through its actual save receipt',async()=>{
+ await fixture(async h=>{h.validateSources=true;await editSelection();const scroll=document.querySelector('.document-scroll');await React.act(async()=>scroll.dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true})));await click(button('将选段加入本次上下文'));await wait(()=>document.querySelector('[aria-label="本次显式上下文"]'));await input('从菜单引用新句');await submitMode('send');await wait(()=>h.calls.some(x=>x.command==='start_generation'));const ref=h.calls.find(x=>x.command==='start_generation').args.injections[0];assert.equal(ref.expectedVersion,'v2');assert.equal(ref.selection,'新写的合成句。');});
+});
+test('editing during source validation preserves unaccepted input for send and practice',async()=>{
+ for(const mode of ['send','practice'])await fixture(async h=>{
+  const view=await editSelection();await input('核对中保留');h.contextGate=deferred();const before=h.calls.filter(x=>x.command==='load_session_context').length;await submitMode(mode);await wait(()=>h.calls.filter(x=>x.command==='load_session_context').length>before);await React.act(async()=>view.dispatch({changes:{from:view.state.doc.length,insert:'\n核对期间又编辑。'}}));h.contextGate.resolve();await wait(()=>document.querySelector('.toast')?.textContent.includes('仍保留'));assert.equal(h.session.entries.filter(x=>x.kind==='user').length,0);assert.equal(h.calls.filter(x=>x.command==='start_generation').length,0);assert.ok(document.querySelector('.composer-reference'));assert.equal(document.querySelector('[aria-label="向学习助手提问"]').value,'核对中保留');
+ });
+});
+
+test('save failure keeps quote/question before acceptance and a deliberate retry saves only one user',async()=>{
+ for(const mode of ['send','practice'])await fixture(async h=>{
+  h.saveFail=true;await editSelection();await input('请保留输入');await submitMode(mode);await wait(()=>document.querySelector('.toast')?.textContent.includes('尚未保存'));assert.equal(h.calls.filter(x=>x.command==='append_entry'||x.command==='start_generation').length,0);assert.ok(document.querySelector('.composer-reference'));assert.equal(document.querySelector('[aria-label="向学习助手提问"]').value,'请保留输入');h.saveFail=false;await submitMode(mode);await wait(()=>h.calls.some(x=>x.command==='start_generation'));assert.equal(h.session.entries.filter(x=>x.kind==='user').length,1);
+ });
+});
+test('edits during a pending save reject before consumption; later save cannot rebind the old quote',async()=>{
+ await fixture(async h=>{
+  h.saveGate=deferred();const view=await editSelection();await input('保留选区');await submitMode('send');await wait(()=>h.calls.some(x=>x.command==='save_document'));await React.act(async()=>view.dispatch({changes:{from:view.state.doc.length,insert:'\n随后又编辑的内容。'}}));h.saveGate.resolve();await wait(()=>document.querySelector('.toast')?.textContent.includes('尚未保存'));assert.equal(h.session.entries.filter(x=>x.kind==='user').length,0);assert.ok(document.querySelector('.composer-reference'));await tick(1150);await submitMode('send');await wait(()=>document.querySelector('.toast')?.textContent.includes('重新选择'));assert.equal(h.calls.filter(x=>x.command==='start_generation').length,0);assert.equal(document.querySelector('[aria-label="向学习助手提问"]').value,'保留选区');
+ });
+});
+test('external source changes fail preflight without accepting or consuming the draft',async()=>{
+ await fixture(async h=>{await select(document.querySelector('.reading-content p'));h.docs.get(h.id).version='external_v2';h.validateSources=true;await input('保持旧引用');await submitMode('send');await tick(40);assert.equal(h.session.entries.filter(x=>x.kind==='user').length,0);assert.equal(h.calls.filter(x=>x.command==='start_generation').length,0);assert.ok(document.querySelector('.composer-reference'));assert.equal(document.querySelector('[aria-label="向学习助手提问"]').value,'保持旧引用');});
+});
+
+test('unknown model result retains the edited frozen version and checks the original run without consuming a new quote',async()=>{
+ await fixture(async h=>{
+  await editSelection();h.runReadFail=true;await input('核对这一问');await submitMode('send');await wait(()=>button('核对生成状态'));const first=clone(h.calls.find(x=>x.command==='start_generation').args);assert.equal(first.injections[0].expectedVersion,'v2');assert.equal(document.querySelector('.composer-reference'),null);await React.act(async()=>document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true})));const view=(await import('@codemirror/view')).EditorView.findFromDOM(document.querySelector('.document-editor:not([hidden]) .cm-editor'));await React.act(async()=>view.dispatch({selection:{anchor:0,head:2}}));await wait(()=>document.querySelector('.composer-reference'));h.runReadFail=false;await click(button('核对生成状态'));await wait(()=>!document.querySelector('.message-delivery.failed'));assert.equal(h.calls.filter(x=>x.command==='start_generation').length,1);assert.equal(h.session.entries.filter(x=>x.kind==='user').length,1);assert.deepEqual(h.session.entries.find(x=>x.kind==='user').data.requestedContext.injections,first.injections);assert.ok(document.querySelector('.composer-reference'));
+ });
+});
+test('history opens the one verified snapshot even if disk changes just after that read',async()=>{
+ await fixture(async h=>{
+  await select(document.querySelector('.reading-content p'));await input('历史选段');await submitMode('send');await wait(()=>h.calls.some(x=>x.command==='start_generation'));await wait(()=>!document.querySelector('.generating'));let reads=0;h.afterRead=({id})=>{if(id===h.id){reads++;h.docs.get(id).version='v2';h.docs.get(id).body='CHANGED_AFTER_VERIFICATION';}};await click(document.querySelector('.message.user .message-references button'));await tick(40);assert.equal(reads,1);assert.doesNotMatch(document.querySelector('.reading-content').textContent,/CHANGED_AFTER_VERIFICATION/);assert.match(document.querySelector('.reading-content').textContent,/同一个原文选句/);
+ });
+});
+
+test('a stale normal refresh cannot replace a verified historical snapshot',async()=>{
+ await fixture(async h=>{
+  await select(document.querySelector('.reading-content p'));await input('旧版本引用');await submitMode('send');await wait(()=>h.calls.some(x=>x.command==='start_generation'));await wait(()=>!document.querySelector('.generating'));
+  const original=clone(h.docs.get(h.id)),gate=deferred();let reads=0;h.docs.get(h.id).version='v2';h.docs.get(h.id).body='STALE_ASYNC_REFRESH';h.afterRead=async({id})=>{if(id===h.id&&++reads===1){h.docs.set(id,original);await gate.promise;}};
+  await click([...document.querySelectorAll('.tree-row')].find(el=>el.title==='当前材料'));await wait(()=>reads===1);await click(document.querySelector('.message.user .message-references button'));await wait(()=>reads===2);gate.resolve();await tick(40);assert.doesNotMatch(document.querySelector('.reading-content').textContent,/STALE_ASYNC_REFRESH/);assert.match(document.querySelector('.reading-content').textContent,/同一个原文选句/);
+ });
+});
+test('opening historical material refuses an unsaved local body and preserves both question and selected draft',async()=>{
+ await fixture(async h=>{
+  await select(document.querySelector('.reading-content p'));await input('已保存的历史问题');await submitMode('send');await wait(()=>h.calls.some(x=>x.command==='start_generation'));await wait(()=>!document.querySelector('.generating'));await editSelection();await input('未发送的新草稿');await click(document.querySelector('.message.user .message-references button'));await wait(()=>document.querySelector('.toast')?.textContent.includes('未保存的编辑'));assert.equal(document.querySelector('[aria-label="向学习助手提问"]').value,'未发送的新草稿');assert.ok(document.querySelector('.composer-reference'));assert.ok(document.querySelector('.document-editor:not([hidden]) .cm-editor'));
+ });
+});
+
+test('an unopened historical source with a different stored draft refuses navigation before clearing current input',async()=>{
+ await fixture(async h=>{
+  await queueDocument('附加材料');await input('旧引用');await submitMode('send');await wait(()=>h.calls.some(x=>x.command==='start_generation'));await wait(()=>!document.querySelector('.generating'));await editSelection();await input('保留当前未存草稿');h.readDraft=({key})=>key===`section:${h.other}`?{key,data:{body:'DIFFERENT_STORED_DRAFT'},version:'stored',updatedAt:'fixture'}:null;await click(document.querySelector('.message.user .message-references button'));await wait(()=>document.querySelector('.toast')?.textContent.includes('待恢复的草稿'));assert.equal(document.querySelector('.document-title-row h1').textContent,'当前材料');assert.equal(document.querySelector('[aria-label="向学习助手提问"]').value,'保留当前未存草稿');assert.ok(document.querySelector('.composer-reference'));
+ });
 });
 
 test('practice consumes only after actual matching user exists; a preallocated failed run ID retains references',async()=>{

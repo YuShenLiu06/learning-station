@@ -1350,6 +1350,20 @@ mod injection_tests {
             retried.entries.last().unwrap().data,
             saved.entries.last().unwrap().data
         );
+        let current = c.content.read(&source.id).unwrap();
+        let acknowledged = ContextInjection {
+            document_id: current.id.clone(),
+            expected_version: current.version.clone(),
+            selection: Some("新版本".into()),
+            locator: Some(crate::citation::Locator {
+                start_char: 0,
+                end_char: 3,
+            }),
+        };
+        let mut next = load(&c.content, &source.id, None).unwrap();
+        inject(&c.content, &mut next, &[acknowledged]).unwrap();
+        assert_eq!(next.manifest[0].version, current.version);
+        assert!(next.text.contains("\"quotedText\":\"新版本\""));
     }
     #[test]
     fn explicit_selection_deduplicates_and_rejects_stale_or_foreign_text() {

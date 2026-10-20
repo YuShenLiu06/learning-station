@@ -7,7 +7,7 @@ import { markdown } from '@codemirror/lang-markdown';
 import { syntaxHighlighting, defaultHighlightStyle } from '@codemirror/language';
 
 export type EditorHandle = { getValue: () => string; focus: () => void; insertText: (text: string) => void };
-type Props = { initial: string; onChange: (value: string) => void; onSelection: (text: string, start: number) => void; onSave: () => void; onReady?: () => void };
+type Props = { initial: string; onChange: (value: string) => void; onSelection: (text: string, start: number, body: string) => void; onSave: () => void; onReady?: () => void };
 export const Editor = forwardRef<EditorHandle, Props>(function Editor(props, ref) {
   const root = useRef<HTMLDivElement>(null);
   const editor = useRef<EditorView | null>(null);
@@ -28,7 +28,7 @@ export const Editor = forwardRef<EditorHandle, Props>(function Editor(props, ref
           EditorView.contentAttributes.of({ 'aria-label': '编辑小节正文', spellcheck: 'false', autocorrect: 'off' }),
           EditorView.updateListener.of(update => {
             if (update.docChanged) callbacks.current.onChange(update.state.doc.toString());
-            if (update.selectionSet) { const selection = update.state.selection.main; if (!selection.empty) callbacks.current.onSelection(update.state.sliceDoc(selection.from, selection.to), selection.from); }
+            if (update.selectionSet) { const selection = update.state.selection.main; if (!selection.empty) callbacks.current.onSelection(update.state.sliceDoc(selection.from, selection.to), selection.from, update.state.doc.toString()); }
           }),
           EditorView.theme({ '&': { minHeight: '100%', fontSize: 'var(--content-font-size, 16px)', background: 'transparent' }, '.cm-content': { fontFamily: 'var(--font-reading)', lineHeight: '1.95', padding: '28px 0 120px', caretColor: '#315d4a' }, '.cm-line': { padding: '0' }, '.cm-focused': { outline: 'none' }, '&.cm-focused': { outline: 'none' }, '.cm-selectionBackground, &.cm-focused .cm-selectionBackground': { background: '#d9e7dc' }, '.cm-scroller': { overflow: 'visible' }, '.cm-gutters': { display: 'none' } }),
         ],

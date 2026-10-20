@@ -12,7 +12,12 @@ export function readContextBridgeManifest(value: unknown): ContextBridgeManifest
    if (!record(item.range) || !count(item.range.startChar) || !count(item.range.endChar) || item.range.endChar < item.range.startChar || typeof item.range.complete !== 'boolean' || !count(item.range.totalBytes)) return;
    range = { startChar: item.range.startChar, endChar: item.range.endChar, complete: item.range.complete, totalBytes: item.range.totalBytes };
   }
-  entries.push({ id: item.id, kind: item.kind as ContextBridgeManifest['entries'][number]['kind'], status: item.status as ContextBridgeManifest['entries'][number]['status'], ...(item.sourceId === undefined ? {} : {sourceId:item.sourceId}), version: item.version, ...(item.textHash === undefined ? {} : {textHash:item.textHash}), includedChars: item.includedChars, ...(range ? {range} : {}), reason: item.reason });
+  let locator: ContextBridgeManifest['entries'][number]['locator'];
+  if (item.locator !== undefined) {
+   if (!record(item.locator) || !count(item.locator.startChar) || !count(item.locator.endChar) || item.includedChars === 0 || item.locator.endChar - item.locator.startChar !== item.includedChars) return;
+   locator = { startChar: item.locator.startChar, endChar: item.locator.endChar };
+  }
+  entries.push({ id: item.id, kind: item.kind as ContextBridgeManifest['entries'][number]['kind'], status: item.status as ContextBridgeManifest['entries'][number]['status'], ...(item.sourceId === undefined ? {} : {sourceId:item.sourceId}), version: item.version, ...(item.textHash === undefined ? {} : {textHash:item.textHash}), includedChars: item.includedChars, ...(range ? {range} : {}), ...(locator ? {locator} : {}), reason: item.reason });
  }
  return {version:1,entries,projectedChars:value.projectedChars,projectedBytes:value.projectedBytes};
 }
