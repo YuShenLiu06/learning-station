@@ -26,7 +26,7 @@
 ## 复习来源
 
 list_review_items({query?,courseId?}) 返回原卡结构并增加 courseId:null|string,courseTitle:null|string,sectionTitle:string,sourceDocumentId:null|string。sourceDocumentId/sectionId是稳定来源；无小节旧独立会话sourceDocumentId=null，打开真实session。来源已回收不猜替代课程。课程可按courseId查关联卡。source标题只展示，跳转必须用ID。五维算法仅保留未来扩展边界，本轮不定义维度/排期。
-课程会话的卡片按真实持久化 Session.courseId 归属与筛选，空材料来源保持空；旧无 courseId 会话仍由原材料解析课程，卡片 payload 中的 courseId 不能改变归属。此查询不迁移或重写旧卡片。
+空材料来源卡片按真实持久化 Session.courseId 归属与筛选，材料来源保持空；有材料卡片（含旧卡）仍由真实来源材料解析当前课程，材料移动后不改绑历史会话。卡片 payload 中的 courseId 不能改变归属，此查询不迁移或重写旧卡片。
 
 ## Anki（真实API，CSV仅降级）
 

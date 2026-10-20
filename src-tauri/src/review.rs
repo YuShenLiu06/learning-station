@@ -77,8 +77,8 @@ pub fn all(store: &mut ContentStore) -> Result<Vec<Value>> {
     for item in &mut items {
         let section_id = item["sectionId"].as_str().unwrap_or("").to_string();
         let node = tree.nodes.iter().find(|n| n.id == section_id);
-        // Course chats retain their persisted owner even without a material source.
-        let owner = item["courseId"].as_str().or_else(|| node.map(|n| n.course_id.as_str()));
+        // Material-free cards use their session; material cards keep the real source's course.
+        let owner = if section_id.is_empty() { item["courseId"].as_str() } else { node.map(|n| n.course_id.as_str()) };
         let course = owner.and_then(|id| tree.nodes.iter().find(|c| c.id == id));
         item["courseId"] = course.map(|n| json!(n.id)).unwrap_or(Value::Null);
         item["courseTitle"] = course.map(|n| json!(n.title)).unwrap_or(Value::Null);
