@@ -604,6 +604,7 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
                         persist(&engine, &managed.run)
                     })
                 }),
+                material_changes: None,
                 compaction_observer: Some({
                     let engine = engine.clone();
                     let id = id.clone();

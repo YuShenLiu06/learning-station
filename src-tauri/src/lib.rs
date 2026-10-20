@@ -38,6 +38,7 @@ pub mod trash;
 
 pub mod grading;
 pub mod material_git;
+mod material_changes;
 
 pub mod anki;
 

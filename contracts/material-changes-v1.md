@@ -1,0 +1,29 @@
+# 固定版本 Changes（课程接入中）
+
+本层提供课程物理仓库的固定 OID 计算、私有事件和 Pi 实际投影接收。最终 `focus::load` / `focus::open_materials(core, focus)` 适配仍等 Focus 已提交课程路由，不复制未提交代码；当前不能宣称完整业务入口已接通。
+
+## 固定比较与正文
+
+`material_changes::prepare` 只复用 MaterialGit.checkpoint/files/read/compare，不 capture、commit、读取最新工作区或记录模型接受。调用者冻结课程、NEW OID、目标来源身份与安全相对路径。
+
+`baseCommitOid` 是本 session 实际请求核对后的课程变化通知 OLD，用于其他文件的 name-status/numstat。`focusBaseCommitOid` 是当前有效完整正文投影的 OLD；聚焦 patch 单独比较这个 OLD 和冻结 NEW，条目的 patchBaseCommitOid 及 focused.gitChange.baseCommitOid 明示其基准。A→B→A 不把 B 时收到的课程通知当成 A 正文。基准由 Pi 现有材料条目提供，Rust 不拼历史或另建缓存。
+
+返回 checkpoint 保留 courseId/checkpointCommitOid/materialTreeOid/excludedFiles，完整 focused 保留真实来源 id/path、内容 SHA version、独立 gitCommitOid/gitBlobOid、text/textHash/range。全文是固定 Git 文件的原始 UTF-8 文本；range 为此文本的字符坐标。Focus 可见段落和 Citation 的正文坐标不能仅凭同 sourceId/version 就假定与含前置信息的 Git 文件坐标相同；引用作者须按真实范围对齐，去重保留双来源。
+
+非聚焦只给文件名/name-status/numstat。聚焦完整原生 Git patch 不静默截断；非 UTF-8 patchBytes 保留在材料服务，发送层明确 patchUnavailable/patchByteLength，不乱码替换或丢文件。二进制只文件状态。无法自动展示的 Focus 类型由冻结/消费边界校验；主动受支持 read 仍走正常权限和工具结果，不用 diff 缓存替身。
+
+fixedVersion 只含课程、固定 commit OID 和材料相对路径；删除指向删除前版本。附件路径取固定 files/read 的真实安全投影，不拼主机路径。排除清单保留真实文件名/原因；未注册文件可没有 assetId，清单仍逐项保留独立身份，不捏造可读 sourceId。
+
+全包512KiB、来源清单256项超过预算显式 LIMIT_EXCEEDED，不宣称不完整材料已完整接收。
+
+## 私有管道与接收
+
+Rust 只有注册 material_changes handler 才发 materialChanges=true；Node 才启用私有 material_changes {id,baseCommitOid,focusBaseCommitOid}，每轮最多8次，含压缩恢复。能力位不注册模型工具或扩大 read 权限，前端/模型不能指定课程、NEW OID、目录或任意路径。无 provider 的旧 Focus 可继续已有 nativeMaterials 投影，便于正常依赖组合。
+
+材料通知不等于正文。Pi 沿当前 session 的实际 full→diff 链验证完整范围、身份、hash 和 Git blob/commit。首次、新 session、压缩或正文基准失效恢复真正全文，不能裸 diff；无变化不追加正文/通知。回合 Focus 元数据只保留定位/范围，不重复已交给材料投影的 text，原冻结对象不变。
+
+Changes 消息与原 request/run/user/native entry 绑定。实际准备请求含该条目后追加接收记录并 session_sync；这证明本地 Pi 请求投影，不宣称服务端已读。失败、取消或未知沿原身份核对；未启动重试不能推进，取消也不一律等于未收到。本地 Git commit、courseReadManifest 授权元数据、非聚焦 summary 都不能推进正文基准。
+
+full commit、材料 tree、课程仓归属与各 session 接收身份分开。本层不提交聊天或做联合回滚。
+
+验证只使用合成课程、真实本地 Git、锁版 Pi 和 localhost。固定计算、Node资源/正文投影、实际私有管道分别报告；最终 Frozen/generation 接通、前端/build和最终SHA CI仍须独立完成。

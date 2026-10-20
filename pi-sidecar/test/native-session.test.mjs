@@ -161,3 +161,9 @@ test('interleaved Focus sends its effective body OLD separately from the last co
   await n.applyContext(changesEnvelope(id,commit));await n.prompt('Focus '+id);const frame=JSON.parse(materialEntries(n).at(-1).content).frames[0];assert.equal(frame.kind,i===2?'diff':'full');if(i===2)assert.equal(frame.unifiedDiff,'A_FIXED_OLD_NEW_GIT_DIFF');n.close();
  }
 });
+
+test('unregistered excluded course files keep separate auditable metadata without invented source identity',async()=>{
+ const s=spec();let manifest;const excludedFiles=['private.env','nested/private.env'].map(fileName=>({assetId:'',fileName,reason:'sensitive_file_name'}));
+ const n=await openNativeSession(s,{...options(),onManifest:m=>manifest=m,loadChanges:async r=>changeReply(r.baseCommitOid,focused('doc_1','Body'),[],{checkpoint:{courseId:'course_fixture',checkpointCommitOid:cp1,materialTreeOid:tree,excludedFiles}})});
+ await n.applyContext(changesEnvelope());const excluded=manifest.entries.filter(e=>e.reason==='excluded:sensitive_file_name');assert.equal(new Set(excluded.map(e=>e.id)).size,2);assert.deepEqual(excluded.map(e=>e.fileName),excludedFiles.map(e=>e.fileName));assert(excluded.every(e=>e.sourceId===undefined&&e.includedChars===0));n.close();
+});

@@ -793,8 +793,10 @@ pub type ToolRecoveryHandler = Arc<
 pub type OutputValidator = Arc<dyn Fn(&str) -> Result<()> + Send + Sync>;
 pub type ContextObserver = Arc<dyn Fn(Value) -> Result<()> + Send + Sync>;
 pub type CompactionObserver = Arc<dyn Fn() + Send + Sync>;
+pub type MaterialChangesHandler = Arc<dyn Fn(Option<String>, Option<String>) -> Result<Value> + Send + Sync>;
 #[derive(Clone)]
 pub struct RequestContext {
+    pub material_changes: Option<MaterialChangesHandler>,
     pub time: crate::time_context::TimeContext,
     pub exploration: Option<crate::exploration::ExplorationContext>,
     pub native_session: Option<crate::native_session::NativeSession>,
@@ -806,6 +808,7 @@ pub struct RequestContext {
 impl RequestContext {
     fn capture() -> Self {
         Self {
+            material_changes: None,
             time: crate::time_context::TimeContext::capture(),
             exploration: None,
             native_session: None,
@@ -996,6 +999,7 @@ async fn run_sidecar(
         exploration_context: Option<&'a crate::exploration::ExplorationContext>,
         native_session: Option<&'a crate::native_session::NativeSession>,
         output_validation: bool,
+        material_changes: bool,
     }
     let mut input = serde_json::to_vec(&Input {
         protocol: 1,
@@ -1012,6 +1016,7 @@ async fn run_sidecar(
         exploration_context: request_context.exploration.as_ref(),
         native_session: request_context.native_session.as_ref(),
         output_validation: request_context.output_validator.is_some(),
+        material_changes: request_context.material_changes.is_some(),
     })
     .map_err(|_| sidecar_error("INVALID_INPUT"))?;
     if input.len() > 4 * MAX_OUTPUT - 1 {
@@ -1091,6 +1096,7 @@ async fn run_sidecar(
         let mut final_content = None;
         let mut had_response = false;
         let mut tool_attempts = 0usize;
+        let mut material_change_requests = 0usize;
         let mut output_validations = 0usize;
         let mut tool_cache: std::collections::BTreeMap<String, (String, Value)> =
             std::collections::BTreeMap::new();
@@ -1191,6 +1197,17 @@ async fn run_sidecar(
                         }
                         output.push_str(text);
                         on_delta(text);
+                    }
+                    Some("material_changes") if ready && !settled => {
+                        material_change_requests += 1;
+                        if material_change_requests > 8 { return Err(sidecar_error("TOOL_LIMIT")); }
+                        let handler=request_context.material_changes.as_ref().ok_or_else(||sidecar_error("TOOLS_DISABLED"))?;
+                        let id=event["id"].as_str().filter(|s|crate::types::valid_id(s)).ok_or_else(||sidecar_error("TOOL_PROTOCOL"))?;
+                        let previous=match &event["baseCommitOid"] {Value::Null=>None,Value::String(oid)=>Some(oid.clone()),_=>return Err(sidecar_error("TOOL_PROTOCOL"))};
+                        let focus_previous=match &event["focusBaseCommitOid"] {Value::Null=>None,Value::String(oid)=>Some(oid.clone()),_=>return Err(sidecar_error("TOOL_PROTOCOL"))};
+                        let result=handler(previous,focus_previous)?;
+                        let mut bytes=serde_json::to_vec(&json!({"type":"tool_result","id":id,"result":result}))?;bytes.push(b'\n');
+                        await_stage(async{stdin.write_all(&bytes).await.map_err(|_|runtime_error())},&cancel,deadline).await?;
                     }
                     Some("session_sync") if !settled => {
                         let native=request_context.native_session.as_ref().ok_or_else(||sidecar_error("TOOLS_DISABLED"))?;
@@ -1825,6 +1842,8 @@ fn sidecar_error(code: &str) -> CoreError {
             "模型输出超过限制，已停止；已收到的内容已保留。",
         ),
         "TOOL_LIMIT" => ("TOOL_LIMIT", "学习工具调用超过本次预算，已停止。"),
+        "LIMIT_EXCEEDED" => ("LIMIT_EXCEEDED", "完整材料变化及必要正文超过发送容量；未截断，原问题与版本保留。"),
+        "CONTEXT_CONFLICT" => ("CONTEXT_CONFLICT", "聚焦正文与固定材料类型不一致，正文未发送；请保留原问题并重新核对聚焦材料。"),
         "TIME_CONTEXT_INVALID" => ("TIME_CONTEXT_INVALID","请求时间或时区无效，未发送模型请求。"),
         "SKILL_MISSING" => ("SKILL_MISSING", "本次学习指导缺失，未发送模型请求。"),
         "SKILL_INVALID" => ("SKILL_INVALID", "学习指导版本或模式校验失败，未发送模型请求。"),
