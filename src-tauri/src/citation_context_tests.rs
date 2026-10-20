@@ -179,6 +179,81 @@ mod cases {
             .contains("NEW_MESSAGE_VERSION"));
     }
     #[test]
+    fn adjacent_paragraph_lists_also_stop_supplement_expansion() {
+        for marker in ["- ", "* ", "+ ", "1. ", "  - "] {
+            let text = format!("prefix chosen suffix\n\nneighbor paragraph\n{marker}OUTSIDE_LIST\n\nFAR_AFTER_LIST");
+            let frozen = plain(&text, "chosen");
+            assert_eq!(frozen.quoted_text, "chosen");
+            let auxiliary = frozen
+                .supplemental_context
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<String>();
+            assert!(auxiliary.contains("neighbor paragraph"));
+            assert!(
+                !auxiliary.contains("OUTSIDE_LIST"),
+                "crossed adjacent {marker:?}"
+            );
+            assert!(!auxiliary.contains("FAR_AFTER_LIST"));
+        }
+    }
+    #[test]
+    fn later_structural_lines_and_setext_headings_block_neighbor_expansion() {
+        for boundary in [
+            "| OUTSIDE_BLOCK |\n| --- |",
+            "<div>OUTSIDE_BLOCK</div>",
+            "> OUTSIDE_BLOCK",
+        ] {
+            let text =
+                format!("Near before\n\nprefix chosen suffix\n{boundary}\n\nFAR_AFTER_BLOCK");
+            let frozen = plain(&text, "chosen");
+            let auxiliary = frozen
+                .supplemental_context
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<String>();
+            assert!(!auxiliary.contains("OUTSIDE_BLOCK"));
+            assert!(!auxiliary.contains("FAR_AFTER_BLOCK"));
+        }
+        for underline in ["===", "---"] {
+            let frozen = plain(
+                &format!(
+                    "FAR_BEFORE_HEADING\n\nprefix chosen suffix\n{underline}\n\nFAR_AFTER_HEADING"
+                ),
+                "chosen",
+            );
+            let auxiliary = frozen
+                .supplemental_context
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<String>();
+            assert!(!auxiliary.contains("FAR_BEFORE_HEADING"));
+            assert!(!auxiliary.contains("FAR_AFTER_HEADING"));
+        }
+    }
+    #[test]
+    fn paragraph_neighbors_stop_at_lists_without_an_intervening_blank_line() {
+        for marker in ["- ", "* ", "+ ", "1. ", "  - "] {
+            let text = format!(
+                "Near before\n\nprefix chosen suffix\n{marker}LIST_BOUNDARY\n\nFAR_AFTER_LIST"
+            );
+            let frozen = plain(&text, "chosen");
+            assert_eq!(frozen.quoted_text, "chosen");
+            let auxiliary = frozen
+                .supplemental_context
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<String>();
+            assert!(auxiliary.contains("Near before"));
+            assert!(auxiliary.contains("prefix ") && auxiliary.contains(" suffix"));
+            assert!(!auxiliary.contains("LIST_BOUNDARY"), "crossed {marker:?}");
+            assert!(
+                !auxiliary.contains("FAR_AFTER_LIST"),
+                "crossed {marker:?} into a farther paragraph"
+            );
+        }
+    }
+    #[test]
     fn source_paragraph_neighbors_preserve_unicode_crlf_fences_and_heading_boundaries() {
         let text="FAR_BEFORE\r\n\r\nNear before\r\n\r\nprefix🙂 chosen suffix\r\n\r\nNear after\r\n\r\nFAR_AFTER";
         let s = plain(text, "chosen");
