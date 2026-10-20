@@ -261,6 +261,44 @@ pub fn inject(store: &ContentStore, ctx: &mut Context, inputs: &[ContextInjectio
 }
 
 pub const MAX_CONTEXT_CHARS: usize = 60_000;
+
+pub(crate) const MAX_READ_SCOPE_SOURCES: usize = 4096;
+
+/// Course metadata authorizes a later read at the submitted version. It contains no
+/// body and does not imply that Pi received any source or retained a full baseline.
+pub fn course_read_manifest(store: &ContentStore, owner: &str) -> Result<Vec<ManifestItem>> {
+    if crate::course_sessions::course(store, owner)?.as_deref() != Some(owner) {
+        return Err(CoreError::new("OUT_OF_SCOPE", "课程读取范围无效。"));
+    }
+    let mut sources: Vec<_> = crate::library_tree::list(store)?
+        .nodes
+        .into_iter()
+        .filter(|node| {
+            node.course_id == owner
+                && matches!(node.kind.as_str(), "section" | "knowledge" | "exploration")
+        })
+        .map(|node| ManifestItem {
+            id: node.id,
+            path: node.path,
+            version: node.version,
+            included_chars: 0,
+        })
+        .collect();
+    sources.extend(
+        crate::assets::list(store, owner)?
+            .into_iter()
+            .map(|asset| ManifestItem {
+                path: format!("assets/{}/{}", asset.course_id, asset.id),
+                id: asset.id,
+                version: asset.sha256,
+                included_chars: 0,
+            }),
+    );
+    if sources.len() > MAX_READ_SCOPE_SOURCES {
+        return Err(CoreError::new("LIMIT_EXCEEDED", "课程可读来源超过本次工具范围上限。"));
+    }
+    Ok(sources)
+}
 pub const MAX_CONTEXT_DOCUMENTS: usize = 32;
 pub const MAX_CONTEXT_DEPTH: usize = 4;
 const MAX_REFERENCE_ATTEMPTS: usize = 128;
