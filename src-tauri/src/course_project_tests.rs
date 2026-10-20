@@ -615,6 +615,52 @@ fn review51_old_nested_courses_document_survives_refresh() {
 }
 
 #[test]
+fn r1close_legacy_anchor_basename_does_not_hide_siblings() {
+    let (_dir, mut store) = fixture();
+    let root = store
+        .create(
+            metadata("legacy", "course", None),
+            "legacy\n",
+            "courses/legacy.md",
+        )
+        .unwrap();
+    let child = store
+        .create(
+            metadata("old_child", "section", Some(&root.id)),
+            "keep\n",
+            "courses/legacy_bucket/old.md",
+        )
+        .unwrap();
+    let anchor = "courses/legacy_bucket/materials/documents/legacy_bucket.md";
+    store
+        .create(
+            metadata("unrelated_anchor", "section", Some("legacy")),
+            "ordinary legacy\n",
+            anchor,
+        )
+        .unwrap();
+    for invalid in [
+        metadata("unrelated_anchor", "section", Some("legacy")),
+        metadata("wrong_id", "course", None),
+        metadata("legacy_bucket", "section", None),
+        metadata("legacy_bucket", "course", Some("legacy")),
+    ] {
+        let bytes = content::serialize(&invalid, "ordinary legacy\n").unwrap();
+        fs::write(store.root().join(anchor), &bytes).unwrap();
+        store.refresh().unwrap();
+        assert_eq!(store.read(&child.id).unwrap().content, child.content);
+        assert_eq!(
+            fs::read(store.root().join(&child.path)).unwrap(),
+            child.content.as_bytes()
+        );
+        assert_eq!(
+            fs::read_to_string(store.root().join(anchor)).unwrap(),
+            bytes
+        );
+    }
+}
+
+#[test]
 fn review51_legacy_materials_component_does_not_trigger_project_routing() {
     let (_dir, mut store) = fixture();
     let parent = store

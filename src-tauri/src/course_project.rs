@@ -186,8 +186,27 @@ fn has_project_anchor(root: &Path, course: &str) -> bool {
     };
     let directory = root.join("materials/documents");
     let document = directory.join(format!("{course}.md"));
-    matches!(fs::symlink_metadata(directory), Ok(m) if !m.file_type().is_symlink() && m.is_dir())
-        && matches!(fs::symlink_metadata(document), Ok(m) if !m.file_type().is_symlink() && m.is_file())
+    if !matches!(fs::symlink_metadata(directory), Ok(m) if !m.file_type().is_symlink() && m.is_dir())
+    {
+        return false;
+    }
+    let Ok(bytes) =
+        crate::assets::bounded_read(&document, crate::content::MAX_DOCUMENT_BYTES as usize)
+    else {
+        return false;
+    };
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return false;
+    };
+    let Ok((metadata, _)) = crate::content::parse(text) else {
+        return false;
+    };
+    metadata.id == course
+        && metadata.kind == "course"
+        && !metadata
+            .extra
+            .get("parentId")
+            .is_some_and(|value| !value.is_null())
 }
 fn required() -> CoreError {
     CoreError::new(
