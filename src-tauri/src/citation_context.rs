@@ -134,6 +134,20 @@ fn window(text: &str, selected: &Locator) -> Locator {
             at = end;
             continue;
         }
+        if fence.is_none()
+            && !trimmed.is_empty()
+            && (trimmed.chars().all(|c| c == '=') || trimmed.chars().all(|c| c == '-'))
+        {
+            blocks.push((start.take().unwrap_or(at), end, false));
+            at = end;
+            continue;
+        }
+        // Lists and other block markers can interrupt a paragraph without a blank line.
+        if fence.is_none() && paragraph && !ordinary(line) {
+            if let Some(s) = start.take() {
+                blocks.push((s, at, true));
+            }
+        }
         if start.is_none() && !trimmed.is_empty() {
             start = Some(at);
             paragraph = ordinary(line);
