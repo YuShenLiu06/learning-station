@@ -134,6 +134,11 @@ impl FrozenMaterials {
                         .to_str()
                         .ok_or_else(scope)?
                         .to_owned();
+                    if store
+                        .is_path_trashed(&format!("courses/{course_id}/materials/{relative}"))?
+                    {
+                        continue;
+                    }
                     let reason = exclusion_reason(name).or_else(|| {
                         (metadata.is_dir()
                             && (matches!(
@@ -173,11 +178,17 @@ impl FrozenMaterials {
                         continue;
                     }
                     let bytes = crate::assets::bounded_read(&path, 5 * 1024 * 1024)?;
-                    if relative.starts_with("documents/") && name.ends_with(".md") {
+                    if relative.starts_with("documents/") && crate::content::is_markdown_path(&path)
+                    {
                         if bytes.len() as u64 > crate::content::MAX_DOCUMENT_BYTES {
                             return Err(limit());
                         }
-                        std::str::from_utf8(&bytes).map_err(|_| scope())?;
+                        let text = std::str::from_utf8(&bytes).map_err(|_| scope())?;
+                        if crate::content::parse(text)
+                            .is_ok_and(|(meta, _)| store.is_trashed(&meta.id))
+                        {
+                            continue;
+                        }
                     } else {
                         crate::assets::inspect(name, &bytes)?;
                     }
@@ -188,6 +199,8 @@ impl FrozenMaterials {
             frozen
                 .excluded_files
                 .sort_by(|a, b| a.file_name.cmp(&b.file_name));
+            // Recheck the existing ledger stamp even if the directory was empty.
+            store.read(course_id)?;
             Ok(frozen)
         };
         let first = capture()?;

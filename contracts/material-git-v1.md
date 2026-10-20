@@ -2,6 +2,8 @@
 
 新增 Rust `material_git` 服务；本层不接 UI、App/Pi 请求、会话实际接收基准或回滚，不初始化/迁移真实课程库。
 
+新物理课程的可写入口已改为 `init_course/open_course` 与 `capture_project`，当前路径、回收可见性和普通 `.git` 契约见 [课程物理项目](course-project-v1.md#独立-git-检查点)。下文 bare 创建示例仅保留为旧合成夹具说明，`create_new` 只在测试编译；生产 `open` 仅用于只读兼容旧快照。
+
 ```rust,ignore
 let git = MaterialGit::create_new(private_absolute_path)?; // 仅显式新建，父目录须存在且不在源码 Git 内
 // 重开：MaterialGit::open(private_absolute_path)?
