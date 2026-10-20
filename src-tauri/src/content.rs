@@ -52,6 +52,10 @@ impl ContentStore {
     pub fn is_trashed(&self, id: &str) -> bool {
         self.hidden_ids.contains(id)
     }
+    pub(crate) fn is_path_trashed(&self, relative: &str) -> Result<bool> {
+        self.visibility_guard()?;
+        Ok(self.hidden_paths.contains(relative))
+    }
     pub fn trashed_ids(&self) -> BTreeSet<String> {
         self.hidden_ids.clone()
     }

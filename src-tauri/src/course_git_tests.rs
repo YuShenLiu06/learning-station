@@ -410,3 +410,77 @@ fn unchanged_and_same_course_file_add_delete_use_actual_material_files() {
         .any(|c| c.path == "documents/new_section.md" && c.status == "A" && c.added.is_some()));
     assert_eq!(f.read(&first, CHILD), f.child.content.as_bytes());
 }
+
+#[test]
+fn trashed_material_is_excluded_until_restore_while_fixed_history_remains_readable() {
+    let mut f = Fixture::new();
+    let first = f.commit(None);
+    let preview = crate::trash::preview(&mut f.store, &f.child.id).unwrap();
+    let receipt = crate::trash::trash(
+        &mut f.store,
+        &f.child.id,
+        &preview.version,
+        "course_git_trash_child",
+    )
+    .unwrap();
+    assert_eq!(f.read(&first, CHILD), f.child.content.as_bytes());
+    assert_eq!(
+        fs::read(f.store.root().join(&f.child.path)).unwrap(),
+        f.child.content.as_bytes()
+    );
+    let hidden = f.commit(Some(&first.checkpoint_commit_oid));
+    let oid = &hidden.checkpoint_commit_oid;
+    let files = f.git.files("course_a", oid).unwrap();
+    assert!(!files.iter().any(|file| file.path == CHILD));
+    assert!(f.git.read("course_a", oid, CHILD).is_err());
+    assert!(f
+        .diff(&first, &hidden, Some(CHILD))
+        .changes
+        .iter()
+        .any(|c| c.path == CHILD && c.status == "D"));
+    crate::trash::restore(&mut f.store, &receipt.trash_id, "course_git_restore_child").unwrap();
+    let restored = f.commit(Some(oid));
+    let restored_oid = &restored.checkpoint_commit_oid;
+    let files = f.git.files("course_a", restored_oid).unwrap();
+    assert!(files.iter().any(|file| file.path == CHILD));
+    assert_eq!(f.read(&restored, CHILD), f.child.content.as_bytes());
+    assert!(f
+        .diff(&hidden, &restored, Some(CHILD))
+        .changes
+        .iter()
+        .any(|c| c.path == CHILD && c.status == "A"));
+    assert_eq!(restored.material_tree_oid, first.material_tree_oid);
+    assert_eq!(f.read(&first, CHILD), f.child.content.as_bytes());
+}
+
+#[test]
+fn trash_visibility_requires_a_fresh_ledger_and_hides_copied_managed_ids() {
+    let mut f = Fixture::new();
+    let first = f.commit(None);
+    let mut stale = ContentStore::new(f.store.root().into(), f.dir.path().join("state")).unwrap();
+    stale.refresh().unwrap();
+    let preview = crate::trash::preview(&mut f.store, &f.child.id).unwrap();
+    crate::trash::trash(
+        &mut f.store,
+        &f.child.id,
+        &preview.version,
+        "trash_visibility",
+    )
+    .unwrap();
+    let error = FrozenMaterials::capture_project(&stale, "course_a").unwrap_err();
+    assert_eq!(error.code, "TRASH_STATE_CHANGED");
+    fs::write(
+        f.root.join("materials/documents/copied.md"),
+        &f.child.content,
+    )
+    .unwrap();
+    let hidden = f.commit(Some(&first.checkpoint_commit_oid));
+    let files = f
+        .git
+        .files("course_a", &hidden.checkpoint_commit_oid)
+        .unwrap();
+    assert!(!files
+        .iter()
+        .any(|file| file.path == CHILD || file.path == "documents/copied.md"));
+    assert_eq!(f.read(&first, CHILD), f.child.content.as_bytes());
+}
