@@ -115,6 +115,70 @@ mod cases {
         sessions::append(&mut c.content, &x.session.id, e, None, id).unwrap()
     }
     #[test]
+    fn real_assistant_supplement_uses_the_bound_message_version_and_paragraphs() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(dir.path().join("library"), dir.path().join("state")).unwrap();
+        let mut c = engine.lock().unwrap();
+        let material = c
+            .create_section("材料", "UNRELATED_MATERIAL", vec![], vec![])
+            .unwrap();
+        let (session, _) = c.start_session(&material.id, false).unwrap();
+        let body = "FAR_BEFORE\n\nNear before\n\nprefix chosen suffix\n\nNear after\n\nFAR_AFTER";
+        let mut answer = entry(body, json!({"runId":"run_citation_answer"}));
+        answer.kind = "assistant".into();
+        let session = sessions::append(
+            &mut c.content,
+            &session.id,
+            answer,
+            None,
+            "citation-message-answer",
+        )
+        .unwrap();
+        let answer = session.entries.last().unwrap();
+        let r = context::AssistantReference {
+            session_id: session.id.clone(),
+            entry_id: answer.id.clone(),
+            run_id: Some("run_citation_answer".into()),
+            text_hash: hash(body),
+            selection: "chosen".into(),
+            locator: Some(locator(body, "chosen")),
+        };
+        let frozen = freeze(&mut c.content, &session, &[], &[r.clone()], &[]).unwrap();
+        let quote = &frozen.references[0];
+        assert_eq!(quote.quoted_text, "chosen");
+        assert_eq!(quote.source.id, answer.id);
+        assert_eq!(
+            quote.source.path,
+            format!("ai-answer/{}/{}", session.id, answer.id)
+        );
+        assert_eq!(quote.source.version, hash(body));
+        let auxiliary = quote
+            .supplemental_context
+            .iter()
+            .map(|p| p.text.as_str())
+            .collect::<String>();
+        assert!(auxiliary.contains("Near before"));
+        assert!(auxiliary.contains("Near after"));
+        assert!(!auxiliary.contains("FAR_"));
+        assert!(!auxiliary.contains("UNRELATED_MATERIAL"));
+        let mut forged = r.clone();
+        forged.session_id = "another_session".into();
+        assert!(freeze(&mut c.content, &session, &[], &[forged], &[]).is_err());
+        let document = c.content.read(&answer.id).unwrap();
+        c.content
+            .save(
+                &answer.id,
+                &content::serialize(&document.metadata, "NEW_MESSAGE_VERSION").unwrap(),
+                &document.version,
+            )
+            .unwrap();
+        let updated = sessions::get(&mut c.content, &session.id).unwrap();
+        assert!(freeze(&mut c.content, &updated, &[], &[r], &[]).is_err());
+        assert!(!serde_json::to_string(&frozen)
+            .unwrap()
+            .contains("NEW_MESSAGE_VERSION"));
+    }
+    #[test]
     fn source_paragraph_neighbors_preserve_unicode_crlf_fences_and_heading_boundaries() {
         let text="FAR_BEFORE\r\n\r\nNear before\r\n\r\nprefix🙂 chosen suffix\r\n\r\nNear after\r\n\r\nFAR_AFTER";
         let s = plain(text, "chosen");
