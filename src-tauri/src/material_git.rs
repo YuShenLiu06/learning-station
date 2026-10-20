@@ -178,7 +178,8 @@ impl FrozenMaterials {
                         continue;
                     }
                     let bytes = crate::assets::bounded_read(&path, 5 * 1024 * 1024)?;
-                    if relative.starts_with("documents/") && name.ends_with(".md") {
+                    if relative.starts_with("documents/") && crate::content::is_markdown_path(&path)
+                    {
                         if bytes.len() as u64 > crate::content::MAX_DOCUMENT_BYTES {
                             return Err(limit());
                         }

@@ -474,13 +474,28 @@ fn trash_visibility_requires_a_fresh_ledger_and_hides_copied_managed_ids() {
         &f.child.content,
     )
     .unwrap();
+    fs::rename(
+        f.store.root().join(&f.child.path),
+        f.root.join("materials/documents/renamed.MD"),
+    )
+    .unwrap();
+    for (stem, extension) in [("lower", "md"), ("mixed", "Md")] {
+        fs::write(
+            f.root
+                .join(format!("materials/documents/renamed_{stem}.{extension}")),
+            &f.child.content,
+        )
+        .unwrap();
+    }
+    f.store.refresh().unwrap();
+    assert_eq!(f.store.read(&f.child.id).unwrap_err().code, "TRASHED");
     let hidden = f.commit(Some(&first.checkpoint_commit_oid));
     let files = f
         .git
         .files("course_a", &hidden.checkpoint_commit_oid)
         .unwrap();
-    assert!(!files
-        .iter()
-        .any(|file| file.path == CHILD || file.path == "documents/copied.md"));
+    assert!(!files.iter().any(|file| file.path == CHILD
+        || file.path == "documents/copied.md"
+        || file.path.starts_with("documents/renamed")));
     assert_eq!(f.read(&first, CHILD), f.child.content.as_bytes());
 }
