@@ -151,6 +151,7 @@ async fn real_rust_node_pi_native_restart_roles_tool_pairs_and_course_isolation(
             first_native = Some(native.directory.clone());
         }
         let request = GenerationRequest {
+            focus: None,
             document_id: (round != 2).then(|| focus.clone()),
             session_id: active.clone(),
             mode: "question".into(),
@@ -279,6 +280,7 @@ async fn real_rust_node_pi_native_restart_roles_tool_pairs_and_course_isolation(
     };
     let prompt = format!("QUESTION_NATIVE_0 {}", "x".repeat(6000));
     let request = GenerationRequest {
+        focus: None,
         document_id: None,
         session_id: sid.clone(),
         mode: "question".into(),
@@ -562,6 +564,7 @@ async fn rust_node_pi_exercise_tool_receipt_corrects_invalid_output_in_same_nati
         ContextBridge::snapshot(&state, &c.content, &s, &ctx).unwrap()
     };
     let request = GenerationRequest {
+        focus: None,
         document_id: None,
         session_id: sid.clone(),
         mode: "question".into(),

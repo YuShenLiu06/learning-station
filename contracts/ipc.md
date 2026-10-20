@@ -137,3 +137,7 @@ ToolActivity=`{id,toolCallId,runId,sessionId,name,status:running|succeeded|faile
 - `start_session(sectionId, newSession?)`：课程内文档返回同一 session；显式新建不绕过课程固定路由。
 - `load_session_context`、`start_generation` 新增可选 `documentId`，由本轮 activeDocumentId 冻结；未传兼容旧 sectionId 锚点。保存问题的 requestedContext.documentId 与生成重试必须一致。
 - 练习 originSessionId 是原作答/批改账本；与当前聊天 session 可以不同，课程和原始来源均由 Rust 校验。
+
+### Focus 冻结
+
+`freeze_focus {request:{sessionId,input:{documentId,expectedBody,expectedVersion?,view,ranges,questionId?,assetId?},selection,injections,assistantReferences,exerciseReferences}}` 返回 [FocusSnapshot](focus-v1.md)。这是一次本机私有材料冻结，不发模型、不改变权限。`start_generation` 增可选 `focus`；既有调用兼容，带 Focus 的请求严格绑定原冻结记录。

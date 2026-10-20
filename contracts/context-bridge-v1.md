@@ -32,3 +32,7 @@ type ContextBridgeManifest = {
 `learning-embed` 块是现有笔记正文的一部分，不增加 bridge 的授权、网络抓取或来源编号。网页/视频链接不自动变为知识来源；AI 回答引用的编号不能冒充 `manifest` 中的材料编号。
 
 内部运行快照可含 Run.sourceDocumentId：它由 Rust 在请求接受时从真实材料/练习账本归一化，区别于可编辑页面 ID。结果持久化与工具派发沿用该来源和冻结 manifest，不依靠页面元数据或课程会话的首次 sectionId 重新选源。旧运行字段可缺省；不新增前端必填参数或读取权限。
+
+## Focus
+
+`GenerationRequest.focus`、`Run.focus` 与 assistant 自身 `entry.data.focus` 使用 [Focus v1](focus-v1.md) 的同一个冻结对象；Pi turn metadata 接收同一值。Focus 不从最新 Session 或页面回填。queued Focus 表示已冻结请求，不冒充 Pi 已接收材料基线。

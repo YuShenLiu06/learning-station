@@ -190,6 +190,7 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
         assert_eq!(intent.original_question, "爱因斯坦是什么人？");
         assert!(!intent.material_source_ids.is_empty());
         let request = GenerationRequest {
+            focus: None,
             document_id: None,
             session_id: session.id.clone(),
             mode: "question".into(),

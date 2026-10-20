@@ -142,7 +142,8 @@ impl FrozenMaterials {
                 continue;
             }
             for document in chain {
-                if document.path != format!("courses/{}.md", document.id) {
+                if document.path != format!("courses/{}.md", document.id)
+                    && !(document.metadata.kind == "exercise" && document.path == format!("exercises/{}.md", document.id)) {
                     return Err(scope());
                 }
                 insert(

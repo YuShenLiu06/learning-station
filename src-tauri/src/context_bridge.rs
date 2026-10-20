@@ -114,6 +114,7 @@ impl ContextBridge {
         metadata.remove("context");
         metadata.remove("userGoal");
         if let Some(document) = &request.document_id { metadata.insert("activeDocumentId".into(), json!(document)); }
+        if let Some(focus) = &request.focus { metadata.insert("focus".into(), json!(focus)); }
         let question = metadata.remove("question").unwrap_or(json!(""));
         let (materials, references) = projection.provider_texts(ctx)?;
         let mut store = Self::default();

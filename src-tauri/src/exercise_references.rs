@@ -765,6 +765,7 @@ mod tests {
         let mut r = reference(&p, "为什么这里用 for？");
         r.text_hash = hash("stale");
         let request = crate::generation::GenerationRequest {
+            focus: None,
             document_id: None,
             session_id: x.session.id,
             mode: "question".into(),

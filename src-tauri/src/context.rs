@@ -16,6 +16,8 @@ pub struct ContextInjection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RequestedContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<crate::focus::Focus>,
     pub document_id: String,
     pub selection: String,
     pub injections: Vec<ContextInjection>,
@@ -47,6 +49,7 @@ pub fn requested_context(
     }
     let frozen: RequestedContext = serde_json::from_value(value.clone()).map_err(|_| invalid())?;
     if (!frozen.document_id.is_empty() && !crate::types::valid_id(&frozen.document_id))
+        || frozen.focus.as_ref().is_some_and(|f| f.document_id != frozen.document_id || f.id.len() != 64 || serde_json::to_vec(f).map_or(true, |s| s.len() > 100_000))
         || frozen.selection.len() > 30000
         || frozen.selection != entry.selection.as_deref().unwrap_or_default()
         || frozen.injections.len()

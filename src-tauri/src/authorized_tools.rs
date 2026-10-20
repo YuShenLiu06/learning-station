@@ -307,8 +307,12 @@ fn execute_read(
             .find(|item| item.id == source_id)
             .ok_or_else(out_of_scope)?;
         let document = {
-            let core = engine.lock()?;
-            core.content.read(&source_id)?
+            let mut core = engine.lock()?;
+            if let Some(focus) = &run.focus {
+                let session = crate::sessions::get(&mut core.content, &scope.session_id)?;
+                crate::focus::load(&mut core, &session, focus)?;
+                crate::focus::read_document(&core, focus, &source_id)?
+            } else { core.content.read(&source_id)? }
         };
         if document.version != item.version {
             return Err(CoreError::new(

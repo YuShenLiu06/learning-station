@@ -152,6 +152,7 @@ async fn context_bridge_real_pi_wire_replays_full_diff_once_per_tool_loop_and_fa
             (s, ctx, p, user)
         };
         let request = GenerationRequest {
+            focus: None,
             document_id: None,
             session_id: sid.clone(),
             mode: "question".into(),

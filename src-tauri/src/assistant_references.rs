@@ -373,6 +373,7 @@ mod tests {
     async fn stale_or_changed_frozen_refs_fail_before_credentials_or_model_requests() {
         let (_d, e, s, r) = fixture();
         let mut request = crate::generation::GenerationRequest {
+            focus: None,
             document_id: None,
             session_id: s.id.clone(),
             mode: "question".into(),

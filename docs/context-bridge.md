@@ -57,7 +57,7 @@ Node 继续使用权限模式，只能读运行组件及读写当前私有会话
 
 [README](../README.md)区分实际锁版 SDK、Rust→受限 Node→Pi localhost、React/mock IPC 和包资源验证。没有新增原生 GUI、真实在线模型、Anki、飞书或鼠标/IME 验收。
 
-自动 focus、通用网络/文件/Bash 权限仍未新增。HTML 预览只改变阅读视图，不增加模型来源授权；嵌入原文仍作为普通不可信笔记内容，远程网页/视频不抓取或自动加入上下文。原版本投影参考保留 [pi-readcache MIT许可](../THIRD_PARTY_NOTICES/pi-readcache.txt)，未安装插件。
+课程内自动 Focus 已按 [Focus v1](../contracts/focus-v1.md) 冻结身份、视图与固定 Git 材料，沿原请求用于重试与来源显示；无课程 legacy 会话保留兼容路径。通用网络权限未新增。HTML 预览只改变阅读视图，不增加模型来源授权；嵌入原文仍作为普通不可信笔记内容，远程网页/视频不抓取或自动加入上下文。原版本投影参考保留 [pi-readcache MIT许可](../THIRD_PARTY_NOTICES/pi-readcache.txt)，未安装插件。
 
 最终练习 JSON 的修正沿同一原生会话和冻结来源进行，程序校验消息不作为用户新问题，也不重新冻结引用或增加来源授权；最多两次修正，来源越界不自动修正。详见原生会话契约的 `validate_output`。
 

@@ -11,6 +11,7 @@ mod desktop;
 pub mod drafts;
 pub mod feishu;
 pub mod generation;
+pub mod focus;
 pub mod learning_skills;
 pub mod learning_tools;
 pub mod model;

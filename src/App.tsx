@@ -1,3 +1,4 @@
+import { captureFocus } from './focus';
 import { InsertContent } from './EmbeddedContent';
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowLeft, ArrowRight, ArrowUp, CornerUpLeft, BookOpen, Check, CheckCheck, ChevronDown, ChevronRight, CircleHelp, Clock3, FileText, FolderOpen, Compass, Layers2, ListTodo, LoaderCircle, MoreHorizontal, Paperclip, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, PencilLine, Plus, Sparkles, Square, X } from 'lucide-react';
@@ -51,7 +52,7 @@ import { onGenerationProgress } from './native';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import type { GenerationProgress } from './native';
-import type { Bootstrap, Exercise, LibraryNode, LibraryTreeSnapshot, CourseAssetPreview, LearningSession, ModelSettings, ReviewCard, Section, Source, Task, UiDraft, RequestContext, ExplorationNote, TrashReceipt, ContextInjection, AssistantReference, Message, ExerciseReference, ExerciseReferenceSource, ExerciseReferencePart } from './types';
+import type { Bootstrap, Exercise, LibraryNode, LibraryTreeSnapshot, CourseAssetPreview, LearningSession, ModelSettings, ReviewCard, Section, Source, Task, UiDraft, RequestContext, ExplorationNote, TrashReceipt, ContextInjection, AssistantReference, Message, ExerciseReference, ExerciseReferenceSource, ExerciseReferencePart, FocusInput, FocusSnapshot } from './types';
 import { StationError } from './types';
 
 type View = 'lesson' | 'review' | 'tasks' | 'settings' | 'explorations' | 'history' | 'history-index' | 'trash';
@@ -82,10 +83,12 @@ export function App() {
   const [linkingMaterials, setLinkingMaterials] = useState(false);
   const linkWrites = useRef(new Set<string>());
   const [assetsOpen, setAssetsOpen] = useState(false);
+  const assetFocusRanges = useRef<{start:number;end:number}[]>([]);
+  const [focusedAsset, setFocusedAsset] = useState<CourseAssetPreview | null>(null);
   const [assetPreview, setAssetPreview] = useState<CourseAssetPreview | null>(null);
   const [assetLoading, setAssetLoading] = useState(false);
   const assetSequence = useRef(0);
-  const [practiceFailure, setPracticeFailure] = useState<{ operationId: string; sourceId: string; selection: string; prompt: string; injections: ContextInjection[]; assistantReferences: AssistantReference[]; exerciseReferences: ExerciseReference[]; userEntryId?: string; unknown: boolean; recovery?: boolean } | null>(null);
+  const [practiceFailure, setPracticeFailure] = useState<{ focus?: FocusSnapshot; focusInput?: FocusInput; operationId: string; sourceId: string; selection: string; prompt: string; injections: ContextInjection[]; assistantReferences: AssistantReference[]; exerciseReferences: ExerciseReference[]; userEntryId?: string; unknown: boolean; recovery?: boolean } | null>(null);
   const [historySession, setHistorySession] = useState<LearningSession | null>(null);
   const [historyError, setHistoryError] = useState('');
   const font = useFontSize();
@@ -167,7 +170,7 @@ export function App() {
   const [liveTools, setLiveTools] = useState<Record<string, ToolActivity[]>>({});
   const [activeRunId, setActiveRunId] = useState('');
   const [objectPreview, setObjectPreview] = useState<{ kind: string; id: string; title: string; body?: string; front?: string; back?: string; dueAt?: string; done?: boolean; reminderEnabled?: boolean } | null>(null);
-  useEffect(() => onGenerationProgress(progress => { if (progress.operationId !== busyRef.current) return; if (progress.userEntryConfirmed) { if (progress.mode === 'practice' && progress.userEntryId) confirmedPracticeUsers.current.set(progress.operationId, progress.userEntryId); consumeReferenceSnapshot(progress.operationId); } if (progress.content) setPartial(progress); if (progress.runId) setActiveRunId(progress.runId); if (progress.toolCalls) setLiveTools(old => ({ ...old, [progress.sessionId]: foldToolActivities([...(old[progress.sessionId] || []), ...progress.toolCalls!], progress.sessionId) })); if (progress.context) { if (contextInputs.current.sessionId === progress.sessionId) actualContextInputs.current = operationContextInputs.current.get(progress.operationId) || null; setContextView({ status: 'ready', actual: true, sessionId: progress.sessionId, context: progress.context }); } else if (progress.manifest) setContextView({ status: 'ready', actual: true, sessionId: progress.sessionId, context: { text: '', manifest: progress.manifest, warnings: [], truncated: false } }); if (progress.contextError) setContextView({ status: 'error', sessionId: progress.sessionId, error: progress.contextError }); }), []);
+  useEffect(() => onGenerationProgress(progress => { if (progress.operationId !== busyRef.current) return; if (progress.userEntryConfirmed) { if (progress.mode === 'practice' && progress.userEntryId) confirmedPracticeUsers.current.set(progress.operationId, progress.userEntryId); consumeReferenceSnapshot(progress.operationId); } if (progress.content) setPartial(progress); if (progress.runId) setActiveRunId(progress.runId); if (progress.toolCalls) setLiveTools(old => ({ ...old, [progress.sessionId]: foldToolActivities([...(old[progress.sessionId] || []), ...progress.toolCalls!], progress.sessionId) })); const frozen = operationContextInputs.current.get(progress.operationId); const visible = frozen?.sessionId === visibleSessionRef.current && frozen.documentId === activeIdRef.current; if (progress.context && visible) { actualContextInputs.current = frozen || null; setContextView({ status: 'ready', actual: true, sessionId: progress.sessionId, context: progress.context }); } else if (progress.manifest && visible) setContextView({ status: 'ready', actual: true, sessionId: progress.sessionId, context: { text: '', manifest: progress.manifest, warnings: [], truncated: false } }); if (progress.contextError && visible) setContextView({ status: 'error', sessionId: progress.sessionId, error: progress.contextError }); }), []);
   const busyRef = useRef('');
   const [aiError, setAiError] = useState('');
   const [importing, setImporting] = useState(false);
@@ -233,6 +236,7 @@ export function App() {
   const activeCourse = containingCourse(nodes, activeId) || boot.courses.find(course => course.sections.some(section => section.id === activeId));
 
   const notify = useCallback((message: string) => setToast(message), []);
+  useEffect(() => { setFocusedAsset(null); }, [activeId]);
   useEffect(() => { if (activeId) questionDrafts.current[activeId] = question; }, [activeId, question]);
   useEffect(() => { if (toast) { const timer = setTimeout(() => setToast(''), 4500); return () => clearTimeout(timer); } }, [toast]);
   const openSection = useCallback(async (id: string) => {
@@ -371,7 +375,7 @@ export function App() {
   useEffect(() => {
     const sequence = ++contextSequence.current;
     if (!session.id) { setContextView({ status: 'idle' }); return; }
-    if (busyId) { setContextView(old => old.sessionId === session.id && old.actual ? old : { status: 'loading', sessionId: session.id }); return; }
+    if (busyId) { setContextView(old => old.sessionId === session.id && old.actual && old.context?.focus?.documentId === activeId ? old : { status: 'loading', sessionId: session.id }); return; }
     const actual = actualContextInputs.current; const inputs = contextInputs.current;
     if (contextView.actual && contextView.sessionId === session.id && actual && Object.keys(inputs).every(key => actual[key as keyof typeof actual] === inputs[key as keyof typeof inputs])) return;
     if (current && current.body !== current.savedBody) { setContextView({ status: 'error', sessionId: session.id, error: '正文有未保存改动，保存后会重新核对来源。' }); return; }
@@ -453,22 +457,39 @@ export function App() {
       if(!locate()){setHistorySession(source);setHistoryError('');switchView('history');requestAnimationFrame(locate);}
     } catch(error){if(sequence===assistantQuoteSequence.current&&intent===navigationIntent.current)notify(errorText(error));}
   }
-  async function executeSend(item: OutgoingMessage, operationId: string) {
+  function focusInput(): FocusInput | undefined {
+    if (!current || !session.courseId) return;
+    const input = captureFocus(activeId, current.body, current.body === current.savedBody ? current.section.version : undefined, focusedAsset?.asset.courseId === courseId ? 'asset' : current.section.kind === 'exercise' ? 'exercise' : editing ? 'edit' : 'read', document.querySelector('.document-scroll'), editing ? editorRefs.current.get(activeId)?.visibleRanges() : undefined, focusedAsset?.asset.courseId === courseId ? focusedAsset.asset.id : undefined);
+    if (input.assetId) input.ranges = assetFocusRanges.current.map(r=>({...r}));
+    return input;
+  }
+  async function freezeFocus(input: FocusInput, target: string, selection: string, injections: ContextInjection[], assistantReferences: AssistantReference[], exerciseReferences: ExerciseReference[]): Promise<FocusSnapshot> {
+    await prepareSource(input.documentId);
+    return call<FocusSnapshot>('focus_freeze', { sessionId: target, input, selection, injections, assistantReferences, exerciseReferences });
+  }
+  async function executeSend(original: OutgoingMessage, operationId: string) {
+    let item = original;
     const target = { id: item.sessionId, sectionId: item.sectionId } as LearningSession;
     let userEntryId = item.userEntryId;
     try {
+      if (!item.focus && item.focusInput) {
+        const focus = await freezeFocus(item.focusInput, item.sessionId, item.selection, item.injections || [], item.assistantReferences || [], item.exerciseReferences || []);
+        item = { ...item, focus }; patchOutgoing(item.sendId, { focus });
+      }
       if (!userEntryId) {
-        const saved = await call<{ session: LearningSession; userEntryId: string }>('message_save', { sectionId: item.sectionId, documentId: item.documentId || item.sectionId, sessionId: item.sessionId, question: item.content, selection: item.selection, mode: item.mode, sendId: item.sendId, injections: item.injections || [], assistantReferences: item.assistantReferences || [], exerciseReferences: item.exerciseReferences || [] });
+        const saved = await call<{ session: LearningSession; userEntryId: string }>('message_save', { focus: item.focus, sectionId: item.sectionId, documentId: item.documentId || item.sectionId, sessionId: item.sessionId, question: item.content, selection: item.selection, mode: item.mode, sendId: item.sendId, injections: item.injections || [], assistantReferences: item.assistantReferences || [], exerciseReferences: item.exerciseReferences || [] });
         userEntryId = saved.userEntryId; patchOutgoing(item.sendId, { userEntryId }); updateTargetSession(saved.session);
       }
       patchOutgoing(item.sendId, { stage: 'preparing' });
-      await prepareSource(item.documentId || item.sectionId);
-      const context = await call<RequestContext>('context_load', { sessionId: item.sessionId, sectionId: item.sectionId, documentId: item.documentId || item.sectionId, selection: item.selection, injections: item.injections || [], assistantReferences: item.assistantReferences || [], exerciseReferences: item.exerciseReferences || [] });
+      if (!item.focus) await prepareSource(item.documentId || item.sectionId);
+      if (!item.focus) { const context = await call<RequestContext>('context_load', { sessionId: item.sessionId, sectionId: item.sectionId, documentId: item.documentId || item.sectionId, selection: item.selection, injections: item.injections || [], assistantReferences: item.assistantReferences || [], exerciseReferences: item.exerciseReferences || [] });
       if (visibleSessionRef.current === item.sessionId) setContextView({ status: 'loading', sessionId: item.sessionId, context });
+      }
       patchOutgoing(item.sendId, { stage: 'generating' });
-      const result = await call<LearningSession>('session_ask', { sectionId: item.sectionId, documentId: item.documentId || item.sectionId, sessionId: item.sessionId, mode: item.mode, question: item.content, selection: item.selection, userEntryId, operationId, injections: item.injections || [], assistantReferences: item.assistantReferences || [], exerciseReferences: item.exerciseReferences || [], resume: item.failureStage === 'unknown' });
+      const result = await call<LearningSession>('session_ask', { focus: item.focus, sectionId: item.sectionId, documentId: item.documentId || item.sectionId, sessionId: item.sessionId, mode: item.mode, question: item.content, selection: item.selection, userEntryId, operationId, injections: item.injections || [], assistantReferences: item.assistantReferences || [], exerciseReferences: item.exerciseReferences || [], resume: item.failureStage === 'unknown' });
       updateTargetSession(result, item.detached); patchOutgoing(item.sendId, { stage: 'done', error: undefined, failureStage: undefined });
     } catch (error) {
+      if (!userEntryId && item.focusInput && !item.focus && visibleSessionRef.current === item.sessionId && activeIdRef.current === item.documentId) setQuestion(old => old || item.content);
       const details = error instanceof StationError ? error.details as { sendStage?: string } | undefined : undefined;
       patchOutgoing(item.sendId, { stage: 'failed', userEntryId, error: modelFailureMessage(error, 'generation'), failureStage: !userEntryId ? 'save' : details?.sendStage === 'unknown' ? 'unknown' : 'generation' });
     } finally {
@@ -484,7 +505,7 @@ export function App() {
     if (!modelReady) { notify(modelBlocked ? '此模型用途受限，请查看供应商设置。问题仍保留，未发送请求。' : '请先保存供应商连接，问题仍保留。'); openSettings(); return; }
     const operationId = makeId();
     operationContextInputs.current.set(operationId, { ...contextInputs.current });
-    const item: OutgoingMessage = { sendId: makeId(), operationId, sessionId: session.id, sectionId: session.sectionId, detached: false, documentId: activeId, mode: isExplorationDocument(nodesRef.current, activeId, explorationFolderId.current) ? 'explore' : 'explain', content: value, selection: requestSelection, injections: freezeInjections(injectionsRef.current[session.id] || []), assistantReferences: freezeAssistantReferences(assistantReferencesRef.current[session.id] || []), exerciseReferences: freezeExerciseReferences(exerciseReferencesRef.current[session.id] || []), createdAt: new Date().toISOString(), stage: 'saving' };
+    const item: OutgoingMessage = { focusInput: focusInput(), sendId: makeId(), operationId, sessionId: session.id, sectionId: session.sectionId, detached: false, documentId: activeId, mode: isExplorationDocument(nodesRef.current, activeId, explorationFolderId.current) ? 'explore' : 'explain', content: value, selection: requestSelection, injections: freezeInjections(injectionsRef.current[session.id] || []), assistantReferences: freezeAssistantReferences(assistantReferencesRef.current[session.id] || []), exerciseReferences: freezeExerciseReferences(exerciseReferencesRef.current[session.id] || []), createdAt: new Date().toISOString(), stage: 'saving' };
     busyRef.current = operationId; setBusyId(operationId); setPartial(null); setActiveRunId(''); setAiError('');
     rememberReferenceConsumption(item.sendId, item.sessionId, activeId, item.selection);
     updateOutgoing(items => [...items, item]);
@@ -525,9 +546,9 @@ export function App() {
     if (previous) { const old = referenceConsumption.current.get(previous.operationId); if (old) { referenceConsumption.current.set(id, old); if (id !== previous.operationId) referenceConsumption.current.delete(previous.operationId); } } else rememberReferenceConsumption(id, session.id, activeId, selected);
     operationContextInputs.current.set(id, operationContextInputs.current.get(previous?.operationId || '') || { ...contextInputs.current });
     busyRef.current = id; setBusyId(id); setPartial(null); setAiError('');
-    const sourceId = activeId; let succeeded = false;
-    try { await prepareSource(sourceId); const result = await call<LearningSession>('exercise_generate', { sectionId: sourceId, documentId: sourceId, sessionId: session.id, selection: selected, prompt, injections: frozen, assistantReferences: frozenAnswers, exerciseReferences: frozenExercises, userEntryId: previous?.userEntryId, operationId: id, resume: previous?.unknown === true }); updateTargetSession(result); setPracticeFailure(null); succeeded = true; }
-    catch (error) { const details = error instanceof StationError ? error.details as { sendStage?: string; recovery?: string } | undefined : undefined; const recovery = details?.recovery === 'same-operation'; const unknown = recovery || details?.sendStage === 'unknown'; setPracticeFailure({ operationId: id, sourceId, selection: selected, prompt, injections: frozen, assistantReferences: frozenAnswers, exerciseReferences: frozenExercises, userEntryId: confirmedPracticeUsers.current.get(id) || previous?.userEntryId, unknown, recovery }); if (busyRef.current === id) setAiError(modelFailureMessage(error, 'generation')); }
+    const sourceId = activeId; const input = previous?.focusInput || focusInput(); let focus = previous?.focus; let succeeded = false;
+    try { if (!focus && input) focus = await freezeFocus(input, session.id, selected, frozen, frozenAnswers, frozenExercises); if (!focus) await prepareSource(sourceId); const result = await call<LearningSession>('exercise_generate', { focus, sectionId: sourceId, documentId: sourceId, sessionId: session.id, selection: selected, prompt, injections: frozen, assistantReferences: frozenAnswers, exerciseReferences: frozenExercises, userEntryId: previous?.userEntryId, operationId: id, resume: previous?.unknown === true }); updateTargetSession(result); setPracticeFailure(null); succeeded = true; }
+    catch (error) { const details = error instanceof StationError ? error.details as { sendStage?: string; recovery?: string } | undefined : undefined; const recovery = details?.recovery === 'same-operation'; const unknown = recovery || details?.sendStage === 'unknown'; setPracticeFailure({ focus, focusInput: input, operationId: id, sourceId, selection: selected, prompt, injections: frozen, assistantReferences: frozenAnswers, exerciseReferences: frozenExercises, userEntryId: confirmedPracticeUsers.current.get(id) || previous?.userEntryId, unknown, recovery }); if (busyRef.current === id) setAiError(modelFailureMessage(error, 'generation')); }
     finally { const tree = await refreshTree(); await refreshAfterGeneration(session, false); if (busyRef.current === id) { busyRef.current = ''; setBusyId(''); } if (succeeded && activeIdRef.current === sourceId) { const child = tree?.nodes.filter(node => node.parentId === sourceId && node.kind === 'exercise').at(-1); if (child) await openSection(child.id); } }
   }
   async function submitAnswer(exercise: Exercise, answer: string) {
@@ -725,9 +746,9 @@ export function App() {
           <div className="document-scroll" onMouseUp={selectText} onKeyUp={selectText} onContextMenu={event=>{if(!current||isContainer||current.section.kind==='exercise')return;event.preventDefault();const chosen=window.getSelection()?.toString()||selection;setInjectionMenu({id:activeId,selection:chosen||undefined,x:Math.min(event.clientX,window.innerWidth-230),y:Math.min(event.clientY,window.innerHeight-130)});}}>
             {assetsOpen && courseId && <CourseAssets key={courseId} courseId={courseId} onInsert={insertAsset} onPreview={setAssetPreview}/>}
             {isContainer && <div className="folder-contents"><h2>{current.section.kind === 'course' ? '课程内容' : '文件夹内容'}</h2>{nodes.filter(node=>node.parentId===activeId).length ? nodes.filter(node=>node.parentId===activeId).map(node=><button key={node.id} className="folder-child" onClick={()=>{void openSection(node.id);}}><FileText size={15}/><span>{node.title}</span><ChevronRight size={14}/></button>) : <p className="muted">这里还没有内容。上方可以添加材料、文件夹或探索。</p>}</div>}
-            {current.section.kind === 'exercise' && !editing && <section className="exercise-workspace" aria-label="练习作答"><p className="muted small">题目与评分读取原始学习记录，编辑下方 Markdown 不会更改评分依据。</p>{session.exercises.filter(exercise=>!current.section.exerciseEntryId || exercise.entryId===current.section.exerciseEntryId).map(exercise=><ExerciseCard key={exercise.id} exercise={exercise} sessionId={exercise.sessionId || session.id} canGrade={modelReady} onRefresh={async()=>{updateTargetSession(await call<LearningSession>('session_refresh',{sectionId:activeId,sessionId:exercise.sessionId || session.id}));}} onReferenceSelection={(part,entryId,selected,position)=>{void quoteExercise(activeId,exercise.sessionId || session.id,exercise.id,part,entryId,selected,position);}} onAnswer={answer=>submitAnswer(exercise,answer)} onReason={reason=>saveReason(exercise,reason)}/>)}<details className="exercise-markdown"><summary>明确展开参考与完整 Markdown</summary><Markdown text={current.body} courseId={courseId} onAsset={(id,assetId)=>{void openAsset(id,assetId);}}/></details></section>}
+            {current.section.kind === 'exercise' && !editing && <section className="exercise-workspace" aria-label="练习作答"><p className="muted small">题目与评分读取原始学习记录，编辑下方 Markdown 不会更改评分依据。</p>{session.exercises.filter(exercise=>!current.section.exerciseEntryId || exercise.entryId===current.section.exerciseEntryId).map(exercise=><ExerciseCard key={exercise.id} exercise={exercise} sessionId={exercise.sessionId || session.id} canGrade={modelReady} onRefresh={async()=>{updateTargetSession(await call<LearningSession>('session_refresh',{sectionId:activeId,sessionId:exercise.sessionId || session.id}));}} onReferenceSelection={(part,entryId,selected,position)=>{void quoteExercise(activeId,exercise.sessionId || session.id,exercise.id,part,entryId,selected,position);}} onAnswer={answer=>submitAnswer(exercise,answer)} onReason={reason=>saveReason(exercise,reason)}/>)}<details className="exercise-markdown"><summary>明确展开参考与完整 Markdown</summary><Markdown text={current.body} focus courseId={courseId} onAsset={(id,assetId)=>{void openAsset(id,assetId);}}/></details></section>}
             {current.section.kind !== 'exercise' && !isContainer && session.exercises.length > 0 && <details className="legacy-exercises"><summary>本页练习记录 · {session.exercises.length} 题</summary>{[...new Map(session.exercises.filter(exercise=>exercise.entryId).map(exercise=>[exercise.entryId!,exercise])).values()].map(exercise=><button key={exercise.entryId} className="quiet-button" onClick={()=>{void openExerciseEntry(exercise.entryId!);}}>打开练习文档 · {exercise.prompt.slice(0,36)}</button>)}</details>}
-            {!editing && current.section.kind !== 'exercise' && <div className="reading-content" tabIndex={0}><Markdown text={current.body} courseId={courseId} onAsset={(id,assetId)=>{void openAsset(id,assetId);}} className={current.body.split('\n')[0].replace(/^#\s+/, '').trim().toLowerCase() === current.section.title.replace(/^\d+\s*[·.、-]\s*/, '').trim().toLowerCase() ? 'hide-redundant-title' : ''} /><div className="reading-end"><span /><BookOpen size={15} /><span /></div></div>}
+            {!editing && current.section.kind !== 'exercise' && <div className="reading-content" tabIndex={0}><Markdown text={current.body} focus courseId={courseId} onAsset={(id,assetId)=>{void openAsset(id,assetId);}} className={current.body.split('\n')[0].replace(/^#\s+/, '').trim().toLowerCase() === current.section.title.replace(/^\d+\s*[·.、-]\s*/, '').trim().toLowerCase() ? 'hide-redundant-title' : ''} /><div className="reading-end"><span /><BookOpen size={15} /><span /></div></div>}
             {Object.entries(docs).filter(([id]) => editedIds.has(id)).map(([id, doc]) => <div key={id} className="document-editor" hidden={!editing || activeId !== id}><Suspense fallback={<div className="muted small">正在打开编辑器…</div>}><Editor ref={handle=>{if(handle)editorRefs.current.set(id,handle);else editorRefs.current.delete(id);}} initial={doc.body} onReady={() => { const started = editorStartedAt.current[id]; if (started !== undefined) { recordMetric('editor-ready', performance.now() - started); delete editorStartedAt.current[id]; } }} onChange={body => changeBody(id, body)} onSelection={value=>{if(activeIdRef.current===id && doc.section.kind !== 'exercise')setSelection(value);}} onSave={() => { void save(id); }} /></Suspense></div>)}
           </div>
 
@@ -746,6 +767,7 @@ export function App() {
 
     {view === 'lesson' && !isContainer && <aside className="assistant-panel"><AssistantResizeHandle width={assistantWidth.width} onChange={assistantWidth.setWidth} /><div className="assistant-heading"><span className="assistant-mark"><Sparkles size={17} /></span><div><h2>一起读明白</h2><p>顺着你的问题，往前一步</p></div></div>
       {assistantWidth.error && <div className="inline-error" role="status">面板宽度尚未保存：{assistantWidth.error}<button onClick={() => { void assistantWidth.flush().catch(() => undefined); }}>重试保存</button></div>}
+      {focusedAsset?.asset.courseId === courseId && <p className="context-loading">聚焦资料：{focusedAsset.asset.fileName}<button className="text-reference" onClick={()=>setFocusedAsset(null)}>回到正文</button></p>}
       <SelectionContextTray references={composerRefs} busy={!!busyId} onRemove={removeComposerReference} onAsk={() => openPanel('explain', '请帮我理解这段内容。')} onPractice={() => openPanel('practice')} onReview={quote => setCardDraft({ front: quote, back: '', sessionId: session.id, sectionId: session.sectionId })}/>
       {!!session.legacySessionIds?.length && <div className="model-prompt">本课程已使用共享对话。原有 {session.legacySessionIds.length} 段对话已备份并保留。<button className="text-back" onClick={()=>switchView('history-index')}>查看学习历史</button></div>}
       <div className="assistant-scroll">
@@ -774,7 +796,7 @@ export function App() {
     {creatingNode && <Dialog title="新建学习内容" description="课程、目录、正文都保存在本机；之后可以整理到其他目录。" onClose={()=>setCreatingNode(null)}><CreateNodeForm nodes={nodes} defaultKind={creatingNode} parentId={isContainer ? activeId : current?.section.parentId || undefined} onCreated={section=>{void acceptCreated(section);}}/></Dialog>}
     {linkingMaterials && current && <Dialog title="关联本页的材料" description="保存成功后才会改变实际来源；提问、选区与学习记录仍属于当前笔记。" onClose={()=>setLinkingMaterials(false)}><LinkedMaterials section={current.section} nodes={nodes} onSave={links=>saveLinks(current.section.id,links)}/></Dialog>}
     {movingNode && current && <Dialog title="整理到其他目录" description="只改变持久目录归属，稳定编号与学习记录保持关联。" onClose={()=>setMovingNode(false)}><MoveNodeForm node={current.section} nodes={nodes} onMoved={section=>{setMovingNode(false);setDocs(old=>({...old,[section.id]:{...old[section.id],section,savedBody:section.body}}));void refreshTree();}}/></Dialog>}
-    {(assetLoading || assetPreview) && <Dialog title={assetPreview?.asset.fileName || '正在读取本机资料'} description="课程资料只读预览，不执行代码、不载入远程内容。" onClose={()=>{assetSequence.current++;setAssetLoading(false);setAssetPreview(null);}}>{assetLoading ? <p className="context-loading"><LoaderCircle size={15} className="spin"/>正在读取本课程资料…</p> : assetPreview && <AssetPreviewContent preview={assetPreview}/>}</Dialog>}
+    {(assetLoading || assetPreview) && <Dialog title={assetPreview?.asset.fileName || '正在读取本机资料'} description="课程资料只读预览，不执行代码、不载入远程内容。" onClose={()=>{assetSequence.current++;setAssetLoading(false);setAssetPreview(null);}}>{assetLoading ? <p className="context-loading"><LoaderCircle size={15} className="spin"/>正在读取本课程资料…</p> : assetPreview && <><AssetPreviewContent preview={assetPreview}/>{session.courseId && <button className="quiet-button" onClick={()=>{assetFocusRanges.current = assetPreview.text !== undefined ? captureFocus(activeId, assetPreview.text, undefined, 'read', document.querySelector('.asset-preview')).ranges : [];setFocusedAsset(assetPreview);setAssetPreview(null);requestAnimationFrame(()=>questionRef.current?.focus());}}>就这份资料提问</button>}</>}</Dialog>}
     {objectPreview && <Dialog title={objectPreview.kind === 'todo' ? '已保存的待办' : objectPreview.title} description="从本机真实记录打开，未重新调用模型或工具。" onClose={() => setObjectPreview(null)}>{objectPreview.kind === 'todo' ? <><h3>{objectPreview.title}</h3><p>{objectPreview.done ? '已完成' : '待完成'} · {objectPreview.reminderEnabled ? '提醒已开启' : '提醒关闭'}</p>{objectPreview.dueAt && <p>{new Date(objectPreview.dueAt).toLocaleString('zh-CN')}</p>}<button className="quiet-button" onClick={() => { setObjectPreview(null); switchView('tasks'); }}>到学习待办</button></> : <><Markdown text={objectPreview.front || objectPreview.body || ''} />{objectPreview.back && <Markdown text={objectPreview.back} />}</>}</Dialog>}
     {backupConflict && <Dialog title="找回了之前的草稿" description="旧草稿还没有被覆盖。请对照正文与未发送的问题，再选择保留哪份输入。" onClose={() => setBackupConflict(null)}><div className="conflict-compare">{[{ label: '当前窗口输入', data: currentDraftData(backupConflict.key) }, { label: '找回的旧草稿', data: backupConflict.data }].map(item => <div key={item.label}><h3>{item.label}</h3>{backupConflict.key === 'workspace' ? <><h4>小节名称</h4><p>{item.data.importTitle || '（空）'}</p><h4>正文</h4><Markdown text={item.data.importBody || '（空）'} /></> : <><h4>正文</h4><Markdown text={item.data.body || '（空）'} /><h4>未发送的问题</h4><p className="draft-question">{item.data.question || '（空）'}</p></>}</div>)}</div><div className="dialog-footer"><button className="quiet-button" onClick={() => { void resolveBackup(true); }}>使用找回的草稿</button><button className="primary-button" onClick={() => { void resolveBackup(false); }}>保留当前输入并备份</button></div></Dialog>}
     {manualExercise && <ManualExerciseDialog sectionId={activeId} sessionId={session.id} onClose={() => setManualExercise(false)} onSaved={result => { updateTargetSession(result.session); setManualExercise(false); void acceptCreated(result.document); notify('练习子文档已保存，可以开始作答。'); }} />}
