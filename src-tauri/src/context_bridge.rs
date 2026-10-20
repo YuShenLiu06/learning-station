@@ -115,6 +115,8 @@ impl ContextBridge {
         metadata.remove("userGoal");
         if let Some(document) = &request.document_id { metadata.insert("activeDocumentId".into(), json!(document)); }
         if let Some(focus) = &request.focus { metadata.insert("focus".into(), json!(focus)); }
+        let metadata_only_ids: Vec<_> = ctx.manifest.iter().filter(|m| m.included_chars == 0 && !ctx.automatic_materials.iter().any(|a|a.id==m.id)).map(|m|m.id.clone()).collect();
+        if !metadata_only_ids.is_empty() { metadata.insert("metadataOnlySourceIds".into(), json!(metadata_only_ids)); }
         let question = metadata.remove("question").unwrap_or(json!(""));
         let (materials, references) = projection.provider_texts(ctx)?;
         let mut store = Self::default();
@@ -165,14 +167,28 @@ impl ContextBridge {
             .chain(&ctx.assistant_reference_manifest)
             .chain(&ctx.exercise_reference_manifest)
         {
-            entries.push(json!({"id":format!("reference:{}",m.id),"kind":"reference","status":"added","sourceId":m.id,"version":m.version,"includedChars":m.included_chars,"reason":"explicit_one_shot"}));
+            let metadata_only = metadata_only_ids.contains(&m.id);
+            entries.push(json!({"id":format!("reference:{}",m.id),"kind":if metadata_only { "material" } else { "reference" },"status":"added","sourceId":m.id,"version":m.version,"includedChars":m.included_chars,"reason":if metadata_only { "material_metadata_only" } else { "explicit_one_shot" }}));
         }
         if !request.selection.is_empty() {
             entries.push(json!({"id":"selection","kind":"reference","status":"added","sourceId":request.document_id.as_deref().unwrap_or(&session.section_id),"version":hash(&request.selection),"includedChars":request.selection.chars().count(),"reason":"explicit_one_shot"}));
         }
+        let mut focus_text = String::new();
+        if let Some(focus) = &request.focus {
+            let source = focus.asset.as_ref().and_then(|a|a["id"].as_str()).unwrap_or(&focus.document_id);
+            if focus.paragraphs.is_empty() { entries.push(json!({"id":"focus","kind":"turn","status":"added","sourceId":source,"version":focus.document_version,"includedChars":0,"reason":"focus_metadata_only"})); }
+            for (index, part) in focus.paragraphs.iter().enumerate() {
+                let text = part["text"].as_str().unwrap_or_default(); focus_text.push_str(text);
+                let mut entry = json!({"id":format!("focus:{index}"),"kind":"turn","status":"added","sourceId":source,"version":focus.document_version,"includedChars":text.chars().count(),"reason":"focus_visible_body"});
+                if part["startChar"].is_u64() && part["endChar"].is_u64() && part["totalBytes"].is_u64() {
+                    entry["range"] = json!({"startChar":part["startChar"],"endChar":part["endChar"],"totalBytes":part["totalBytes"],"complete":part["startChar"]==0 && part["endChar"]==part["totalChars"]});
+                }
+                entries.push(entry);
+            }
+        }
         entries.push(json!({"id":"request-time","kind":"turn","status":"added","version":hash(&serde_json::to_string(&time)?),"includedChars":serde_json::to_string(&time)?.chars().count(),"reason":"frozen_current_turn"}));
         entries.push(json!({"id":"context-protocol","kind":"stable","status":"retained","version":"1","includedChars":serde_json::to_string(&store.parts["stable"].value)?.chars().count(),"reason":"projection_protocol"}));
-        let manifest = json!({"version":1,"entries":entries,"projectedChars":projection.text.chars().count(),"projectedBytes":projection.text.len()});
+        let manifest = json!({"version":1,"entries":entries,"projectedChars":projection.text.chars().count()+focus_text.chars().count(),"projectedBytes":projection.text.len()+focus_text.len()});
         let mut messages = store.assemble()?;
         let content = messages[0]["content"].as_str().unwrap_or_default();
         // The exact same immutable inventory is transmitted, stored on Run, and shown by the UI.

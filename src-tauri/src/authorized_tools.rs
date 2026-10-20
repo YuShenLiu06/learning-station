@@ -310,7 +310,18 @@ fn execute_read(
             let mut core = engine.lock()?;
             if let Some(focus) = &run.focus {
                 let session = crate::sessions::get(&mut core.content, &scope.session_id)?;
-                crate::focus::load(&mut core, &session, focus)?;
+                let frozen = crate::focus::load(&mut core, &session, focus)?;
+                if let Some(path) = frozen.asset_path(&source_id) {
+                    let asset = crate::assets::list(&core.content, &focus.course_id)?.into_iter().find(|a| a.id == source_id && a.sha256 == item.version).ok_or_else(out_of_scope)?;
+                    if !matches!(asset.mime.as_str(), "text/plain" | "text/markdown" | "text/csv" | "application/json") {
+                        return Err(CoreError::new("UNSUPPORTED_TYPE", "该附件没有受支持的文本正文；图片/PDF仍只提供元数据，未将图片字节冒充文本。"));
+                    }
+                    let bytes = crate::focus::open_materials(&core)?.read(&focus.course_id, &focus.commit_hash, path)?;
+                    let text = std::str::from_utf8(&bytes).map_err(|_| out_of_scope())?;
+                    if crate::content::hash(text) != item.version { return Err(CoreError::new("CONFLICT", "资料与本轮固定版本不一致。")); }
+                    let (content, truncated) = bounded_text(text, MAX_READ_BYTES);
+                    return Ok(json!({"sessionId":scope.session_id,"sourceId":source_id,"path":path,"title":path.rsplit('/').next(),"kind":"asset","version":item.version,"includedChars":content.chars().count(),"content":content,"truncated":truncated,"manifestRole":"user-reference"}));
+                }
                 crate::focus::read_document(&core, focus, &source_id)?
             } else { core.content.read(&source_id)? }
         };

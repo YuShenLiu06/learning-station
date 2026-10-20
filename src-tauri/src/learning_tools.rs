@@ -713,6 +713,7 @@ fn query_knowledge(
         {
             continue;
         }
+        if frozen.is_some_and(|f| f.asset_path(&item.id).is_some()) { continue; }
         let document = if let Some(frozen) = frozen { crate::focus::read_document(core, &frozen.focus, &item.id)? } else { store.read(&item.id)? };
         if !matches!(document.metadata.kind.as_str(), "section" | "knowledge") {
             continue;

@@ -67,3 +67,5 @@ Focus 切换时，native 的历史授权集合保留仍属于该课程的已见�
 ## 本轮 Focus
 
 本轮 metadata 携带 [Focus v1](focus-v1.md) 的冻结对象，含课程、焦点文档、原来源文档、视图及固定 Git OID。它与本次 nativeMaterials 来自同次冻结；重试沿原 Focus，Pi 仍独占消息/压缩管理。本层不建立材料接收基准。
+
+Focus 的 `metadataOnlySourceIds` 由 Rust 冻结 Context 生成并限制在本轮授权来源内。Pi 排除这些来源此前的自动材料投影，保留普通历史与用户主动引用；后续恢复文本时重新载入真实完整基准。Git binary 判定仅控制自动投影，不替代 read 工具的类型与授权校验。

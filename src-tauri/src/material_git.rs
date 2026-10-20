@@ -660,3 +660,6 @@ fn limit() -> CoreError {
 #[cfg(test)]
 #[path = "material_git_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+pub(crate) use tests::retry_busy;

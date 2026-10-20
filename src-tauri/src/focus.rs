@@ -3,13 +3,15 @@ use crate::{app::{atomic_json, Core}, automatic_context::MaterialSnapshot, conte
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, fs};
+use std::{collections::{BTreeMap, BTreeSet}, fs};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Focus {
     pub id: String,
     pub course_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub session_id: String,
     pub document_id: String,
     pub source_document_id: String,
     pub path: String,
@@ -19,6 +21,8 @@ pub struct Focus {
     pub excluded_files: Vec<crate::material_git::ExcludedFile>,
     pub document_version: String,
     pub view: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub binary: bool,
     pub paragraphs: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exercise: Option<Value>,
@@ -57,6 +61,7 @@ pub struct Frozen {
     assets: BTreeMap<String, String>,
     requested: context::RequestedContext,
 }
+fn is_false(value: &bool) -> bool { !*value }
 fn conflict() -> CoreError { CoreError::new("CONTEXT_CONFLICT", "聚焦材料或冻结快照不一致，原问题保留；请重新核对。") }
 fn directory(core: &Core) -> Result<std::path::PathBuf> {
     let path = core.state_dir.join("focus");
@@ -84,8 +89,25 @@ fn paragraphs(body: &str, ranges: &[Range]) -> Result<Vec<Value>> {
         let text = body.get(offset(r.start).ok_or_else(conflict)?..offset(r.end).ok_or_else(conflict)?).ok_or_else(conflict)?;
         chars += text.chars().count(); previous = r.end;
         if chars > 8000 { return Err(conflict()); }
-        Ok(json!({"start":r.start,"end":r.end,"text":text}))
+        Ok(json!({"start":r.start,"end":r.end,"startChar":body[..offset(r.start).unwrap()].chars().count(),"endChar":body[..offset(r.end).unwrap()].chars().count(),"totalChars":body.chars().count(),"totalBytes":body.len(),"text":text}))
     }).collect()
+}
+// Remove only automatically supplied bodies by trusted Context byte spans, never text matching.
+fn metadata_only(ctx: &mut Context, binary_ids: &BTreeSet<String>) -> Result<()> {
+    let mut text = String::new(); let mut cursor = 0; let mut retained = Vec::new();
+    for mut source in std::mem::take(&mut ctx.automatic_materials) {
+        let start = source.start; let end = source.end;
+        if start < cursor || end < start || end > ctx.text.len() || !ctx.text.is_char_boundary(start) || !ctx.text.is_char_boundary(end) { return Err(conflict()); }
+        text.push_str(&ctx.text[cursor..start]);
+        if binary_ids.contains(&source.id) {
+            for item in ctx.manifest.iter_mut().filter(|m| m.id == source.id) { item.included_chars = 0; }
+            ctx.warnings.push(format!("BINARY_MATERIAL_METADATA_ONLY: {} Git检查点判为二进制，自动材料仅保留元数据。",source.id));
+        } else {
+            source.start = text.len(); text.push_str(&ctx.text[start..end]); source.end = text.len(); retained.push(source);
+        }
+        cursor = end;
+    }
+    text.push_str(&ctx.text[cursor..]); ctx.text = text; ctx.automatic_materials = retained; Ok(())
 }
 pub fn freeze(core: &mut Core, request: FreezeRequest) -> Result<Focus> {
     let i = &request.input;
@@ -100,6 +122,7 @@ pub fn freeze(core: &mut Core, request: FreezeRequest) -> Result<Focus> {
     let frozen = FrozenMaterials::capture(&core.content, &course)?;
     let git = repository(core)?;
     let cp = git.commit(&frozen, None)?;
+    let binary_paths: BTreeSet<_> = git.compare(&course, None, &cp.checkpoint_commit_oid, None)?.changes.into_iter().filter(|f|f.binary).map(|f|f.path).collect();
     let assets: BTreeMap<_, _> = crate::assets::list(&core.content, &course)?.into_iter().map(|a| Ok((a.id.clone(), crate::material_git::attachment_path(&a.id, &a.file_name)?))).collect::<Result<_>>()?;
     // Verify every included source against the same fixed checkpoint, including explicit sources.
     for m in &ctx.manifest {
@@ -107,12 +130,15 @@ pub fn freeze(core: &mut Core, request: FreezeRequest) -> Result<Focus> {
         let bytes = git.read(&course, &cp.checkpoint_commit_oid, &path)?;
         if content::hash(std::str::from_utf8(&bytes).map_err(|_| conflict())?) != m.version { return Err(conflict()); }
     }
+    let binary_ids = ctx.automatic_materials.iter().filter(|m| binary_paths.contains(&assets.get(&m.id).cloned().unwrap_or_else(||format!("documents/{}.md",m.id)))).map(|m|m.id.clone()).collect();
+    metadata_only(&mut ctx, &binary_ids)?;
     let raw = git.read(&course, &cp.checkpoint_commit_oid, &format!("documents/{}.md", i.document_id))?;
     if content::hash(std::str::from_utf8(&raw).map_err(|_| conflict())?) != document.version { return Err(conflict()); }
-    let mut focus = Focus { id: String::new(), course_id: course.clone(), document_id: i.document_id.clone(), source_document_id: crate::course_sessions::source(&core.content, &session, &i.document_id)?, path: format!("documents/{}.md", i.document_id), r#type: "markdown".into(), commit_hash: cp.checkpoint_commit_oid, material_tree_oid: cp.material_tree_oid, excluded_files: cp.excluded_files, document_version: document.version, view: i.view.clone(), paragraphs: vec![], exercise: None, asset: None };
-    if document.metadata.kind == "exercise" {
+    let mut focus = Focus { id: String::new(), course_id: course.clone(), session_id: session.id.clone(), document_id: i.document_id.clone(), source_document_id: crate::course_sessions::source(&core.content, &session, &i.document_id)?, path: format!("documents/{}.md", i.document_id), r#type: "markdown".into(), commit_hash: cp.checkpoint_commit_oid, material_tree_oid: cp.material_tree_oid, excluded_files: cp.excluded_files, document_version: document.version, view: i.view.clone(), binary: binary_paths.contains(&format!("documents/{}.md",i.document_id)), paragraphs: vec![], exercise: None, asset: None };
+    if document.metadata.kind == "exercise" && i.asset_id.is_none() {
         if i.view != "exercise" && i.view != "edit" { return Err(conflict()); }
         focus.r#type = "exercise".into();
+        if i.view == "exercise" || i.question_id.is_some() {
         let origin = crate::exercises::get(&mut core.content, &i.document_id)?;
         let questions = origin.exercises["exercises"].as_array().ok_or_else(conflict)?;
         let (number, question) = questions.iter().enumerate().find(|(_, q)| i.question_id.as_deref().is_none_or(|id| q["id"].as_str() == Some(id))).ok_or_else(conflict)?;
@@ -120,21 +146,27 @@ pub fn freeze(core: &mut Core, request: FreezeRequest) -> Result<Focus> {
         let attempt = origin.session.entries.iter().rev().find(|e| e.kind == "attempt" && e.data.as_ref().is_some_and(|d| d["exerciseId"] == id));
         let graded = attempt.is_some_and(|a| origin.session.entries.iter().any(|e| e.kind == "feedback" && e.data.as_ref().is_some_and(|d| d["attemptId"] == a.id)));
         focus.exercise = Some(json!({"questionId":id,"number":number+1,"answered":attempt.is_some(),"graded":graded}));
+        }
         // Exercise Markdown contains reference answers: never auto-project its visible text.
     } else if let Some(asset_id) = &i.asset_id {
         if i.view != "asset" { return Err(conflict()); }
         let asset = crate::assets::list(&core.content, &course)?.into_iter().find(|a| &a.id == asset_id).ok_or_else(conflict)?;
-        focus.path = assets.get(asset_id).ok_or_else(conflict)?.clone();
+        focus.path = assets.get(asset_id).ok_or_else(conflict)?.clone(); focus.binary = binary_paths.contains(&focus.path);
         let bytes = git.read(&course, &focus.commit_hash, &focus.path)?;
         if format!("{:x}", Sha256::digest(&bytes)) != asset.sha256 { return Err(conflict()); }
         focus.r#type = if asset.mime.starts_with("image/") { "image" } else if asset.mime == "application/pdf" { "pdf" } else { "text" }.into();
         focus.document_version = asset.sha256;
         focus.asset = Some(json!({"id":asset.id,"mime":asset.mime,"size":asset.size}));
         // Binary previews provide identity only; text attachments use the same bounded ranges.
-        if focus.r#type == "text" { focus.paragraphs = paragraphs(std::str::from_utf8(&bytes).map_err(|_| conflict())?, &i.ranges)?; }
+        if focus.r#type == "text" && !focus.binary { focus.paragraphs = paragraphs(std::str::from_utf8(&bytes).map_err(|_| conflict())?, &i.ranges)?; }
+        if !ctx.manifest.iter().any(|m| m.id == *asset_id) {
+            if ctx.manifest.len() >= crate::context::MAX_CONTEXT_DOCUMENTS { return Err(CoreError::new("LIMIT_EXCEEDED", "聚焦附件超过来源预算。")); }
+            ctx.manifest.push(ManifestItem { id: asset_id.clone(), path: focus.path.clone(), version: focus.document_version.clone(), included_chars: focus.paragraphs.iter().filter_map(|p|p["text"].as_str()).map(|s|s.chars().count()).sum() });
+        }
+
     } else {
         if i.view != "read" && i.view != "edit" { return Err(conflict()); }
-        focus.paragraphs = paragraphs(&document.body, &i.ranges)?;
+        if !focus.binary { focus.paragraphs = paragraphs(&document.body, &i.ranges)?; }
     }
     let mut record = Frozen { focus, materials: ctx.automatic_materials.clone(), context: ctx, assets, requested: context::RequestedContext { focus: None, document_id: i.document_id.clone(), selection: request.selection, injections: request.injections, assistant_references: request.assistant_references, exercise_references: request.exercise_references } };
     record.focus.id = hash(&serde_json::to_string(&record)?);
@@ -142,6 +174,7 @@ pub fn freeze(core: &mut Core, request: FreezeRequest) -> Result<Focus> {
     Ok(record.focus)
 }
 pub fn load(core: &mut Core, session: &Session, focus: &Focus) -> Result<Frozen> {
+    if !focus.session_id.is_empty() && focus.session_id != session.id { return Err(conflict()); }
     if focus.id.len() != 64 || !focus.id.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) { return Err(conflict()); }
     let path = directory(core)?.join(format!("{}.json", focus.id));
     let meta = fs::symlink_metadata(&path)?;
@@ -170,6 +203,7 @@ pub fn load(core: &mut Core, session: &Session, focus: &Focus) -> Result<Frozen>
     Ok(record)
 }
 impl Frozen {
+    pub fn asset_path(&self, id: &str) -> Option<&str> { self.assets.get(id).map(String::as_str) }
     pub fn matches(&self, request: &crate::generation::GenerationRequest) -> Result<bool> {
         Ok(self.requested.document_id == request.document_id.as_deref().unwrap_or_default() && self.requested.selection == request.selection && serde_json::to_value(&self.requested.injections)? == serde_json::to_value(&request.injections)? && serde_json::to_value(&self.requested.assistant_references)? == serde_json::to_value(&request.assistant_references)? && serde_json::to_value(&self.requested.exercise_references)? == serde_json::to_value(&request.exercise_references)?)
     }
@@ -184,6 +218,7 @@ pub fn read_document(core: &Core, focus: &Focus, id: &str) -> Result<Document> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::material_git::retry_busy;
     use crate::{app::{Engine, UiPreferences}, generation::{Run, ManagedRun}, learning_tools::ToolScope};
     fn setup() -> (tempfile::TempDir, std::sync::Arc<Engine>, String, String, String) {
         let dir = tempfile::tempdir().unwrap();
@@ -227,16 +262,23 @@ mod tests {
     fn fixed_read_and_query_use_the_same_run_checkpoint_after_workspace_edits() {
         let (_dir, e, _a, b, sid) = setup();
         e.save_ui_preferences(UiPreferences { tool_authorization_tier: "read".into(), ..UiPreferences::default() }).unwrap();
-        let mut c = e.lock().unwrap(); let r = request(&c, &sid, &b); let f = freeze(&mut c, r).unwrap();
+        let mut c = e.lock().unwrap();
+        let owner = crate::library_tree::course_id(&c.content, &b).unwrap();
+        let asset = retry_busy(|| crate::assets::import(&c.content, &owner, "lesson.txt", b"Frozen attachment", "focus-text-asset")).unwrap();
+        let d = c.content.read(&b).unwrap(); c.content.save(&b, &content::serialize(&d.metadata, &format!("{}\n\n[Text]({})", d.body, asset.reference)).unwrap(), &d.version).unwrap();
+        let r = request(&c, &sid, &b); let f = freeze(&mut c, r).unwrap();
         let session = crate::sessions::get(&mut c.content, &sid).unwrap(); let ctx = load(&mut c, &session, &f).unwrap().context;
+        let allowed_ids = ctx.manifest.iter().map(|m| m.id.clone()).collect();
         let run: Run = serde_json::from_value(json!({"focus":f,"id":"run_focus_fixture","sessionId":sid,"mode":"explain","status":"cancelled","content":"","createdAt":"fixture","updatedAt":"fixture","requestDigest":"fixture","contextSnapshotVersion":1,"contextManifest":ctx.manifest})).unwrap();
         e.runs.lock().unwrap().insert(run.id.clone(), ManagedRun { run, cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)) });
         let d = c.content.read(&b).unwrap(); c.content.save(&b, &content::serialize(&d.metadata, "NEW WORKSPACE").unwrap(), &d.version).unwrap(); drop(c);
-        let scope = ToolScope { session_id: sid, section_id: b.clone(), run_id: "run_focus_fixture".into(), allowed_ids: vec![b.clone()] };
+        let scope = ToolScope { session_id: sid, section_id: b.clone(), run_id: "run_focus_fixture".into(), allowed_ids };
         let read = crate::authorized_tools::execute(&e, &scope, "read-old", "read", json!({"sourceId":b})).unwrap();
         assert!(read["content"].as_str().unwrap().contains("原文😀")); assert!(!read["content"].as_str().unwrap().contains("NEW WORKSPACE"));
-        let query = crate::learning_tools::execute(&e, &scope, "query-old", "query_related_knowledge", json!({"knowledgeId":b})).unwrap();
+        let query = crate::learning_tools::execute(&e, &scope, "query-old", "query_related_knowledge", json!({"query":"原文"})).unwrap();
         assert!(query["results"][0]["excerpt"].as_str().unwrap().contains("原文😀"));
+        let attachment = crate::authorized_tools::execute(&e, &scope, "read-asset", "read", json!({"sourceId":asset.id})).unwrap();
+        assert_eq!(attachment["content"], "Frozen attachment"); assert_eq!(attachment["version"], asset.sha256);
     }
     #[test]
     fn exercise_focus_contains_question_state_without_reference_answers() {
@@ -262,10 +304,96 @@ mod tests {
         let (_dir, e, a, _b, sid) = setup(); let mut c = e.lock().unwrap();
         let owner = crate::library_tree::course_id(&c.content, &a).unwrap();
         let bytes = vec![137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 4, 0, 0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 252, 255, 31, 0, 3, 3, 2, 0, 239, 163, 87, 151, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130];
-        let image = crate::assets::import(&c.content, &owner, "test.png", &bytes, "focus-image").unwrap();
-        crate::assets::import(&c.content, &owner, "auth.json", b"{}", "focus-excluded").unwrap();
+        let image = retry_busy(|| crate::assets::import(&c.content, &owner, "test.png", &bytes, "focus-image")).unwrap();
+        retry_busy(|| crate::assets::import(&c.content, &owner, "auth.json", b"{}", "focus-excluded")).unwrap();
         let mut r = request(&c, &sid, &a); r.input.view = "asset".into(); r.input.asset_id = Some(image.id.clone()); r.input.ranges.clear();
         let f = freeze(&mut c, r).unwrap(); assert_eq!(f.r#type, "image"); assert_eq!(f.document_version, image.sha256); assert!(f.paragraphs.is_empty()); assert_eq!(f.excluded_files.len(), 1);
         assert_eq!(f.excluded_files[0].file_name, "auth.json"); assert!(!serde_json::to_string(&f).unwrap().contains("iVBOR"));
+        let exercise = crate::exercises::create_manual(&mut c.content, &sid, &a, crate::exercises::ManualExercise { question:"Q?".into(), format:"exact".into(), answers:vec!["hidden".into()], explanation:"Reason".into() }, "focus-image-exercise").unwrap();
+        let mut r = request(&c, &sid, &exercise.document.id); r.input.view = "asset".into(); r.input.asset_id = Some(image.id); r.input.ranges.clear();
+        let f = freeze(&mut c, r).unwrap(); assert_eq!(f.r#type, "image"); assert_eq!(f.document_id, exercise.document.id);
+
+    }
+    #[test]
+    fn focused_attachment_inventory_records_identity_partial_ranges_and_deduplicates_existing_sources() {
+        let (_dir, e, a, _b, sid) = setup(); let mut c = e.lock().unwrap();
+        let owner = crate::library_tree::course_id(&c.content, &a).unwrap();
+        let bytes = "prefix\nVISIBLE😀\ntail".as_bytes();
+        let asset = retry_busy(|| crate::assets::import(&c.content, &owner, "focused.txt", bytes, "focus-inventory-one")).unwrap();
+        let other = retry_busy(|| crate::assets::import(&c.content, &owner, "same.txt", bytes, "focus-inventory-two")).unwrap();
+        let mut r = request(&c, &sid, &a); r.input.view = "asset".into(); r.input.asset_id = Some(asset.id.clone()); r.input.ranges = vec![Range{start:7,end:16}];
+        let f = freeze(&mut c, r).unwrap(); let session = crate::sessions::get(&mut c.content, &sid).unwrap(); let ctx = load(&mut c, &session, &f).unwrap().context;
+        let item = ctx.manifest.iter().find(|m|m.id==asset.id).unwrap(); assert_eq!(item.included_chars,8); assert_eq!(item.version,asset.sha256);
+        let req = serde_json::from_value(json!({"focus":f,"documentId":a,"sessionId":sid,"mode":"explain","selection":"","prompt":"Explain","requestId":"focus-inventory"})).unwrap();
+        let projection = crate::automatic_context::prepare_native(&c.state_dir,&session,&ctx);
+        let prompt = crate::context_bridge::ContextBridge::freeze(&req,&ctx,&session,None,&projection,crate::time_context::for_operation(&c.state_dir,"focus-inventory").unwrap()).unwrap();
+        let envelope:Value = serde_json::from_str(prompt.messages[0]["content"].as_str().unwrap()).unwrap();
+        let entry = envelope["contextBridgeManifest"]["entries"].as_array().unwrap().iter().find(|e|e["id"]=="focus:0").unwrap();
+        assert_eq!(entry["sourceId"],asset.id); assert_eq!(entry["includedChars"],8); assert_eq!(entry["range"]["startChar"],7); assert_eq!(entry["range"]["endChar"],15); assert_eq!(entry["range"]["complete"],false);
+        let d = c.content.read(&a).unwrap(); c.content.save(&a,&content::serialize(&d.metadata,&format!("{}\n\n[Text]({})",d.body,asset.reference)).unwrap(),&d.version).unwrap();
+        let mut r = request(&c,&sid,&a); r.input.view="asset".into();r.input.asset_id=Some(asset.id.clone());r.input.ranges.clear();
+        let quoted = freeze(&mut c,r).unwrap(); let quoted_ctx=load(&mut c,&session,&quoted).unwrap().context;assert_eq!(quoted_ctx.manifest.iter().filter(|m|m.id==asset.id).count(),1);
+        let mut r = request(&c,&sid,&a);r.input.view="asset".into();r.input.asset_id=Some(other.id.clone());r.input.ranges.clear();
+        let distinct=freeze(&mut c,r).unwrap();let distinct_ctx=load(&mut c,&session,&distinct).unwrap().context;assert!(distinct_ctx.manifest.iter().any(|m|m.id==other.id));assert_ne!(f.asset,distinct.asset);
+    }
+    #[test]
+    fn frozen_focus_cannot_cross_independent_sessions_in_the_same_course() {
+        let (_dir,e,a,_b,sid) = setup(); let mut c=e.lock().unwrap();
+        let owner=crate::library_tree::course_id(&c.content,&a).unwrap();
+        let second=crate::sessions::create_course(&mut c.content,&a,&[],"focus_other_chat",&owner,&[]).unwrap();
+        let r=request(&c,&sid,&a);let f=freeze(&mut c,r).unwrap();
+        let own=crate::sessions::get(&mut c.content,&sid).unwrap();assert!(load(&mut c,&own,&f).is_ok());
+        assert_eq!(load(&mut c,&second,&f).err().map(|e|e.code),Some("CONTEXT_CONFLICT".into()));
+        let r=request(&c,&second.id,&a);let other=freeze(&mut c,r).unwrap();assert_ne!(f.id,other.id);
+        assert!(load(&mut c,&second,&other).is_ok());
+    }
+    #[test]
+    fn git_binary_automatic_materials_are_metadata_only_but_authorized_active_read_remains_text() {
+        let (_dir, e, a, b, sid) = setup();
+        e.save_ui_preferences(UiPreferences { tool_authorization_tier: "read".into(), ..UiPreferences::default() }).unwrap();
+        let mut c = e.lock().unwrap(); let d = c.content.read(&a).unwrap();
+        let mut metadata = d.metadata; metadata.links = vec![b.clone()];
+        c.content.save(&a, &content::serialize(&metadata, "Visible\0SYNTHETIC_BINARY_FOCUS_MARKER\n").unwrap(), &d.version).unwrap();
+        let r = request(&c, &sid, &a); let f = freeze(&mut c, r).unwrap(); assert!(f.binary); assert!(f.paragraphs.is_empty());
+        assert!(open_materials(&c).unwrap().compare(&f.course_id,None,&f.commit_hash,Some(&f.path)).unwrap().changes[0].binary);
+        let session = crate::sessions::get(&mut c.content,&sid).unwrap(); let frozen = load(&mut c,&session,&f).unwrap(); let ctx = &frozen.context;
+        assert_eq!(ctx.manifest.iter().find(|m|m.id==a).unwrap().included_chars,0);
+        assert_eq!(ctx.automatic_materials.len(),1); assert_eq!(ctx.automatic_materials[0].id,b);
+        let kept = &ctx.automatic_materials[0]; assert!(ctx.text[kept.start..kept.end].contains(&kept.text));
+        let req = serde_json::from_value(json!({"focus":f,"documentId":a,"sessionId":sid,"mode":"explain","selection":"","prompt":"Synthetic question","requestId":"binary-focus"})).unwrap();
+        let projection = crate::automatic_context::prepare_native(&c.state_dir,&session,ctx);
+        let packet = crate::context_bridge::ContextBridge::freeze(&req,ctx,&session,None,&projection,crate::time_context::for_operation(&c.state_dir,"binary-focus").unwrap()).unwrap();
+        let envelope:Value = serde_json::from_str(packet.messages[0]["content"].as_str().unwrap()).unwrap();
+        assert!(!serde_json::to_string(&envelope).unwrap().contains("SYNTHETIC_BINARY_FOCUS_MARKER"));
+        assert_eq!(envelope["metadataOnlySourceIds"],json!([a])); assert_eq!(envelope["nativeMaterials"][0]["id"],b);
+        assert!(envelope["nativeMaterials"][0]["text"].as_str().unwrap().contains("原文😀"));
+        let run:Run = serde_json::from_value(json!({"id":"run_binary_focus","focus":f,"sessionId":sid,"mode":"explain","status":"cancelled","content":"","createdAt":"fixture","updatedAt":"fixture","requestDigest":"fixture","contextSnapshotVersion":1,"contextManifest":ctx.manifest})).unwrap();
+        let scope = ToolScope { session_id:sid,section_id:a.clone(),run_id:run.id.clone(),allowed_ids:ctx.manifest.iter().map(|m|m.id.clone()).collect() };
+        e.runs.lock().unwrap().insert(run.id.clone(),ManagedRun { run,cancel:std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)) });
+        let d = c.content.read(&a).unwrap(); c.content.save(&a,&content::serialize(&d.metadata,"NEW WORKSPACE").unwrap(),&d.version).unwrap(); drop(c);
+        let active = crate::authorized_tools::execute(&e,&scope,"read-binary-markdown","read",json!({"sourceId":a})).unwrap();
+        assert!(active["content"].as_str().unwrap().contains("SYNTHETIC_BINARY_FOCUS_MARKER")); assert!(!active["content"].as_str().unwrap().contains("NEW WORKSPACE"));
+    }
+    #[test]
+    fn read_rejects_all_image_mimes_including_complete_valid_utf8_gif() {
+        let (_dir,e,a,_b,sid) = setup();
+        e.save_ui_preferences(UiPreferences { tool_authorization_tier:"read".into(),..UiPreferences::default() }).unwrap();
+        let mut c = e.lock().unwrap(); let owner = crate::library_tree::course_id(&c.content,&a).unwrap();
+        // Complete 1x1 GIF with a 256-color table; C7 80 is valid UTF-8. Encoding does not make it text.
+        let mut gif = b"GIF89a".to_vec(); gif.extend_from_slice(&[1,0,1,0,0xc7,0x80,0]); gif.extend_from_slice(&[0;768]);
+        gif.extend_from_slice(&[0x2c,0,0,0,0,1,0,1,0,0,2,2,0x44,1,0,0x3b]); assert!(std::str::from_utf8(&gif).is_ok());
+        // Other entries are importer-accepted signature fixtures for the MIME gate, not decode tests.
+        let fixtures = [("boundary.gif",gif),("boundary.webp",b"RIFF\0\0\0\0WEBP".to_vec()),("boundary.png",b"\x89PNG\r\n\x1a\n".to_vec()),("boundary.jpg",vec![0xff,0xd8,0xff])];
+        for (index,(name,bytes)) in fixtures.into_iter().enumerate() {
+            let asset = retry_busy(|| crate::assets::import(&c.content,&owner,name,&bytes,&format!("focus-mime-{index}"))).unwrap();
+            let mut r = request(&c,&sid,&a); r.input.view="asset".into(); r.input.asset_id=Some(asset.id.clone()); r.input.ranges.clear();
+            let f = freeze(&mut c,r).unwrap(); assert_eq!(f.r#type,"image"); assert!(f.paragraphs.is_empty());
+            let session = crate::sessions::get(&mut c.content,&sid).unwrap(); let ctx = load(&mut c,&session,&f).unwrap().context;
+            let run:Run = serde_json::from_value(json!({"id":format!("run_image_{index}"),"focus":f,"sessionId":sid,"mode":"explain","status":"running","content":"","createdAt":"fixture","updatedAt":"fixture","requestDigest":"fixture","contextSnapshotVersion":1,"contextManifest":ctx.manifest})).unwrap();
+            let scope = ToolScope { session_id:sid.clone(),section_id:a.clone(),run_id:run.id.clone(),allowed_ids:vec![asset.id.clone()] };
+            e.runs.lock().unwrap().insert(run.id.clone(),ManagedRun { run,cancel:std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)) }); drop(c);
+            assert_eq!(retry_busy(|| crate::authorized_tools::execute(&e,&scope,&format!("read-image-{index}"),"read",json!({"sourceId":asset.id}))).unwrap_err().code,"UNSUPPORTED_TYPE");
+            c=e.lock().unwrap();
+        }
     }
 }
