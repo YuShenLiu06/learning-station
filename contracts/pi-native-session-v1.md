@@ -56,13 +56,13 @@ Rust 在 practice 模式显式开启 `outputValidation`，Node 每次完成最�
 
 ## 课程会话路由（M2 / #11）
 
-显式 course 根下的笔记与练习经 `sessionByCourse[courseId]` 恢复同一业务 session；Pi 的目录、header ID、精确重开与幂等协议仍由该业务 ID 决定。无课程的旧笔记和独立探索保持原行为。`Session.courseId` 是固定归属，`sectionId` 仅保留创建时锚点，不能代替本轮材料。
+显式 course 根下允许多个业务 session，按 `activeSessionByCourse[courseId]` 恢复用户选择；旧 `sessionByCourse` 仅保留原有会话兼容映射，不再约束数量；Pi 的目录、header ID、精确重开与幂等协议仍由该业务 ID 决定。无课程的旧笔记和独立探索保持原行为。`Session.courseId` 是固定归属，`sectionId` 仅保留创建时锚点，不能代替本轮材料。
 
-`load_session_context` 与 `start_generation` 接受可选 `documentId`；前端提交时从 activeDocumentId 冻结，经保存问题、重试、生成和练习落盘保持不变。省略时兼容旧锚点。Rust 检查课程归属；练习页面读取来源材料，不将含参考答案的页面正文自动注入。当前来源决定工具及练习目标，切页不改已提交请求。
+`load_session_context` 与 `start_generation` 接受可选 `documentId`；未提供Focus的课程普通聊天为空或省略时不自动附带笔记正文，探索、明确引用及练习生成另传真实来源，经保存问题、重试、生成和练习落盘保持不变。无课程旧会话省略时兼容旧锚点。Rust 检查课程归属；练习页面读取来源材料，不将含参考答案的页面正文自动注入。当前来源决定工具及练习目标，切页不改已提交请求。
 
 首次承接旧课程时，先将原 preferences、业务会话目录和对应 Pi 目录备份到私有 `course-session-backups/<sha256(courseId)>/`，完整回执后才建立新课程对话。原对话及来源保持原样，`legacySessionIds` 供界面提示和历史查看；不选一段旧对话覆盖其他记录，不拼接 Pi 历史。备份遇到运行锁、符号链接或读写失败时不切换路由。旧练习仍按 originSessionId 作答/批改，聊天使用课程 session；引用校验同时核实原账本与课程。
 
-Focus 切换时，native 的历史授权集合保留仍属于该课程的已见来源，课程外来源仍须本轮明确提供；回收历史保护仍生效。此集合不注入其他笔记正文，不扩大 Rust ToolScope/read 工具的本轮来源列表。
+Focus 切换时，native 的历史授权集合保留仍属于该课程的已见来源，显式材料引用也核对同课程归属；回收历史保护仍生效。此集合不注入其他笔记正文，不扩大 Rust ToolScope/read 工具的本轮来源列表。
 
 ### 来源、移动与回收边界
 
@@ -84,3 +84,10 @@ Focus 切换时，native 的历史授权集合保留仍属于该课程的已见�
 - `course_session_rename(courseId, sessionId, title, expectedVersion)` 核对 `Session.version` 后修改名称；返回已有 `Session` 结构。
 
 创建与选择也返回 `Session`，仅更新会话偏好，不修改阅读文档。bootstrap 增加 `lastSessionId`、`lastCourseId`，原有字段继续保留。原 `sessionByCourse` 保留旧固定会话映射；新 `activeSessionByCourse` 记录每课程最近选择。旧会话 ID、原生私有目录及 Markdown 历史不变，新会话使用独立 Pi 绑定；无选择且存在多个候选时明确要求选择，不以最新文件猜测恢复目标。
+
+探索额外上下文复用 `ExplorationContext`，由业务入口输出 `origin=exploration-entry` 和 `originalUserEntryId`；原问题取自与确定性会话、笔记及条目ID匹配的真实入口条目，不按模式、目录或第一条用户消息猜身份。无真实标记时不生成额外场景，普通课程会话不携带此上下文。旧持久记录新增字段默认空，保留兼容读取。
+## 本轮 Focus
+
+本轮 metadata 携带 [Focus v1](focus-v1.md) 的冻结对象，含课程、焦点文档、原来源文档、视图及固定 Git OID。它与本次 nativeMaterials 来自同次冻结；重试沿原 Focus，Pi 仍独占消息/压缩管理。本层不建立材料接收基准。
+
+Focus 的 `metadataOnlySourceIds` 由 Rust 冻结 Context 生成并限制在本轮授权来源内。Pi 排除这些来源此前的自动材料投影，保留普通历史与用户主动引用；后续恢复文本时重新载入真实完整基准。Git binary 判定仅控制自动投影，不替代 read 工具的类型与授权校验。

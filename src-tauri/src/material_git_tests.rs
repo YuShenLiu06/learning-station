@@ -5,7 +5,7 @@ use tempfile::TempDir;
 #[path = "material_git_regressions.rs"]
 mod regressions;
 
-fn retry_busy<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
+pub(crate) fn retry_busy<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
         match operation() {

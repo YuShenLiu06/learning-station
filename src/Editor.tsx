@@ -6,14 +6,14 @@ import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
 import { markdown } from '@codemirror/lang-markdown';
 import { syntaxHighlighting, defaultHighlightStyle } from '@codemirror/language';
 
-export type EditorHandle = { getValue: () => string; focus: () => void; insertText: (text: string) => void };
+export type EditorHandle = { getValue: () => string; visibleRanges: () => { start: number; end: number }[]; focus: () => void; insertText: (text: string) => void };
 type Props = { initial: string; onChange: (value: string) => void; onSelection: (text: string, start: number, body: string) => void; onSave: () => void; onReady?: () => void };
 export const Editor = forwardRef<EditorHandle, Props>(function Editor(props, ref) {
   const root = useRef<HTMLDivElement>(null);
   const editor = useRef<EditorView | null>(null);
   const callbacks = useRef(props);
   callbacks.current = props;
-  useImperativeHandle(ref, () => ({ getValue: () => editor.current?.state.doc.toString() ?? props.initial, focus: () => editor.current?.focus(), insertText: (text: string) => { const view = editor.current; if (!view) return; const selection = view.state.selection.main; view.dispatch({ changes: { from: selection.from, to: selection.to, insert: text }, selection: { anchor: selection.from + text.length }, scrollIntoView: true }); view.focus(); } }), []);
+  useImperativeHandle(ref, () => ({ getValue: () => editor.current?.state.doc.toString() ?? props.initial, visibleRanges: () => { const view = editor.current; if (!view) return []; const clip = view.dom.closest('.document-scroll')?.getBoundingClientRect(); const top = Math.max(0, clip?.top || 0) - view.documentTop, bottom = Math.min(window.innerHeight, clip?.bottom || window.innerHeight) - view.documentTop; return bottom > 0 ? [{ start: view.lineBlockAtHeight(Math.max(0, top)).from, end: view.lineBlockAtHeight(Math.max(0, bottom)).to }] : []; }, focus: () => editor.current?.focus(), insertText: (text: string) => { const view = editor.current; if (!view) return; const selection = view.state.selection.main; view.dispatch({ changes: { from: selection.from, to: selection.to, insert: text }, selection: { anchor: selection.from + text.length }, scrollIntoView: true }); view.focus(); } }), []);
   useEffect(() => {
     if (!root.current) return;
     const view = new EditorView({

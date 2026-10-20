@@ -14,7 +14,7 @@ const MAX_FRAMES: usize = 8;
 const MAX_DIFF_LINES: usize = 4096;
 
 /// The offsets address a captured Context.text, not marker text parsed from untrusted Markdown.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MaterialSnapshot {
     pub id: String,
     pub path: String,

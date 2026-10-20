@@ -39,8 +39,17 @@ type ContextBridgeManifest = {
 
 `learning-embed` 块是现有笔记正文的一部分，不增加 bridge 的授权、网络抓取或来源编号。网页/视频链接不自动变为知识来源；AI 回答引用的编号不能冒充 `manifest` 中的材料编号。
 
-显式材料选区采用 [Citation](citation-v1.md) 的 quoted_material 块；若同一来源已在自动材料中，保留一个材料 manifest 项，并以 citation:<id> 的 reference 项标记选区及位置。两类生命周期仍分开；本切片未接入 Focus 或 Git 版本差量去重。
+显式材料选区采用 [Citation](citation-v1.md) 的 quoted_material 块；若同一来源已在自动材料中，保留一个材料 manifest 项，并以 citation:<id> 的 reference 项标记选区及位置。两类生命周期仍分开；Focus 冻结与固定 Git 投影复用同一来源身份；实际接收基准仍由各 Pi 会话确认。
 
 内部运行快照可含 Run.sourceDocumentId：它由 Rust 在请求接受时从真实材料/练习账本归一化，区别于可编辑页面 ID。结果持久化与工具派发沿用该来源和冻结 manifest，不依靠页面元数据或课程会话的首次 sectionId 重新选源。旧运行字段可缺省；不新增前端必填参数或读取权限。
 
-课程会话 `documentId` 为空或省略表示本轮无自动材料；`selection` 此时必须为空。显式 `injections` 逐项核对版本、选区与本课程归属，且不改变本轮的 `sourceDocumentId`。真实探索/练习传材料编号；Run 与已保存问题冻结各自来源，恢复不回落当前阅读文档。
+课程会话尚未提供Focus时，`documentId` 为空或省略表示本轮无自动材料；`selection` 此时必须为空。显式 `injections` 逐项核对版本、选区与本课程归属，且不改变本轮的 `sourceDocumentId`。真实探索/练习传材料编号；Run 与已保存问题冻结各自来源，恢复不回落当前阅读文档。
+
+课程目录与已读事实分别记账：`Run.courseReadManifest` 是提交时可读来源及版本的授权元数据快照，不含正文，不是已读基准或第二缓存；`Run.contextManifest`/`Context.manifest` 保留实际发送正文语义，界面“实际来源”只取该实际快照。课程可读清单与实际来源分开展示；`includedChars=0` 不构成已收到/已读的证据。`contextBridgeManifest` 记录实际发出的正文范围，工具read回执说明实际版本、范围及截断；每会话实际收到的正文事实继续由Pi消息/投影负责，不重打包历史。
+
+Focus由独立冻结接口传入，仍自动加载聚焦正文；本层空来源只取消无Focus开局的自动笔记加载，不取消Focus正文或显式Citation补充。Focus首次或Pi实际上下文缺基准时完整提供；有效全文基准存在时可沿固定Git OID提交聚焦diff，无变化不重复，接收基准按会话独立并由Pi实际投影/回执确认，Git提交不算模型已收。
+## Focus
+
+`GenerationRequest.focus`、`Run.focus` 与 assistant 自身 `entry.data.focus` 使用 [Focus v1](focus-v1.md) 的同一个冻结对象；Pi turn metadata 接收同一值。Focus 不从最新 Session 或页面回填。queued Focus 表示已冻结请求，不冒充 Pi 已接收材料基线。
+
+Focus 使用同 checkpoint 的 Git binary 判定移除自动材料正文，清单保留0字符元数据；`metadataOnlySourceIds` 同步排除 Pi 旧自动材料投影。用户明确选区/引用及经授权的主动文本 read 沿各自原协议，不能把元数据身份当作图片正文读取权限。

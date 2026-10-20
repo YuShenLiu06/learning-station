@@ -17,6 +17,8 @@ use std::{
 #[serde(rename_all = "camelCase")]
 pub struct GenerationRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<crate::focus::Focus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub document_id: Option<String>,
     pub session_id: String,
     pub mode: String,
@@ -37,6 +39,8 @@ pub struct GenerationRequest {
 pub struct Run {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_document_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<crate::focus::Focus>,
     pub id: String,
     pub session_id: String,
     pub mode: String,
@@ -267,41 +271,31 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
     let model_store = engine.model.lock().await;
     let (ctx, session, exploration_context, projection, source_id, course_read_manifest) = {
         let mut core = engine.lock()?;
-        let session = sessions::get (& mut
-            core.content,&request.session_id)?;
-        let source_id = crate::course_sessions::source(&core.content, &session, crate::course_sessions::request_document(&session, request.document_id.as_deref()),)?;
-        if request.mode == "practice" && source_id.is_empty() {
-            return Err(CoreError::new("SOURCE_REQUIRED", "请先选择本课程材料再生成练习；普通对话没有默认材料来源。",));
+        let session = sessions::get(&mut core.content, &request.session_id)?;
+        let frozen = request.focus.as_ref().map(|focus| crate::focus::load(&mut core, &session, focus)).transpose()?;
+        if let Some(f) = &frozen {
+            if !f.matches(&request)? { return Err(CoreError::new("CONTEXT_CONFLICT", "本次材料与原冻结请求不同。")); }
         }
-        let (_, mut ctx) = if session.course_id.is_some() {
-            // Reading position is not a request to traverse the notebook body.
-            // Future Focus ranges have their own provider; explicit Citation stays intact.
+        let source_id = if let Some(f) = &frozen { f.focus.source_document_id.clone() } else {
+            crate::course_sessions::source(&core.content, &session, crate::course_sessions::request_document(&session, request.document_id.as_deref()))?
+        };
+        if request.mode == "practice" && source_id.is_empty() {
+            return Err(CoreError::new("SOURCE_REQUIRED", "请先选择本课程材料再生成练习；普通对话没有默认材料来源。"));
+        }
+        let mut ctx = if let Some(f) = &frozen { f.context.clone() } else if session.course_id.is_some() {
             if source_id.is_empty() && !request.selection.is_empty() {
                 return Err(CoreError::new("INVALID_INPUT", "请先选择选句所属材料。"));
             }
-            let result = core.session_context_for(&session.id, Some(""), None)?;
-            result
+            core.session_context_for(&session.id, Some(""), None)?.1
         } else {
-            core.session_context_for(
-                &session.id,
-                request.document_id.as_deref(),
-                Some(&request.selection),
-            )?
+            core.session_context_for(&session.id, request.document_id.as_deref(), Some(&request.selection))?.1
         };
-        if session.course_id.is_some()
-            && (request.mode == "practice" || !request.selection.is_empty())
-        {
+        if frozen.is_none() && session.course_id.is_some() && (request.mode == "practice" || !request.selection.is_empty()) {
             let document = core.content.read(&source_id)?;
-            context::inject(
-                &core.content,
-                &mut ctx,
-                &[context::ContextInjection {
-                    document_id: source_id.clone(),
-                    expected_version: document.version,
-                    selection: (!request.selection.is_empty()).then(|| request.selection.clone()),
-                    locator: None,
-                }],
-            )?;
+            context::inject(&core.content, &mut ctx, &[context::ContextInjection {
+                document_id: source_id.clone(), expected_version: document.version,
+                selection: (!request.selection.is_empty()).then(|| request.selection.clone()), locator: None,
+            }])?;
         }
         if let Some(entry_id) = &request.user_entry_id {
             validate_reused_user(
@@ -322,7 +316,8 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
                 return Err(CoreError::new("CONTEXT_CONFLICT", "原问题的冻结来源已变化，未使用新页面替换原请求。"));
             }
             if let Some(frozen) = context::requested_context(entry, None)? {
-                if frozen.document_id != crate::course_sessions::request_document(&session, request.document_id.as_deref())
+                if serde_json::to_value(&frozen.focus)? != serde_json::to_value(&request.focus)?
+                    || frozen.document_id != crate::course_sessions::request_document(&session, request.document_id.as_deref())
                     || serde_json::to_value(frozen.exercise_references)?
                     != serde_json::to_value(&request.exercise_references)?
                     || serde_json::to_value(frozen.assistant_references)?
@@ -338,40 +333,25 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
                 }
             }
         }
-        crate::exercise_references::inject_request(
-            &mut core.content,
-            &mut ctx,
-            &session,
-            &request.injections,
-            &request.assistant_references,
-            &request.exercise_references,
-        )?;
-        let course_read_manifest = session
-            .course_id
-            .as_deref()
-            .map(|owner| context::course_read_manifest(&core.content, owner))
-            .transpose()?;
+        if frozen.is_none() {
+            crate::exercise_references::inject_request(&mut core.content, &mut ctx, &session,
+                &request.injections, &request.assistant_references, &request.exercise_references)?;
+        }
+        // Focus body and authorization versions must come from the same capture.
+        let course_read_manifest = if let Some(f) = &frozen { f.course_read_manifest.clone() } else {
+            session.course_id.as_deref().map(|owner| context::course_read_manifest(&core.content, owner)).transpose()?
+        };
         if let Some(readable) = &course_read_manifest {
-            if ctx.manifest.iter().any(|item| {
-                !readable
-                    .iter()
-                    .any(|source| source.id == item.id && source.version == item.version)
-            }) {
-                return Err(CoreError::new(
-                    "CONTEXT_CONFLICT",
-                    "引用来源与本次课程版本不一致，请重新选择。",
-                ));
+            if ctx.manifest.iter().any(|item| !readable.iter().any(|source| source.id == item.id && source.version == item.version)) {
+                return Err(CoreError::new("CONTEXT_CONFLICT", "引用来源与本次课程版本不一致，请重新选择。"));
             }
         }
         // Native Pi owns model history. Rust retains business records without clipping them into the prompt.
         ctx.history_manifest.clear();
         ctx.warnings.retain(|w| !w.starts_with("TRUNCATED_HISTORY"));
-        let projection = crate::context_bridge::ContextBridge::snapshot(
-            &core.state_dir,
-            &core.content,
-            &session,
-            &ctx,
-        )?;
+        let projection = if request.focus.is_some() {
+            crate::automatic_context::prepare_native(&core.state_dir, &session, &ctx)
+        } else { crate::context_bridge::ContextBridge::snapshot(&core.state_dir, &core.content, &session, &ctx)? };
         let session = sessions::set_context_snapshot_explicit(
             &mut core.content,
             &session.id,
@@ -449,6 +429,7 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
     let run = Run {
         source_document_id: Some(source_id.clone()),
         course_read_manifest: course_read_manifest.clone(),
+        focus: request.focus.clone(),
         id: id.clone(),
         session_id: request.session_id.clone(),
         mode: request.mode.clone(),
@@ -731,7 +712,7 @@ fn generation_user_entry(request: &GenerationRequest, session: &Session, id: &st
         selection: (!request.selection.is_empty()).then_some(request.selection.clone()),
         related_ids: vec![],
         data: Some(
-            json!({"mode":request.mode,"runId":id,"requestedContext":{"documentId":crate::course_sessions::request_document(&session, request.document_id.as_deref()),"selection":request.selection,"injections":request.injections,"assistantReferences":request.assistant_references,"exerciseReferences":request.exercise_references}}),
+            json!({"mode":request.mode,"runId":id,"requestedContext":{"focus":request.focus,"documentId":crate::course_sessions::request_document(&session, request.document_id.as_deref()),"selection":request.selection,"injections":request.injections,"assistantReferences":request.assistant_references,"exerciseReferences":request.exercise_references}}),
         ),
     }
 }
@@ -753,7 +734,7 @@ mod course_source_tests {
             c.start_session(&a.id, false).unwrap();
             (session, a, b, ctx)
         };
-        let request = GenerationRequest { document_id: Some(b.id.clone()), session_id: session.id.clone(), mode: "practice".into(), selection: "".into(), prompt: "Practice B".into(), request_id: "frozen-practice-op".into(), user_entry_id: None, injections: vec![], assistant_references: vec![], exercise_references: vec![] };
+        let request = GenerationRequest { focus: None, document_id: Some(b.id.clone()), session_id: session.id.clone(), mode: "practice".into(), selection: "".into(), prompt: "Practice B".into(), request_id: "frozen-practice-op".into(), user_entry_id: None, injections: vec![], assistant_references: vec![], exercise_references: vec![] };
         let user = generation_user_entry(&request, &session, "frozen_practice_run");
         assert_eq!(user.data.as_ref().unwrap()["requestedContext"]["documentId"], b.id);
         {
@@ -789,7 +770,7 @@ mod course_source_tests {
             let ctx = c.session_context_for(&session.id, Some(&page.id), None).unwrap().1;
             (session, a, page, b, ctx)
         };
-        let request = GenerationRequest { document_id: Some(page.id.clone()), session_id: session.id.clone(), mode: "practice".into(), selection: "".into(), prompt: "Practice original source".into(), request_id: "inflight-practice-operation".into(), user_entry_id: None, injections: vec![], assistant_references: vec![], exercise_references: vec![] };
+        let request = GenerationRequest { focus: None, document_id: Some(page.id.clone()), session_id: session.id.clone(), mode: "practice".into(), selection: "".into(), prompt: "Practice original source".into(), request_id: "inflight-practice-operation".into(), user_entry_id: None, injections: vec![], assistant_references: vec![], exercise_references: vec![] };
         let run_id = "run_inflight_source";
         let user = generation_user_entry(&request, &session, run_id);
         {
@@ -1231,7 +1212,7 @@ fn save_result(
         "assistant",
         text.to_string(),
         Some(
-            json!({"mode":request.mode,"runId":run_id,"contextManifest":ctx.manifest,"contextBridgeManifest":engine.runs.lock().ok().and_then(|r|r.get(run_id).and_then(|r|r.run.context_bridge_manifest.clone())),"historyManifest":ctx.history_manifest,"assistantReferenceManifest":ctx.assistant_reference_manifest,"exerciseReferenceManifest":ctx.exercise_reference_manifest,"excludedHistorySourceIds":ctx.excluded_history_source_ids,"contextWarnings":ctx.warnings,"contextTruncated":ctx.truncated,"learningSkills":versions,"promptVersion":"learning-v2"}),
+            json!({"mode":request.mode,"runId":run_id,"focus":request.focus,"contextManifest":ctx.manifest,"contextBridgeManifest":engine.runs.lock().ok().and_then(|r|r.get(run_id).and_then(|r|r.run.context_bridge_manifest.clone())),"historyManifest":ctx.history_manifest,"assistantReferenceManifest":ctx.assistant_reference_manifest,"exerciseReferenceManifest":ctx.exercise_reference_manifest,"excludedHistorySourceIds":ctx.excluded_history_source_ids,"contextWarnings":ctx.warnings,"contextTruncated":ctx.truncated,"learningSkills":versions,"promptVersion":"learning-v2"}),
         ),
     );
     let entry = Entry {
@@ -1275,6 +1256,7 @@ mod tests {
             truncated: false,
         };
         let req = GenerationRequest {
+            focus: None,
             document_id: None,
             session_id: "s".into(),
             mode: "explain".into(),
@@ -1336,6 +1318,7 @@ mod prestart_tests {
         let run = Run {
             source_document_id: None,
             course_read_manifest: None,
+            focus: None,
             id: id.into(),
             session_id: session.id.clone(),
             mode: "explain".into(),
@@ -1428,6 +1411,7 @@ mod exploration_tests {
             .start_exploration(Some(&section.id), false, false)
             .unwrap();
         let request = GenerationRequest {
+            focus: None,
             document_id: None,
             session_id: free.id.clone(),
             mode: "question".into(),
@@ -1654,6 +1638,7 @@ mod lifecycle_tests {
         Run {
             source_document_id: None,
             course_read_manifest: None,
+            focus: None,
             id: "run_lifecycle".into(),
             session_id: session_id.into(),
             mode: "question".into(),
@@ -1742,6 +1727,7 @@ mod lifecycle_tests {
         let current = sessions::get(&mut engine.lock().unwrap().content, &session.id).unwrap();
         assert_eq!(current.entries.len(), 1);
         let request = GenerationRequest {
+            focus: None,
             document_id: None,
             session_id: session.id.clone(),
             mode: "explain".into(),
@@ -1897,6 +1883,7 @@ mod unknown_ack_tests {
             core.start_session(&section.id, false).unwrap().0
         };
         let request = GenerationRequest {
+            focus: None,
             document_id: None,
             session_id: session.id,
             mode: "question".into(),
@@ -1954,6 +1941,7 @@ mod exercise_document_tests {
             (source, session, context)
         };
         let request = GenerationRequest {
+            focus: None,
             document_id: None,
             session_id: session.id.clone(),
             mode: "practice".into(),
@@ -2002,6 +1990,7 @@ mod exercise_document_tests {
         assert!(practice(&raw, &[], "run_strict").is_ok());
         assert!(practice(&format!("```json\n{raw}\n```"), &[], "run_strict").is_err());
         let request = GenerationRequest {
+            focus: None,
             document_id: None,
             session_id: "session_fixture".into(),
             mode: "explain".into(),
@@ -2079,6 +2068,7 @@ mod exercise_repair_tests {
             core.start_session(&source.id, false).unwrap()
         };
         let request = GenerationRequest {
+            focus: None,
             document_id: None,
             session_id: session.id.clone(),
             mode: "practice".into(),
@@ -2110,6 +2100,7 @@ mod exercise_repair_tests {
         let old = Run {
             source_document_id: None,
             course_read_manifest: None,
+            focus: None,
             id: id.clone(),
             session_id: session.id.clone(),
             mode: "practice".into(),
@@ -2317,6 +2308,7 @@ mod history_audit_tests {
         let question = "CURRENT_QUESTION完整".repeat(500);
         let selection = "CURRENT_SELECTION完整".repeat(500);
         let request = GenerationRequest {
+            focus: None,
             document_id: None,
             session_id: state.id.clone(),
             mode: "question".into(),
@@ -2535,6 +2527,7 @@ mod trash_prompt_tests {
             included_chars: 99,
         });
         let request = GenerationRequest {
+            focus: None,
             document_id: None,
             session_id: session.id.clone(),
             mode: "question".into(),
@@ -2636,6 +2629,7 @@ mod recycle_integration_tests {
             (source, root, session, user.path, user.content)
         };
         let request = GenerationRequest {
+            focus: None,
             document_id: None,
             session_id: session.id.clone(),
             mode: "practice".into(),
@@ -2748,6 +2742,7 @@ mod recycle_integration_tests {
         let old = Run {
             source_document_id: None,
             course_read_manifest: None,
+            focus: None,
             id: id.clone(),
             session_id: session.id.clone(),
             mode: "practice".into(),
@@ -2912,6 +2907,7 @@ mod learning_v2_tests {
             c.start_session(&source.id, false).unwrap()
         };
         let req = GenerationRequest {
+            focus: None,
             document_id: None,
             session_id: session.id.clone(),
             mode: "practice".into(),
@@ -3019,6 +3015,7 @@ mod learning_v2_tests {
             c.start_session(&a.id, false).unwrap()
         };
         let request = GenerationRequest {
+            focus: None,
             document_id: None,
             session_id: s.id,
             mode: "question".into(),
@@ -3089,6 +3086,7 @@ mod assistant_reference_snapshot_tests {
             context::inject_request(&c.content, &mut ctx, &s, &[], &[r.clone()]).unwrap();
         }
         let request = GenerationRequest {
+            focus: None,
             document_id: None,
             session_id: s.id.clone(),
             mode: "question".into(),
@@ -3234,6 +3232,7 @@ mod rendered_exercise_snapshot_tests {
         .unwrap();
         drop(c);
         let request = GenerationRequest {
+            focus: None,
             document_id: None,
             session_id: x.session.id.clone(),
             mode: "practice".into(),

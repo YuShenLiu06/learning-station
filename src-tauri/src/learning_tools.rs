@@ -301,6 +301,7 @@ pub fn execute(
     } else {
         None
     };
+    let focus_run = if matches!(&operation, Operation::Query(_)) { match crate::generation::get(engine, &scope.run_id) { Ok(run) => Some(run), Err(e) if e.code == "NOT_FOUND" => None, Err(e) => return Err(e) } } else { None };
     let mut core = engine.lock()?;
     let session = sessions::get(&mut core.content, &scope.session_id)?;
     if crate::course_sessions::source(&core.content, &session, &scope.section_id).map_err(|_| out_of_scope())? != scope.section_id {
@@ -332,7 +333,11 @@ pub fn execute(
         }
     }
     if let Operation::Query(query) = operation {
-        return query_knowledge(&core.content, scope, query);
+        let frozen = if let Some(run) = &focus_run {
+            if run.session_id != scope.session_id { return Err(out_of_scope()); }
+            run.focus.as_ref().map(|f| crate::focus::load(&mut core, &session, f)).transpose()?
+        } else { None };
+        return query_knowledge(&core, scope, query, frozen.as_ref());
     }
     if let Some(user) = &business_user {
         if !session
@@ -666,10 +671,12 @@ fn load_skill(engine: &Engine, scope: &ToolScope, id: &str) -> Result<Value> {
 }
 
 fn query_knowledge(
-    store: &crate::content::ContentStore,
+    core: &crate::app::Core,
     scope: &ToolScope,
     query: QueryKnowledge,
+    frozen: Option<&crate::focus::Frozen>,
 ) -> Result<Value> {
+    let store = &core.content;
     if scope.section_id.is_empty() {
         return Ok(
             json!({"sectionId":"","sessionId":scope.session_id,"results":[],"manifest":[],
@@ -685,7 +692,7 @@ fn query_knowledge(
     {
         return Err(out_of_scope());
     }
-    let context = context::load(store, &scope.section_id, None)?;
+    let context = if let Some(frozen) = frozen { frozen.context.clone() } else { context::load(store, &scope.section_id, None)? };
     if query
         .knowledge_id
         .as_ref()
@@ -703,7 +710,8 @@ fn query_knowledge(
         {
             continue;
         }
-        let document = store.read(&item.id)?;
+        if frozen.is_some_and(|f| f.asset_path(&item.id).is_some()) { continue; }
+        let document = if let Some(frozen) = frozen { crate::focus::read_document(core, &frozen.focus, &item.id)? } else { store.read(&item.id)? };
         if !matches!(document.metadata.kind.as_str(), "section" | "knowledge") {
             continue;
         }

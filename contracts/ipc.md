@@ -138,3 +138,7 @@ ToolActivity=`{id,toolCallId,runId,sessionId,name,status:running|succeeded|faile
 - `load_session_context`、`start_generation` 新增可选 `documentId`，由本轮 activeDocumentId 冻结；未传兼容旧 sectionId 锚点。保存问题的 requestedContext.documentId 与生成重试必须一致。
 - 练习 originSessionId 是原作答/批改账本；与当前聊天 session 可以不同，课程和原始来源均由 Rust 校验。
 - `restore_library_node` 在可见性提交前核对本批练习的原 session/entry；依赖仍在其他回收记录中时返回 `DEPENDENCY_TRASHED`，details 给出 documentId、originSessionId、exerciseEntryId、dependencyId、blockingTrashId、restoreTargetId/Kind。提示先恢复对应原课程或练习；本项保持回收状态，失败不占用请求回执，解决依赖后可用原 requestId 重试，不隐式恢复其他记录。
+
+### Focus 冻结
+
+`freeze_focus {request:{sessionId,input:{documentId,expectedBody,expectedVersion?,view,ranges,questionId?,assetId?},selection,injections,assistantReferences,exerciseReferences}}` 返回 [FocusSnapshot](focus-v1.md)。这是一次本机私有材料冻结，不发模型、不改变权限。`start_generation` 增可选 `focus`；既有调用兼容，带 Focus 的请求严格绑定原冻结记录。

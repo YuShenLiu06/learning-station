@@ -161,6 +161,9 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
       if(containsSecret(envelope,apiKey))throw new NativeSessionError('AUTH');
       currentSources=envelope.nativeMaterials??[];currentTurn=envelope;
       const inventory=structuredClone(envelope.contextBridgeManifest??{version:1,entries:[]});
+      const metadataOnly=envelope.metadataOnlySourceIds??[];
+      if(!Array.isArray(metadataOnly)||metadataOnly.some(id=>!spec.authorizedSourceIds.includes(id)))throw new NativeSessionError();
+      for(const entry of manager.buildSessionProjection().entries)if(entry.messages.length&&entry.sourceEntry.type==='custom_message'&&entry.sourceEntry.customType==='learning-station-material'&&metadataOnly.includes(entry.sourceEntry.details?.sourceId))manager.appendContextEdit(entry.sourceEntry.id,null);
       inventory.entries=inventory.entries.filter(e=>e.kind!=='history');
       if(loadChanges&&envelope.focus){
         const focus=envelope.focus;
@@ -206,7 +209,7 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
         const item=inventory.entries.find(e=>e.sourceId===source.id&&e.kind==='material');if(item){item.status=status;item.reason=status==='retained'?'native_projection_contains_baseline':status==='updated'?'native_projection_verified_diff':'native_baseline_reload';}
       }
       for(const entry of manager.buildSessionProjection().entries){if(entry.sourceEntry.type==='custom_message'&&entry.sourceEntry.customType==='learning-station-turn'&&entry.messages.length)manager.appendContextEdit(entry.sourceEntry.id,null);}
-      const projectedMaterial=manager.buildSessionProjection().entries.filter(e=>e.messages.length&&e.sourceEntry.type==='custom_message'&&['learning-station-material','learning-station-changes'].includes(e.sourceEntry.customType)).flatMap(e=>e.messages.map(text)).join('\n')+(envelope.nativeReferences??'');
+      const projectedMaterial=manager.buildSessionProjection().entries.filter(e=>e.messages.length&&e.sourceEntry.type==='custom_message'&&['learning-station-material','learning-station-changes'].includes(e.sourceEntry.customType)).flatMap(e=>e.messages.map(text)).join('\n')+(envelope.nativeReferences??'')+(loadChanges?'':(envelope.focus?.paragraphs??[]).map(p=>p.text??'').join(''));
       inventory.projectedChars=[...projectedMaterial].length;inventory.projectedBytes=Buffer.byteLength(projectedMaterial);
       const turn={...envelope};delete turn.nativeMaterials;delete turn.learningHistory;delete turn.historyManifest;delete turn.context;delete turn.question;
       // The fixed full/diff frames above own the automatic Focus body. Keep the

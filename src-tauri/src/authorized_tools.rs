@@ -307,20 +307,29 @@ fn execute_read(
             .ok_or_else(out_of_scope)?;
         let document = {
             let mut core = engine.lock()?;
-            let session = crate::sessions::get(&mut core.content, &scope.session_id)
-                .map_err(|_| out_of_scope())?;
-            if core.content.is_trashed(&scope.session_id) {
-                return Err(out_of_scope());
+            let session = crate::sessions::get(&mut core.content, &scope.session_id).map_err(|_| out_of_scope())?;
+            if core.content.is_trashed(&scope.session_id) { return Err(out_of_scope()); }
+            if let Some(focus) = &run.focus {
+                let frozen = crate::focus::load(&mut core, &session, focus)?;
+                if let Some(path) = frozen.asset_path(&source_id) {
+                    let asset = crate::assets::list(&core.content, &focus.course_id)?.into_iter().find(|a| a.id == source_id).ok_or_else(out_of_scope)?;
+                    if !matches!(asset.mime.as_str(), "text/plain" | "text/markdown" | "text/csv" | "application/json") {
+                        return Err(CoreError::new("UNSUPPORTED_TYPE", "该附件没有受支持的文本正文；图片/PDF仍只提供元数据。"));
+                    }
+                    let bytes = crate::focus::open_materials(&core, focus)?.read(&focus.course_id, &focus.commit_hash, path)?;
+                    let text = std::str::from_utf8(&bytes).map_err(|_| CoreError::new("UNSUPPORTED_TYPE", "该附件没有受支持的文本正文。"))?;
+                    if hash(text) != item.version { return Err(CoreError::new("CONFLICT", "资料与本轮固定版本不一致。")); }
+                    let (content, truncated) = bounded_text(text, MAX_READ_BYTES);
+                    let chars = content.chars().count();
+                    let included = run.context_manifest.iter().any(|m| m.id == source_id && m.version == item.version && m.included_chars > 0);
+                    return Ok(json!({"sessionId":scope.session_id,"sourceId":source_id,"path":path,"title":path.rsplit('/').next(),"kind":"asset","version":item.version,"includedChars":chars,"content":content,"truncated":truncated,"manifestRole":"user-reference","includedInInitialContext":included,"authorizationScope":if run.course_read_manifest.is_some(){"course-read-manifest"}else{"run-context-manifest"},"delivery":"tool-result","range":{"startChar":0,"endChar":chars,"complete":!truncated,"totalBytes":bytes.len()}}));
+                }
+                crate::course_sessions::source(&core.content, &session, &source_id).map_err(|_| out_of_scope())?;
+                crate::focus::read_document(&core, focus, &source_id)?
+            } else {
+                if session.course_id.is_some() && crate::course_sessions::source(&core.content, &session, &source_id).map_err(|_| out_of_scope())? != source_id { return Err(out_of_scope()); }
+                core.content.read(&source_id)?
             }
-            let course_scope = session.course_id.is_some();
-            if course_scope
-                && crate::course_sessions::source(&core.content, &session, &source_id)
-                    .map_err(|_| out_of_scope())?
-                    != source_id
-            {
-                return Err(out_of_scope());
-            }
-            core.content.read(&source_id)?
         };
         if document.version != item.version {
             return Err(CoreError::new(
@@ -331,7 +340,7 @@ fn execute_read(
         let content = bounded_text(&document.content, MAX_READ_BYTES);
         let included_chars = content.0.chars().count();
         let included_in_initial_context = run.context_manifest.iter().any(|context_item| {
-            context_item.id == source_id && context_item.version == item.version
+            context_item.id == source_id && context_item.version == item.version && context_item.included_chars > 0
         });
         Ok(json!({"sessionId":scope.session_id,"sourceId":source_id,"path":document.path,
             "title":document.metadata.title,"kind":document.metadata.kind,"version":document.version,
