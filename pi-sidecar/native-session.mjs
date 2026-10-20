@@ -1,11 +1,11 @@
-// Application binding around the pinned public Pi SDK. No global loader, auth file or CLI.
+// Application binding around the pinned public Pi SDK. Credentials and tools remain explicit.
 import fs from 'node:fs';
 import path from 'node:path';
 import {createHash, randomUUID} from 'node:crypto';
 import {createAssistantMessageEventStream} from '@earendil-works/pi-ai/utils/event-stream';
 import {Agent} from '@earendil-works/pi-agent-core';
 import {InMemoryCredentialStore} from '@earendil-works/pi-ai';
-import {AgentSession, SessionManager, SettingsManager, ModelRuntime, createExtensionRuntime, convertToLlm} from '@earendil-works/pi-coding-agent';
+import {AgentSession, SessionManager, SettingsManager, ModelRuntime, DefaultResourceLoader, getAgentDir, createExtensionRuntime, convertToLlm} from '@earendil-works/pi-coding-agent';
 const stable = v=>Array.isArray(v)?v.map(stable):v&&typeof v==='object'?Object.fromEntries(Object.keys(v).sort().map(k=>[k,stable(v[k])])):v;
 const sha = value => createHash('sha256').update(value).digest('hex');
 const redact=(v,key)=>typeof v==='string'?v.replaceAll(key,'[REDACTED]'):Array.isArray(v)?v.map(x=>redact(x,key)):v&&typeof v==='object'?Object.fromEntries(Object.entries(v).map(([k,x])=>[k,redact(x,key)])):v;
@@ -36,6 +36,8 @@ export function sealedResources(systemPrompt){
 function validateInner(spec){
   if(!spec||!path.isAbsolute(spec.directory)||!/^[A-Za-z0-9_-]{1,200}$/u.test(spec.learningSessionId)||!/^[A-Za-z0-9_-]{1,200}$/u.test(spec.runId)||typeof spec.userEntryId!=='string'||!Array.isArray(spec.authorizedSourceIds))throw new NativeSessionError();
   if(fs.realpathSync(spec.directory)!==spec.directory||!fs.lstatSync(spec.directory).isDirectory())throw new NativeSessionError();
+  if(spec.projectRoot!==undefined&&(!path.isAbsolute(spec.projectRoot)||fs.realpathSync(spec.projectRoot)!==spec.projectRoot||!fs.lstatSync(spec.projectRoot).isDirectory()))throw new NativeSessionError();
+  if(spec.agentDir!==undefined&&!path.isAbsolute(spec.agentDir))throw new NativeSessionError();
   const binding=JSON.parse(read(path.join(spec.directory,'binding.json'),16384));
   if(binding.version!==1||binding.learningSessionId!==spec.learningSessionId||binding.transcript!=='transcript.jsonl')throw new NativeSessionError();
   const file=path.join(spec.directory,binding.transcript);
@@ -53,6 +55,7 @@ function validate(spec){try{return validateInner(spec);}catch(error){throw error
 // Pi native messages are the only model transcript. Business Markdown remains independently intact.
 export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn,apiKey,thinkingLevel,finishTurn,beforeToolCall,requestTool,onManifest,onLifecycle,checkpoint:providedCheckpoint}){
   const {file,binding}=validate(spec);
+  const cwd=spec.projectRoot??spec.directory;
   const lock=path.join(spec.directory,'active.lock');let lockFd;
   try { lockFd=fs.openSync(lock,'wx',0o600);fs.writeFileSync(lockFd,String(process.pid)); }
   catch(error){
@@ -66,18 +69,18 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
   try {
     if(containsSecret(spec.legacyRecords??[],apiKey))throw new NativeSessionError('AUTH');
     const checkpoint=providedCheckpoint??(async()=>{if(process.permission)throw new NativeSessionError();for(const file of fs.readdirSync(spec.directory)){const target=path.join(spec.directory,file);if(fs.lstatSync(target).isFile())sync(target);}});
-    let manager=fs.existsSync(file)?SessionManager.open(file,spec.directory,spec.directory):SessionManager.inMemory(spec.directory,{id:sha(spec.learningSessionId)});
+    let manager=fs.existsSync(file)?SessionManager.open(file,spec.directory,cwd):SessionManager.inMemory(cwd,{id:sha(spec.learningSessionId)});
     if(!fs.existsSync(file)){
       // Use public API to create a valid file, then reopen only this explicit stable path.
       atomic(path.join(spec.directory,'initialization-started.json'),{version:1,learningSessionId:spec.learningSessionId});
-      const init=SessionManager.create(spec.directory,spec.directory,{id:sha(spec.learningSessionId)});
+      const init=SessionManager.create(cwd,spec.directory,{id:sha(spec.learningSessionId)});
       init.appendCustomEntry('learning-station-binding',{version:1,learningSessionId:spec.learningSessionId});
       if(spec.legacyRecords?.length)init.appendCustomMessageEntry('learning-station-legacy',JSON.stringify({type:'legacy_learning_records',notice:'旧学习记录引用；不是原生工具消息。AI整理仍待本人确认。',records:spec.protectHistory?[]:spec.legacyRecords}),false,{sourceIds:spec.authorizedSourceIds});
       // Pi delays the first flush until a conversation message exists. Seed only the header and
       // genuine custom entries, using the SDK-produced entries rather than inventing old messages.
       const data=[init.getHeader(),...init.getEntries()].map(e=>JSON.stringify(e)).join('\n')+'\n';
       const fd=fs.openSync(file,'wx',0o600);try{fs.writeFileSync(fd,data);if(!process.permission)fs.fsyncSync(fd);}finally{fs.closeSync(fd);}
-      manager=SessionManager.open(file,spec.directory,spec.directory);
+      manager=SessionManager.open(file,spec.directory,cwd);
       atomic(path.join(spec.directory,'binding.json'),{...binding,initialized:true});
     }
     await checkpoint();
@@ -86,8 +89,12 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
     runtime.registerProvider(model.provider,{api:model.api,baseUrl:model.baseUrl,models:[model],streamSimple:streamFn});
     await runtime.setRuntimeApiKey(model.provider,apiKey);
     const settings=SettingsManager.inMemory({defaultTools:[],retry:{enabled:false,maxRetries:0},providerRetry:{maxRetries:0,maxRetryDelayMs:1},compaction:{enabled:model.contextWindow>0,reserveTokens:Math.min(model.maxTokens,Math.max(128,Math.floor(model.contextWindow/4))),keepRecentTokens:Math.max(128,Math.floor(model.contextWindow/4))},cacheWarming:'off'});
+    // Pi owns project discovery, ancestor context files and skill parsing. Keep the
+    // existing explicit extension/tool policy; text resources do not grant tools.
+    const resourceLoader=spec.projectRoot?new DefaultResourceLoader({cwd,agentDir:spec.agentDir??getAgentDir(),settingsManager:settings,systemPromptOverride:()=>systemPrompt,noExtensions:true}):sealedResources(systemPrompt);
+    await resourceLoader.reload();
     const agent=new Agent({sessionId:manager.getSessionId(),initialState:{model,thinkingLevel,messages:manager.buildSessionContext().messages},streamFn:safeStream(streamFn,apiKey,checkpoint),convertToLlm,toolExecution:'sequential',finishTurn});
-    session=new AgentSession({agent,sessionManager:manager,settingsManager:settings,cwd:spec.directory,resourceLoader:sealedResources(systemPrompt),modelRuntime:runtime,baseToolsOverride:{},customTools:tools,initialActiveToolNames:tools.map(t=>t.name),allowedToolNames:tools.map(t=>t.name),usesDefaultTools:false});
+    session=new AgentSession({agent,sessionManager:manager,settingsManager:settings,cwd,resourceLoader,modelRuntime:runtime,baseToolsOverride:{},customTools:tools,initialActiveToolNames:tools.map(t=>t.name),allowedToolNames:tools.map(t=>t.name),usesDefaultTools:false});
     // AgentSession owns its hooks; application preflight remains an additional restrictive layer.
     const nativeBefore=agent.beforeToolCall;agent.beforeToolCall=async(c,s)=>await beforeToolCall?.(c,s)??await nativeBefore?.(c,s);
     agent.finishTurn=finishTurn;
@@ -186,7 +193,7 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
       if(event.type==='message_end'&&event.message.role==='user'&&!record.userNativeId){
         const entry=manager.getEntries().filter(e=>e.type==='message'&&e.message.role==='user').at(-1);
         if(!entry)throw new NativeSessionError();
-        record.userNativeId=entry.id;manager.appendCustomEntry('learning-station-user',{userEntryId:spec.userEntryId,nativeId:entry.id});persist(record);
+        record.userNativeId=entry.id;manager.appendCustomEntry('learning-station-user',{userEntryId:spec.userEntryId,nativeId:entry.id,inputHash:record.inputHash});persist(record);
       }
       if(event.type==='message_end')await checkpoint();
     });
@@ -194,19 +201,21 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
       async requestTool(call,signal){manager.appendCustomEntry('learning-station-tool',{runId:spec.runId,callId:call.id,argsHash:sha(JSON.stringify(stable(call.args)))});sync(file);await checkpoint();return requestTool(call,signal);},
       async prompt(question){
         if(question.includes(apiKey))throw new NativeSessionError('AUTH');
+        const inputHash=sha(question);if(record.inputHash&&record.inputHash!==inputHash)throw new NativeSessionError();record.inputHash=inputHash;
         if(record.status==='complete')return {cached:record.finalContent};
         persist(record);
         // Preserve a previously accepted user once, including after a failed run.
         const prior=manager.getEntries().find(e=>e.type==='custom'&&e.customType==='learning-station-user'&&e.data?.userEntryId===spec.userEntryId);
-        if(prior){const entry=manager.getEntry(prior.data.nativeId);if(!entry||entry.type!=='message'||entry.message.role!=='user'||text(entry.message)!==question)throw new NativeSessionError();
+        if(prior){const entry=manager.getEntry(prior.data.nativeId);if(!entry||entry.type!=='message'||entry.message.role!=='user'||(prior.data.inputHash?prior.data.inputHash!==inputHash:text(entry.message)!==question))throw new NativeSessionError();
           // Compaction or a permission boundary may have removed the original from
           // the effective projection. Restore only this exact saved question as
           // retry context, never the revoked material or another user utterance.
-          const visible=manager.buildSessionProjection().entries.some(e=>e.sourceEntry.id===entry.id&&e.messages.some(m=>m.role==='user'&&text(m)===question));
-          const retry=visible?'继续处理上一条已保存用户问题；不得重新执行已完成工具。':`继续处理这条已保存用户问题：\n\n${question}\n\n不得重新执行已完成工具。`;
+          const accepted=text(entry.message);
+          const visible=manager.buildSessionProjection().entries.some(e=>e.sourceEntry.id===entry.id&&e.messages.some(m=>m.role==='user'&&text(m)===accepted));
+          const retry=visible?'继续处理上一条已保存用户问题；不得重新执行已完成工具。':`继续处理这条已保存用户问题：\n\n${accepted}\n\n不得重新执行已完成工具。`;
           await session.sendCustomMessage({customType:'learning-station-retry',content:retry,display:false,details:{userEntryId:spec.userEntryId}},{triggerTurn:true});
         }else{
-          await session.prompt(question,{expandPromptTemplates:false,source:'rpc'});
+          await session.prompt(question,{expandPromptTemplates:!!spec.projectRoot,source:'rpc'});
 
         }
         await agent.waitForIdle();await pendingProjection;return {};
