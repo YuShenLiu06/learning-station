@@ -279,7 +279,14 @@ fn mime_for(extension: &str) -> Option<(&'static str, bool)> {
     })
 }
 
-fn inspect(file_name: &str, bytes: &[u8]) -> Result<(String, &'static str)> {
+pub(crate) fn material_file_allowed(name: &str) -> bool {
+    extension(name)
+        .ok()
+        .and_then(|ext| mime_for(&ext))
+        .is_some()
+}
+
+pub(crate) fn inspect(file_name: &str, bytes: &[u8]) -> Result<(String, &'static str)> {
     let extension = extension(file_name)?;
     let (mime, image) = mime_for(&extension).ok_or_else(|| {
         CoreError::new(
@@ -603,7 +610,7 @@ fn same_file(a: &Metadata, b: &Metadata) -> bool {
     }
 }
 
-fn bounded_read(path: &Path, maximum: usize) -> Result<Vec<u8>> {
+pub(crate) fn bounded_read(path: &Path, maximum: usize) -> Result<Vec<u8>> {
     let file = checked_file(path, maximum)?;
     let mut bytes = Vec::new();
     file.take((maximum + 1) as u64)

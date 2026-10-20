@@ -1,5 +1,5 @@
-//! Git plumbing over frozen, course-owned bytes. No worktree, index, checkout,
-//! material commands, network, UI or model/session acceptance state is involved.
+//! Git plumbing over frozen, course-owned bytes in independent normal course
+//! repositories. No index/checkout, material commands, network or acceptance state.
 use crate::{
     content::ContentStore,
     types::{valid_id, CoreError, Document, Result},
@@ -70,9 +70,133 @@ pub struct FrozenMaterials {
     course_id: String,
     entries: BTreeMap<String, Vec<u8>>,
     excluded_files: Vec<ExcludedFile>,
+    project_root: Option<PathBuf>,
 }
 
 impl FrozenMaterials {
+    /// Reads only this physical course's materials. Two equal captures reject
+    /// observed concurrent edits; returned owned bytes cannot change afterward.
+    pub fn capture_project(store: &ContentStore, course_id: &str) -> Result<Self> {
+        let root = crate::course_project::course_project_root(store.root(), course_id)?;
+        let document = store.read(course_id)?;
+        if document.path != crate::course_project::material_path(course_id, course_id)?
+            || document.metadata.kind != "course"
+            || document
+                .metadata
+                .extra
+                .get("parentId")
+                .is_some_and(|v| !v.is_null())
+        {
+            return Err(scope());
+        }
+        let capture = || -> Result<Self> {
+            let mut frozen = Self {
+                course_id: course_id.into(),
+                entries: BTreeMap::new(),
+                excluded_files: vec![],
+                project_root: Some(root.clone()),
+            };
+            let mut pending = vec![root.join("materials")];
+            let mut seen = 0;
+            let mut remaining = 64 * 1024 * 1024usize;
+            while let Some(directory) = pending.pop() {
+                let metadata = fs::symlink_metadata(&directory)?;
+                if metadata.file_type().is_symlink()
+                    || !directory
+                        .canonicalize()?
+                        .starts_with(root.join("materials"))
+                {
+                    return Err(scope());
+                }
+                let mut paths = Vec::new();
+                for entry in fs::read_dir(directory)? {
+                    seen += 1;
+                    if seen > 4096 {
+                        return Err(limit());
+                    }
+                    paths.push(entry?.path());
+                }
+                paths.sort();
+                for path in paths {
+                    let metadata = fs::symlink_metadata(&path)?;
+                    if metadata.file_type().is_symlink()
+                        || !path.canonicalize()?.starts_with(root.join("materials"))
+                    {
+                        return Err(scope());
+                    }
+                    let name = path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .ok_or_else(scope)?;
+                    let relative = path
+                        .strip_prefix(root.join("materials"))
+                        .map_err(|_| scope())?
+                        .to_str()
+                        .ok_or_else(scope)?
+                        .to_owned();
+                    let reason = exclusion_reason(name).or_else(|| {
+                        (metadata.is_dir()
+                            && (matches!(
+                                name,
+                                "node_modules" | "target" | "dist" | "vendor" | "cache"
+                            ) || path.join(".git").exists()
+                                || path.join("objects").is_dir() && path.join("HEAD").exists()))
+                        .then_some("source_or_cache_directory")
+                    });
+                    if let Some(reason) = reason {
+                        let asset_id = if relative.starts_with(&format!("assets/{course_id}/")) {
+                            relative.split('/').nth(2).unwrap_or("").to_owned()
+                        } else {
+                            String::new()
+                        };
+                        frozen.excluded_files.push(ExcludedFile {
+                            asset_id,
+                            file_name: relative,
+                            reason: reason.into(),
+                        });
+                        continue;
+                    }
+                    check_path(&relative)?;
+                    if metadata.is_dir() {
+                        pending.push(path);
+                        continue;
+                    }
+                    if !metadata.is_file() {
+                        return Err(scope());
+                    }
+                    if !crate::assets::material_file_allowed(name) {
+                        frozen.excluded_files.push(ExcludedFile {
+                            asset_id: String::new(),
+                            file_name: relative,
+                            reason: "unsupported_type".into(),
+                        });
+                        continue;
+                    }
+                    let bytes = crate::assets::bounded_read(&path, 5 * 1024 * 1024)?;
+                    if relative.starts_with("documents/") && name.ends_with(".md") {
+                        if bytes.len() as u64 > crate::content::MAX_DOCUMENT_BYTES {
+                            return Err(limit());
+                        }
+                        std::str::from_utf8(&bytes).map_err(|_| scope())?;
+                    } else {
+                        crate::assets::inspect(name, &bytes)?;
+                    }
+                    remaining = remaining.checked_sub(bytes.len()).ok_or_else(limit)?;
+                    frozen.entries.insert(relative, bytes);
+                }
+            }
+            frozen
+                .excluded_files
+                .sort_by(|a, b| a.file_name.cmp(&b.file_name));
+            Ok(frozen)
+        };
+        let first = capture()?;
+        if first != capture()? {
+            return Err(conflict());
+        }
+        Ok(first)
+    }
+
     /// Call under the application's Core lock, after refreshing its index.
     /// Two equal captures reject observed external edits; this is not a filesystem
     /// transaction. Once returned, later edits cannot alter these owned bytes.
@@ -168,15 +292,84 @@ impl FrozenMaterials {
             course_id: course_id.into(),
             entries,
             excluded_files,
+            project_root: None,
         })
     }
 }
 
 pub struct MaterialGit {
     directory: PathBuf,
+    course: Option<String>,
+    writable: bool,
 }
 
 impl MaterialGit {
+    /// Initializes only a new independent normal repository in an existing
+    /// physical course. Existing repositories are opened and never reset.
+    pub fn init_course(library_root: &Path, course_id: &str) -> Result<Self> {
+        let root = crate::course_project::course_project_root(library_root, course_id)?;
+        if fs::symlink_metadata(root.join(".git")).is_ok() {
+            return Self::open_course(library_root, course_id);
+        }
+        for ancestor in root.parent().ok_or_else(scope)?.ancestors() {
+            if ancestor.join(".git").exists()
+                || ancestor.join("objects").is_dir() && ancestor.join("HEAD").exists()
+            {
+                return Err(scope());
+            }
+        }
+        let bytes = crate::assets::bounded_read(
+            &root.join(format!("materials/documents/{course_id}.md")),
+            crate::content::MAX_DOCUMENT_BYTES as usize,
+        )?;
+        let (metadata, _) =
+            crate::content::parse(std::str::from_utf8(&bytes).map_err(|_| scope())?)?;
+        if metadata.id != course_id
+            || metadata.kind != "course"
+            || metadata.extra.get("parentId").is_some_and(|v| !v.is_null())
+        {
+            return Err(scope());
+        }
+        let repo = Self {
+            directory: root,
+            course: Some(course_id.into()),
+            writable: true,
+        };
+        repo.git(&["init", "--template=", "--object-format=sha1", "."], &[])?;
+        let marker = repo.directory.join(".git/learning-materials-v2");
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(marker)?;
+        file.write_all(course_id.as_bytes())?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        {
+            fs::File::open(repo.directory.join(".git"))?.sync_all()?;
+            fs::File::open(&repo.directory)?.sync_all()?;
+        }
+        Self::open_course(library_root, course_id)
+    }
+
+    pub fn open_course(library_root: &Path, course_id: &str) -> Result<Self> {
+        let repo = Self {
+            directory: crate::course_project::course_project_root(library_root, course_id)?,
+            course: Some(course_id.into()),
+            writable: true,
+        };
+        repo.validate_layout()?;
+        if fs::read(repo.directory.join(".git/learning-materials-v2"))? != course_id.as_bytes()
+            || repo.text(&["rev-parse", "--is-bare-repository"], &[])? != "false"
+            || Path::new(&repo.text(&["rev-parse", "--show-toplevel"], &[])?) != repo.directory
+        {
+            return Err(scope());
+        }
+        Ok(repo)
+    }
+
+    // Legacy writer exists only for isolated compatibility fixtures. Production
+    // can open old shared bare snapshots read-only, never append new snapshots.
+    #[cfg(test)]
     /// Explicit opt-in only. The parent must exist; never initializes an existing
     /// directory or a directory nested in a software source Git repository.
     pub fn create_new(directory: &Path) -> Result<Self> {
@@ -208,7 +401,11 @@ impl MaterialGit {
             builder.mode(0o700);
         }
         builder.create(&directory)?;
-        let repo = Self { directory };
+        let repo = Self {
+            directory,
+            course: None,
+            writable: true,
+        };
         // An interrupted initialization is left intact, never silently reset.
         repo.git(
             &["init", "--bare", "--template=", "--object-format=sha1", "."],
@@ -224,7 +421,10 @@ impl MaterialGit {
         }
         let repo = Self {
             directory: directory.canonicalize()?,
+            course: None,
+            writable: false,
         };
+        repo.validate_layout()?;
         if fs::read(repo.directory.join("learning-materials-v1"))? != b"1\n"
             || repo.text(&["rev-parse", "--is-bare-repository"], &[])? != "true"
         {
@@ -237,6 +437,20 @@ impl MaterialGit {
     /// On failure, callers retain the old receipt/baseline and may retry the same
     /// frozen input. Unreachable objects left by Git are harmless, not receipts.
     pub fn commit(&self, frozen: &FrozenMaterials, parent: Option<&str>) -> Result<Checkpoint> {
+        self.validate_layout()?;
+        if !self.writable
+            || self.course.as_deref()
+                != frozen
+                    .project_root
+                    .as_ref()
+                    .map(|_| frozen.course_id.as_str())
+            || frozen
+                .project_root
+                .as_ref()
+                .is_some_and(|root| root != &self.directory)
+        {
+            return Err(scope());
+        }
         let mut blobs = Vec::new();
         for (path, bytes) in &frozen.entries {
             check_path(path)?;
@@ -246,17 +460,37 @@ impl MaterialGit {
             ));
         }
         let material = self.tree(&blobs)?;
-        let courses = self.tree_entries(&[("tree", &material, &frozen.course_id)])?;
+        let courses = if self.course.is_some() {
+            material
+        } else {
+            self.tree_entries(&[("tree", &material, &frozen.course_id)])?
+        };
         let report = self.text(
             &["hash-object", "-w", "--no-filters", "--stdin"],
             &serde_json::to_vec(&frozen.excluded_files)?,
         )?;
         let reports =
             self.tree_entries(&[("blob", &report, &format!("{}.json", frozen.course_id))])?;
-        let root = self.tree_entries(&[
-            ("tree", &courses, "materials"),
-            ("tree", &reports, "material-exclusions"),
-        ])?;
+        let mut root_entries = Vec::new();
+        if let Some(parent) = parent {
+            self.checkpoint(&frozen.course_id, parent)?;
+            for row in self
+                .git(&["ls-tree", "-z", parent], &[])?
+                .split(|b| *b == 0)
+                .filter(|r| !r.is_empty())
+            {
+                let (_, name) =
+                    row.split_at(row.iter().position(|b| *b == b'\t').ok_or_else(scope)? + 1);
+                if name != b"materials" && name != b"material-exclusions" {
+                    root_entries.extend_from_slice(row);
+                    root_entries.push(0);
+                }
+            }
+        }
+        root_entries.extend_from_slice(format!("040000 tree {courses}\tmaterials\0").as_bytes());
+        root_entries
+            .extend_from_slice(format!("040000 tree {reports}\tmaterial-exclusions\0").as_bytes());
+        let root = self.text(&["mktree", "-z"], &root_entries)?;
         let mut args = vec!["commit-tree", &root];
         if let Some(parent) = parent {
             self.checkpoint(&frozen.course_id, parent)?;
@@ -278,19 +512,25 @@ impl MaterialGit {
 
     /// Derives material identity from the commit, rather than trusting metadata.
     pub fn checkpoint(&self, course_id: &str, commit_oid: &str) -> Result<Checkpoint> {
+        self.validate_layout()?;
         check_id(course_id)?;
+        if self
+            .course
+            .as_deref()
+            .is_some_and(|course| course != course_id)
+        {
+            return Err(scope());
+        }
         check_oid(commit_oid)?;
         if self.text(&["cat-file", "-t", commit_oid], &[])? != "commit" {
             return Err(scope());
         }
-        let material_tree_oid = self.text(
-            &[
-                "rev-parse",
-                "--verify",
-                &format!("{commit_oid}:materials/{course_id}"),
-            ],
-            &[],
-        )?;
+        let material_path = if self.course.is_some() {
+            format!("{commit_oid}:materials")
+        } else {
+            format!("{commit_oid}:materials/{course_id}")
+        };
+        let material_tree_oid = self.text(&["rev-parse", "--verify", &material_path], &[])?;
         check_oid(&material_tree_oid)?;
         if self.text(&["cat-file", "-t", &material_tree_oid], &[])? != "tree" {
             return Err(scope());
@@ -366,7 +606,7 @@ impl MaterialGit {
         let new = self.checkpoint(course_id, new)?.material_tree_oid;
         let old_tree = match old {
             Some(oid) => self.checkpoint(course_id, oid)?.material_tree_oid,
-            None => self.tree_entries(&[])?,
+            None => self.text(&["hash-object", "-t", "tree", "--stdin"], &[])?,
         };
         let diff = |flags: &[&str], path: Option<&str>| {
             let mut args = vec![
@@ -441,6 +681,57 @@ impl MaterialGit {
             initial: old.is_none(),
             changes,
         })
+    }
+
+    fn validate_layout(&self) -> Result<()> {
+        let git = if self.course.is_some() {
+            self.directory.join(".git")
+        } else {
+            self.directory.clone()
+        };
+        let mut pending = vec![git.clone()];
+        let mut seen = 0;
+        while let Some(path) = pending.pop() {
+            seen += 1;
+            if seen > 65536 {
+                return Err(CoreError::new(
+                    "LIMIT_EXCEEDED",
+                    "Git 仓库条目超过校验上限，未读取或写入快照。",
+                ));
+            }
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                return Err(scope());
+            }
+            if metadata.is_dir() {
+                for entry in fs::read_dir(path)? {
+                    pending.push(entry?.path());
+                }
+            } else if !metadata.is_file() {
+                return Err(scope());
+            }
+            #[cfg(unix)]
+            if metadata.is_file() {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.nlink() != 1 {
+                    return Err(scope());
+                }
+            }
+        }
+        if let Some(course) = &self.course {
+            if crate::assets::bounded_read(&git.join("learning-materials-v2"), 128)?
+                != course.as_bytes()
+            {
+                return Err(scope());
+            }
+        }
+        if git.join("commondir").exists()
+            || git.join("objects/info/alternates").exists()
+            || git.join("objects/info/http-alternates").exists()
+        {
+            return Err(scope());
+        }
+        Ok(())
     }
 
     fn tree(&self, blobs: &[(String, String)]) -> Result<String> {
@@ -522,6 +813,20 @@ impl MaterialGit {
                 "-c",
                 "protocol.allow=never",
             ])
+            .arg(format!(
+                "--git-dir={}",
+                if self.course.is_some() {
+                    self.directory.join(".git")
+                } else {
+                    self.directory.clone()
+                }
+                .display()
+            ))
+            .args(
+                self.course
+                    .as_ref()
+                    .map(|_| format!("--work-tree={}", self.directory.display())),
+            )
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -659,3 +964,7 @@ fn limit() -> CoreError {
 #[cfg(test)]
 #[path = "material_git_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "course_git_tests.rs"]
+mod course_tests;
