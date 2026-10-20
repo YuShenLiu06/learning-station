@@ -18,6 +18,8 @@ pub struct ContextInjection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RequestedContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<crate::focus::Focus>,
     pub document_id: String,
     pub selection: String,
     pub injections: Vec<ContextInjection>,
@@ -49,6 +51,7 @@ pub fn requested_context(
     }
     let frozen: RequestedContext = serde_json::from_value(value.clone()).map_err(|_| invalid())?;
     if (!frozen.document_id.is_empty() && !crate::types::valid_id(&frozen.document_id))
+        || frozen.focus.as_ref().is_some_and(|f| f.document_id != frozen.document_id || f.id.len() != 64 || serde_json::to_vec(f).map_or(true, |s| s.len() > 100_000))
         || frozen.selection.len() > 30000
         || frozen.selection != entry.selection.as_deref().unwrap_or_default()
         || frozen.injections.len()
@@ -298,6 +301,39 @@ pub fn inject(store: &ContentStore, ctx: &mut Context, inputs: &[ContextInjectio
 }
 
 pub const MAX_CONTEXT_CHARS: usize = 60_000;
+
+/// Course metadata authorizes a later read at the submitted version. It contains no
+/// body and does not imply that Pi received any source or retained a full baseline.
+pub fn course_read_manifest(store: &ContentStore, owner: &str) -> Result<Vec<ManifestItem>> {
+    if crate::course_sessions::course(store, owner)?.as_deref() != Some(owner) {
+        return Err(CoreError::new("OUT_OF_SCOPE", "课程读取范围无效。"));
+    }
+    let mut sources: Vec<_> = crate::library_tree::list(store)?
+        .nodes
+        .into_iter()
+        .filter(|node| {
+            node.course_id == owner
+                && matches!(node.kind.as_str(), "section" | "knowledge" | "exploration")
+        })
+        .map(|node| ManifestItem {
+            id: node.id,
+            path: node.path,
+            version: node.version,
+            included_chars: 0,
+        })
+        .collect();
+    sources.extend(
+        crate::assets::list(store, owner)?
+            .into_iter()
+            .map(|asset| ManifestItem {
+                path: format!("assets/{}/{}", asset.course_id, asset.id),
+                id: asset.id,
+                version: asset.sha256,
+                included_chars: 0,
+            }),
+    );
+    Ok(sources)
+}
 pub const MAX_CONTEXT_DOCUMENTS: usize = 32;
 pub const MAX_CONTEXT_DEPTH: usize = 4;
 const MAX_REFERENCE_ATTEMPTS: usize = 128;
@@ -970,7 +1006,7 @@ pub fn protect_trashed_history(
         .retain(|warning| !warning.starts_with(TRASHED_HISTORY_PREFIX));
     let mut matched = BTreeSet::new();
     for id in std::iter::once(&session.id)
-        .chain(std::iter::once(&session.section_id))
+        .chain(session.course_id.is_none().then_some(&session.section_id))
         .chain(session.context_excluded_history_source_ids.iter())
         .chain(context.excluded_history_source_ids.iter())
     {
@@ -1208,6 +1244,8 @@ mod trash_history_tests {
     use serde_json::{json, Value};
     fn session(data: Value, related_ids: Vec<String>) -> Session {
         Session {
+            course_id: None,
+            legacy_session_ids: vec![],
             id: "kept_session".into(),
             section_id: "kept_source".into(),
             title: "Kept".into(),

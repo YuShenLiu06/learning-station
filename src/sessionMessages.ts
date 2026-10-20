@@ -1,3 +1,4 @@
+import { readFocus } from './focus.ts';
 import { readRequestedContext } from './requestedContext.ts';
 import { readContextBridgeManifest } from './contextBridge.ts';
 import type { Message } from './types';
@@ -14,7 +15,7 @@ export function sessionMessages(entries: Entry[]): Message[] {
     createdAt: entry.createdAt,
     requestedContext: entry.kind === 'user' ? readRequestedContext(entry.data?.requestedContext, entry.selection || '', entry.data?.citationContext) : undefined,
 
-    context: entry.kind === 'assistant' && Array.isArray(entry.data?.contextManifest) ? { text: '', contextBridgeManifest: readContextBridgeManifest(entry.data.contextBridgeManifest), manifest: entry.data.contextManifest as NonNullable<Message['context']>['manifest'], historyManifest: Array.isArray(entry.data.historyManifest) ? entry.data.historyManifest as NonNullable<Message['context']>['manifest'] : [], assistantReferenceManifest: Array.isArray(entry.data.assistantReferenceManifest) ? entry.data.assistantReferenceManifest as NonNullable<Message['context']>['manifest'] : undefined, exerciseReferenceManifest: Array.isArray(entry.data.exerciseReferenceManifest) ? entry.data.exerciseReferenceManifest as NonNullable<Message['context']>['manifest'] : undefined, warnings: Array.isArray(entry.data.contextWarnings) ? entry.data.contextWarnings.filter((value): value is string => typeof value === 'string') : [], truncated: entry.data.contextTruncated === true } : undefined,
+    context: entry.kind === 'assistant' && Array.isArray(entry.data?.contextManifest) ? { text: '', focus: readFocus(entry.data.focus), contextBridgeManifest: readContextBridgeManifest(entry.data.contextBridgeManifest), manifest: entry.data.contextManifest as NonNullable<Message['context']>['manifest'], historyManifest: Array.isArray(entry.data.historyManifest) ? entry.data.historyManifest as NonNullable<Message['context']>['manifest'] : [], assistantReferenceManifest: Array.isArray(entry.data.assistantReferenceManifest) ? entry.data.assistantReferenceManifest as NonNullable<Message['context']>['manifest'] : undefined, exerciseReferenceManifest: Array.isArray(entry.data.exerciseReferenceManifest) ? entry.data.exerciseReferenceManifest as NonNullable<Message['context']>['manifest'] : undefined, warnings: Array.isArray(entry.data.contextWarnings) ? entry.data.contextWarnings.filter((value): value is string => typeof value === 'string') : [], truncated: entry.data.contextTruncated === true } : undefined,
     needsConfirmation: entry.kind === 'note' && entry.data?.needsConfirmation === true,
   }));
 }

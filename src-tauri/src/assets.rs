@@ -52,8 +52,16 @@ struct StoredAsset {
 
 struct LockedRoot {
     path: PathBuf,
-    // Advisory OS locking is released on process exit, including a crash.
+    // Constructed only after this file has acquired the advisory lock.
     _lock: File,
+}
+
+impl Drop for LockedRoot {
+    fn drop(&mut self) {
+        // close alone may leave a spawned child's inherited descriptor holding
+        // this lock. Release our ownership before File closes and OPERATIONS drops.
+        let _ = self._lock.unlock();
+    }
 }
 
 /// Imports bytes provided by the caller, never a caller-selected system path.
@@ -88,17 +96,28 @@ pub fn import(
         asset,
     };
     let _process = OPERATIONS.lock().map_err(|_| busy())?;
-    let root = lock_root(store, true)?.ok_or_else(invalid_state)?;
+    let (storage, project) = crate::course_project::asset_storage(store, course_id)?;
+    let root = lock_root(&storage, true)?.ok_or_else(invalid_state)?;
     // The ID is global even though storage and authorization are course-scoped.
     // Checking only directory existence discloses no other course's contents.
     reject_other_course_request(&root.path, course_id, &id)?;
+    for summary in store
+        .summaries()
+        .into_iter()
+        .filter(|s| s.kind == "course" && s.id != course_id)
+    {
+        let (other, _) = crate::course_project::asset_storage(store, &summary.id)?;
+        if fs::symlink_metadata(other.join("assets").join(&summary.id).join(&id)).is_ok() {
+            return Err(conflict());
+        }
+    }
     let course =
-        checked_directory(store.root(), &["assets", course_id], true)?.ok_or_else(invalid_state)?;
+        checked_directory(&storage, &["assets", course_id], true)?.ok_or_else(invalid_state)?;
     let path = course.join(&id);
     if fs::symlink_metadata(&path).is_ok() {
-        return existing_receipt(store.root(), course_id, &id, &record);
+        return existing_receipt(&storage, course_id, &id, &record, project);
     }
-    let existing = list_course(store.root(), course_id)?;
+    let existing = list_course(&storage, course_id, project)?;
     let total: u64 = existing.iter().map(|asset| asset.size).sum();
     if existing.len() >= MAX_ASSETS || total + bytes.len() as u64 > MAX_COURSE_BYTES {
         return Err(limit("每门课程最多保存100份资料，总大小不得超过25MiB。"));
@@ -106,16 +125,24 @@ pub fn import(
     match create_private_directory(&path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            return existing_receipt(store.root(), course_id, &id, &record);
+            return existing_receipt(&storage, course_id, &id, &record, project);
         }
         Err(error) => return Err(CoreError::io(error)),
     }
-    checked_directory(store.root(), &["assets", course_id, &id], false)?
-        .ok_or_else(invalid_state)?;
-    write_noclobber(&path, &format!("content.{extension}"), bytes)?;
+    checked_directory(&storage, &["assets", course_id, &id], false)?.ok_or_else(invalid_state)?;
+    let name = if project {
+        editable_name(file_name)
+    } else {
+        format!("content.{extension}")
+    };
+    write_noclobber(&path, &name, bytes)?;
     write_noclobber(
         &path,
-        "metadata.json",
+        if project {
+            ".asset.json"
+        } else {
+            "metadata.json"
+        },
         &serde_json::to_vec(&record).map_err(|_| invalid_state())?,
     )?;
     sync_directory(&course)?;
@@ -125,18 +152,40 @@ pub fn import(
 pub fn list(store: &ContentStore, course_id: &str) -> Result<Vec<Asset>> {
     validate_course(store, course_id)?;
     let _process = OPERATIONS.lock().map_err(|_| busy())?;
-    let Some(_root) = lock_root(store, false)? else {
+    let (storage, project) = crate::course_project::asset_storage(store, course_id)?;
+    let Some(_root) = lock_root(&storage, false)? else {
         return Ok(vec![]);
     };
-    list_course(store.root(), course_id)
+    list_course(&storage, course_id, project)
+}
+
+/// Full, validated inert bytes for a checkpoint; never the truncated preview.
+pub(crate) fn checkpoint_bytes(
+    store: &ContentStore,
+    course_id: &str,
+) -> Result<Vec<(Asset, Vec<u8>)>> {
+    validate_course(store, course_id)?;
+    let _process = OPERATIONS.lock().map_err(|_| busy())?;
+    let (storage, project) = crate::course_project::asset_storage(store, course_id)?;
+    let Some(_root) = lock_root(&storage, false)? else {
+        return Ok(vec![]);
+    };
+    list_course(&storage, course_id, project)?
+        .iter()
+        .map(|asset| {
+            load_asset(&storage, course_id, &asset.id, project)
+                .map(|(record, bytes)| (record.asset, bytes))
+        })
+        .collect()
 }
 
 pub fn read(store: &ContentStore, course_id: &str, asset_id: &str) -> Result<AssetPreview> {
     validate_course(store, course_id)?;
     validate_asset_id(asset_id)?;
     let _process = OPERATIONS.lock().map_err(|_| busy())?;
-    let _root = lock_root(store, false)?.ok_or_else(not_found)?;
-    let (record, bytes) = load_asset(store.root(), course_id, asset_id)?;
+    let (storage, project) = crate::course_project::asset_storage(store, course_id)?;
+    let _root = lock_root(&storage, false)?.ok_or_else(not_found)?;
+    let (record, bytes) = load_asset(&storage, course_id, asset_id, project)?;
     let is_image = record.asset.mime.starts_with("image/");
     let (text, data_url, truncated) = if is_image {
         (
@@ -238,7 +287,14 @@ fn mime_for(extension: &str) -> Option<(&'static str, bool)> {
     })
 }
 
-fn inspect(file_name: &str, bytes: &[u8]) -> Result<(String, &'static str)> {
+pub(crate) fn material_file_allowed(name: &str) -> bool {
+    extension(name)
+        .ok()
+        .and_then(|ext| mime_for(&ext))
+        .is_some()
+}
+
+pub(crate) fn inspect(file_name: &str, bytes: &[u8]) -> Result<(String, &'static str)> {
     let extension = extension(file_name)?;
     let (mime, image) = mime_for(&extension).ok_or_else(|| {
         CoreError::new(
@@ -299,6 +355,10 @@ fn inspect(file_name: &str, bytes: &[u8]) -> Result<(String, &'static str)> {
     Ok((extension, mime))
 }
 
+pub(crate) fn editable_name(name: &str) -> String {
+    name.replace('%', "%25").replace(':', "%3A")
+}
+
 fn payload_hash(asset: &Asset) -> Result<String> {
     let bytes = serde_json::to_vec(&(
         &asset.course_id,
@@ -316,17 +376,18 @@ fn existing_receipt(
     course_id: &str,
     id: &str,
     requested: &StoredAsset,
+    project: bool,
 ) -> Result<Asset> {
-    let (existing, _) = load_asset(root, course_id, id)?;
+    let (existing, _) = load_asset(root, course_id, id, project)?;
     if existing.request_id != requested.request_id
         || existing.payload_hash != requested.payload_hash
     {
         return Err(conflict());
     }
-    Ok(existing.asset)
+    Ok(requested.asset.clone())
 }
 
-fn list_course(root: &Path, course_id: &str) -> Result<Vec<Asset>> {
+fn list_course(root: &Path, course_id: &str, project: bool) -> Result<Vec<Asset>> {
     let Some(course) = checked_directory(root, &["assets", course_id], false)? else {
         return Ok(vec![]);
     };
@@ -342,7 +403,7 @@ fn list_course(root: &Path, course_id: &str) -> Result<Vec<Asset>> {
         if assets.len() >= MAX_ASSETS {
             return Err(limit("课程资料超过100份，未读取或写入更多内容。"));
         }
-        let (record, _) = load_asset(root, course_id, &id)?;
+        let (record, _) = load_asset(root, course_id, &id, project)?;
         total += record.asset.size;
         if total > MAX_COURSE_BYTES {
             return Err(limit("课程资料总大小超过25MiB。"));
@@ -353,12 +414,22 @@ fn list_course(root: &Path, course_id: &str) -> Result<Vec<Asset>> {
     Ok(assets)
 }
 
-fn load_asset(root: &Path, course_id: &str, id: &str) -> Result<(StoredAsset, Vec<u8>)> {
+fn load_asset(
+    root: &Path,
+    course_id: &str,
+    id: &str,
+    project: bool,
+) -> Result<(StoredAsset, Vec<u8>)> {
     validate_asset_id(id)?;
     let directory =
         checked_directory(root, &["assets", course_id, id], false)?.ok_or_else(not_found)?;
-    let metadata = bounded_read(&directory.join("metadata.json"), MAX_METADATA)?;
-    let record: StoredAsset = serde_json::from_slice(&metadata).map_err(|_| invalid_state())?;
+    let receipt = if project {
+        ".asset.json"
+    } else {
+        "metadata.json"
+    };
+    let metadata = bounded_read(&directory.join(receipt), MAX_METADATA)?;
+    let mut record: StoredAsset = serde_json::from_slice(&metadata).map_err(|_| invalid_state())?;
     if record.version != 1
         || !crate::types::valid_id(&record.request_id)
         || record.asset.id != id
@@ -382,11 +453,15 @@ fn load_asset(root: &Path, course_id: &str, id: &str) -> Result<(StoredAsset, Ve
     {
         return Err(invalid_state());
     }
-    let content_name = format!("content.{ext}");
+    let content_name = if project {
+        editable_name(&record.asset.file_name)
+    } else {
+        format!("content.{ext}")
+    };
     let mut entries = 0;
     for entry in fs::read_dir(&directory).map_err(CoreError::io)? {
         let name = entry.map_err(CoreError::io)?.file_name();
-        if name != "metadata.json" && name != content_name.as_str() {
+        if name != receipt && name != content_name.as_str() {
             return Err(invalid_state());
         }
         entries += 1;
@@ -401,10 +476,16 @@ fn load_asset(root: &Path, course_id: &str, id: &str) -> Result<(StoredAsset, Ve
         &directory.join(content_name),
         if image { MAX_IMAGE } else { MAX_TEXT },
     )?;
-    if bytes.len() as u64 != record.asset.size || digest(&bytes) != record.asset.sha256 {
+    if !project
+        && (bytes.len() as u64 != record.asset.size || digest(&bytes) != record.asset.sha256)
+    {
         return Err(invalid_state());
     }
     inspect(&record.asset.file_name, &bytes)?;
+    if project {
+        record.asset.size = bytes.len() as u64;
+        record.asset.sha256 = digest(&bytes);
+    }
     Ok((record, bytes))
 }
 
@@ -437,8 +518,8 @@ fn reject_other_course_request(root: &Path, course_id: &str, id: &str) -> Result
     Ok(())
 }
 
-fn lock_root(store: &ContentStore, create: bool) -> Result<Option<LockedRoot>> {
-    let Some(root) = checked_directory(store.root(), &["assets"], create)? else {
+fn lock_root(root: &Path, create: bool) -> Result<Option<LockedRoot>> {
+    let Some(root) = checked_directory(root, &["assets"], create)? else {
         return Ok(None);
     };
     let path = root.join(LOCK_NAME);
@@ -537,7 +618,7 @@ fn same_file(a: &Metadata, b: &Metadata) -> bool {
     }
 }
 
-fn bounded_read(path: &Path, maximum: usize) -> Result<Vec<u8>> {
+pub(crate) fn bounded_read(path: &Path, maximum: usize) -> Result<Vec<u8>> {
     let file = checked_file(path, maximum)?;
     let mut bytes = Vec::new();
     file.take((maximum + 1) as u64)
@@ -1080,5 +1161,194 @@ mod tests {
         ] {
             assert_eq!(base64(input), encoded);
         }
+    }
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod lock_lifecycle_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::mpsc;
+    use std::thread::{self, JoinHandle};
+    use std::time::{Duration, Instant};
+
+    struct InheritedFile {
+        child: Child,
+        output: Option<JoinHandle<()>>,
+    }
+
+    impl InheritedFile {
+        fn hold(file: &File) -> Self {
+            let fd = file.as_raw_fd();
+            let metadata = file.metadata().unwrap();
+            let ready = format!(
+                "ASSET_LOCK_CHILD_READY:{}:{}",
+                metadata.dev(),
+                metadata.ino()
+            );
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "assets::lock_lifecycle_tests::inherited_asset_lock_child",
+                    "--nocapture",
+                ])
+                .env("LEARNING_STATION_ASSET_TEST_FD", fd.to_string())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            // Only the child changes CLOEXEC, immediately before exec. The parent
+            // retains its flags; no unrelated test's executable inherits this FD.
+            unsafe {
+                command.pre_exec(move || {
+                    unsafe extern "C" {
+                        fn fcntl(fd: i32, command: i32, ...) -> i32;
+                    }
+                    const F_GETFD: i32 = 1;
+                    const F_SETFD: i32 = 2;
+                    const FD_CLOEXEC: i32 = 1;
+                    let flags = fcntl(fd, F_GETFD);
+                    if flags < 0 || fcntl(fd, F_SETFD, flags & !FD_CLOEXEC) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut child = command.spawn().unwrap();
+            let output = child.stdout.take().unwrap();
+            let (sender, receiver) = mpsc::channel();
+            let output = thread::spawn(move || {
+                for line in BufReader::new(output)
+                    .lines()
+                    .map_while(std::result::Result::ok)
+                {
+                    if line.contains(&ready) {
+                        let _ = sender.send(());
+                    }
+                }
+            });
+            let holder = Self {
+                child,
+                output: Some(output),
+            };
+            receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+            holder
+        }
+
+        fn finish(mut self) {
+            self.child.stdin.take().unwrap().write_all(b"x").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    assert!(status.success());
+                    break;
+                }
+                assert!(Instant::now() < deadline, "inherited-FD child did not exit");
+                thread::sleep(Duration::from_millis(5));
+            }
+            self.output.take().unwrap().join().unwrap();
+        }
+    }
+
+    impl Drop for InheritedFile {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            if let Some(output) = self.output.take() {
+                let _ = output.join();
+            }
+        }
+    }
+
+    #[test]
+    fn inherited_asset_lock_child() {
+        let Ok(fd) = std::env::var("LEARNING_STATION_ASSET_TEST_FD") else {
+            return;
+        };
+        let file = unsafe { File::from_raw_fd(fd.parse().unwrap()) };
+        let metadata = file.metadata().unwrap();
+        println!(
+            "ASSET_LOCK_CHILD_READY:{}:{}",
+            metadata.dev(),
+            metadata.ino()
+        );
+        std::io::stdout().flush().unwrap();
+        std::io::stdin().read_exact(&mut [0]).unwrap();
+        drop(file);
+    }
+
+    #[test]
+    fn close_only_control_keeps_lock_until_inherited_descriptor_closes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.lock");
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.try_lock().unwrap();
+        let child = InheritedFile::hold(&file);
+        drop(file);
+        let contender = File::options().read(true).write(true).open(path).unwrap();
+        assert!(matches!(
+            contender.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        child.finish();
+    }
+
+    #[test]
+    fn guard_releases_inherited_lock_on_return_error_and_unwind() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ContentStore::new(
+            directory.path().join("library"),
+            directory.path().join("state"),
+        )
+        .unwrap();
+        for exit in ["return", "error", "unwind"] {
+            let mut child = None;
+            let outcome =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                    let root = lock_root(store.root(), true)?.unwrap();
+                    child = Some(InheritedFile::hold(&root._lock));
+                    match exit {
+                        "error" => Err(invalid_state()),
+                        "unwind" => panic!("synthetic asset-guard unwind"),
+                        _ => Ok(()),
+                    }
+                }));
+            match exit {
+                "error" => assert!(outcome.unwrap().is_err()),
+                "unwind" => assert!(outcome.is_err()),
+                _ => outcome.unwrap().unwrap(),
+            }
+            let next = lock_root(store.root(), false).unwrap().unwrap();
+            child.take().unwrap().finish();
+            // Closing an inherited descriptor of the old owner must not unlock
+            // the next owner, which uses a different open-file-description.
+            assert_eq!(lock_root(store.root(), false).err().unwrap().code, "BUSY");
+            drop(next);
+        }
+    }
+
+    #[test]
+    fn failed_acquisition_does_not_unlock_the_existing_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ContentStore::new(
+            directory.path().join("library"),
+            directory.path().join("state"),
+        )
+        .unwrap();
+        let owner = lock_root(store.root(), true).unwrap().unwrap();
+        for _ in 0..2 {
+            assert_eq!(lock_root(store.root(), false).err().unwrap().code, "BUSY");
+        }
+        drop(owner);
+        assert!(lock_root(store.root(), false).unwrap().is_some());
     }
 }

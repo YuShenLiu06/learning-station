@@ -351,6 +351,7 @@ pub fn freeze(
     if inputs.len() + ai.len() + exercise.len() > 8 {
         return Err(CoreError::new("LIMIT_EXCEEDED", "附加引用合计最多8份。"));
     }
+    crate::course_sessions::validate_injections(store, session, inputs)?;
     crate::assistant_references::validate_references(store, session, ai)?;
     let projected = exercises::validate_references(store, session, exercise)?;
     let mut refs = vec![];
@@ -446,6 +447,12 @@ pub fn validate(
         return Err(conflict());
     }
     for (saved, now) in frozen.references.iter().zip(current.references) {
+        let origin = if saved.exercise_state.is_some() {
+            let path = saved.source.path.split('/').collect::<Vec<_>>();
+            let reference = exercise.iter().find(|r| path.len() == 5 && r.document_id == path[1] && r.question_id == path[2]).ok_or_else(conflict)?;
+            Some(crate::sessions::get(store, &reference.session_id)?)
+        } else { None };
+        let source_session = origin.as_ref().unwrap_or(session);
         if saved.supplemental_context.len() > context::MAX_CONTEXT_DOCUMENTS
             || saved.quoted_text.chars().count()
                 + saved
@@ -512,7 +519,7 @@ pub fn validate(
                 }
                 let p = exercise_source(exercises::project(
                     store,
-                    session,
+                    source_session,
                     path[1],
                     path[2],
                     path[3],
@@ -555,12 +562,12 @@ pub fn validate(
                 return Err(conflict());
             }
             if let Some(id) = &state.attempt_id {
-                exercises::project(store, session, path[1], path[2], "attempt", Some(id))?;
+                exercises::project(store, source_session, path[1], path[2], "attempt", Some(id))?;
             } else if state.status != "unanswered" {
                 return Err(conflict());
             }
             if let Some(id) = &state.feedback_entry_id {
-                let entry = session
+                let entry = source_session
                     .entries
                     .iter()
                     .find(|e| &e.id == id)
@@ -570,7 +577,7 @@ pub fn validate(
                 {
                     return Err(conflict());
                 }
-                exercises::project(store, session, path[1], path[2], "feedback", Some(id))?;
+                exercises::project(store, source_session, path[1], path[2], "feedback", Some(id))?;
             }
         }
     }

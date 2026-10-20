@@ -28,6 +28,8 @@ pub struct LibraryState {
     pub documents: Vec<DocumentSummary>,
     pub active_document_id: Option<String>,
     pub active_session_id: Option<String>,
+    pub last_session_id: Option<String>,
+    pub last_course_id: Option<String>,
     pub last_run_id: Option<String>,
     pub model: ModelSettings,
     pub indexing: bool,
@@ -346,6 +348,15 @@ impl Engine {
             .read()
             .map_err(|_| CoreError::new("BUSY", "模型设置暂不可用。"))?
             .clone();
+        let last_session_id = core.preferences.active_session_id.clone()
+            .filter(|id| !core.content.is_trashed(id));
+        // Session paths are canonical and bounded; restoring chat selection does not
+        // require reopening the reading document or scanning the whole library.
+        let last_course_id = last_session_id.as_deref().filter(|id| valid_id(id))
+            .and_then(|id| core.content.register(&format!("sessions/{id}/session.md")).ok())
+            .filter(|d| Some(d.id.as_str()) == last_session_id.as_deref() && d.metadata.kind == "session")
+            .and_then(|d| d.metadata.extra.get("courseId").and_then(Value::as_str).map(str::to_owned))
+            .filter(|id| !core.content.is_trashed(id));
         Ok(LibraryState {
             root: core.content.root().to_string_lossy().into_owned(),
             documents: core.summaries(),
@@ -359,6 +370,8 @@ impl Engine {
                 .active_session_id
                 .clone()
                 .filter(|id| !core.content.is_trashed(id)),
+            last_session_id,
+            last_course_id,
             last_run_id: core
                 .preferences
                 .active_session_id
@@ -637,6 +650,13 @@ impl Core {
         section_id: &str,
         new_session: bool,
     ) -> Result<(Session, Context)> {
+        if let Some(owner) = crate::course_sessions::course(&self.content, section_id)? {
+            if new_session {
+                let session = crate::course_sessions::create(self, &owner, &uuid::Uuid::new_v4().simple().to_string())?;
+                return self.session_context_for(&session.id, Some(section_id), None);
+            }
+            return crate::course_sessions::open(self, section_id, &owner);
+        }
         if self.content.read(section_id)?.metadata.kind == "exercise" {
             let item = crate::exercises::get(&mut self.content, section_id)?;
             let (_, context) = self.session_context(&item.session.id, None)?;
@@ -745,12 +765,16 @@ impl Core {
         session_id: &str,
         selection: Option<&str>,
     ) -> Result<(Session, Context)> {
+        self.session_context_for(session_id, None, selection)
+    }
+    pub fn session_context_for(&mut self, session_id: &str, document_id: Option<&str>, selection: Option<&str>) -> Result<(Session, Context)> {
         let session = sessions::get(&mut self.content, session_id)?;
-        let mut context = if session.section_id.is_empty() {
+        let source = crate::course_sessions::source(&self.content, &session, crate::course_sessions::request_document(&session, document_id))?;
+        let mut context = if source.is_empty() {
             if selection.is_some_and(|text| !text.is_empty()) {
                 return Err(CoreError::new(
                     "INVALID_INPUT",
-                    "独立探索不带入当前小节选句，请清除选句或开启小节关联。",
+                    "未选择材料，不能带入选句；请明确选择本次材料后再发送。",
                 ));
             }
             Context {
@@ -766,7 +790,7 @@ impl Core {
                 truncated: false,
             }
         } else {
-            context::load(&self.content, &session.section_id, selection)?
+            context::load(&self.content, &source, selection)?
         };
         context::protect_trashed_history(&mut context, &session, &self.content.trashed_ids());
         Ok((session, context))

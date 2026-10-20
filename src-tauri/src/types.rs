@@ -148,6 +148,10 @@ pub struct Entry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Session {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub course_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub legacy_session_ids: Vec<String>,
     pub id: String,
     pub section_id: String,
     pub title: String,

@@ -104,6 +104,10 @@ pub fn begin(
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ExplorationContext {
+    #[serde(default)]
+    pub origin: String,
+    #[serde(default)]
+    pub original_user_entry_id: String,
     pub scenario: String,
     pub original_question: String,
     pub user_goal: String,
@@ -116,52 +120,25 @@ pub fn request_context(
     goal: &str,
     manifest: &[ManifestItem],
 ) -> Result<Option<ExplorationContext>> {
-    if session.section_id.is_empty() {
+    // Explicit courses are not standalone exploration; their creation anchor may be recycled.
+    if session.course_id.is_some() || session.section_id.is_empty() {
         return Ok(None);
     }
-    let doc = store.read(&session.section_id)?;
-    let fixed = format!("node_{}", &hash(FOLDER_REQUEST_ID)[..32]);
-    let mut found = doc.metadata.kind == "exploration";
-    let mut parent = doc
-        .metadata
-        .extra
-        .get("parentId")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    let mut visited = std::collections::BTreeSet::new();
-    for _ in 0..16 {
-        let Some(id) = parent else { break };
-        if !visited.insert(id.clone()) {
-            break;
-        }
-        if id == fixed {
-            found = true;
-            break;
-        }
-        let ancestor = match store.read(&id) {
-            Ok(doc) => doc,
-            Err(error) if error.code == "NOT_FOUND" => break,
-            Err(error) => return Err(error),
-        };
-        parent = ancestor
-            .metadata
-            .extra
-            .get("parentId")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
+    let markers: Vec<_> = session.entries.iter().filter(|entry| entry.kind == "user"
+        && entry.data.as_ref().and_then(|data| data.get("origin")).and_then(serde_json::Value::as_str) == Some("exploration-entry")).collect();
+    let Some(original) = markers.first() else { return Ok(None); };
+    let request = original.data.as_ref().and_then(|data| data.get("clientMessageId")).and_then(serde_json::Value::as_str).unwrap_or("");
+    if markers.len() != 1 || !valid_id(request) || session.id != session_id(request)
+        || original.id != format!("entry_{}", &hash(&entry_request_id(request))[..32])
+        || session.section_id != format!("node_{}", &hash(&note_request_id(request))[..32]) {
+        return Err(CoreError::new("CONTEXT_CONFLICT", "探索入口与原问题来源不一致，未把普通聊天冒充为探索。"));
     }
-    if !found {
-        return Ok(None);
-    }
-    let original = session
-        .entries
-        .iter()
-        .find(|e| e.kind == "user")
-        .map(|e| e.content.clone())
-        .unwrap_or_else(|| goal.into());
+    store.read(&session.section_id)?;
     Ok(Some(ExplorationContext {
+        origin: "exploration-entry".into(),
+        original_user_entry_id: original.id.clone(),
         scenario: "question-led-exploration".into(),
-        original_question: original,
+        original_question: original.content.clone(),
         user_goal: goal.into(),
         storage_document_id: session.section_id.clone(),
         material_source_ids: manifest
@@ -305,6 +282,26 @@ mod tests {
         );
         assert_eq!(store.read(&first.document.id).unwrap().body, question);
         assert_eq!(counts(&mut store), (1, 1, 1, 1));
+    }
+
+    #[test]
+    fn exploration_intent_requires_its_real_launch_entry_not_mode_or_first_user() {
+        let (_, mut store) = fixture();
+        let launch = begin(&mut store, "Real launch question", "exploration_origin_001").unwrap();
+        let mut session = launch.session.clone();
+        let intent = request_context(&store, &session, "Followup goal", &[]).unwrap().unwrap();
+        assert_eq!(intent.origin, "exploration-entry");
+        assert_eq!(intent.original_user_entry_id, launch.user_entry_id);
+        assert_eq!(intent.original_question, "Real launch question");
+        session.entries.insert(0, Entry { id: "other_user".into(), kind: "user".into(), content: "Unrelated earlier question".into(), created_at: String::new(), selection: None, related_ids: vec![], data: None });
+        assert_eq!(request_context(&store, &session, "Goal", &[]).unwrap().unwrap().original_question, "Real launch question");
+        session.entries.retain(|entry| entry.id != launch.user_entry_id);
+        assert!(request_context(&store, &session, "Goal", &[]).unwrap().is_none());
+        session = launch.session;
+        session.entries[0].id = "forged_user".into();
+        assert_eq!(request_context(&store, &session, "Goal", &[]).unwrap_err().code, "CONTEXT_CONFLICT");
+        session.course_id = Some("ordinary_course".into());
+        assert!(request_context(&store, &session, "Goal", &[]).unwrap().is_none());
     }
 
     #[test]

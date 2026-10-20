@@ -31,6 +31,8 @@ type CitationContext = { version: 1; references: Array<{
 - 练习：复用 `exercise_references::project/context_parts`。同题题干、真实已保存attempt和作答状态单列；选旧attempt/feedback绑定那次attempt，其余绑定冻结时最新保存attempt。参考/解析只在同题实际提交资格满足时读取；反馈只使用既有public_feedback白名单。私有草稿、原始评分prompt/rubric/diagnostics不进入补充。
 - 沿每引用8000码点/30000字节、整轮60000码点/32实际来源预算。精确选区优先；补充不足时按真实范围裁剪并标truncated，不能静默截断quote。模型实际裁剪与持久用户原快照分开，实际来源清单记录实际范围与截断。
 
+决策样例：五个空行分隔的普通段落为“远前 / 近前 / prefix chosen suffix / 近后 / 远后”时，`quotedText`只保留`chosen`；补充只包含近前、所选段落其余部分与近后，远前/远后不进入。遇标题、列表、表格或代码围栏不向该块之外扩相邻段落。预算不足优先保留靠近选区的真实范围，显式标截断，不另设token魔数或新增设置UI。引用同题旧作答则补充该次真实attempt/status，不能把之后提交的新答案混入历史。参考 [Continue选区与文件上下文](https://docs.continue.dev/ide-extensions/edit/how-it-works) 和 [Cline显式文件引用](https://docs.cline.bot/core-workflows/working-with-files) 的选区/来源区分；本项目使用上述保守段落边界，不照搬整篇注入。
+
 ## Focus / Changes / Pi 接缝
 
 - 授权元数据 `courseReadManifest`、非聚焦summary、Git文件存在均不是正文覆盖。Citation只消费同次 `Context.automatic_materials` 的**真实正文**（来源ID、Document.version及精确字符范围/原文一致）或同轮更早Citation已投影范围。

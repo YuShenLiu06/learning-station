@@ -16,6 +16,10 @@ use std::{
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerationRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<crate::focus::Focus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_id: Option<String>,
     pub session_id: String,
     pub mode: String,
     pub selection: String,
@@ -33,6 +37,10 @@ pub struct GenerationRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Run {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_document_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<crate::focus::Focus>,
     pub id: String,
     pub session_id: String,
     pub mode: String,
@@ -43,6 +51,9 @@ pub struct Run {
     pub updated_at: String,
     pub request_digest: String,
     pub context_manifest: Vec<ManifestItem>,
+    /// Frozen authorization/version metadata only; never sent-body or session-read evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub course_read_manifest: Option<Vec<ManifestItem>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_bridge_manifest: Option<Value>,
     #[serde(default)]
@@ -110,6 +121,13 @@ pub struct ToolActivity {
 pub struct ManagedRun {
     pub run: Run,
     pub cancel: Arc<AtomicBool>,
+}
+impl Run {
+    pub(crate) fn read_scope_manifest(&self) -> &[ManifestItem] {
+        self.course_read_manifest
+            .as_deref()
+            .unwrap_or(&self.context_manifest)
+    }
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -228,7 +246,7 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
             ));
         }
         let session = sessions::get(&mut core.content, &request.session_id)?;
-        if !session.section_id.is_empty() && core.content.is_trashed(&session.section_id) {
+        if session.course_id.is_none() && !session.section_id.is_empty() && core.content.is_trashed(&session.section_id) {
             return Err(CoreError::new(
                 "TRASHED",
                 "当前学习文档已在回收站，请先恢复后再生成。",
@@ -251,10 +269,34 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
     // Serialize source validation and queued-run reservation with recycle/restore operations.
     // Taking this mutex does not read a Keychain item; credentials are resolved only after context.
     let model_store = engine.model.lock().await;
-    let (ctx, session, exploration_context, projection) = {
+    let (ctx, session, exploration_context, projection, source_id, course_read_manifest) = {
         let mut core = engine.lock()?;
-        let (session, mut ctx) =
-            core.session_context(&request.session_id, Some(&request.selection))?;
+        let session = sessions::get(&mut core.content, &request.session_id)?;
+        let frozen = request.focus.as_ref().map(|focus| crate::focus::load(&mut core, &session, focus)).transpose()?;
+        if let Some(f) = &frozen {
+            if !f.matches(&request)? { return Err(CoreError::new("CONTEXT_CONFLICT", "本次材料与原冻结请求不同。")); }
+        }
+        let source_id = if let Some(f) = &frozen { f.focus.source_document_id.clone() } else {
+            crate::course_sessions::source(&core.content, &session, crate::course_sessions::request_document(&session, request.document_id.as_deref()))?
+        };
+        if request.mode == "practice" && source_id.is_empty() {
+            return Err(CoreError::new("SOURCE_REQUIRED", "请先选择本课程材料再生成练习；普通对话没有默认材料来源。"));
+        }
+        let mut ctx = if let Some(f) = &frozen { f.context.clone() } else if session.course_id.is_some() {
+            if source_id.is_empty() && !request.selection.is_empty() {
+                return Err(CoreError::new("INVALID_INPUT", "请先选择选句所属材料。"));
+            }
+            core.session_context_for(&session.id, Some(""), None)?.1
+        } else {
+            core.session_context_for(&session.id, request.document_id.as_deref(), Some(&request.selection))?.1
+        };
+        if frozen.is_none() && session.course_id.is_some() && (request.mode == "practice" || !request.selection.is_empty()) {
+            let document = core.content.read(&source_id)?;
+            context::inject(&core.content, &mut ctx, &[context::ContextInjection {
+                document_id: source_id.clone(), expected_version: document.version,
+                selection: (!request.selection.is_empty()).then(|| request.selection.clone()), locator: None,
+            }])?;
+        }
         if let Some(entry_id) = &request.user_entry_id {
             validate_reused_user(
                 &session,
@@ -271,14 +313,25 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
                 .find(|entry| &entry.id == entry_id)
                 .ok_or_else(|| CoreError::new("NOT_FOUND", "原问题记录不存在。"))?;
             // Legacy accepted users have no auxiliary snapshot; never sample newer answers for them.
-            ctx.citation_context = Some(crate::citation_context::saved(entry)?.unwrap_or(
+            let saved_citation = crate::citation_context::saved(entry)?;
+            let expected_citation = ctx.citation_context.as_ref().filter(|c| !c.references.is_empty());
+            if frozen.is_some() && serde_json::to_value(&saved_citation)? != serde_json::to_value(expected_citation)? {
+                return Err(CoreError::new("CONTEXT_CONFLICT", "原问题的引用补充与冻结快照不同，未替换原请求。"));
+            }
+            ctx.citation_context = Some(saved_citation.unwrap_or(
                 crate::citation_context::CitationContext {
                     version: 1,
                     references: vec![],
                 },
             ));
-            if let Some(frozen) = context::requested_context(entry, Some(&session.section_id))? {
-                if serde_json::to_value(frozen.exercise_references)?
+            if entry.data.as_ref().and_then(|d| d.get("sourceDocumentId")).and_then(Value::as_str).is_some_and(|id| id != source_id) {
+                return Err(CoreError::new("CONTEXT_CONFLICT", "原问题的冻结来源已变化，未使用新页面替换原请求。"));
+            }
+            if let Some(frozen) = context::requested_context(entry, None)? {
+                if serde_json::to_value(&frozen.focus)? != serde_json::to_value(&request.focus)?
+                    || frozen.document_id != crate::course_sessions::request_document(&session, request.document_id.as_deref())
+                    || serde_json::to_value(frozen.exercise_references)?
+
                     != serde_json::to_value(&request.exercise_references)?
                     || serde_json::to_value(frozen.assistant_references)?
                         != serde_json::to_value(&request.assistant_references)?
@@ -293,23 +346,25 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
                 }
             }
         }
-        crate::exercise_references::inject_request(
-            &mut core.content,
-            &mut ctx,
-            &session,
-            &request.injections,
-            &request.assistant_references,
-            &request.exercise_references,
-        )?;
+        if frozen.is_none() {
+            crate::exercise_references::inject_request(&mut core.content, &mut ctx, &session,
+                &request.injections, &request.assistant_references, &request.exercise_references)?;
+        }
+        // Focus body and authorization versions must come from the same capture.
+        let course_read_manifest = if let Some(f) = &frozen { f.course_read_manifest.clone() } else {
+            session.course_id.as_deref().map(|owner| context::course_read_manifest(&core.content, owner)).transpose()?
+        };
+        if let Some(readable) = &course_read_manifest {
+            if ctx.manifest.iter().any(|item| !readable.iter().any(|source| source.id == item.id && source.version == item.version)) {
+                return Err(CoreError::new("CONTEXT_CONFLICT", "引用来源与本次课程版本不一致，请重新选择。"));
+            }
+        }
         // Native Pi owns model history. Rust retains business records without clipping them into the prompt.
         ctx.history_manifest.clear();
         ctx.warnings.retain(|w| !w.starts_with("TRUNCATED_HISTORY"));
-        let projection = crate::context_bridge::ContextBridge::snapshot(
-            &core.state_dir,
-            &core.content,
-            &session,
-            &ctx,
-        )?;
+        let projection = if request.focus.is_some() {
+            crate::automatic_context::prepare_native(&core.state_dir, &session, &ctx)
+        } else { crate::context_bridge::ContextBridge::snapshot(&core.state_dir, &core.content, &session, &ctx)? };
         let session = sessions::set_context_snapshot_explicit(
             &mut core.content,
             &session.id,
@@ -326,7 +381,8 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
         } else {
             None
         };
-        (ctx, session, intent, projection)
+        (ctx, session, intent, projection, source_id,
+            course_read_manifest,)
     };
     // Resolve visible sources and recycle-bin protections before touching this app's credential.
     // The authorization tier comes only from local user preferences; a read failure stays closed.
@@ -367,20 +423,26 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
     let native_session = {
         let core = engine.lock()?;
         let markdown = core.content.read(&session.id)?.content;
+        let mut native =
         crate::native_session::prepare(
             &core.state_dir,
             &session,
             &id,
             &native_user_id,
-            ctx.manifest.iter().map(|m| m.id.clone()).collect(),
+            crate::course_sessions::history_sources(&core.content, &session, &ctx.manifest)?,
             context::history_is_protected(&ctx),
             native_legacy_records(&session, Some(&native_user_id)),
             &markdown,
-        )?
+        )?;
+        native.project_root = crate::native_session::project_root(&core.content, &session)?;
+        native
     };
     let credentials = model_store.credentials()?;
     let stamp = timestamp();
     let run = Run {
+        source_document_id: Some(source_id.clone()),
+        course_read_manifest: course_read_manifest.clone(),
+        focus: request.focus.clone(),
         id: id.clone(),
         session_id: request.session_id.clone(),
         mode: request.mode.clone(),
@@ -446,7 +508,8 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
         );
     }
     drop(model_store); // Model selection cannot race credential capture and queued-run insertion.
-    let user_entry = generation_user_entry(&request, &session, &id);
+    let mut user_entry = generation_user_entry(&request, &session, &id);
+    user_entry.data.as_mut().unwrap()["sourceDocumentId"] = json!(source_id);
     record_user_and_resume(
         &engine,
         &session.id,
@@ -457,9 +520,9 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
     )?;
     let tool_scope = crate::learning_tools::ToolScope {
         session_id: session.id.clone(),
-        section_id: session.section_id.clone(),
+        section_id: source_id,
         run_id: id.clone(),
-        allowed_ids: ctx.manifest.iter().map(|item| item.id.clone()).collect(),
+        allowed_ids: run.read_scope_manifest().iter().map(|item| item.id.clone()).collect(),
     };
     let returned = run.clone();
     tokio::spawn(async move {
@@ -607,64 +670,7 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
     Ok(returned)
 }
 
-pub(crate) fn task_tool_policy(mode: &str, authorization: &str) -> model::ToolPolicy {
-    let (names, max_calls): (&[&str], usize) = match mode {
-        "question" => (
-            &[
-                "query_related_knowledge",
-                "record_question",
-                "create_note",
-                "create_todo",
-                "generate_exercises",
-                "list_learning_skills",
-                "load_learning_skill",
-            ],
-            4,
-        ),
-        "explain" => (
-            &[
-                "record_question",
-                "create_error",
-                "query_related_knowledge",
-                "create_review_card",
-                "create_note",
-                "create_todo",
-                "generate_exercises",
-                "list_learning_skills",
-                "load_learning_skill",
-            ],
-            6,
-        ),
-        // Practice keeps its small budget; only guidance listing/loading joins it.
-        "practice" => (
-            &[
-                "query_related_knowledge",
-                "list_learning_skills",
-                "load_learning_skill",
-            ],
-            2,
-        ),
-        "review" => (&["query_related_knowledge"], 2),
-        _ => (&[], 0),
-    };
-    let mut policy = model::ToolPolicy {
-        mode: mode.into(),
-        allowed_tools: names.iter().map(|name| (*name).to_owned()).collect(),
-        max_calls,
-        authorization: authorization.into(),
-    };
-    // Only the interactive exploration modes gain tier-authorized workspace tools.
-    if matches!(mode, "question" | "explain") {
-        if let Ok(extra) = model::authorization_tools(authorization) {
-            for name in extra {
-                if !policy.allowed_tools.iter().any(|tool| tool == name) {
-                    policy.allowed_tools.push((*name).to_owned());
-                }
-            }
-        }
-    }
-    policy
-}
+pub(crate) use crate::model::task_tool_policy;
 
 fn learning_tool_handler(
     engine: Arc<Engine>,
@@ -719,8 +725,91 @@ fn generation_user_entry(request: &GenerationRequest, session: &Session, id: &st
         selection: (!request.selection.is_empty()).then_some(request.selection.clone()),
         related_ids: vec![],
         data: Some(
-            json!({"mode":request.mode,"runId":id,"requestedContext":{"documentId":session.section_id,"selection":request.selection,"injections":request.injections,"assistantReferences":request.assistant_references,"exerciseReferences":request.exercise_references}}),
+            json!({"mode":request.mode,"runId":id,"requestedContext":{"focus":request.focus,"documentId":crate::course_sessions::request_document(&session, request.document_id.as_deref()),"selection":request.selection,"injections":request.injections,"assistantReferences":request.assistant_references,"exerciseReferences":request.exercise_references}}),
         ),
+    }
+}
+
+#[cfg(test)]
+mod course_source_tests {
+    use super::*;
+    #[test]
+    fn accepted_question_and_practice_retry_keep_the_frozen_note_after_navigation() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(dir.path().join("library"), dir.path().join("state")).unwrap();
+        let (session, a, b, ctx) = {
+            let mut c = engine.lock().unwrap();
+            let course = crate::library_tree::create(&mut c.content, "course", "Course", None, "", "frozen-course-owner").unwrap();
+            let a = crate::library_tree::create(&mut c.content, "section", "A", Some(&course.id), "First note", "frozen-course-note-a").unwrap();
+            let b = crate::library_tree::create(&mut c.content, "section", "B", Some(&course.id), "Second note", "frozen-course-note-b").unwrap();
+            let session = c.start_session(&a.id, false).unwrap().0;
+            let ctx = c.session_context_for(&session.id, Some(&b.id), None).unwrap().1;
+            c.start_session(&a.id, false).unwrap();
+            (session, a, b, ctx)
+        };
+        let request = GenerationRequest { focus: None, document_id: Some(b.id.clone()), session_id: session.id.clone(), mode: "practice".into(), selection: "".into(), prompt: "Practice B".into(), request_id: "frozen-practice-op".into(), user_entry_id: None, injections: vec![], assistant_references: vec![], exercise_references: vec![] };
+        let user = generation_user_entry(&request, &session, "frozen_practice_run");
+        assert_eq!(user.data.as_ref().unwrap()["requestedContext"]["documentId"], b.id);
+        {
+            let mut c = engine.lock().unwrap();
+            sessions::append(&mut c.content, &session.id, user.clone(), None, "frozen-user-operation").unwrap();
+            sessions::append(&mut c.content, &session.id, user, None, "frozen-user-operation").unwrap();
+        }
+        let text = json!({"exercises":[{"question":"B question?","format":"exact","answers":["B"],"explanation":"B explanation","tags":[],"sourceIds":[b.id]}],"summary":"B practice"}).to_string();
+        let first = save_result(&engine, &request, &ctx, "frozen_practice_run", &text).unwrap();
+        let retry = save_result(&engine, &request, &ctx, "frozen_practice_run", &text).unwrap();
+        assert_eq!(first.entries.len(), retry.entries.len());
+        let mut c = engine.lock().unwrap(); c.content.refresh().unwrap();
+        let children: Vec<_> = crate::library_tree::list(&c.content).unwrap().nodes.into_iter().filter(|n| n.kind == "exercise").collect();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].parent_id.as_deref(), Some(b.id.as_str()));
+        assert_ne!(children[0].parent_id.as_deref(), Some(a.id.as_str()));
+        assert_eq!(retry.entries.iter().filter(|e| e.kind == "user").count(), 1);
+        assert_eq!(retry.entries.iter().find(|e| e.kind == "exercise").unwrap().data.as_ref().unwrap()["sourceDocumentId"], b.id);
+    }
+    #[tokio::test]
+    async fn in_flight_page_edits_cannot_redirect_practice_or_saved_question_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(dir.path().join("library"), dir.path().join("state")).unwrap();
+        let (session, source, page, other, ctx) = {
+            let mut c = engine.lock().unwrap();
+            let owner = crate::library_tree::create(&mut c.content, "course", "Course", None, "", "inflight-course-owner").unwrap();
+            let a = crate::library_tree::create(&mut c.content, "section", "A", Some(&owner.id), "A material", "inflight-note-a").unwrap();
+            let b = crate::library_tree::create(&mut c.content, "section", "B", Some(&owner.id), "B material", "inflight-note-b").unwrap();
+            let session = c.start_session(&a.id, false).unwrap().0;
+            let page = exercises::create_manual(&mut c.content, &session.id, &a.id, exercises::ManualExercise {
+                question: "Original A?".into(), format: "exact".into(), answers: vec!["A".into()], explanation: "A explanation".into(),
+            }, "inflight-original-exercise").unwrap().document;
+            let ctx = c.session_context_for(&session.id, Some(&page.id), None).unwrap().1;
+            (session, a, page, b, ctx)
+        };
+        let request = GenerationRequest { focus: None, document_id: Some(page.id.clone()), session_id: session.id.clone(), mode: "practice".into(), selection: "".into(), prompt: "Practice original source".into(), request_id: "inflight-practice-operation".into(), user_entry_id: None, injections: vec![], assistant_references: vec![], exercise_references: vec![] };
+        let run_id = "run_inflight_source";
+        let user = generation_user_entry(&request, &session, run_id);
+        {
+            let mut c = engine.lock().unwrap();
+            let saved = sessions::append(&mut c.content, &session.id, user, None, "inflight-saved-question").unwrap();
+            assert_eq!(saved.entries.last().unwrap().data.as_ref().unwrap()["sourceDocumentId"], source.id);
+            let mut meta = page.metadata.clone(); meta.extra.insert("sourceDocumentId".into(), json!(other.id));
+            c.content.save(&page.id, &crate::content::serialize(&meta, &page.body).unwrap(), &page.version).unwrap();
+        }
+        let run: Run = serde_json::from_value(json!({
+            "id":run_id,"sessionId":session.id,"sourceDocumentId":source.id,"mode":"practice","status":"running",
+            "content":"","error":null,"createdAt":timestamp(),"updatedAt":timestamp(),"requestDigest":"fixture",
+            "contextSnapshotVersion":1,"contextManifest":ctx.manifest
+        })).unwrap();
+        engine.runs.lock().unwrap().insert(run_id.into(), ManagedRun { run, cancel: Arc::new(AtomicBool::new(false)) });
+        let mut retry = request.clone(); retry.request_id = "inflight-retry-question".into();
+        retry.user_entry_id = Some(format!("entry_{}", &hash("inflight-saved-question")[..32]));
+        assert_eq!(start(engine.clone(), retry, Arc::new(|_| {})).await.unwrap_err().code, "CONTEXT_CONFLICT");
+        let text = json!({"exercises":[{"question":"Frozen A?","format":"exact","answers":["A"],"explanation":"A explanation","tags":[],"sourceIds":[source.id]}],"summary":"Frozen A"}).to_string();
+        save_result(&engine, &request, &ctx, run_id, &text).unwrap();
+        save_result(&engine, &request, &ctx, run_id, &text).unwrap();
+        let c = engine.lock().unwrap();
+        let tree = crate::library_tree::list(&c.content).unwrap();
+        let created: Vec<_> = tree.nodes.iter().filter(|n| n.kind == "exercise" && n.id != page.id).collect();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].parent_id.as_deref(), Some(source.id.as_str()));
     }
 }
 
@@ -1006,6 +1095,10 @@ pub(crate) fn messages_current(
         json!({"role":"user","content":serde_json::to_string(&json!({"type":"learning_request","explorationContext":intent,"context":ctx.text,"manifest":ctx.manifest,"assistantReferenceManifest":ctx.assistant_reference_manifest,"exerciseReferenceManifest":ctx.exercise_reference_manifest,"warnings":ctx.warnings.iter().filter(|w|!w.starts_with("TRUNCATED_HISTORY")).collect::<Vec<_>>(),"selectedText":request.selection,"question":if request.prompt.trim().is_empty(){default_request(&request.mode)}else{&request.prompt},"mode":request.mode})).unwrap_or_default()}),
     ]
 }
+
+#[cfg(test)]
+#[path = "generation_project_tests.rs"]
+mod project_context_tests;
 fn native_legacy_records(session: &Session, exclude: Option<&str>) -> Vec<Value> {
     session.entries.iter().filter(|e|included_history(e,exclude)).map(|entry|json!({"id":entry.id,"kind":entry.kind,"origin":history_origin(entry),"content":if entry.kind=="exercise"{exercise_history(entry)}else{entry.content.clone()},"isUserStatement":entry.kind=="user","notice":"旧业务记录引用，未还原缺失工具消息"})).collect()
 }
@@ -1088,6 +1181,7 @@ fn save_result(
         .get(run_id)
         .map(|managed| managed.run.learning_skills.clone())
         .unwrap_or_default();
+    let frozen_source = engine.runs.lock().map_err(|_| CoreError::new("BUSY", "运行记录正在使用。"))?.get(run_id).and_then(|r| r.run.source_document_id.clone());
     if request.mode == "practice" {
         let mut data = practice(text, &ctx.manifest, run_id)?;
         data["contextManifest"] = json!(ctx.manifest);
@@ -1103,13 +1197,15 @@ fn save_result(
         let output_request = format!("{run_id}-output");
         let entry_id = format!("entry_{}", &hash(&output_request)[..32]);
         let mut expected = data.clone();
-        expected["sourceDocumentId"] = json!(session.section_id);
-        if let Err(mut error) = exercises::create(
+        let source_id = crate::course_sessions::source(&core.content, &session, crate::course_sessions::request_document(&session, frozen_source.as_deref().or(request.document_id.as_deref())))?;
+        expected["sourceDocumentId"] = json!(source_id);
+        if let Err(mut error) = exercises::create_from_snapshot(
             &mut core.content,
             &request.session_id,
-            &session.section_id,
+            &source_id,
             data,
             &output_request,
+            Some(&ctx.manifest),
         ) {
             if sessions::get(&mut core.content, &request.session_id).is_ok_and(|saved| {
                 saved.entries.iter().any(|entry| {
@@ -1131,7 +1227,7 @@ fn save_result(
         "assistant",
         text.to_string(),
         Some(
-            json!({"mode":request.mode,"runId":run_id,"contextManifest":ctx.manifest,"contextBridgeManifest":engine.runs.lock().ok().and_then(|r|r.get(run_id).and_then(|r|r.run.context_bridge_manifest.clone())),"historyManifest":ctx.history_manifest,"assistantReferenceManifest":ctx.assistant_reference_manifest,"exerciseReferenceManifest":ctx.exercise_reference_manifest,"excludedHistorySourceIds":ctx.excluded_history_source_ids,"contextWarnings":ctx.warnings,"contextTruncated":ctx.truncated,"learningSkills":versions,"promptVersion":"learning-v2"}),
+            json!({"mode":request.mode,"runId":run_id,"focus":request.focus,"contextManifest":ctx.manifest,"contextBridgeManifest":engine.runs.lock().ok().and_then(|r|r.get(run_id).and_then(|r|r.run.context_bridge_manifest.clone())),"historyManifest":ctx.history_manifest,"assistantReferenceManifest":ctx.assistant_reference_manifest,"exerciseReferenceManifest":ctx.exercise_reference_manifest,"excludedHistorySourceIds":ctx.excluded_history_source_ids,"contextWarnings":ctx.warnings,"contextTruncated":ctx.truncated,"learningSkills":versions,"promptVersion":"learning-v2"}),
         ),
     );
     let entry = Entry {
@@ -1176,6 +1272,8 @@ mod tests {
             truncated: false,
         };
         let req = GenerationRequest {
+            focus: None,
+            document_id: None,
             session_id: "s".into(),
             mode: "explain".into(),
             selection: String::new(),
@@ -1187,6 +1285,8 @@ mod tests {
             injections: vec![],
         };
         let s = Session {
+            course_id: None,
+            legacy_session_ids: vec![],
             id: "s".into(),
             section_id: "x".into(),
             title: "t".into(),
@@ -1232,6 +1332,9 @@ mod prestart_tests {
         let stamp = timestamp();
         let id = "run_prestart_test";
         let run = Run {
+            source_document_id: None,
+            course_read_manifest: None,
+            focus: None,
             id: id.into(),
             session_id: session.id.clone(),
             mode: "explain".into(),
@@ -1324,6 +1427,8 @@ mod exploration_tests {
             .start_exploration(Some(&section.id), false, false)
             .unwrap();
         let request = GenerationRequest {
+            focus: None,
+            document_id: None,
             session_id: free.id.clone(),
             mode: "question".into(),
             selection: String::new(),
@@ -1547,6 +1652,9 @@ mod lifecycle_tests {
     use super::*;
     fn run(session_id: &str) -> Run {
         Run {
+            source_document_id: None,
+            course_read_manifest: None,
+            focus: None,
             id: "run_lifecycle".into(),
             session_id: session_id.into(),
             mode: "question".into(),
@@ -1635,6 +1743,8 @@ mod lifecycle_tests {
         let current = sessions::get(&mut engine.lock().unwrap().content, &session.id).unwrap();
         assert_eq!(current.entries.len(), 1);
         let request = GenerationRequest {
+            focus: None,
+            document_id: None,
             session_id: session.id.clone(),
             mode: "explain".into(),
             selection: "for a period".into(),
@@ -1790,6 +1900,8 @@ mod unknown_ack_tests {
             core.start_session(&section.id, false).unwrap().0
         };
         let request = GenerationRequest {
+            focus: None,
+            document_id: None,
             session_id: session.id,
             mode: "question".into(),
             selection: String::new(),
@@ -1846,6 +1958,8 @@ mod exercise_document_tests {
             (source, session, context)
         };
         let request = GenerationRequest {
+            focus: None,
+            document_id: None,
             session_id: session.id.clone(),
             mode: "practice".into(),
             selection: String::new(),
@@ -1893,6 +2007,8 @@ mod exercise_document_tests {
         assert!(practice(&raw, &[], "run_strict").is_ok());
         assert!(practice(&format!("```json\n{raw}\n```"), &[], "run_strict").is_err());
         let request = GenerationRequest {
+            focus: None,
+            document_id: None,
             session_id: "session_fixture".into(),
             mode: "explain".into(),
             selection: String::new(),
@@ -1916,6 +2032,8 @@ mod exercise_document_tests {
             truncated: false,
         };
         let session = Session {
+            course_id: None,
+            legacy_session_ids: vec![],
             id: "session_fixture".into(),
             section_id: "source_fixture".into(),
             title: "Fixture".into(),
@@ -1968,6 +2086,8 @@ mod exercise_repair_tests {
             core.start_session(&source.id, false).unwrap()
         };
         let request = GenerationRequest {
+            focus: None,
+            document_id: None,
             session_id: session.id.clone(),
             mode: "practice".into(),
             selection: String::new(),
@@ -1996,6 +2116,9 @@ mod exercise_repair_tests {
         assert!(failure.message.contains("练习内容已保存"));
         fs::remove_dir(&child_path).unwrap();
         let old = Run {
+            source_document_id: None,
+            course_read_manifest: None,
+            focus: None,
             id: id.clone(),
             session_id: session.id.clone(),
             mode: "practice".into(),
@@ -2075,6 +2198,8 @@ mod history_audit_tests {
     }
     fn session(entries: Vec<Entry>) -> Session {
         Session {
+            course_id: None,
+            legacy_session_ids: vec![],
             id: "history_session".into(),
             section_id: "history_source".into(),
             title: "History".into(),
@@ -2201,6 +2326,8 @@ mod history_audit_tests {
         let question = "CURRENT_QUESTION完整".repeat(500);
         let selection = "CURRENT_SELECTION完整".repeat(500);
         let request = GenerationRequest {
+            focus: None,
+            document_id: None,
             session_id: state.id.clone(),
             mode: "question".into(),
             selection: selection.clone(),
@@ -2266,52 +2393,17 @@ mod history_audit_tests {
         assert!(history_warnings(&state)[0].contains("未生成摘要"));
     }
     #[test]
-    fn context_audit_does_not_broaden_mode_tool_permissions() {
-        for (mode, maximum, names) in [
-            (
-                "question",
-                4,
-                vec![
-                    "query_related_knowledge",
-                    "record_question",
-                    "create_note",
-                    "create_todo",
-                    "generate_exercises",
-                    "list_learning_skills",
-                    "load_learning_skill",
-                ],
-            ),
-            (
-                "explain",
-                6,
-                vec![
-                    "record_question",
-                    "create_error",
-                    "query_related_knowledge",
-                    "create_review_card",
-                    "create_note",
-                    "create_todo",
-                    "generate_exercises",
-                    "list_learning_skills",
-                    "load_learning_skill",
-                ],
-            ),
-            (
-                "practice",
-                2,
-                vec![
-                    "query_related_knowledge",
-                    "list_learning_skills",
-                    "load_learning_skill",
-                ],
-            ),
-            ("review", 2, vec!["query_related_knowledge"]),
-            ("feedback", 0, vec![]),
-        ] {
-            let policy = task_tool_policy(mode, "off");
-            assert_eq!(policy.max_calls, maximum);
-            assert_eq!(policy.allowed_tools, names);
-            assert_eq!(policy.authorization, "off");
+    fn chat_entries_share_all_learning_tools_without_workspace_authorization() {
+        let question = task_tool_policy("question", "off");
+        let explain = task_tool_policy("explain", "off");
+        assert_eq!(question.allowed_tools, explain.allowed_tools);
+        assert_eq!(question.max_calls, explain.max_calls);
+        for name in ["create_review_card", "create_error", "load_learning_skill"] {
+            assert!(question.allowed_tools.contains(&name.into()));
+        }
+        assert_eq!(question.authorization, "off");
+        for mode in ["feedback", "grading", "unknown"] {
+            assert!(task_tool_policy(mode, "bash").allowed_tools.is_empty());
         }
     }
     #[test]
@@ -2402,6 +2494,8 @@ mod trash_prompt_tests {
     fn fresh_protection_flag_excludes_actual_prompt_history_even_when_session_and_manifest_are_stale(
     ) {
         let session = Session {
+            course_id: None,
+            legacy_session_ids: vec![],
             id: "kept_session".into(),
             section_id: "kept_source".into(),
             title: "Kept".into(),
@@ -2453,6 +2547,8 @@ mod trash_prompt_tests {
             included_chars: 99,
         });
         let request = GenerationRequest {
+            focus: None,
+            document_id: None,
             session_id: session.id.clone(),
             mode: "question".into(),
             selection: "CURRENT_SELECTION".into(),
@@ -2553,6 +2649,8 @@ mod recycle_integration_tests {
             (source, root, session, user.path, user.content)
         };
         let request = GenerationRequest {
+            focus: None,
+            document_id: None,
             session_id: session.id.clone(),
             mode: "practice".into(),
             selection: "CURRENT_SELECTED_TEXT".into(),
@@ -2662,6 +2760,9 @@ mod recycle_integration_tests {
         }
         let id = format!("run_{}", &hash(&request.request_id)[..32]);
         let old = Run {
+            source_document_id: None,
+            course_read_manifest: None,
+            focus: None,
             id: id.clone(),
             session_id: session.id.clone(),
             mode: "practice".into(),
@@ -2826,6 +2927,8 @@ mod learning_v2_tests {
             c.start_session(&source.id, false).unwrap()
         };
         let req = GenerationRequest {
+            focus: None,
+            document_id: None,
             session_id: session.id.clone(),
             mode: "practice".into(),
             selection: String::new(),
@@ -2932,6 +3035,8 @@ mod learning_v2_tests {
             c.start_session(&a.id, false).unwrap()
         };
         let request = GenerationRequest {
+            focus: None,
+            document_id: None,
             session_id: s.id,
             mode: "question".into(),
             selection: String::new(),
@@ -3001,6 +3106,8 @@ mod assistant_reference_snapshot_tests {
             context::inject_request(&c.content, &mut ctx, &s, &[], &[r.clone()]).unwrap();
         }
         let request = GenerationRequest {
+            focus: None,
+            document_id: None,
             session_id: s.id.clone(),
             mode: "question".into(),
             selection: String::new(),
@@ -3145,6 +3252,8 @@ mod rendered_exercise_snapshot_tests {
         .unwrap();
         drop(c);
         let request = GenerationRequest {
+            focus: None,
+            document_id: None,
             session_id: x.session.id.clone(),
             mode: "practice".into(),
             selection: String::new(),
