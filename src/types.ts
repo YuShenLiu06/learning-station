@@ -21,7 +21,7 @@ export type ExerciseReference = { sessionId: string; documentId: string; exercis
 export type ExerciseReferenceSource = Omit<ExerciseReference, 'selection'> & { title: string; documentVersion: string; text: string; sourceId: string };
 export type RequestedContext = { documentId: string; selection: string; injections: ContextInjection[]; assistantReferences?: AssistantReference[]; exerciseReferences?: ExerciseReference[] };
 export type ContextInjection = { documentId: string; expectedVersion: string; selection?: string };
-export type LearningSession = { courseId?: string; legacySessionIds?: string[]; exerciseSessionId?: string; id: string; sectionId: string; messages: Message[]; toolCalls?: ToolActivity[]; sources?: Source[]; contextAssistantReferenceManifest?: ContextManifestItem[]; contextExerciseReferenceManifest?: ContextManifestItem[]; exercises: Exercise[]; mistakes: Mistake[]; cards: ReviewCard[] };
+export type LearningSession = { title?: string; version?: string; courseId?: string; legacySessionIds?: string[]; exerciseSessionId?: string; id: string; sectionId: string; messages: Message[]; toolCalls?: ToolActivity[]; sources?: Source[]; contextAssistantReferenceManifest?: ContextManifestItem[]; contextExerciseReferenceManifest?: ContextManifestItem[]; exercises: Exercise[]; mistakes: Mistake[]; cards: ReviewCard[] };
 export type Task = { id: string; title: string; dueAt?: string; completed: boolean; reminderEnabled?: boolean };
 export type Notice = { id: string; title: string; body?: string; read: boolean };
 export type UiPreferences = { fontSize: number; assistantWidth?: number; sidebarWidth?: number; sidebarCollapsed?: boolean; expandedNodeIds?: string[]; toolAuthorizationTier?: string };
@@ -29,7 +29,7 @@ export type ContextManifestItem = { id: string; path: string; version: string; i
 export type ContextBridgeManifest = { version: 1; entries: { id: string; kind: 'material' | 'history' | 'reference' | 'turn' | 'stable'; status: 'added' | 'retained' | 'updated' | 'reloaded'; sourceId?: string; version: string; textHash?: string; includedChars: number; range?: { startChar: number; endChar: number; complete: boolean; totalBytes: number }; reason: string }[]; projectedChars: number; projectedBytes: number };
 export type RequestContext = { contextBridgeManifest?: ContextBridgeManifest; text: string; manifest: ContextManifestItem[]; historyManifest?: ContextManifestItem[]; assistantReferenceManifest?: ContextManifestItem[]; exerciseReferenceManifest?: ContextManifestItem[]; warnings: string[]; truncated: boolean };
 export type ModelSettings = { maxOutputTokens?: number; contextWindow?: number | null; protocol?: string; requestUrl?: string; usageGate?: string; configured: boolean; provider: string; baseUrl: string; model: string; credentialStored: boolean; harness?: string; connected?: boolean };
-export type Bootstrap = { courses: Course[]; lastSectionId?: string; model: ModelSettings; tasks: Task[]; notices: Notice[]; dataPath?: string; nodes?: LibraryNode[]; treeWarnings?: string[]; recovery?: { status: string; content: string; message?: string } };
+export type Bootstrap = { courses: Course[]; lastSectionId?: string; lastSessionId?: string; lastCourseId?: string; model: ModelSettings; tasks: Task[]; notices: Notice[]; dataPath?: string; nodes?: LibraryNode[]; treeWarnings?: string[]; recovery?: { status: string; content: string; message?: string } };
 export class StationError extends Error {
   code: string;
   details?: unknown;
@@ -46,6 +46,7 @@ export type CourseAsset = { id: string; courseId: string; fileName: string; mime
 export type CourseAssetPreview = { asset: CourseAsset; text?: string; dataUrl?: string; truncated: boolean };
 
 export type SessionSummary = { id: string; title: string; modifiedAt?: string; path?: string; version?: string };
+export type CourseConversations = { courseId: string; activeSessionId: string | null; sessions: SessionSummary[] };
 export type TrashPreview = { id: string; title: string; kind: LibraryNodeKind; nodeCount: number; sessionCount: number; version: string };
 export type TrashReceipt = { trashId: string; id: string; title: string; kind: LibraryNodeKind; nodeCount: number; sessionCount: number; createdAt: string; restoredAt: string | null; status: 'trashed' | 'restored' };
 export type ExplorationNote = { document: Section; session: LearningSession; userEntryId: string; folderId: string };
