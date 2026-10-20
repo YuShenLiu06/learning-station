@@ -619,7 +619,7 @@ fn same_file(a: &Metadata, b: &Metadata) -> bool {
     }
 }
 
-fn bounded_read(path: &Path, maximum: usize) -> Result<Vec<u8>> {
+pub(crate) fn bounded_read(path: &Path, maximum: usize) -> Result<Vec<u8>> {
     let file = checked_file(path, maximum)?;
     let mut bytes = Vec::new();
     file.take((maximum + 1) as u64)
