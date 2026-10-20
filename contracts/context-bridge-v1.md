@@ -1,5 +1,12 @@
 # ContextBridge v1 清单契约
 
+## 课程可读范围与实际正文
+
+- `Run.courseReadManifest?: ManifestItem[]` 仅是本次提交的课程可读来源与精确版本快照，不含正文、不进入模型 payload，也不是已读/已收到/完整基准证据。其 `includedChars` 不参与投影判断；兼容值0不能解释为阅读状态。字段缺省的旧Run继续使用原授权快照。
+- `Context.manifest` / `Run.contextManifest` 保持实际正文来源语义，课程目录不能混入其中。现有UI仅将此实际字段渲染为来源；如需显示课程可读目录须另列，不合并为已发送来源。
+- `contextBridgeManifest` 在 Pi 完成真实投影后记录该请求提供的实际来源、版本和截断范围；queued/unknown不冒充已收到。Rust read 回包另提供实际 `sourceId/version/includedChars/truncated` 和返回范围，原生工具消息及持久回执保留各session的接收事实；不从课程Git存在或授权清单推导基准。
+- 普通开局没有Focus时不自动遍历笔记。Focus继续自动加载：无有效完整正文时给全文，有保留基准才可沿固定OLD/NEW Git版本给完整差量，无变化不重复；新session、压缩或基准失效恢复全文。此层复用 Pi 既有material projection/receipt/compaction，不新增缓存或重打包历史。其他文件summary与显式Citation补充范围由各自provider接缝接入，保留双来源。
+
 职责、角色和恢复见[上下文桥](../docs/context-bridge.md)与[原生会话](pi-native-session-v1.md)。UI清单类型保持兼容；课程会话管理 IPC 见原生会话契约。
 
 `Run.contextBridgeManifest?` 在Pi完成实际材料投影后保存；queued初始可空。该对象同时进入本轮原生turn custom message，最终assistant自身 `entry.data.contextBridgeManifest`复制自己的快照。预览/旧缺字段不从Session补齐。

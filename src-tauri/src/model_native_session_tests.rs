@@ -479,18 +479,24 @@ async fn native_restart_case(same_course: bool) {
         1
     );
     assert_eq!(doc, s.section_id);
-    let cards = crate::review::list_for_course(&mut c.content, "", Some(&doc)).unwrap();
+    let owner = s.course_id.as_deref().unwrap_or(&doc);
+    let cards = crate::review::list_for_course(&mut c.content, "", Some(owner)).unwrap();
     assert_eq!(cards.len(), 1);
     assert_eq!(cards[0]["front"], "Durable native card");
     assert!(cards[0]["back"].as_str().unwrap().contains("Saved locally"));
     assert_eq!(cards[0]["sourceDocumentId"], doc);
     assert_eq!(cards[0]["sessionId"], sid);
-    assert_eq!(cards[0]["courseId"], doc);
+    assert_eq!(cards[0]["courseId"], owner);
     let other_session = sessions::get(&mut c.content, &other).unwrap();
+    let other_owner = other_session
+        .course_id
+        .as_deref()
+        .unwrap_or(&other_session.section_id);
     assert!(
-        crate::review::list_for_course(&mut c.content, "", Some(&other_session.section_id))
+        crate::review::list_for_course(&mut c.content, "", Some(other_owner))
             .unwrap()
-            .is_empty()
+            .iter()
+            .all(|card| card["sessionId"] != other_session.id)
     );
     assert_eq!(c.content.read(&doc).unwrap().body, "MATERIAL_NATIVE_STABLE");
     if let Ok(target) = std::env::var("LEARNING_STATION_NATIVE_EVIDENCE") {
