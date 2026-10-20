@@ -228,8 +228,8 @@ pub(crate) fn execute(
     let run = crate::generation::get(engine, &scope.run_id)?;
     if run.session_id != scope.session_id || run.context_snapshot_version != 1
         || run.source_document_id.as_ref().is_some_and(|id| id != &scope.section_id)
-        || !scope.section_id.is_empty() && !run.context_manifest.iter().any(|m| m.id == scope.section_id)
-        || scope.allowed_ids.iter().any(|id| !run.context_manifest.iter().any(|m| &m.id == id)) { return Err(out_of_scope()); }
+        || !scope.section_id.is_empty() && !run.read_scope_manifest().iter().any(|m| m.id == scope.section_id)
+        || scope.allowed_ids.iter().any(|id| !run.read_scope_manifest().iter().any(|m| &m.id == id)) { return Err(out_of_scope()); }
     let state_dir = {
         let mut core = engine.lock()?;
         let session = crate::sessions::get(&mut core.content, &scope.session_id)?;
@@ -279,14 +279,14 @@ pub(crate) fn execute(
 fn execute_read(
     engine: &crate::app::Engine,
     scope: &ToolScope,
-    args: ReadArgs,
+    args: ReadArgs
 ) -> Result<Value> {
     let exclusive = args.source_id.is_some() as u8 + args.path.is_some() as u8;
     if exclusive != 1 {
         return Err(invalid());
     }
     if let Some(source_id) = args.source_id {
-        if !crate::types::valid_id(&source_id) || scope.section_id.is_empty() {
+        if !crate::types::valid_id(&source_id) {
             return Err(out_of_scope());
         }
         let mut allowed: std::collections::BTreeSet<&str> =
@@ -295,19 +295,31 @@ fn execute_read(
         if !allowed.contains(source_id.as_str()) {
             return Err(out_of_scope());
         }
-        // The run's frozen manifest is the authorization source of truth, the
-        // same precedent generate_exercises follows; a fresh load is not.
+        // Authorization/version scope is frozen separately from automatic context.
         let run = crate::generation::get(engine, &scope.run_id)?;
         if run.session_id != scope.session_id || run.context_snapshot_version != 1 {
             return Err(out_of_scope());
         }
         let item = run
-            .context_manifest
+            .read_scope_manifest()
             .iter()
             .find(|item| item.id == source_id)
             .ok_or_else(out_of_scope)?;
         let document = {
-            let core = engine.lock()?;
+            let mut core = engine.lock()?;
+            let session = crate::sessions::get(&mut core.content, &scope.session_id)
+                .map_err(|_| out_of_scope())?;
+            if core.content.is_trashed(&scope.session_id) {
+                return Err(out_of_scope());
+            }
+            let course_scope = session.course_id.is_some();
+            if course_scope
+                && crate::course_sessions::source(&core.content, &session, &source_id)
+                    .map_err(|_| out_of_scope())?
+                    != source_id
+            {
+                return Err(out_of_scope());
+            }
             core.content.read(&source_id)?
         };
         if document.version != item.version {
@@ -318,10 +330,15 @@ fn execute_read(
         }
         let content = bounded_text(&document.content, MAX_READ_BYTES);
         let included_chars = content.0.chars().count();
+        let included_in_initial_context = run.context_manifest.iter().any(|context_item| {
+            context_item.id == source_id && context_item.version == item.version
+        });
         Ok(json!({"sessionId":scope.session_id,"sourceId":source_id,"path":document.path,
             "title":document.metadata.title,"kind":document.metadata.kind,"version":document.version,
             "includedChars":included_chars,"content":content.0,"truncated":content.1,
-            "manifestRole":"user-reference"}))
+            "manifestRole":"user-reference","includedInInitialContext":included_in_initial_context,
+            "authorizationScope":if run.course_read_manifest.is_some() {"course-read-manifest"} else {"run-context-manifest"},
+            "delivery":"tool-result","range":{"startChar":0,"endChar":included_chars,"complete":!content.1,"totalBytes":document.content.len()}}),)
     } else {
         let path = args.path.as_deref().ok_or_else(invalid)?;
         if !valid_relative_path(path) {
@@ -564,8 +581,7 @@ fn read_bounded(pipe: &mut impl Read, cap: usize) -> (Vec<u8>, bool) {
 }
 
 fn char_boundary(bytes: &[u8], mut end: usize) -> usize {
-    while end > 0 && (bytes[end - 1] & 0xC0) == 0x80 {
-        end -= 1;
+    while end > 0 && end <bytes.len() && (bytes[end] & 0xC0) == 0x80 {end -= 1;
     }
     end.min(bytes.len())
 }
@@ -574,23 +590,44 @@ fn bounded_text(value: &str, cap: usize) -> (String, bool) {
     if value.len() <= cap {
         return (value.to_owned(), false);
     }
-    (value[..char_boundary(value.as_bytes(), cap)].to_owned(), true)
+    (value[..char_boundary(value.as_bytes(), cap)].to_owned(), true,)
 }
 
 /// Final guard: keep the serialized reply below the transport budget by
 /// truncating long string fields on the Unicode boundary.
 fn fit_result_bytes(result: &mut Value) -> Result<()> {
+    let mut content_was_truncated = false;
     for _ in 0..8 {
         if serde_json::to_vec(result)?.len() <= MAX_RESULT_BYTES {
+            if let Some(content_chars) = result
+                .get("content")
+                .and_then(Value::as_str)
+                .map(|content| content.chars().count())
+            {
+                if result.get("includedChars").is_some() {
+                    result["includedChars"] = json!(content_chars);
+                }
+                if content_was_truncated {
+                    result["truncated"] = json!(true);
+                }
+                if result.get("range").is_some() {
+                    result["range"]["endChar"] = json!(content_chars);
+                    result["range"]["complete"] =
+                        json!(!result["truncated"].as_bool().unwrap_or(false));
+                }
+            }
             return Ok(());
         }
         let mut changed = false;
         if let Some(object) = result.as_object_mut() {
-            for (_, value) in object.iter_mut() {
+            for (key, value) in object.iter_mut() {
                 if let Some(text) = value.as_str() {
                     if text.len() > 512 {
                         let (cut, _) = bounded_text(text, text.len() / 2);
                         *value = Value::String(cut);
+                        if key == "content" {
+                            content_was_truncated = true;
+                        }
                         changed = true;
                     }
                 }
@@ -717,7 +754,104 @@ mod tests {
         (directory, engine, scope)
     }
 
-    fn run(engine: &Arc<Engine>, scope: &ToolScope, call: &str, name: &str, args: Value) -> Result<Value, CoreError> {
+    fn course_fixture(tier: &str) -> (tempfile::TempDir,Arc<Engine>,ToolScope, String, String) {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            directory.path().join("library"),
+            directory.path().join("state"),
+        )
+        .unwrap();
+        engine
+            .save_ui_preferences(UiPreferences {
+                tool_authorization_tier: tier.into(),
+                ..UiPreferences::default()
+            })
+            .unwrap();
+        let (scope, source_id, sibling_id) = {
+            let mut core = engine.lock().unwrap();
+            let course = crate::library_tree::create(
+                &mut core.content,
+                "course",
+                "Synthetic course",
+                None,
+                "",
+                "authorized-read-course",
+            )
+            .unwrap();
+            let source = crate::library_tree::create(
+                &mut core.content,
+                "section",
+                "Synthetic source",
+                Some(&course.id),
+                "authorized source body",
+                "authorized-read-source",
+            )
+            .unwrap();
+            let sibling_course = crate::library_tree::create(
+                &mut core.content,
+                "course",
+                "Synthetic sibling course",
+                None,
+                "",
+                "authorized-read-sibling-course",
+            )
+            .unwrap();
+            let sibling = crate::library_tree::create(
+                &mut core.content,
+                "section",
+                "Sibling source",
+                Some(&sibling_course.id),
+                "sibling body must stay private",
+                "authorized-read-sibling-source",
+            )
+            .unwrap();
+            let session = crate::course_sessions::create(
+                &mut core,
+                &course.id,
+                "authorized-read-course-session",
+            )
+            .unwrap();
+            let read_manifest = crate::context::course_read_manifest(&core.content, &course.id)
+                .unwrap()
+                .into_iter()
+                .filter(|item| item.id == source.id)
+                .collect::<Vec<_>>();
+            let run: crate::generation::Run = serde_json::from_value(json!({
+                "id":"run_course_read_fixture","sessionId":session.id,"mode":"question","status":"succeeded",
+                "content":"","error":null,"createdAt":"2026-10-17T00:00:00Z","updatedAt":"2026-10-17T00:00:00Z",
+                "requestDigest":"course-read-fixture","contextSnapshotVersion":1,
+                "contextManifest":[],"courseReadManifest":read_manifest
+            }))
+            .unwrap();
+            crate::app::atomic_json(
+                &core.state_dir.join("runs").join(format!("{}.json", run.id)),
+                &run,
+            )
+            .unwrap();
+            engine.runs.lock().unwrap().insert(
+                run.id.clone(),
+                crate::generation::ManagedRun {
+                    run,
+                    cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                },
+            );
+            (
+                ToolScope {
+                    session_id: session.id,
+                    section_id: String::new(),
+                    run_id: "run_course_read_fixture".into(),
+                    allowed_ids: vec![source.id.clone()],
+                },
+                source.id,
+                sibling.id,
+            )
+        };
+        (directory, engine, scope, source_id, sibling_id)
+    }
+
+    fn run(
+        engine: &Arc<Engine>,
+        scope: &ToolScope, call: &str, name: &str, args: Value,) -> Result<Value, CoreError> {
         crate::authorized_tools::execute(engine, scope, call, name, args)
     }
 
@@ -775,9 +909,117 @@ mod tests {
     }
 
     #[test]
+    fn course_read_scope_is_separate_from_automatic_context_and_versioned() {
+        let (_directory, engine, scope, source_id, sibling_id) = course_fixture("read");
+        let result = run(
+            &engine,
+            &scope,
+            "course-read-source",
+            "read",
+            json!({"sourceId":source_id}),
+        )
+        .unwrap();
+        assert!(result["content"]
+            .as_str()
+            .unwrap()
+            .contains("authorized source body"));
+        assert_eq!(result["authorizationScope"], "course-read-manifest");
+        assert_eq!(result["includedInInitialContext"], false);
+        assert_eq!(result["delivery"], "tool-result");
+        assert_eq!(
+            result["includedChars"],
+            result["content"].as_str().unwrap().chars().count()
+        );
+        assert_eq!(result["truncated"], false);
+        assert_eq!(result["range"]["startChar"], 0);
+        assert_eq!(result["range"]["endChar"], result["includedChars"]);
+        assert_eq!(result["range"]["complete"], true);
+        assert!(result["version"].is_string());
+        assert!(crate::generation::get(&engine, &scope.run_id)
+            .unwrap()
+            .context_manifest
+            .is_empty());
+
+        let mut sibling_scope = scope.clone();
+        sibling_scope.allowed_ids = vec![sibling_id.clone()];
+        assert_eq!(
+            run(
+                &engine,
+                &sibling_scope,
+                "course-read-sibling",
+                "read",
+                json!({"sourceId":sibling_id}),
+            )
+            .unwrap_err()
+            .code,
+            "TOOL_SCOPE"
+        );
+
+        {
+            let mut runs = engine.runs.lock().unwrap();
+            runs.get_mut(&scope.run_id)
+                .unwrap()
+                .run
+                .course_read_manifest
+                .as_mut()
+                .unwrap()[0]
+                .version = "stale-version".into();
+        }
+        assert_eq!(
+            run(
+                &engine,
+                &scope,
+                "course-read-stale-version",
+                "read",
+                json!({"sourceId":source_id}),
+            )
+            .unwrap_err()
+            .code,
+            "CONFLICT"
+        );
+
+        engine
+            .save_ui_preferences(UiPreferences {
+                tool_authorization_tier: "off".into(),
+                ..UiPreferences::default()
+            })
+            .unwrap();
+        assert_eq!(
+            run(
+                &engine,
+                &scope,
+                "course-read-tier-off",
+                "read",
+                json!({"sourceId":source_id}),
+            )
+            .unwrap_err()
+            .code,
+            "TOOL_NOT_ALLOWED"
+        );
+    }
+
+    #[test]
+    fn final_fit_updates_read_character_count_and_truncation_flag() {
+        let mut result = json!({
+            "content":"🙂".repeat(20_000),
+            "includedChars":20_000,
+            "truncated":false,
+            "range":{"startChar":0,"endChar":20_000,"complete":true,"totalBytes":80_000}
+        });
+        super::fit_result_bytes(&mut result).unwrap();
+        assert!(result["truncated"].as_bool().unwrap());
+        assert_eq!(
+            result["includedChars"],
+            result["content"].as_str().unwrap().chars().count()
+        );
+        assert_eq!(result["range"]["endChar"], result["includedChars"]);
+        assert_eq!(result["range"]["complete"], false);
+    }
+
+    #[test]
     fn write_tier_confines_files_to_the_session_workspace() {
         let (directory, engine, scope) = fixture("write");
-        let written = run(&engine, &scope, "write-note", "write", json!({"path":"notes/summary.md","content":"controlled scratch content"})).unwrap();
+        let written = run(&engine, &scope, "write-note", "write", json!({"path":"notes/summary.md","content":"controlled scratch content"}),).unwrap();
         assert_eq!(written["persisted"], true);
         assert_eq!(written["path"], "notes/summary.md");
         assert_eq!(written["bytes"], "controlled scratch content".len());

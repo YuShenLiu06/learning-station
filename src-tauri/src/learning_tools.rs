@@ -277,7 +277,7 @@ pub fn execute(
             || scope
                 .allowed_ids
                 .iter()
-                .any(|id| !run.context_manifest.iter().any(|m| &m.id == id))
+                .any(|id| !run.read_scope_manifest().iter().any(|m| &m.id == id))
         {
             return Err(out_of_scope());
         }

@@ -146,12 +146,6 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
       currentSources=envelope.nativeMaterials??[];currentTurn=envelope;
       const inventory=structuredClone(envelope.contextBridgeManifest??{version:1,entries:[]});
       inventory.entries=inventory.entries.filter(e=>e.kind!=='history');
-      if(spec.projectRoot){
-        if(currentSources.length||inventory.entries.some(e=>e.kind==='material'))throw new NativeSessionError();
-        // Keep the raw transcript and genuine read/tool history; retire only the
-        // old automatic material projection when a course becomes a Pi project.
-        for(const entry of manager.buildSessionProjection().entries){if(entry.sourceEntry.type==='custom_message'&&entry.sourceEntry.customType==='learning-station-material'&&entry.messages.length)manager.appendContextEdit(entry.sourceEntry.id,null);}
-      }
       for(const source of currentSources){
         if(typeof source.text!=='string'||sha(source.text)!==source.textHash||!spec.authorizedSourceIds.includes(source.id))throw new NativeSessionError();
         const active=manager.buildSessionProjection().entries.filter(e=>e.messages.length&&e.sourceEntry.type==='custom_message'&&e.sourceEntry.customType==='learning-station-material'&&e.sourceEntry.details?.sourceId===source.id);
