@@ -137,3 +137,4 @@ ToolActivity=`{id,toolCallId,runId,sessionId,name,status:running|succeeded|faile
 - `start_session(sectionId, newSession?)`：课程内文档返回同一 session；显式新建不绕过课程固定路由。
 - `load_session_context`、`start_generation` 新增可选 `documentId`，由本轮 activeDocumentId 冻结；未传兼容旧 sectionId 锚点。保存问题的 requestedContext.documentId 与生成重试必须一致。
 - 练习 originSessionId 是原作答/批改账本；与当前聊天 session 可以不同，课程和原始来源均由 Rust 校验。
+- `restore_library_node` 在可见性提交前核对本批练习的原 session/entry；依赖仍在其他回收记录中时返回 `DEPENDENCY_TRASHED`，details 给出 documentId、originSessionId、exerciseEntryId、dependencyId、blockingTrashId、restoreTargetId/Kind。提示先恢复对应原课程或练习；本项保持回收状态，失败不占用请求回执，解决依赖后可用原 requestId 重试，不隐式恢复其他记录。

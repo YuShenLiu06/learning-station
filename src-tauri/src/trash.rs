@@ -238,9 +238,11 @@ pub fn restore(store: &mut ContentStore, trash_id: &str, request_id: &str) -> Re
             digest,
         },
     );
+    verify_restore_dependencies(&documents, &ledger)?;
     let sync_error = commit(store.state_dir(), &loaded, &ledger, || {
         if record.receipt.status == "trashed" {
             documents = preflight(store, &record)?;
+            verify_restore_dependencies(&documents, &ledger)?;
         }
         Ok(())
     })?;
@@ -498,6 +500,34 @@ fn preflight(store: &ContentStore, record: &Record) -> Result<Vec<Document>> {
         documents.push(document);
     }
     Ok(documents)
+}
+// Check the proposed visibility, not the current hidden set: dependencies restored
+// in this same record are allowed. No hidden ledger content is read or restored here.
+fn verify_restore_dependencies(documents: &[Document], ledger: &Ledger) -> Result<()> {
+    let remaining = visibility(ledger);
+    for document in documents.iter().filter(|doc| doc.metadata.kind == "exercise") {
+        let field = |key: &str| document.metadata.extra.get(key).and_then(Value::as_str)
+            .filter(|id| valid_id(id)).ok_or_else(restore_conflict);
+        let session = field("originSessionId")?;
+        let entry = field("exerciseEntryId")?;
+        for (dependency, path) in [
+            (session, format!("sessions/{session}/session.md")),
+            (entry, format!("sessions/{session}/entries/{entry}.md")),
+        ] {
+            if !remaining.ids.contains(dependency) && !remaining.paths.contains(&path) { continue; }
+            let blocked = ledger.records.values().find(|record| record.receipt.status == "trashed"
+                && record.snapshots.iter().any(|item| item.id == dependency || item.path == path))
+                .ok_or_else(corrupt)?;
+            return Err(CoreError::new("DEPENDENCY_TRASHED", format!(
+                "原练习账本仍在回收站，请先恢复“{}”（{}）后重试；本项仍保留在回收站。",
+                blocked.receipt.title, blocked.receipt.id,
+            )).details(json!({"documentId":document.id,"originSessionId":session,
+                "exerciseEntryId":entry,"dependencyId":dependency,
+                "blockingTrashId":blocked.receipt.trash_id,"restoreTargetId":blocked.receipt.id,
+                "restoreTargetKind":blocked.receipt.kind})));
+        }
+    }
+    Ok(())
 }
 fn operation_key(kind: &str, request_id: &str) -> String {
     format!("op_{}", hash(&format!("{kind}\n{request_id}")))
