@@ -350,7 +350,7 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
         ctx.history_manifest.clear();
         ctx.warnings.retain(|w| !w.starts_with("TRUNCATED_HISTORY"));
         let projection = if request.focus.is_some() {
-            crate::automatic_context::prepare_native(&core.state_dir, &session, &ctx)
+            crate::automatic_context::prepare_current(&ctx)
         } else { crate::context_bridge::ContextBridge::snapshot(&core.state_dir, &core.content, &session, &ctx)? };
         let session = sessions::set_context_snapshot_explicit(
             &mut core.content,
@@ -585,7 +585,16 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
                         persist(&engine, &managed.run)
                     })
                 }),
-                material_changes: None,
+                material_changes: request.focus.clone().map(|focus| {
+                    let engine = engine.clone();
+                    let sid = session.id.clone();
+                    Arc::new(move |previous: Option<String>, body_previous: Option<String>| {
+                        let mut core = engine.lock()?;
+                        let session = sessions::get(&mut core.content, &sid)?;
+                        crate::material_changes::for_focus(&mut core, &session, &focus,
+                            previous.as_deref(), body_previous.as_deref())
+                    }) as model::MaterialChangesHandler
+                }),
                 compaction_observer: Some({
                     let engine = engine.clone();
                     let id = id.clone();
@@ -617,10 +626,12 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
                     managed.run.content = text.clone();
                 }
                 save_result(&engine, &request, &ctx, &id, &text).map(|saved| {
-                    if let Ok(core) = engine.lock() {
-                        let anchor = format!("entry_{}", &hash(&format!("{id}-output"))[..32]);
-                        // Optimization failure never discards a saved learning answer.
-                        let _ = projection.commit_native(&core.state_dir, &saved, &anchor);
+                    if request.focus.is_none() {
+                        if let Ok(core) = engine.lock() {
+                            let anchor = format!("entry_{}", &hash(&format!("{id}-output"))[..32]);
+                            // Optimization failure never discards a saved learning answer.
+                            let _ = projection.commit_native(&core.state_dir, &saved, &anchor);
+                        }
                     }
                     text
                 })

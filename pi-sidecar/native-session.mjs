@@ -178,16 +178,16 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
         if(changes?.complete!==true||changes.checkpoint?.courseId!==focus.courseId||changes.checkpoint.checkpointCommitOid!==focus.commitHash||changes.checkpoint.materialTreeOid!==focus.materialTreeOid||changes.baseCommitOid!==(received?.details.checkpointCommitOid??null)||!Array.isArray(changes.changes))throw new NativeSessionError();
         if(Buffer.byteLength(JSON.stringify(changes))>512*1024)throw new NativeSessionError('LIMIT_EXCEEDED');
         if(containsSecret(changes,apiKey))throw new NativeSessionError('AUTH');
-        if((changes.focused?.textUnavailable||['image','pdf'].includes(focus.type))&&focus.paragraphs?.some(p=>p.text?.length))throw new NativeSessionError('CONTEXT_CONFLICT');
+        if((changes.focused?.textUnavailable||focus.binary||['image','pdf','exercise'].includes(focus.type))&&(typeof changes.focused?.text==='string'||focus.paragraphs?.some(p=>p.text?.length)))throw new NativeSessionError('CONTEXT_CONFLICT');
         currentSources=typeof changes.focused?.text==='string'?[changes.focused]:[];
         for(const source of currentSources)if(sha(source.text)!==source.textHash||!spec.authorizedSourceIds.includes(source.id))throw new NativeSessionError();
         if(currentSources.length+changes.changes.length+(changes.checkpoint.excludedFiles?.length??0)+inventory.entries.filter(e=>e.kind!=='material').length>256)throw new NativeSessionError('LIMIT_EXCEEDED');
         inventory.entries=inventory.entries.filter(e=>e.kind!=='material');
         for(const source of currentSources)inventory.entries.push({id:source.id,kind:'material',sourceId:source.id,path:source.path,version:source.version,includedChars:[...source.text].length,range:source.range});
-        if(focus.asset&&!currentSources.length&&!changes.focused?.textUnavailable)inventory.entries.push({id:focus.asset.id,kind:'material',status:'added',sourceId:focus.asset.id,path:focus.path,version:focus.documentVersion,includedChars:0,reason:'focus_metadata_only'});
+        if(!currentSources.length&&!changes.focused?.textUnavailable)inventory.entries.push({id:`focus:${focus.asset?.id??focus.documentId}`,kind:'material',status:'added',sourceId:focus.asset?.id??focus.documentId,path:focus.path,version:focus.documentVersion,includedChars:0,reason:'focus_metadata_only'});
         if(changes.focused?.textUnavailable)inventory.entries.push({id:changes.focused.id,kind:'material',status:'retained',sourceId:changes.focused.id,version:focus.documentVersion??focus.commitHash,includedChars:0,reason:`text_unavailable:${changes.focused.textUnavailable}`,fixedVersion:{courseId:focus.courseId,checkpointCommitOid:focus.commitHash,path:changes.focused.path,blobOid:changes.focused.gitBlobOid}});
-        for(const change of changes.changes)inventory.entries.push({id:`change:${change.path}`,kind:'material',status:change.status==='A'?'added':'updated',version:focus.materialTreeOid,includedChars:JSON.stringify(change).length,path:change.path,fileStatus:change.status,added:change.added,deleted:change.deleted,binary:change.binary,reason:change.patchUnavailable?'git_patch_non_utf8':change.binary?'git_binary_status':change.patch?'git_complete_diff':'git_name_status_numstat'});
-        for(const [index,excluded] of (changes.checkpoint.excludedFiles??[]).entries())inventory.entries.push({id:`excluded:${excluded.assetId||index}`,kind:'material',status:'retained',...(excluded.assetId?{sourceId:excluded.assetId}:{}),version:focus.commitHash,includedChars:0,reason:`excluded:${excluded.reason}`,fileName:excluded.fileName});
+        for(const change of changes.changes)inventory.entries.push({id:`change:${change.path}`,kind:'material',status:change.status==='A'?'added':'updated',version:focus.materialTreeOid,includedChars:JSON.stringify(change).length,path:change.path,fileStatus:change.status,added:change.added,deleted:change.deleted,binary:change.binary,fixedVersion:change.fixedVersion,reason:change.patchUnavailable?'git_patch_non_utf8':change.binary?'git_binary_status':change.patch?'git_complete_diff':'git_name_status_numstat'});
+        for(const [index,excluded] of (changes.checkpoint.excludedFiles??[]).entries())inventory.entries.push({id:`excluded:${index}:${excluded.assetId}`,kind:'material',status:'retained',...(excluded.assetId?{sourceId:excluded.assetId}:{}),version:focus.commitHash,includedChars:0,reason:`excluded:${excluded.reason}`,fileName:excluded.fileName});
         if(changes.changes.length||changes.exclusionsChanged){
           const notification={type:'material_changes',checkpoint:changes.checkpoint,baseCommitOid:changes.baseCommitOid,initial:changes.initial,changes:changes.changes,complete:true};
           manager.appendCustomMessageEntry('learning-station-changes',JSON.stringify(notification),false,{courseId:focus.courseId,checkpointCommitOid:focus.commitHash,materialTreeOid:focus.materialTreeOid,runId:spec.runId,userEntryId:spec.userEntryId});
@@ -204,7 +204,7 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
         }
         if(frames.length){
           if(frames[0].kind==='full')for(const entry of active)manager.appendContextEdit(entry.sourceEntry.id,null);
-          manager.appendCustomMessageEntry('learning-station-material',JSON.stringify({type:'automatic_material_projection',id:source.id,...(source.path?{path:source.path}:{}),version:source.version,range:source.range,frames}),false,{sourceId:source.id,...(source.path?{path:source.path}:{}),textHash:source.textHash,version:source.version,range:source.range,...(source.gitCommitOid?{gitCommitOid:source.gitCommitOid,gitBlobOid:source.gitBlobOid}:{})});
+          manager.appendCustomMessageEntry('learning-station-material',JSON.stringify({type:'automatic_material_projection',id:source.id,...(source.path?{path:source.path}:{}),version:source.version,range:source.range,...(source.bodyStartChar?{bodyStartChar:source.bodyStartChar}:{}),frames}),false,{sourceId:source.id,...(source.path?{path:source.path}:{}),textHash:source.textHash,version:source.version,range:source.range,...(source.gitCommitOid?{gitCommitOid:source.gitCommitOid,gitBlobOid:source.gitBlobOid}:{})});
         }
         const item=inventory.entries.find(e=>e.sourceId===source.id&&e.kind==='material');if(item){item.status=status;item.reason=status==='retained'?'native_projection_contains_baseline':status==='updated'?'native_projection_verified_diff':'native_baseline_reload';}
       }
@@ -214,7 +214,7 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
       const turn={...envelope};delete turn.nativeMaterials;delete turn.learningHistory;delete turn.historyManifest;delete turn.context;delete turn.question;
       // The fixed full/diff frames above own the automatic Focus body. Keep the
       // frozen source untouched; repeating visible text here bypasses that chain.
-      if(loadChanges&&currentSources.length&&turn.focus?.paragraphs){turn.focus={...turn.focus,paragraphs:turn.focus.paragraphs.map(({text,...location})=>location)};}
+      if(loadChanges&&currentSources.length&&turn.focus?.paragraphs){turn.focus={...turn.focus,paragraphs:turn.focus.paragraphs.map(({text,...location})=>location)};for(const item of inventory.entries)if(item.kind==='turn'&&(item.id==='focus'||item.id.startsWith('focus:'))){item.includedChars=0;item.reason='focus_location';}}
       turn.context=envelope.nativeReferences??'';delete turn.nativeReferences;turn.contextBridgeManifest=inventory;
       manager.appendCustomMessageEntry('learning-station-turn',JSON.stringify(turn),false,{runId:spec.runId});
       agent.state.messages=manager.buildSessionContext().messages;

@@ -366,7 +366,7 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
     let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
     let server = thread::spawn(move || {
         let mut packets = vec![];
-        for _ in 0..4 {
+        for _ in 0..6 {
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
             let (mut socket, _) = loop { match listener.accept() {
                 Ok(v) => break v,
@@ -379,12 +379,10 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
         }
         packets
     });
-    let mut parent: Option<String> = None;
     let mut first = String::new();
-    for round in 0..4 {
+    for round in 0..6 {
         let document = if round == 2 { &b } else { &a };
-        let path = format!("documents/{document}.md");
-        let (root, cp, native) = {
+        let (focus, messages, native) = {
             let mut c = e.lock().unwrap();
             if round == 1 || round == 3 {
                 let id = if round == 1 { &b } else { &a };
@@ -392,26 +390,33 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
                 let doc = c.content.read(id).unwrap();
                 c.content.save(id, &crate::content::serialize(&doc.metadata, body).unwrap(), &doc.version).unwrap();
             }
-            let git = crate::material_git::MaterialGit::open_course(c.content.root(), &course).unwrap();
-            let cp = if round == 2 { git.checkpoint(&course, parent.as_deref().unwrap()).unwrap() } else {
-                git.commit(&crate::material_git::FrozenMaterials::capture_project(&c.content, &course).unwrap(), parent.as_deref()).unwrap()
-            };
+            let sid = if round == 5 { crate::course_sessions::create(&mut c, &course, "wire_new_session").unwrap().id } else { sid.clone() };
+            let doc = c.content.read(document).unwrap();
+            let focus = crate::focus::freeze(&mut c, crate::focus::FreezeRequest { session_id:sid.clone(), input:crate::focus::Input { document_id:document.clone(), expected_body:doc.body, expected_version:Some(doc.version), view:"read".into(), ranges:vec![crate::focus::Range{start:0,end:4}], question_id:None, asset_id:None }, selection:String::new(), injections:vec![], assistant_references:vec![], exercise_references:vec![] }).unwrap();
             let session = sessions::get(&mut c.content, &sid).unwrap();
+            let frozen = crate::focus::load(&mut c, &session, &focus).unwrap();
+            let projection = crate::automatic_context::prepare_current(&frozen.context);
+            let request = GenerationRequest { focus:Some(focus.clone()), document_id:Some(document.clone()), session_id:sid.clone(), mode:"question".into(), selection:String::new(), prompt:format!("Fixed Changes {round}"), request_id:format!("wire_request_{round}"), user_entry_id:None, injections:vec![], assistant_references:vec![], exercise_references:vec![] };
+            let messages = ContextBridge::freeze(&request,&frozen.context,&session,None,&projection,crate::time_context::TimeContext::capture()).unwrap().messages;
+            assert_eq!(frozen.course_read_manifest.as_ref().unwrap().iter().find(|m|m.id==*document).unwrap().version,focus.document_version);
             let markdown = c.content.read(&sid).unwrap().content;
             let native = crate::native_session::prepare(&c.state_dir, &session, &format!("wire_run_{round}"), &format!("wire_user_{round}"), vec![a.clone(),b.clone()], false, vec![], &markdown).unwrap();
             if round == 2 { let doc = c.content.read(&b).unwrap();c.content.save(&b, &crate::content::serialize(&doc.metadata, "UNFROZEN_WORKSPACE_BODY_MUST_NOT_LEAK").unwrap(), &doc.version).unwrap(); }
-            (c.content.root().to_owned(), cp, native)
+            (focus, messages, native)
         };
-        if round == 0 { first = cp.checkpoint_commit_oid.clone(); }
-        parent = Some(cp.checkpoint_commit_oid.clone());
-        let focus = json!({"courseId":course,"documentId":document,"path":path,"type":"markdown","commitHash":cp.checkpoint_commit_oid,"materialTreeOid":cp.material_tree_oid,"paragraphs":[]});
-        let messages = vec![json!({"role":"user","content":json!({"focus":focus,"question":format!("Fixed Changes {round}"),"nativeMaterials":[],"nativeReferences":"","contextBridgeManifest":{"version":1,"entries":[]}}).to_string()})];
-        let course = course.clone();let document = document.clone();let first = first.clone();
+        if round == 0 { first = focus.commit_hash.clone(); }
+        let engine = e.clone();let first = first.clone();let session_id=native.learning_session_id.clone();
         let handler: MaterialChangesHandler = Arc::new(move |previous, body_previous| {
             if round == 2 { assert!(body_previous.is_none()); }
             if round == 3 { assert_ne!(previous.as_deref(), Some(first.as_str()));assert_eq!(body_previous.as_deref(), Some(first.as_str())); }
-            let git = crate::material_git::MaterialGit::open_course(&root, &course)?;
-            crate::material_changes::prepare(&git, &course, &cp.checkpoint_commit_oid, previous.as_deref(), body_previous.as_deref(), Some((&document, &path)), 512*1024)
+            if round == 5 { assert!(previous.is_none() && body_previous.is_none()); }
+            let mut core=engine.lock()?;
+            let session=sessions::get(&mut core.content,&session_id)?;
+            let value=crate::material_changes::for_focus(&mut core,&session,&focus,previous.as_deref(),body_previous.as_deref())?;
+            let text=value["focused"]["text"].as_str().unwrap();
+            let (_,body)=crate::content::parse(text)?;
+            assert_eq!(value["focused"]["bodyStartChar"].as_u64().unwrap() as usize,text[..text.len()-body.len()].chars().count());
+            Ok(value)
         });
         generate_scoped(ModelCredentials::new(ModelSettings { provider:"custom".into(), protocol:PROTOCOL.into(), base_url:endpoint.clone(), model:"fixture".into(), ..ModelSettings::default() }, "synthetic-fixed-git-only".into()).unwrap(), messages, Arc::new(AtomicBool::new(false)), |_|{}, None, ToolPolicy::legacy(false), vec![], Some(RequestContext { material_changes:Some(handler), native_session:Some(native), ..RequestContext::capture() })).await.unwrap();
     }
@@ -420,6 +425,11 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
     assert!(packets[2].to_string().contains("B_FIXED_SECOND_BODY"));
     assert!(packets[2].to_string().contains("automatic_material_projection"));
     assert!(packets[3].to_string().contains("unifiedDiff"));
+    assert_eq!(packets[3]["messages"].as_array().unwrap().len(),packets[4]["messages"].as_array().unwrap().len()-2);
+    assert!(!packets[5].to_string().contains("B_FIXED_SECOND_BODY"));
+    assert!(packets[5].to_string().contains("A_FIXED_CHANGED_GIT_BODY"));
+    let frames: Vec<Value> = packets[5]["messages"].as_array().unwrap().iter().filter_map(|m| { let text=m["content"].as_str().map(str::to_owned).unwrap_or_else(||m["content"].as_array().into_iter().flatten().filter_map(|p|p["text"].as_str()).collect::<String>()); serde_json::from_str::<Value>(&text).ok() }).filter(|v| v["type"]=="automatic_material_projection").inspect(|v|assert!(v["bodyStartChar"].as_u64().unwrap()>0)).flat_map(|v|v["frames"].as_array().cloned().unwrap_or_default()).collect();
+    assert!(!frames.is_empty() && frames.iter().all(|f|f["kind"]=="full"));
     assert!(packets[3].to_string().contains("A_FIXED_CHANGED_GIT_BODY"));
     assert!(packets.iter().all(|packet|!packet.to_string().contains("UNFROZEN_WORKSPACE_BODY_MUST_NOT_LEAK")));
 }

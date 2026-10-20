@@ -14,7 +14,7 @@
 
 Changes 接口提供首次全文、后续完整 Git diff。显式引用继续走 `nativeReferences`。仅旧无 Git 身份的 automatic material custom 从有效投影排除，已验证的 Focus 投影及原始会话/真实工具历史保留。
 
-Changes 私有适配发送 `material_changes {id,baseCommitOid,focusBaseCommitOid}`：前者来自本 session 原请求核对后的课程变化通知，后者来自当前有效完整正文投影的 Git commit，缺失为 null。两者独立，A→B→A 不把 B 时收到的通知当作 A 正文。复用原生材料条目的 full→diff 链与压缩恢复，不增加缓存；基准缺失/不完整时恢复全文，无变化不重复。Rust 固定 OLD/NEW 比较接入依赖最终 Focus 课程仓路由，本组合当前只验证 Node/Pi 适配，不声明业务端到端完成。
+Changes 私有适配发送 `material_changes {id,baseCommitOid,focusBaseCommitOid}`：前者来自本 session 原请求核对后的课程变化通知，后者来自当前有效完整正文投影的 Git commit，缺失为 null。两者独立，A→B→A 不把 B 时收到的通知当作 A 正文。复用原生材料条目的 full→diff 链与压缩恢复，不增加缓存；基准缺失/不完整时恢复全文，无变化不重复。Rust 固定 OLD/NEW 比较通过已提交 Focus 课程仓路由接入，同一Frozen供generation与for_focus使用；不在Rust保存新的正文接收缓存。
 
 项目资源使用锁版 Pi 的 `DefaultResourceLoader`：保留父级 AGENTS 与课程/用户 skills、prompt templates 等文本发现，使用显式应用 system prompt override，不另造 parser 或缓存。SettingsManager 仍为内存配置，不加载外部可执行 extensions、自动包安装或用户凭据。原生 `/skill` 展开保留原始输入哈希与实际 user entry 映射，同一问题重试复用已接受的展开文本。
 

@@ -118,7 +118,8 @@ impl ContextBridge {
         let metadata_only_ids: Vec<_> = ctx.manifest.iter().filter(|m| m.included_chars == 0 && !ctx.automatic_materials.iter().any(|a|a.id==m.id)).map(|m|m.id.clone()).collect();
         if !metadata_only_ids.is_empty() { metadata.insert("metadataOnlySourceIds".into(), json!(metadata_only_ids)); }
         let question = metadata.remove("question").unwrap_or(json!(""));
-        let (materials, references) = projection.provider_texts(ctx)?;
+        let (mut materials, references) = projection.provider_texts(ctx)?;
+        if request.focus.is_some() { materials.clear(); }
         let mut store = Self::default();
         for part in [
             PromptPart {
@@ -154,7 +155,7 @@ impl ContextBridge {
         ] {
             store.add(&part)?;
         }
-        let mut entries = projection.manifest_entries(ctx);
+        let mut entries = if request.focus.is_some() { vec![] } else { projection.manifest_entries(ctx) };
         let auto_ids = ctx
             .automatic_materials
             .iter()
@@ -210,7 +211,7 @@ impl ContextBridge {
             "{},\"contextBridgeManifest\":{},\"nativeMaterials\":{},\"nativeReferences\":{}{}",
             &content[..at],
             serde_json::to_string(&manifest)?,
-            serde_json::to_string(&projection.native_materials(ctx))?,
+            serde_json::to_string(&if request.focus.is_some() { vec![] } else { projection.native_materials(ctx) })?,
             serde_json::to_string(&references)?,
             &content[at..]
         );

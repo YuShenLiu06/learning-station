@@ -3,6 +3,32 @@
 use crate::{material_git::MaterialGit, types::*};
 use serde_json::{json, Value};
 
+pub fn for_focus(
+    core: &mut crate::app::Core,
+    session: &Session,
+    focus: &crate::focus::Focus,
+    previous: Option<&str>,
+    focus_previous: Option<&str>,
+) -> Result<Value> {
+    let frozen = crate::focus::load(core, session, focus)?;
+    let focus = &frozen.focus;
+    let source = focus.asset.as_ref().and_then(|a| a["id"].as_str()).unwrap_or(&focus.document_id);
+    let text = (!focus.binary && matches!(focus.r#type.as_str(), "markdown" | "text"))
+        .then_some((source, focus.path.as_str()));
+    let mut value = prepare(&crate::focus::open_materials(core, focus)?, &focus.course_id,
+        &focus.commit_hash, previous, focus_previous, text, 512 * 1024)?;
+    if focus.r#type == "markdown" {
+        if let Some(text) = value["focused"]["text"].as_str() {
+            // parse returns the actual suffix after the validated metadata fence;
+            // repeated body text in metadata cannot change this coordinate.
+            let (_, body) = crate::content::parse(text)?;
+            let offset = text[..text.len() - body.len()].chars().count();
+            value["focused"]["bodyStartChar"] = json!(offset);
+        }
+    }
+    Ok(value)
+}
+
 /// `source_id` is already authorized by the submission, not inferred from a path.
 /// Only text permitted for automatic projection may be supplied (not answer keys).
 pub fn prepare(

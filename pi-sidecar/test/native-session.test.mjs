@@ -148,9 +148,9 @@ test('binary asset Focus retains genuine metadata provenance without inventing a
  let called=false;const denied=await openNativeSession(spec(),{...options(),loadChanges:async()=>{called=true;throw Error('must not load unauthorized asset');}});await assert.rejects(denied.applyContext(next),e=>e.code==='NATIVE_SESSION_INVALID');assert.equal(called,false);assert.equal(materialEntries(denied).length,0);denied.close();
 });
 test('inconsistent binary or image Focus cannot bypass metadata-only through visible paragraphs',async()=>{
- for(const kind of ['binary','image']){
-  const s=spec();let calls=0;const n=await openNativeSession(s,{...options(fixture(()=>calls++)),loadChanges:async r=>changeReply(r.baseCommitOid,kind==='binary'?{id:'doc_1',textUnavailable:'binary'}:null,[])});
-  const next=changesEnvelope();next.focus={...next.focus,type:kind==='image'?'image':'markdown',paragraphs:[{text:'SYNTHETIC_BINARY_BODY_MUST_NOT_SEND'}]};
+ for(const kind of ['binary','image','exercise']){
+  const s=spec();let calls=0;const n=await openNativeSession(s,{...options(fixture(()=>calls++)),loadChanges:async r=>changeReply(r.baseCommitOid,kind==='binary'?{id:'doc_1',textUnavailable:'binary'}:kind==='exercise'?focused('doc_1','SYNTHETIC_EXERCISE_BODY_MUST_NOT_SEND'):null,[])});
+  const next=changesEnvelope();next.focus={...next.focus,type:kind==='image'?'image':kind==='exercise'?'exercise':'markdown',paragraphs:kind==='exercise'?[]:[{text:'SYNTHETIC_BINARY_BODY_MUST_NOT_SEND'}]};
   await assert.rejects(n.applyContext(next),e=>e.code==='CONTEXT_CONFLICT');assert.equal(changeEntries(n).length,0);assert.equal(materialEntries(n).length,0);assert.equal(calls,0);assert(!fs.readFileSync(path.join(s.directory,'transcript.jsonl'),'utf8').includes('SYNTHETIC_BINARY_BODY_MUST_NOT_SEND'));n.close();
  }
 });
@@ -180,8 +180,8 @@ test('interleaved Focus sends its effective body OLD separately from the last co
  }
 });
 
-test('unregistered excluded course files keep separate auditable metadata without invented source identity',async()=>{
- const s=spec();let manifest;const excludedFiles=['private.env','nested/private.env'].map(fileName=>({assetId:'',fileName,reason:'sensitive_file_name'}));
+test('registered and unregistered excluded course files keep separate auditable metadata without invented source identity',async()=>{
+ const s=spec();let manifest;const excludedFiles=['private.env','nested/private.env'].map(fileName=>({assetId:'',fileName,reason:'sensitive_file_name'}));excludedFiles.push(...['private.env','.asset.json'].map(fileName=>({assetId:'asset_fixture',fileName,reason:'sensitive_file_name'})));
  const n=await openNativeSession(s,{...options(),onManifest:m=>manifest=m,loadChanges:async r=>changeReply(r.baseCommitOid,focused('doc_1','Body'),[],{checkpoint:{courseId:'course_fixture',checkpointCommitOid:cp1,materialTreeOid:tree,excludedFiles}})});
- await n.applyContext(changesEnvelope());const excluded=manifest.entries.filter(e=>e.reason==='excluded:sensitive_file_name');assert.equal(new Set(excluded.map(e=>e.id)).size,2);assert.deepEqual(excluded.map(e=>e.fileName),excludedFiles.map(e=>e.fileName));assert(excluded.every(e=>e.sourceId===undefined&&e.includedChars===0));n.close();
+ await n.applyContext(changesEnvelope());const excluded=manifest.entries.filter(e=>e.reason==='excluded:sensitive_file_name');assert.equal(new Set(excluded.map(e=>e.id)).size,4);assert.deepEqual(excluded.map(e=>e.fileName),excludedFiles.map(e=>e.fileName));assert(excluded.slice(0,2).every(e=>e.sourceId===undefined));assert(excluded.slice(2).every(e=>e.sourceId==='asset_fixture'));assert(excluded.every(e=>e.includedChars===0));n.close();
 });

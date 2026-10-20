@@ -1,6 +1,6 @@
-# 固定版本 Changes（课程接入中）
+# 固定版本 Changes
 
-本层提供课程物理仓库的固定 OID 计算、私有事件和 Pi 实际投影接收。最终 `focus::load` / `focus::open_materials(core, focus)` 适配仍等 Focus 已提交课程路由，不复制未提交代码；当前不能宣称完整业务入口已接通。
+本层基于 Focus 9440b51 的课程路由接入 generation：`for_focus` 只消费 `focus::load` 的同一 Frozen，经 `focus::open_materials(core, focus)` 读取固定 OID，不再次 capture 或刷新目录。完整产品验收仍以组合测试和对应 SHA 的 CI 为准。
 
 ## 固定比较与正文
 
@@ -8,7 +8,7 @@
 
 `baseCommitOid` 是本 session 实际请求核对后的课程变化通知 OLD，用于其他文件的 name-status/numstat。`focusBaseCommitOid` 是当前有效完整正文投影的 OLD；聚焦 patch 单独比较这个 OLD 和冻结 NEW，条目的 patchBaseCommitOid 及 focused.gitChange.baseCommitOid 明示其基准。A→B→A 不把 B 时收到的课程通知当成 A 正文。基准由 Pi 现有材料条目提供，Rust 不拼历史或另建缓存。
 
-返回 checkpoint 保留 courseId/checkpointCommitOid/materialTreeOid/excludedFiles，完整 focused 保留真实来源 id/path、内容 SHA version、独立 gitCommitOid/gitBlobOid、text/textHash/range。全文是固定 Git 文件的原始 UTF-8 文本；range 为此文本的字符坐标。Focus 可见段落和 Citation 的正文坐标不能仅凭同 sourceId/version 就假定与含前置信息的 Git 文件坐标相同；引用作者须按真实范围对齐，去重保留双来源。
+返回 checkpoint 保留 courseId/checkpointCommitOid/materialTreeOid/excludedFiles，完整 focused 保留真实来源 id/path、内容 SHA version、独立 gitCommitOid/gitBlobOid、text/textHash/range。全文是固定 Git 文件的原始 UTF-8 文本；range 为此文本的字符坐标。Focus 可见段落和 Citation 的正文坐标不能仅凭同 sourceId/version 就假定与含前置信息的 Git 文件坐标相同；`focused.bodyStartChar` 从顶部元数据解析后的真实正文边界计算并传到 Pi 材料投影；文本附件为0。Citation补充切片须在其已提交head上按真实范围组合，去重保留双来源。
 
 非聚焦只给文件名/name-status/numstat。聚焦完整原生 Git patch 不静默截断；非 UTF-8 patchBytes 保留在材料服务，发送层明确 patchUnavailable/patchByteLength，不乱码替换或丢文件。二进制只文件状态，通用计算从固定NEW checkpoint原生Git分类取得，不用NUL猜；最终wrapper仅对markdown/text且!Focus.binary提供正文，沿封存类型边界。主动受支持read仍走正常权限和工具结果，不用diff缓存替身。
 
@@ -26,4 +26,4 @@ Changes 消息与原 request/run/user/native entry 绑定。实际准备请求�
 
 full commit、材料 tree、课程仓归属与各 session 接收身份分开。本层不提交聊天或做联合回滚。
 
-验证只使用合成课程、真实本地 Git、锁版 Pi 和 localhost。固定计算、Node资源/正文投影、实际私有管道分别报告；最终 Frozen/generation 接通、前端/build和最终SHA CI仍须独立完成。
+验证只使用合成课程、真实本地 Git、锁版 Pi 和 localhost。固定计算、Node资源/正文投影、实际私有管道分别报告；同一 Frozen/generation 接缝与前端/build分别验证；最终SHA CI、Citation补充组合与本人GUI验收仍须独立完成。
