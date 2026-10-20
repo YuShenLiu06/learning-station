@@ -87,6 +87,31 @@ fn missing_oid_never_invokes_a_configured_promisor_transport() {
 }
 
 #[test]
+fn busy_attachment_storage_keeps_the_old_receipt_and_can_retry_after_unlock() {
+    let f = Fixture::new();
+    f.import("lesson.txt", b"existing bytes\n", "locked_lesson");
+    let first = f.commit(None);
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(f.store.root().join("assets/.assets.lock"))
+        .unwrap();
+    lock.try_lock().unwrap();
+    let error = FrozenMaterials::capture(&f.store, &f.course.id).unwrap_err();
+    assert_eq!(error.code, "BUSY");
+    assert!(error.retryable);
+    assert_eq!(
+        f.git
+            .checkpoint(&f.course.id, &first.checkpoint_commit_oid)
+            .unwrap(),
+        first
+    );
+    lock.unlock().unwrap();
+    let next = f.commit(Some(&first.checkpoint_commit_oid));
+    assert_eq!(first.material_tree_oid, next.material_tree_oid);
+}
+
+#[test]
 fn teaching_names_survive_and_exclusions_are_readable_from_the_commit() {
     let f = Fixture::new();
     let original = f.commit(None);

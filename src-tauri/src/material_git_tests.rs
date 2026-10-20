@@ -41,7 +41,17 @@ impl Fixture {
         }
     }
     fn freeze(&self) -> FrozenMaterials {
-        FrozenMaterials::capture(&self.store, &self.course.id).unwrap()
+        // BUSY is a valid read-only capture outcome under concurrent OS locks.
+        // Retry only that outcome; permanent contention and all other errors fail.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match FrozenMaterials::capture(&self.store, &self.course.id) {
+                Err(error) if error.code == "BUSY" && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                result => return result.unwrap(),
+            }
+        }
     }
     fn commit(&self, parent: Option<&str>) -> Checkpoint {
         self.git.commit(&self.freeze(), parent).unwrap()
