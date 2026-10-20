@@ -12,6 +12,10 @@
 
 课程项目适配另支持可选 `projectRoot` 与 `agentDir`：课程根只作为 Pi cwd，`directory` 仍为当前 session 专属存储。Rust 核实 canonical 真实目录，并显式提供允许的用户 agentDir；缺省保持旧会话资源行为。课程业务接入必须消费 `course_project_root`，不能接受前端任意绝对路径。普通开局不遍历笔记全文；Focus 仍经现有 `nativeMaterials` 投影接收全文或差量，显式引用继续走 `nativeReferences`。已收到的正文与真实工具历史保留，不因没有新的 Focus 重置基准。
 
+Changes 接口提供首次全文、后续完整 Git diff。显式引用继续走 `nativeReferences`。仅旧无 Git 身份的 automatic material custom 从有效投影排除，已验证的 Focus 投影及原始会话/真实工具历史保留。
+
+Changes 私有适配发送 `material_changes {id,baseCommitOid,focusBaseCommitOid}`：前者来自本 session 原请求核对后的课程变化通知，后者来自当前有效完整正文投影的 Git commit，缺失为 null。两者独立，A→B→A 不把 B 时收到的通知当作 A 正文。复用原生材料条目的 full→diff 链与压缩恢复，不增加缓存；基准缺失/不完整时恢复全文，无变化不重复。Rust 固定 OLD/NEW 比较通过已提交 Focus 课程仓路由接入，同一Frozen供generation与for_focus使用；不在Rust保存新的正文接收缓存。
+
 项目资源使用锁版 Pi 的 `DefaultResourceLoader`：保留父级 AGENTS 与课程/用户 skills、prompt templates 等文本发现，使用显式应用 system prompt override，不另造 parser 或缓存。SettingsManager 仍为内存配置，不加载外部可执行 extensions、自动包安装或用户凭据。原生 `/skill` 展开保留原始输入哈希与实际 user entry 映射，同一问题重试复用已接受的展开文本。
 
 cwd 与 Node 目录读取参数都不是强隔离：真实锁版 read/Bash 可读取兄弟 fixture，Node 24 的预存 symlink 也可绕过目录范围。基础原生 read/Bash 不启用，现有 Rust 工具校验不变；不新增 sandbox/插件。Node 只增加课程、父级说明文件候选与允许用户文本资源的只读范围，不增加写入或 child-process 权限。上述行为用合成 fixture 验证，不代表 GUI、真实模型或课程整合已验收。

@@ -237,6 +237,7 @@ async fn native_restart_case(same_course: bool) {
                     Ok(())
                 })),
                 tool_recovery: None,
+                material_changes: None,
                 compaction_observer: None,
             }),
         )
@@ -370,6 +371,7 @@ async fn native_restart_case(same_course: bool) {
             native_session: Some(native),
             context_observer: None,
             tool_recovery: Some(recovery),
+            material_changes: None,
             compaction_observer: None,
         }),
     )
@@ -756,6 +758,7 @@ async fn rust_node_pi_exercise_tool_receipt_corrects_invalid_output_in_same_nati
             native_session: Some(native.clone()),
             context_observer: None,
             tool_recovery: None,
+            material_changes: None,
             compaction_observer: None,
         }),
     )

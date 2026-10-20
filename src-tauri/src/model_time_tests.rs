@@ -258,6 +258,7 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
                 native_session: None,
                 context_observer: None,
                 tool_recovery: None,
+                material_changes: None,
                 compaction_observer: None,
                 time: clock.clone(),
                 exploration: Some(intent),

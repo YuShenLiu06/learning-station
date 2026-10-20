@@ -39,3 +39,15 @@ test('queued/current Run and persisted reply retain separate own snapshots; late
 });
 
 test.after(async()=>{clearMocks();dom.window.close();await unlink(file).catch(()=>{});});
+
+test('Changes inventory preserves safe paths, counts and exclusion reasons through the actual provenance reader',async()=>{
+ const value={version:1,projectedChars:0,projectedBytes:0,entries:[
+ {id:'change:new',kind:'material',status:'added',version:hash('tree'),includedChars:0,path:'attachments/new/lesson%3Aone.txt',fileStatus:'A',added:111,deleted:2,binary:false,reason:'git_name_status_numstat'},
+ {id:'excluded:asset',kind:'material',status:'retained',version:hash('commit'),includedChars:0,fileName:'credentials.json',reason:'excluded:sensitive_file_name'},
+ {id:'image-asset',kind:'material',sourceId:'asset_image',status:'added',version:hash('image'),includedChars:0,path:'attachments/asset_image/image.png',reason:'focus_metadata_only'},
+ {id:'unavailable',kind:'material',status:'retained',version:hash('commit'),includedChars:0,reason:'text_unavailable:non_utf8',fixedVersion:{courseId:'course',checkpointCommitOid:'a'.repeat(40),path:'documents/non_utf8.md'}}]};
+ const parsed=ui.readContextBridgeManifest(value);assert.deepEqual(parsed,value);
+ const actual={...context(parsed),focus:{courseId:'course',path:'A.md',type:'markdown',documentId:'a',view:'read',commitHash:'a'.repeat(40),documentVersion:'b'.repeat(64),excludedFiles:[],paragraphs:[]},manifest:[{id:'unfocused_b',path:'B.txt',version:hash('B'),includedChars:111}]};
+ await view({status:'ready',actual:true,context:actual},async()=>{const group=document.querySelector('.context-bridge-sources');assert.match(document.querySelector('.source-details').textContent,/冻结范围 111 字符/);assert.doesNotMatch(document.querySelector('.source-details').textContent,/已读取 111/);assert.match(group.textContent,/lesson%3Aone.txt/);assert.match(group.textContent,/\+111 \/ -2/);assert.match(group.textContent,/已排除 credentials.json · 敏感配置名称/);const image=[...group.querySelectorAll('.context-source')].find(e=>e.textContent.includes('image.png'));assert.match(image.textContent,/仅元数据，未提供正文/);assert.doesNotMatch(image.textContent,/修改|\+0/);assert.match(group.textContent,/固定读取版本 aaaaaaaaaa/);assert.equal(group.querySelector('a,button'),null);});
+ for(const field of [{added:-1},{binary:'false'},{path:{}},{fixedVersion:{courseId:'course',checkpointCommitOid:'HEAD',path:'x'}}])assert.equal(ui.readContextBridgeManifest({...value,entries:[{...value.entries[0],...field}]}),undefined);
+});

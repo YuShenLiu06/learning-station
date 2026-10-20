@@ -378,6 +378,10 @@ pub fn prepare(state: &Path, session: &Session, ctx: &Context) -> Prepared {
 pub fn prepare_native(state: &Path, session: &Session, ctx: &Context) -> Prepared {
     prepare_mode(state, session, ctx, true)
 }
+/// Pi owns the fixed Git full/diff chain; prepare only this frozen request.
+pub fn prepare_current(ctx: &Context) -> Prepared {
+    Prepared { text: ctx.text.clone(), stats: json!({"version":1,"mode":"fixed_git_changes"}), chains: vec![] }
+}
 fn prepare_mode(state: &Path, session: &Session, ctx: &Context, native: bool) -> Prepared {
     let previous = load(state, session, ctx, native);
     let mut bases: BTreeMap<String, Chain> = previous

@@ -482,6 +482,7 @@ pub async fn start(
                     native_session: None,
                     context_observer: None,
                     tool_recovery: None,
+                    material_changes: None,
                     compaction_observer: None,
                     time: time_context,
                     exploration: None,
