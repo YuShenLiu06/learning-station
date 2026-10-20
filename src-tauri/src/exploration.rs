@@ -116,7 +116,8 @@ pub fn request_context(
     goal: &str,
     manifest: &[ManifestItem],
 ) -> Result<Option<ExplorationContext>> {
-    if session.section_id.is_empty() {
+    // Explicit courses are not standalone exploration; their creation anchor may be recycled.
+    if session.course_id.is_some() || session.section_id.is_empty() {
         return Ok(None);
     }
     let doc = store.read(&session.section_id)?;

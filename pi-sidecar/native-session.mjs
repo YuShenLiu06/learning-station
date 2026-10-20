@@ -131,11 +131,11 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
       manager.appendMessage({role:'toolResult',toolCallId:call.id,toolName:call.name,content:[{type:'text',text:JSON.stringify(value)}],isError:!!reply.reply.error,timestamp:Date.now()});
     }
     // A changed scope must not hide an unresolved write and bypass its receipt.
-    if(revoked||spec.protectHistory){
+    if(revoked||spec.protectHistory&&(!spec.historyBoundaryKey||previousBinding?.historyBoundaryKey!==spec.historyBoundaryKey)){
       const boundary=manager.appendCustomMessageEntry('learning-station-permission-boundary','资料授权已变化；此前模型上下文已排除，仅使用本轮授权资料。',false,{});
       manager.appendCompaction('应用权限边界：此前内容未重新授权，不作为本轮依据。',boundary,0,{reason:'authorization-change'},true);
     }
-    manager.appendCustomEntry('learning-station-scope',{sourceIds:spec.authorizedSourceIds});
+    manager.appendCustomEntry('learning-station-scope',{sourceIds:spec.authorizedSourceIds,historyBoundaryKey:spec.historyBoundaryKey});
     agent.state.messages=manager.buildSessionContext().messages;
     // Old per-turn references are not silently injected into later requests.
     for(const entry of manager.buildSessionProjection().entries){if(entry.sourceEntry.type==='custom_message'&&entry.sourceEntry.customType==='learning-station-turn'&&entry.messages.length)manager.appendContextEdit(entry.sourceEntry.id,null);}

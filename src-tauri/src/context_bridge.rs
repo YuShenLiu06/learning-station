@@ -113,6 +113,7 @@ impl ContextBridge {
         metadata.remove("historyManifest");
         metadata.remove("context");
         metadata.remove("userGoal");
+        if let Some(document) = &request.document_id { metadata.insert("activeDocumentId".into(), json!(document)); }
         let question = metadata.remove("question").unwrap_or(json!(""));
         let (materials, references) = projection.provider_texts(ctx)?;
         let mut store = Self::default();
@@ -177,7 +178,7 @@ impl ContextBridge {
             entries.push(entry);
         }
         if !request.selection.is_empty() {
-            entries.push(json!({"id":"selection","kind":"reference","status":"added","sourceId":session.section_id,"version":hash(&request.selection),"includedChars":request.selection.chars().count(),"reason":"explicit_one_shot"}));
+            entries.push(json!({"id":"selection","kind":"reference","status":"added","sourceId":request.document_id.as_deref().unwrap_or(&session.section_id),"version":hash(&request.selection),"includedChars":request.selection.chars().count(),"reason":"explicit_one_shot"}));
         }
         entries.push(json!({"id":"request-time","kind":"turn","status":"added","version":hash(&serde_json::to_string(&time)?),"includedChars":serde_json::to_string(&time)?.chars().count(),"reason":"frozen_current_turn"}));
         entries.push(json!({"id":"context-protocol","kind":"stable","status":"retained","version":"1","includedChars":serde_json::to_string(&store.parts["stable"].value)?.chars().count(),"reason":"projection_protocol"}));

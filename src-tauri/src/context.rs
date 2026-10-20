@@ -949,7 +949,7 @@ pub fn protect_trashed_history(
         .retain(|warning| !warning.starts_with(TRASHED_HISTORY_PREFIX));
     let mut matched = BTreeSet::new();
     for id in std::iter::once(&session.id)
-        .chain(std::iter::once(&session.section_id))
+        .chain(session.course_id.is_none().then_some(&session.section_id))
         .chain(session.context_excluded_history_source_ids.iter())
         .chain(context.excluded_history_source_ids.iter())
     {
@@ -1187,6 +1187,8 @@ mod trash_history_tests {
     use serde_json::{json, Value};
     fn session(data: Value, related_ids: Vec<String>) -> Session {
         Session {
+            course_id: None,
+            legacy_session_ids: vec![],
             id: "kept_session".into(),
             section_id: "kept_source".into(),
             title: "Kept".into(),

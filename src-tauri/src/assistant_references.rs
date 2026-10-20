@@ -105,6 +105,7 @@ pub fn inject_request(
             "资料与AI回答的附加引用合计最多8份。",
         ));
     }
+    crate::course_sessions::validate_injections(store, session, injections)?;
     validate_references(store, session, refs)?;
     if !refs.is_empty() && context::history_is_protected(ctx) {
         return Err(CoreError::new(
@@ -393,6 +394,7 @@ mod tests {
     async fn stale_or_changed_frozen_refs_fail_before_credentials_or_model_requests() {
         let (_d, e, s, r) = fixture();
         let mut request = crate::generation::GenerationRequest {
+            document_id: None,
             session_id: s.id.clone(),
             mode: "question".into(),
             selection: String::new(),

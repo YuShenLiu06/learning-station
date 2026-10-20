@@ -1,6 +1,6 @@
 # Pi 原生会话 v1
 
-仅应用内部私有管道；不新增前端 IPC、模型权限或任意路径接口。锁定 `@earendil-works/pi-coding-agent`、agent-core、pi-ai 均为1.3.0。
+原生会话部分仅使用应用内部私有管道，不新增模型权限或任意路径接口。锁定 `@earendil-works/pi-coding-agent`、agent-core、pi-ai 均为1.3.0。
 
 ## 持有关系
 
@@ -8,7 +8,7 @@
 - Rust：Markdown/学习对象、授权与版本快照、Keychain、模型配置、准确映射、运行与业务回执、落盘同步。
 - React：沿用原 IPC 与来源快照；不读写 Pi 文件或密钥。
 
-`RequestContext.nativeSession` 内部字段：`directory`（Rust已核实的私有目录）、`learningSessionId`、`runId`、`userEntryId`、`authorizedSourceIds`、`protectHistory`、`legacyRecords`。前端不能提供这些路径或扩大范围。
+`RequestContext.nativeSession` 内部字段：`directory`（Rust已核实的私有目录）、`learningSessionId`、`runId`、`userEntryId`、`authorizedSourceIds`、`protectHistory`、可选 `historyBoundaryKey`、`legacyRecords`。前端不能提供这些路径或扩大范围。
 
 课程项目适配另支持可选 `projectRoot` 与 `agentDir`：课程根只作为 Pi cwd，`directory` 仍为当前 session 专属存储。Rust 核实 canonical 真实目录，并显式提供允许的用户 agentDir；缺省保持旧会话资源行为。课程业务接入必须消费 `course_project_root`，不能接受前端任意绝对路径。`projectRoot` 请求不接受自动笔记正文或 material 清单，显式引用继续走 `nativeReferences`；旧 automatic material custom 只从有效投影排除，不删除原始会话或真实工具历史。
 
@@ -49,3 +49,34 @@ cwd 与 Node 目录读取参数都不是强隔离：真实锁版 read/Bash 可�
 Rust 在 practice 模式显式开启 `outputValidation`，Node 每次完成最终文本后发送只读 `validate_output {id, content}`；Rust 使用原轮冻结 manifest 校验，回复 `tool_result.result={valid,recoverable,message?}`，不保存对象、不增加权限。两端均最多接受三次校验（首次及最多两次修正），沿用原请求超时与工具预算。
 
 可纠正错误通过 `learning-station-output-validation` 原生 custom message 回传 Agent，包含安全字段路径、原因与长度限制，不伪造新用户问题。未知来源或权限错误不可自动修正；失败原文留在私有原生会话，最终失败文本留在Run。仅校验通过才标记原生记录complete；Rust保存前再次校验并沿既有操作编号幂等写入。该私有事件不注册为模型工具或前端IPC。
+
+## 课程会话路由（M2 / #11）
+
+显式 course 根下的笔记与练习经 `sessionByCourse[courseId]` 恢复同一业务 session；Pi 的目录、header ID、精确重开与幂等协议仍由该业务 ID 决定。无课程的旧笔记和独立探索保持原行为。`Session.courseId` 是固定归属，`sectionId` 仅保留创建时锚点，不能代替本轮材料。
+
+`load_session_context` 与 `start_generation` 接受可选 `documentId`；前端提交时从 activeDocumentId 冻结，经保存问题、重试、生成和练习落盘保持不变。省略时兼容旧锚点。Rust 检查课程归属；练习页面读取来源材料，不将含参考答案的页面正文自动注入。当前来源决定工具及练习目标，切页不改已提交请求。
+
+首次承接旧课程时，先将原 preferences、业务会话目录和对应 Pi 目录备份到私有 `course-session-backups/<sha256(courseId)>/`，完整回执后才建立新课程对话。原对话及来源保持原样，`legacySessionIds` 供界面提示和历史查看；不选一段旧对话覆盖其他记录，不拼接 Pi 历史。备份遇到运行锁、符号链接或读写失败时不切换路由。旧练习仍按 originSessionId 作答/批改，聊天使用课程 session；引用校验同时核实原账本与课程。
+
+Focus 切换时，native 的历史授权集合保留仍属于该课程的已见来源，课程外来源仍须本轮明确提供；回收历史保护仍生效。此集合不注入其他笔记正文，不扩大 Rust ToolScope/read 工具的本轮来源列表。
+
+### 来源、移动与回收边界
+
+练习页面是可编辑视图。来源解析核对稳定页面 ID、originSessionId、exerciseEntryId、页面摘要与真实 exercise entry；来源取自原账本，不一致返回 CONTEXT_CONFLICT。旧账本缺来源时才兼容原单篇锚点。请求接受时 Rust 把归一化来源保存到可选 Run.sourceDocumentId 与问题记录；在途改页、切页和结果保存不重新选择来源。
+
+工具入口核对真实 run 的冻结 manifest、归一化来源和当前课程归属；原有档位、路径、版本、配额及回执约束继续执行。错题按原题账本取源，手动复习卡保存创建来源，旧单篇缺字段才回退原锚点。
+
+材料连同练习子树跨课程移动后，原账本及 Pi 历史保持原位；只读题目/已保存作答/公开反馈核实原账本，注入当前对话时另核实目标课程。单独跨课程移动练习在修改前拒绝。其他课程仍有活动练习依赖原账本时，回收原课程返回 SOURCE_IN_USE，先处理依赖或移回来源材料。
+
+共享会话按固定 courseId 回收；单篇材料仅收纳该材料、练习及明确来源的复习对象。整课程回收和恢复保留稳定会话 ID 与准确 Pi 绑定。课程历史保护的 historyBoundaryKey 是已排除来源集合的摘要；同一回收边界只排除旧历史一次，后续仍获授权的对话可继续保留。来源撤权或排除集合变化会重新建立权限边界，旧原始记录不删除。
+
+恢复也按本次提交后的可见性核对练习原 session/entry：同批恢复的账本允许，仍在其他回收记录的依赖返回 DEPENDENCY_TRASHED 及明确恢复目标。失败保持原回收记录，同 requestId 可在依赖恢复后重试；不读取隐藏账本给模型，不隐式恢复原课程或改写 Pi 绑定。
+
+## 课程多会话业务 IPC
+
+- `course_sessions(courseId)` 返回 `{courseId, activeSessionId, sessions: DocumentSummary[]}`。
+- `course_session_create(courseId, requestId)` 幂等创建无材料锚点的新会话，并选中它。
+- `course_session_select(courseId, sessionId)` 核对固定 `Session.courseId` 后选中已有会话。
+- `course_session_rename(courseId, sessionId, title, expectedVersion)` 核对 `Session.version` 后修改名称；返回已有 `Session` 结构。
+
+创建与选择也返回 `Session`，仅更新会话偏好，不修改阅读文档。bootstrap 增加 `lastSessionId`、`lastCourseId`，原有字段继续保留。原 `sessionByCourse` 保留旧固定会话映射；新 `activeSessionByCourse` 记录每课程最近选择。旧会话 ID、原生私有目录及 Markdown 历史不变，新会话使用独立 Pi 绑定；无选择且存在多个候选时明确要求选择，不以最新文件猜测恢复目标。

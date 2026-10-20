@@ -19,6 +19,7 @@ pub mod model;
 pub mod native_session;
 pub mod reminders;
 pub mod sessions;
+pub mod course_sessions;
 pub mod time_context;
 pub mod types;
 #[cfg(feature = "desktop")]
