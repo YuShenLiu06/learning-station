@@ -1,5 +1,6 @@
 use crate::{
-    generation::{self, Engine, GenerationRequest},
+    app::Engine,
+    generation::{self, GenerationRequest},
     library_tree, native_session,
 };
 use std::sync::Arc;
