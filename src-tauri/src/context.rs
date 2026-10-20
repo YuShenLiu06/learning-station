@@ -129,7 +129,9 @@ mod requested_context_tests {
         let (session, _) = core.start_session(&source.id, false).unwrap();
         let mut v = value();
         v["documentId"] = json!(source.id);
-        v["injections"][0]["documentId"] = json!("frozen_reference_only");
+        v["injections"][0]["documentId"] = json!(source.id);
+        v["injections"][0]["expectedVersion"] = json!(source.version);
+        v["injections"][0]["selection"] = json!("原文");
         let original = entry(v);
         let saved = sessions::append(
             &mut core.content,
@@ -152,7 +154,11 @@ mod requested_context_tests {
         let (history, _) = crate::generation::quoted_history(&retry, None);
         assert!(!serde_json::to_string(&history)
             .unwrap()
-            .contains("frozen_reference_only"));
+            .contains(&source.id));
+        let mut missing = entry(value());
+        missing.data.as_mut().unwrap()["requestedContext"]["documentId"] = json!(source.id);
+        missing.data.as_mut().unwrap()["requestedContext"]["injections"][0]["documentId"] = json!("frozen_reference_only");
+        assert!(sessions::append(&mut core.content, &session.id, missing, None, "missing-reference-intent").is_err());
         let mut foreign = entry(value());
         foreign.data.as_mut().unwrap()["requestedContext"]["documentId"] = json!("another_source");
         assert_eq!(

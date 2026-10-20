@@ -243,8 +243,11 @@ pub fn append_entry(core: &mut Core, session_id: &str, entry: Entry, expected: O
             return Err(conflict());
         }
     }
-    crate::sessions::append_citation(&mut core.content, session_id, entry, expected, request_id,
-        frozen.as_ref().and_then(|r| r.context.citation_context.as_ref()))
+    // Older private Focus records never had auxiliary context. Keep that fact
+    // instead of expanding their citations from a later editable workspace.
+    let empty = crate::citation_context::CitationContext { version: 1, references: vec![] };
+    let citation = frozen.as_ref().map(|r| r.context.citation_context.as_ref().unwrap_or(&empty));
+    crate::sessions::append_citation(&mut core.content, session_id, entry, expected, request_id, citation)
 }
 pub fn read_document(core: &Core, focus: &Focus, id: &str) -> Result<Document> {
     if !valid_id(id) { return Err(conflict()); }
