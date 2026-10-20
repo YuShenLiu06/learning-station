@@ -1,3 +1,6 @@
+import { locateCitation } from './citation';
+import { renderedCitation, renderedCitationRange } from './renderedCitation';
+import type { CitationLocator } from './types';
 import { InsertContent } from './EmbeddedContent';
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowLeft, ArrowRight, ArrowUp, CornerUpLeft, BookOpen, Check, CheckCheck, ChevronDown, ChevronRight, CircleHelp, Clock3, FileText, FolderOpen, Compass, Layers2, ListTodo, LoaderCircle, MoreHorizontal, Paperclip, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, PencilLine, Plus, Sparkles, Square, X } from 'lucide-react';
@@ -34,7 +37,7 @@ import { AssistantReplyMenu } from './AssistantQuote';
 import { ExerciseQuote } from './ExerciseQuote';
 import { addExerciseReference, exerciseReferenceKey, freezeExerciseReferences, validateExerciseSelection } from './exerciseReferences';
 import type { AssistantReplyMenuState } from './AssistantQuote';
-import { addAssistantReference, assistantTextHash, freezeAssistantReferences, validateAssistantSelection, assistantReplyContent, assistantReplySelection } from './assistantReferences';
+import { addAssistantReference, assistantTextHash, freezeAssistantReferences, validateAssistantSelection, assistantReplyContent } from './assistantReferences';
 import { CreateNodeForm, MoveNodeForm, isContainerKind } from './NodeDialogs';
 import type { CreatableKind } from './NodeDialogs';
 import { CourseAssets, AssetPreviewContent } from './CourseAssets';
@@ -122,7 +125,23 @@ export function App() {
   const [rightbar, setRightbar] = useState(true);
   const [selection, setSelectionState] = useState('');
   const selectionStateRef = useRef({ value: '', revision: 0 });
-  function setSelection(value: string) { selectionStateRef.current = { value, revision: selectionStateRef.current.revision + 1 }; setSelectionState(value); }
+  const selectionCitation = useRef<ContextInjection | undefined>(undefined);
+  const selectionDraftBody = useRef<string | undefined>(undefined);
+  const selectionSourceBody = useRef<string | undefined>(undefined);
+  const preparingOperation = useRef('');
+  function setSelection(value: string, locator?: CitationLocator, sourceBody?: string) {
+    if (value) { const doc = docsRef.current[activeIdRef.current]; if (!doc) return; const body = sourceBody ?? doc.body; const located = locator ? { selection: value, locator } : locateCitation(body, value); selectionCitation.current = { documentId: activeIdRef.current, expectedVersion: doc.section.version, ...located }; selectionDraftBody.current = body !== doc.savedBody ? body : undefined; selectionSourceBody.current = body; }
+    else { selectionCitation.current = undefined; selectionDraftBody.current = undefined; selectionSourceBody.current = undefined; }
+    selectionStateRef.current = { value, revision: selectionStateRef.current.revision + 1 }; setSelectionState(value);
+  }
+  function materialReferences(sessionId: string) {
+    const items = injectionsRef.current[sessionId] || [], citation = selectionCitation.current;
+    if (citation) {
+      const source = docsRef.current[citation.documentId];
+      if (selectionDraftBody.current !== undefined || !source || source.saving || source.body !== source.savedBody || source.section.version !== citation.expectedVersion) throw new Error('引用尚未绑定已保存的原文版本，请先保存或重新选择；问题与引用仍保留。');
+    }
+    return freezeInjections(citation ? addContextInjection(items, citation, (assistantReferencesRef.current[sessionId] || []).length + (exerciseReferencesRef.current[sessionId] || []).length) : items);
+  }
   const [injectionsBySession,setInjectionsBySession]=useState<Record<string,ContextInjection[]>>({});
   const injectionsRef=useRef(injectionsBySession);injectionsRef.current=injectionsBySession;
   const [assistantReferencesBySession, setAssistantReferencesBySession] = useState<Record<string, AssistantReference[]>>({});
@@ -154,7 +173,7 @@ export function App() {
     if (keptExercises.length !== exercises.length) { const next = { ...exerciseReferencesRef.current, [snapshot.sessionId]: keptExercises }; exerciseReferencesRef.current = next; setExerciseReferencesBySession(next); }
     if (snapshot.selection && activeIdRef.current === snapshot.documentId && selectionStateRef.current.revision === snapshot.selectionRevision && selectionStateRef.current.value === snapshot.selection) setSelection('');
   }
-  const [injectionMenu,setInjectionMenu]=useState<{id:string;selection?:string;x:number;y:number;exercise?:{sessionId:string;questionId:string;part:ExerciseReferencePart;entryId?:string}}|null>(null);
+  const [injectionMenu,setInjectionMenu]=useState<{id:string;selection?:string;citation?:ContextInjection;x:number;y:number;exercise?:{sessionId:string;questionId:string;part:ExerciseReferencePart;entryId?:string;rendered?: { body: HTMLElement; range: Range }}}|null>(null);
   const [question, setQuestion] = useState('');
   const [busyId, setBusyId] = useState('');
   const [partial, setPartial] = useState<GenerationProgress | null>(null);
@@ -217,12 +236,13 @@ export function App() {
   const displayedMessages = conversation.slice(-30);
   const repliedRuns = new Set(displayedMessages.filter(message=>message.role==='assistant'&&message.runId).map(message=>message.runId));
   const composerQuestion = question;
-  const requestSelection = session.sectionId && current?.section.kind !== 'exercise' ? selection : '';
+  const requestSelection = ''; // New material selections travel through the same versioned citation queue.
+  const visibleSelection = session.sectionId && current?.section.kind !== 'exercise' ? selection : '';
   const injections=injectionsBySession[session.id]||[];
   const assistantReferences = assistantReferencesBySession[session.id] || [];
   const exerciseReferences = exerciseReferencesBySession[session.id] || [];
-  const injectionKey=JSON.stringify([injections,assistantReferences,exerciseReferences]);
-  const composerRefs = composerReferences(requestSelection, session.sectionId, current?.section.version || '', current?.section.title || '当前材料', injections, id => nodes.find(node => node.id === id)?.title || id, assistantReferences, exerciseReferences);
+  const injectionKey=JSON.stringify([injections,assistantReferences,exerciseReferences,selectionCitation.current]);
+  const composerRefs = composerReferences(visibleSelection, activeId, current?.section.version || '', current?.section.title || '当前材料', injections, id => nodes.find(node => node.id === id)?.title || id, assistantReferences, exerciseReferences);
   contextInputs.current = { sessionId: session.id, documentId: activeId, body: current?.body || '', version: current?.section.version || '', selection: requestSelection, injections: injectionKey };
   const canCompose = !!current && !isContainer;
   const visibleSessionRef = useRef(session.id); visibleSessionRef.current = session.id;
@@ -234,16 +254,23 @@ export function App() {
   const notify = useCallback((message: string) => setToast(message), []);
   useEffect(() => { if (activeId) questionDrafts.current[activeId] = question; }, [activeId, question]);
   useEffect(() => { if (toast) { const timer = setTimeout(() => setToast(''), 4500); return () => clearTimeout(timer); } }, [toast]);
-  const openSection = useCallback(async (id: string) => {
+  const openSection = useCallback(async (id: string, verified?: Section) => {
     const started = performance.now();
-    const sequence = ++openSequence.current;
+    const sequence = ++openSequence.current, beforeNavigation = navigationIntent.current;
+    const cached = docsRef.current[id];
+    if (verified && (verified.id !== id || cached && (cached.saving || cached.body !== cached.savedBody))) throw new Error('来源有未保存的编辑，请先处理；历史引用与当前草稿仍保留。');
+    const verifiedDraft = verified && !cached && nativeAvailable ? await call<UiDraft | null>('draft_get', { key: `section:${id}` }) : null;
+    if (sequence !== openSequence.current || beforeNavigation !== navigationIntent.current) return;
+    if (verified && verifiedDraft?.data.body !== undefined && verifiedDraft.data.body !== verified.body) throw new Error('来源有待恢复的草稿，未将其作为历史版本展示；请先处理草稿。');
     navigationRef.current.ensureExpanded(ancestorIds(nodesRef.current, id));
     activeIdRef.current = id; setActiveId(id); setAssetsOpen(false); setQuestion(questionForSection(questionDrafts.current, id)); switchView('lesson'); setEditing(false); setSelection(''); setAiError(''); setOpenError('');
     const intent = navigationIntent.current;
     const stillCurrent = () => intent === navigationIntent.current && sequence === openSequence.current;
     if (docsRef.current[id]) {
       if (!isContainerKind(docsRef.current[id].section.kind)) void call<LearningSession>('session_open', { sectionId: id }).then(value => setSessions(old => ({ ...old, [id]: value }))).catch(error => { if (stillCurrent()) setAiError(`学习记录尚未读到：${errorText(error)}`); });
-      if (nativeAvailable) void call<Section>('section_open', { id }).then(section => {
+      if (verified) { const opened = { section: verified, body: verified.body, savedBody: verified.body, saving: false, draftLoaded: docsRef.current[id].draftLoaded }; docsRef.current = { ...docsRef.current, [id]: opened }; setDocs(old => ({ ...old, [id]: opened })); }
+      else if (nativeAvailable) void call<Section>('section_open', { id }).then(section => {
+        if (!stillCurrent()) return;
         const local = docsRef.current[id];
         if (!local || local.saving || section.version === local.section.version) return;
         if (local.body !== local.savedBody) { setDocs(old => ({ ...old, [id]: { ...old[id], conflict: true, error: '原文件已在外部更新。当前编辑保留，请先对照新版本。' } })); return; }
@@ -254,7 +281,8 @@ export function App() {
     }
     setOpening(true);
     try {
-      const [section, draft] = await Promise.all([call<Section>('section_open', { id }), nativeAvailable ? call<UiDraft | null>('draft_get', { key: `section:${id}` }).then(value => ({ loaded: true, value })).catch(error => { reportDraftError(`section:${id}`, error); return { loaded: false, value: null }; }) : Promise.resolve({ loaded: true, value: null })]);
+      const [section, draft] = await Promise.all([verified ? Promise.resolve(verified) : call<Section>('section_open', { id }), verified ? Promise.resolve({ loaded: true, value: verifiedDraft }) : nativeAvailable ? call<UiDraft | null>('draft_get', { key: `section:${id}` }).then(value => ({ loaded: true, value })).catch(error => { reportDraftError(`section:${id}`, error); return { loaded: false, value: null }; }) : Promise.resolve({ loaded: true, value: null })]);
+      if (!stillCurrent()) return;
       const opened: DocState = { section, body: draft.value?.data.body ?? section.body, savedBody: section.body, saving: false, recovery: draft.value?.data.body !== undefined && draft.value.data.body !== section.body, draftLoaded: draft.loaded };
       // Immediate follow-up actions use the same committed document before React paints.
       docsRef.current = { ...docsRef.current, [id]: opened };
@@ -262,7 +290,7 @@ export function App() {
       if (stillCurrent() && !isContainerKind(section.kind)) void call<LearningSession>('session_open', { sectionId: id }).then(learning => setSessions(previous => ({ ...previous, [id]: learning }))).catch(error => { if (activeIdRef.current === id) setAiError(`小节已打开，学习记录暂未载入：${errorText(error)}`); });
       requestAnimationFrame(() => recordMetric('section-ready', performance.now() - started));
       if (draft.value?.data.question) { questionDrafts.current[id] = draft.value.data.question; if (stillCurrent()) setQuestion(draft.value.data.question); }
-    } catch (error) { if (stillCurrent()) setOpenError(errorText(error)); }
+    } catch (error) { if (verified) throw error; if (stillCurrent()) setOpenError(errorText(error)); }
     finally { if (stillCurrent()) setOpening(false); }
   }, []);
   const load = useCallback(async () => {
@@ -301,12 +329,17 @@ export function App() {
     const doc = docsRef.current[id];
     if (!doc || doc.saving || linkWrites.current.has(id) || doc.body === doc.savedBody || doc.conflict) return;
     const body = doc.body;
+    docsRef.current = { ...docsRef.current, [id]: { ...doc, saving: true, error: undefined } };
     setDocs(previous => ({ ...previous, [id]: { ...previous[id], saving: true, error: undefined } }));
     try {
       const result = await call<Section>('section_save', { id, body, expectedVersion: doc.section.version });
+      // Only an actual save of the exact selected draft may bind its new version.
+      if (selectionCitation.current?.documentId === id && selectionDraftBody.current === body && result.body === body) { selectionCitation.current = { ...selectionCitation.current, expectedVersion: result.version }; selectionDraftBody.current = undefined; }
+      docsRef.current = { ...docsRef.current, [id]: { ...docsRef.current[id], section: result, savedBody: body, saving: false, error: undefined, conflict: false, recovery: false } };
       setDocs(previous => ({ ...previous, [id]: { ...previous[id], section: result, savedBody: body, saving: false, error: undefined, conflict: false, recovery: false } }));
     } catch (error) {
       const conflict = error instanceof StationError && /CONFLICT|VERSION/i.test(error.code);
+      docsRef.current = { ...docsRef.current, [id]: { ...docsRef.current[id], saving: false, error: errorText(error), conflict } };
       setDocs(previous => ({ ...previous, [id]: { ...previous[id], saving: false, error: errorText(error), conflict } }));
     }
   }, []);
@@ -318,6 +351,26 @@ export function App() {
       await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
       if (docsRef.current[id].body !== docsRef.current[id].savedBody) throw new Error('正文尚未保存，请先处理保存提示。当前选句与问题仍保留。');
     }
+  }
+  function releaseOperation(id: string) {
+    if (busyRef.current !== id) return false;
+    busyRef.current = ''; setBusyId('');
+    return true;
+  }
+  async function prepareReferences(documentId: string, targetSession: string, operationId: string) {
+    if (busyRef.current !== operationId) return;
+    preparingOperation.current = operationId;
+    const revision = selectionStateRef.current.revision;
+    const queues = [injectionsRef.current[targetSession], assistantReferencesRef.current[targetSession], exerciseReferencesRef.current[targetSession]] as const;
+    const unchanged = () => busyRef.current === operationId && activeIdRef.current === documentId && visibleSessionRef.current === targetSession && revision === selectionStateRef.current.revision && queues[0] === injectionsRef.current[targetSession] && queues[1] === assistantReferencesRef.current[targetSession] && queues[2] === exerciseReferencesRef.current[targetSession];
+    try {
+      await prepareSource(documentId);
+      if (!unchanged()) throw new Error('页面或引用已变化，请核对后发送；问题与引用仍保留。');
+      const frozen = materialReferences(targetSession);
+      await call<RequestContext>('context_load', { sessionId: targetSession, sectionId: sessions[documentId]?.sectionId || documentId, documentId, selection: '', injections: frozen, assistantReferences: freezeAssistantReferences(queues[1]), exerciseReferences: freezeExerciseReferences(queues[2]) });
+      if (!unchanged() || JSON.stringify(frozen) !== JSON.stringify(materialReferences(targetSession))) throw new Error('核对期间正文、页面或引用已变化，请重新发送；输入仍保留。');
+      return frozen;
+    } finally { if (preparingOperation.current === operationId) preparingOperation.current = ''; }
   }
   useEffect(() => {
     if (!nativeAvailable) return;
@@ -375,7 +428,7 @@ export function App() {
     if (contextView.actual && contextView.sessionId === session.id && actual && Object.keys(inputs).every(key => actual[key as keyof typeof actual] === inputs[key as keyof typeof inputs])) return;
     if (current && current.body !== current.savedBody) { setContextView({ status: 'error', sessionId: session.id, error: '正文有未保存改动，保存后会重新核对来源。' }); return; }
     setContextView({ status: 'loading', sessionId: session.id });
-    const timer = setTimeout(() => { void call<RequestContext>('context_load', { sessionId: session.id, sectionId: session.sectionId, selection: requestSelection, injections: freezeInjections(injections), assistantReferences: freezeAssistantReferences(assistantReferences), exerciseReferences: freezeExerciseReferences(exerciseReferences) }).then(context => { if (sequence === contextSequence.current) setContextView({ status: 'ready', sessionId: session.id, context }); }).catch(error => { if (sequence === contextSequence.current) setContextView({ status: 'error', sessionId: session.id, error: errorText(error) }); }); }, 150);
+    const timer = setTimeout(() => { void Promise.resolve().then(() => call<RequestContext>('context_load', { sessionId: session.id, sectionId: session.sectionId, selection: requestSelection, injections: materialReferences(session.id), assistantReferences: freezeAssistantReferences(assistantReferences), exerciseReferences: freezeExerciseReferences(exerciseReferences) })).then(context => { if (sequence === contextSequence.current) setContextView({ status: 'ready', sessionId: session.id, context }); }).catch(error => { if (sequence === contextSequence.current) setContextView({ status: 'error', sessionId: session.id, error: errorText(error) }); }); }, 150);
     return () => clearTimeout(timer);
   }, [session.id, requestSelection, current?.body, current?.savedBody, current?.section.version, busyId, contextRetry, injectionKey]);
   function updateComposer(value: string) { setQuestion(value); }
@@ -394,25 +447,30 @@ export function App() {
   }
   function removeInjection(id:string){const next={...injectionsRef.current,[session.id]:(injectionsRef.current[session.id]||[]).filter(item=>item.documentId!==id)};injectionsRef.current=next;setInjectionsBySession(next);}
   function removeComposerReference(item: ComposerReference) { if (item.kind === 'exercise') { const next = { ...exerciseReferencesRef.current, [session.id]: (exerciseReferencesRef.current[session.id] || []).filter(value => exerciseReferenceKey(value) !== exerciseReferenceKey(item)) }; exerciseReferencesRef.current = next; setExerciseReferencesBySession(next); } else if (item.kind === 'assistant') { const next = { ...assistantReferencesRef.current, [session.id]: (assistantReferencesRef.current[session.id] || []).filter(value => value.entryId !== item.entryId) }; assistantReferencesRef.current = next; setAssistantReferencesBySession(next); } else if (item.currentSelection) setSelection(''); else removeInjection(item.documentId); }
-  async function injectDocument(id:string,selected?:string){
+  async function injectDocument(id:string,selected?:string,provided?:ContextInjection){
+    let citation = provided || (selectionCitation.current?.documentId===id&&selectionCitation.current.selection===selected ? freezeInjections([selectionCitation.current])[0] : undefined);
     const selectedRevision = selectionStateRef.current.revision;
+    const draftBody = citation && JSON.stringify(citation) === JSON.stringify(selectionCitation.current) ? selectionDraftBody.current : undefined;
     const targetSession=session.id;if(!targetSession){notify('请先打开学习会话。');return;}
-    try{const local=docsRef.current[id];if(local&&local.body!==local.savedBody)await prepareSource(id);const document=await call<Section>('section_open',{id});if(!['section','knowledge','exploration'].includes(document.kind||'section'))throw new Error('只可加入学习材料，不能加入目录、练习参考或系统记录。');if(selected&&!document.body.includes(selected))throw new Error('选区与已保存原文不一致，请在原文中重新选择。');const item:ContextInjection={documentId:id,expectedVersion:document.version,...(selected?{selection:selected}:{})};const next={...injectionsRef.current,[targetSession]:addContextInjection(injectionsRef.current[targetSession]||[],item,(assistantReferencesRef.current[targetSession]||[]).length + (exerciseReferencesRef.current[targetSession]||[]).length)};injectionsRef.current=next;setInjectionsBySession(next);if(selected&&activeIdRef.current===id&&visibleSessionRef.current===targetSession&&selectionStateRef.current.revision===selectedRevision&&selectionStateRef.current.value===selected)setSelection('');notify('已显式加入本次上下文，尚未发送模型请求。');}catch(error){notify(errorText(error));}
+    try{const local=docsRef.current[id];if(local&&local.body!==local.savedBody)await prepareSource(id);if(citation&&draftBody!==undefined&&selectionStateRef.current.revision===selectedRevision&&docsRef.current[id]?.savedBody===draftBody&&selectionDraftBody.current===undefined&&selectionCitation.current?.documentId===id)citation={...citation,expectedVersion:selectionCitation.current.expectedVersion};const document=await call<Section>('section_open',{id});if(!['section','knowledge','exploration'].includes(document.kind||'section'))throw new Error('只可加入学习材料，不能加入目录、练习参考或系统记录。');if(selected&&citation&&citation.expectedVersion!==document.version)throw new Error('来源版本已变化，请重新选择；原引用保留。');if(selected&&!document.body.includes(selected))throw new Error('选区与已保存原文不一致，请在原文中重新选择。');const item:ContextInjection={documentId:id,expectedVersion:document.version,...(selected?locateCitation(document.body,selected,citation?.locator ? Array.from(document.body).slice(0,citation.locator.startChar).join('').length : undefined):{})};const next={...injectionsRef.current,[targetSession]:addContextInjection(injectionsRef.current[targetSession]||[],item,(assistantReferencesRef.current[targetSession]||[]).length + (exerciseReferencesRef.current[targetSession]||[]).length)};injectionsRef.current=next;setInjectionsBySession(next);if(selected&&activeIdRef.current===id&&visibleSessionRef.current===targetSession&&selectionStateRef.current.revision===selectedRevision&&selectionStateRef.current.value===selected)setSelection('');notify('已显式加入本次上下文，尚未发送模型请求。');}catch(error){notify(errorText(error));}
   }
-  function addExerciseQuote(source: ExerciseReferenceSource, selected: string) {
+  function addExerciseQuote(source: ExerciseReferenceSource, selected: string, locator?: CitationLocator) {
     if (visibleSessionRef.current !== source.sessionId || activeIdRef.current !== source.documentId) { notify('已切换学习文档，未将旧选段加入新页面。'); return; }
-    try { validateExerciseSelection(source.text, selected); const item: ExerciseReference = { sessionId: source.sessionId, documentId: source.documentId, exerciseEntryId: source.exerciseEntryId, questionId: source.questionId, part: source.part, entryId: source.entryId, textHash: source.textHash, selection: selected }; const next = { ...exerciseReferencesRef.current, [source.sessionId]: addExerciseReference(exerciseReferencesRef.current[source.sessionId] || [], item, (injectionsRef.current[source.sessionId] || []).length + (assistantReferencesRef.current[source.sessionId] || []).length) }; exerciseReferencesRef.current = next; setExerciseReferencesBySession(next); setExerciseQuote(null); setRightbar(true); }
+    try { validateExerciseSelection(source.text, selected); const item: ExerciseReference = { sessionId: source.sessionId, documentId: source.documentId, exerciseEntryId: source.exerciseEntryId, questionId: source.questionId, part: source.part, entryId: source.entryId, textHash: source.textHash, ...(locator ? { selection: selected, locator } : locateCitation(source.text, selected)) }; const next = { ...exerciseReferencesRef.current, [source.sessionId]: addExerciseReference(exerciseReferencesRef.current[source.sessionId] || [], item, (injectionsRef.current[source.sessionId] || []).length + (assistantReferencesRef.current[source.sessionId] || []).length) }; exerciseReferencesRef.current = next; setExerciseReferencesBySession(next); setExerciseQuote(null); setRightbar(true); }
     catch (error) { notify(errorText(error)); }
   }
-  async function quoteExercise(documentId: string, sessionId: string, questionId: string, part: ExerciseReferencePart, entryId: string | undefined, selected: string, position?: {x:number;y:number}) {
-    if (position) { setInjectionMenu({ id: documentId, selection: selected, x: Math.min(position.x, window.innerWidth - 230), y: Math.min(position.y, window.innerHeight - 130), exercise: { sessionId, questionId, part, entryId } }); return; }
+  async function quoteExercise(documentId: string, sessionId: string, questionId: string, part: ExerciseReferencePart, entryId: string | undefined, selected: string, position?: {x:number;y:number}, rendered?: { body: HTMLElement; range: Range }) {
+    if (position) { setInjectionMenu({ id: documentId, selection: selected, x: Math.min(position.x, window.innerWidth - 230), y: Math.min(position.y, window.innerHeight - 130), exercise: { sessionId, questionId, part, entryId, rendered } }); return; }
     const sequence = ++exerciseQuoteSequence.current;
     try { const source = await call<ExerciseReferenceSource>('get_exercise_reference', { sessionId, documentId, questionId, part, ...(entryId ? {entryId} : {}) });
       if (sequence !== exerciseQuoteSequence.current || visibleSessionRef.current !== sessionId || activeIdRef.current !== documentId) return;
-      if (source.text.includes(selected)) addExerciseQuote(source, selected); else setExerciseQuote(source);
+      if (rendered) {
+        try { const located = renderedCitationRange(rendered.body, source.text, rendered.range); addExerciseQuote(source, located.selection, located.locator); }
+        catch { setExerciseQuote(source); }
+      } else if (source.text.includes(selected) && source.text.indexOf(selected) === source.text.lastIndexOf(selected)) addExerciseQuote(source, selected); else setExerciseQuote(source);
     } catch (error) { if (sequence === exerciseQuoteSequence.current) notify(`练习选段未加入：${errorText(error)}`); }
   }
-  async function replyToAssistant(message: Message, sessionId: string, selected?: string) {
+  async function replyToAssistant(message: Message, sessionId: string, selected?: string, locator?: CitationLocator) {
     const sequence = ++assistantQuoteSequence.current, intent = navigationIntent.current;
     try {
       if (visibleSessionRef.current !== sessionId || !canCompose) throw new Error('请先打开这条回答所属的学习会话，再回复。');
@@ -424,7 +482,7 @@ export function App() {
       if (!stored) throw new Error('这条回答已不存在，未替换成其他内容。');
       if (await assistantTextHash(stored.content) !== expectedHash || stored.runId !== message.runId) throw new Error('回答原文或运行记录已变化，请重新选择；原引用和输入均保留。');
       if (sequence !== assistantQuoteSequence.current || intent !== navigationIntent.current || visibleSessionRef.current !== sessionId) return;
-      const item: AssistantReference = { sessionId, entryId: stored.id, ...(stored.runId?{runId:stored.runId}:{}), textHash: expectedHash, selection };
+      const item: AssistantReference = { sessionId, entryId: stored.id, ...(stored.runId?{runId:stored.runId}:{}), textHash: expectedHash, ...(locator ? { selection, locator } : locateCitation(stored.content, selection)) };
       const next = { ...assistantReferencesRef.current, [sessionId]: addAssistantReference(assistantReferencesRef.current[sessionId] || [], item, (injectionsRef.current[sessionId] || []).length + (exerciseReferencesRef.current[sessionId] || []).length) };
       assistantReferencesRef.current = next; setAssistantReferencesBySession(next); setRightbar(true); switchView('lesson'); requestAnimationFrame(()=>questionRef.current?.focus());
     } catch (error) { if (sequence === assistantQuoteSequence.current) notify(errorText(error)); }
@@ -432,7 +490,7 @@ export function App() {
   function assistantMenu(event: React.MouseEvent<HTMLDivElement> | React.KeyboardEvent<HTMLDivElement>, message: Message, sessionId: string) {
     if ('key' in event && (event.nativeEvent.isComposing || event.key !== 'ContextMenu' && !(event.shiftKey && event.key === 'F10'))) return;
     event.preventDefault(); event.stopPropagation();
-    try { const body = event.currentTarget; const selected = assistantReplySelection(body, message.content, window.getSelection()); const rect = body.getBoundingClientRect(); setAssistantReplyMenu({message,sessionId,selection:selected,trigger:body,x:'clientX' in event?event.clientX:rect.left+20,y:'clientY' in event?event.clientY:rect.bottom}); }
+    try { const body = event.currentTarget; const selected = renderedCitation(body, message.content, window.getSelection()); const rect = body.getBoundingClientRect(); setAssistantReplyMenu({message,sessionId,selection:selected?.selection,locator:selected?.locator,trigger:body,x:'clientX' in event?event.clientX:rect.left+20,y:'clientY' in event?event.clientY:rect.bottom}); }
     catch(error){notify(errorText(error));}
   }
   function closeAssistantMenu(restoreFocus = false) { const trigger=assistantReplyMenu?.trigger; setAssistantReplyMenu(null); if(restoreFocus)requestAnimationFrame(()=>trigger?.focus()); }
@@ -455,9 +513,11 @@ export function App() {
         userEntryId = saved.userEntryId; patchOutgoing(item.sendId, { userEntryId }); updateTargetSession(saved.session);
       }
       patchOutgoing(item.sendId, { stage: 'preparing' });
-      await prepareSource(item.documentId || item.sectionId);
-      const context = await call<RequestContext>('context_load', { sessionId: item.sessionId, sectionId: item.sectionId, selection: item.selection, injections: item.injections || [], assistantReferences: item.assistantReferences || [], exerciseReferences: item.exerciseReferences || [] });
-      if (visibleSessionRef.current === item.sessionId) setContextView({ status: 'loading', sessionId: item.sessionId, context });
+      if (item.failureStage !== 'unknown') {
+        await prepareSource(item.documentId || item.sectionId);
+        const context = await call<RequestContext>('context_load', { sessionId: item.sessionId, sectionId: item.sectionId, selection: item.selection, injections: item.injections || [], assistantReferences: item.assistantReferences || [], exerciseReferences: item.exerciseReferences || [] });
+        if (visibleSessionRef.current === item.sessionId) setContextView({ status: 'loading', sessionId: item.sessionId, context });
+      }
       patchOutgoing(item.sendId, { stage: 'generating' });
       const result = await call<LearningSession>('session_ask', { sectionId: item.sectionId, sessionId: item.sessionId, mode: item.mode, question: item.content, selection: item.selection, userEntryId, operationId, injections: item.injections || [], assistantReferences: item.assistantReferences || [], exerciseReferences: item.exerciseReferences || [], resume: item.failureStage === 'unknown' });
       updateTargetSession(result, item.detached); patchOutgoing(item.sendId, { stage: 'done', error: undefined, failureStage: undefined });
@@ -466,7 +526,7 @@ export function App() {
       patchOutgoing(item.sendId, { stage: 'failed', userEntryId, error: modelFailureMessage(error, 'generation'), failureStage: !userEntryId ? 'save' : details?.sendStage === 'unknown' ? 'unknown' : 'generation' });
     } finally {
       await refreshAfterGeneration(target, item.detached);
-      if (busyRef.current === operationId) { busyRef.current = ''; setBusyId(''); }
+      releaseOperation(operationId);
     }
   }
   async function ask(preset?: string) {
@@ -476,9 +536,11 @@ export function App() {
     if (!canCompose || !session.id) { setAiError('学习会话尚未就绪，请重试打开，问题仍保留。'); return; }
     if (!modelReady) { notify(modelBlocked ? '此模型用途受限，请查看供应商设置。问题仍保留，未发送请求。' : '请先保存供应商连接，问题仍保留。'); openSettings(); return; }
     const operationId = makeId();
-    const item: OutgoingMessage = { sendId: makeId(), operationId, sessionId: session.id, sectionId: session.sectionId, detached: false, documentId: activeId, mode: isExplorationDocument(nodesRef.current, activeId, explorationFolderId.current) ? 'explore' : 'explain', content: value, selection: requestSelection, injections: freezeInjections(injectionsRef.current[session.id] || []), assistantReferences: freezeAssistantReferences(assistantReferencesRef.current[session.id] || []), exerciseReferences: freezeExerciseReferences(exerciseReferencesRef.current[session.id] || []), createdAt: new Date().toISOString(), stage: 'saving' };
     busyRef.current = operationId; setBusyId(operationId); setPartial(null); setActiveRunId(''); setAiError('');
-    rememberReferenceConsumption(item.sendId, item.sessionId, activeId, item.selection);
+    let frozenMaterials: ContextInjection[] | undefined; try { frozenMaterials = await prepareReferences(activeId, session.id, operationId); } catch (error) { if (releaseOperation(operationId)) notify(errorText(error)); return; }
+    if (!frozenMaterials || busyRef.current !== operationId) { releaseOperation(operationId); return; }
+    const item: OutgoingMessage = { sendId: makeId(), operationId, sessionId: session.id, sectionId: session.sectionId, detached: false, documentId: activeId, mode: isExplorationDocument(nodesRef.current, activeId, explorationFolderId.current) ? 'explore' : 'explain', content: value, selection: requestSelection, injections: frozenMaterials, assistantReferences: freezeAssistantReferences(assistantReferencesRef.current[session.id] || []), exerciseReferences: freezeExerciseReferences(exerciseReferencesRef.current[session.id] || []), createdAt: new Date().toISOString(), stage: 'saving' };
+    rememberReferenceConsumption(item.sendId, item.sessionId, activeId, visibleSelection);
     updateOutgoing(items => [...items, item]);
     setQuestion(old => old.trim() === value ? '' : old);
     await executeSend(item, operationId);
@@ -499,6 +561,7 @@ export function App() {
 
   async function cancel() {
     const id = busyRef.current; if (!id) return;
+    if (preparingOperation.current === id) { preparingOperation.current = ''; releaseOperation(id); notify('已停止本次提问，问题与引用仍保留；正文保存可能继续完成。'); return; }
     try { await call('operation_cancel', { operationId: id }); notify('已请求停止生成，已保存的对话仍保留。'); }
     catch (error) { notify(`停止请求未确认：${errorText(error)}`); }
   }
@@ -509,15 +572,17 @@ export function App() {
     if (!retry && practiceFailure?.sourceId === activeId && practiceFailure.unknown) { notify('上次练习结果未确认，请先核对原请求。'); return; }
     const previous = retry && practiceFailure?.sourceId === activeId ? practiceFailure : null;
     const id = previous?.unknown ? previous.operationId : makeId(); const selected = previous ? previous.selection : requestSelection;
-    const prompt=previous?previous.prompt:composerQuestion.trim(); const frozen=previous?previous.injections:freezeInjections(injectionsRef.current[session.id] || []);
+    busyRef.current = id; setBusyId(id); setPartial(null); setActiveRunId(''); setAiError('');
+    let frozen: ContextInjection[] | undefined; try { frozen = previous ? previous.injections : await prepareReferences(activeId, session.id, id); } catch (error) { if (releaseOperation(id)) notify(errorText(error)); return; }
+    if (!frozen || busyRef.current !== id) { releaseOperation(id); return; }
+    const prompt=previous?previous.prompt:composerQuestion.trim();
     const frozenAnswers=previous?previous.assistantReferences:freezeAssistantReferences(assistantReferencesRef.current[session.id] || []);
     const frozenExercises=previous?previous.exerciseReferences:freezeExerciseReferences(exerciseReferencesRef.current[session.id] || []);
-    if (previous) { const old = referenceConsumption.current.get(previous.operationId); if (old) { referenceConsumption.current.set(id, old); if (id !== previous.operationId) referenceConsumption.current.delete(previous.operationId); } } else rememberReferenceConsumption(id, session.id, activeId, selected);
-    busyRef.current = id; setBusyId(id); setPartial(null); setAiError('');
+    if (previous) { const old = referenceConsumption.current.get(previous.operationId); if (old) { referenceConsumption.current.set(id, old); if (id !== previous.operationId) referenceConsumption.current.delete(previous.operationId); } } else rememberReferenceConsumption(id, session.id, activeId, visibleSelection);
     const sourceId = activeId; let succeeded = false;
-    try { await prepareSource(sourceId); const result = await call<LearningSession>('exercise_generate', { sectionId: sourceId, sessionId: session.id, selection: selected, prompt, injections: frozen, assistantReferences: frozenAnswers, exerciseReferences: frozenExercises, userEntryId: previous?.userEntryId, operationId: id, resume: previous?.unknown === true }); updateTargetSession(result); setPracticeFailure(null); succeeded = true; }
+    try { if (!previous?.unknown) await prepareSource(sourceId); const result = await call<LearningSession>('exercise_generate', { sectionId: sourceId, sessionId: session.id, selection: selected, prompt, injections: frozen, assistantReferences: frozenAnswers, exerciseReferences: frozenExercises, userEntryId: previous?.userEntryId, operationId: id, resume: previous?.unknown === true }); updateTargetSession(result); setPracticeFailure(null); succeeded = true; }
     catch (error) { const details = error instanceof StationError ? error.details as { sendStage?: string; recovery?: string } | undefined : undefined; const recovery = details?.recovery === 'same-operation'; const unknown = recovery || details?.sendStage === 'unknown'; setPracticeFailure({ operationId: id, sourceId, selection: selected, prompt, injections: frozen, assistantReferences: frozenAnswers, exerciseReferences: frozenExercises, userEntryId: confirmedPracticeUsers.current.get(id) || previous?.userEntryId, unknown, recovery }); if (busyRef.current === id) setAiError(modelFailureMessage(error, 'generation')); }
-    finally { const tree = await refreshTree(); await refreshAfterGeneration(session, false); if (busyRef.current === id) { busyRef.current = ''; setBusyId(''); } if (succeeded && activeIdRef.current === sourceId) { const child = tree?.nodes.filter(node => node.parentId === sourceId && node.kind === 'exercise').at(-1); if (child) await openSection(child.id); } }
+    finally { const tree = await refreshTree(); await refreshAfterGeneration(session, false); releaseOperation(id); if (succeeded && activeIdRef.current === sourceId) { const child = tree?.nodes.filter(node => node.parentId === sourceId && node.kind === 'exercise').at(-1); if (child) await openSection(child.id); } }
   }
   async function submitAnswer(exercise: Exercise, answer: string) {
     const result = await call<LearningSession>('exercise_answer', { sectionId: activeId, sessionId: session.id, exerciseId: exercise.id, entryId: exercise.entryId, answer });
@@ -528,7 +593,7 @@ export function App() {
     updateTargetSession(result); notify('错因已保存，下次可按情境找回。');
   }
   async function openLegacyHistory() { await readHistory('legacy_history_open'); }
-  async function openSourceDocument(id:string){try{await call<Section>('section_open',{id});await openSection(id);}catch(error){notify(`来源暂不可用（${id}）：${errorText(error)}。原卡保留，未跳转到其他材料。`);}}
+  async function openSourceDocument(id:string,expectedVersion?:string){const intent=navigationIntent.current;try{const source=await call<Section>('section_open',{id});if(intent!==navigationIntent.current)return;if(expectedVersion&&source.version!==expectedVersion)throw new Error('来源版本已变化，历史引用保留发送时原文，请在当前版本重新选择');await openSection(id,expectedVersion?source:undefined);}catch(error){notify(`来源暂不可用（${id}）：${errorText(error)}。原卡保留，未跳转到其他材料。`);}}
   async function openReviewSource(card: ReviewCard) {
     if (card.sourceDocumentId || card.sectionId) { await openSourceDocument(card.sourceDocumentId || card.sectionId); return; }
     if (!card.sessionId) { notify('这条历史记录缺少可打开的会话编号。'); return; }
@@ -550,8 +615,8 @@ export function App() {
     catch (error) { setTaskError(errorText(error)); }
   }
   function selectText() {
-    const selection = window.getSelection();
-    if (selection && !selection.isCollapsed && document.querySelector('.reading-content')?.contains(selection.anchorNode)) setSelection(selection.toString().trim().slice(0, 5000));
+    const body = document.querySelector<HTMLElement>('.reading-content'); if (!body || !current || !body.contains(window.getSelection()?.anchorNode || null)) return;
+    try { const located = renderedCitation(body.querySelector<HTMLElement>('.markdown') || body, current.body, window.getSelection()); if (located) setSelection(located.selection, located.locator); } catch (error) { notify(errorText(error)); }
   }
   function currentDraftData(key: string): UiDraft['data'] {
     if (key === 'workspace') return { importTitle: materialDraft.current.title, importBody: materialDraft.current.body };
@@ -658,7 +723,10 @@ export function App() {
     try {
       const latest = docsRef.current[id];
       if (!latest || latest.saving) throw new Error('正文正在保存，请稍候再保存关联。');
+      const citation = selectionCitation.current, revision = selectionStateRef.current.revision;
       const section = await call<Section>('document_links', { id, links, expectedVersion: latest.section.version });
+      // A known predecessor plus the same full body proves this local metadata write.
+      if (citation?.documentId === id && citation.expectedVersion === latest.section.version && revision === selectionStateRef.current.revision && selectionSourceBody.current === latest.savedBody && section.body === latest.savedBody) selectionCitation.current = { ...citation, expectedVersion: section.version };
       setDocs(old => ({ ...old, [id]: { ...old[id], section } }));
       setLinkingMaterials(false); setContextRetry(old => old + 1);
     } finally { linkWrites.current.delete(id); }
@@ -711,13 +779,13 @@ export function App() {
             {current.recovery && <div className="recovered-draft"><strong>已找回上次未写入文件的草稿</strong><p>当前显示你的草稿，原文件保持原样。确认后保存，或展开来源检查外部文件。</p><button className="quiet-button" onClick={() => { void save(activeId); }}>保存这份草稿</button><button className="quiet-button" onClick={async () => { try { setComparison(await call<Section>('section_open', { id: activeId })); } catch (error) { notify(errorText(error)); } }}>对照原文件</button></div>}
             {current.error && <div className="inline-error"><strong>{current.conflict ? '外部文件已更新，你的编辑仍在这里。' : '这次编辑还没有写入文件。'}</strong><p>{current.error}</p><div className="button-row">{current.conflict && <button onClick={async () => { try { setComparison(await call<Section>('section_open', { id: activeId })); } catch (error) { notify(errorText(error)); } }}>查看外部新版本</button>}{!current.conflict && <button onClick={() => { void save(activeId); }}>重新保存</button>}<button onClick={async () => { try { const result = await call<Section>('section_import', { title: `${current.section.title}（我的草稿）`, body: current.body }); notify('已另存一份草稿，原文件保留。'); setBoot(old => ({ ...old, courses: old.courses.map(course => course.id === result.courseId ? { ...course, sections: [...course.sections, { id: result.id, title: result.title }] } : course) })); setDocs(old => ({ ...old, [result.id]: { section: result, body: result.body, savedBody: result.body, saving: false, draftLoaded: result.draftReady !== false } })); setActiveId(result.id); } catch (error) { notify(errorText(error)); } }}>另存为新小节</button></div></div>}
           </div>
-          <div className="document-scroll" onMouseUp={selectText} onKeyUp={selectText} onContextMenu={event=>{if(!current||isContainer||current.section.kind==='exercise')return;event.preventDefault();const chosen=window.getSelection()?.toString()||selection;setInjectionMenu({id:activeId,selection:chosen||undefined,x:Math.min(event.clientX,window.innerWidth-230),y:Math.min(event.clientY,window.innerHeight-130)});}}>
+          <div className="document-scroll" onMouseUp={selectText} onKeyUp={selectText} onContextMenu={event=>{if(!current||isContainer||current.section.kind==='exercise')return;event.preventDefault();try{const body=event.currentTarget.querySelector<HTMLElement>('.reading-content .markdown');const located=body?renderedCitation(body,current.body,window.getSelection()):undefined;if(located)setSelection(located.selection,located.locator);const chosen=located?.selection||selection;setInjectionMenu({id:activeId,selection:chosen||undefined,citation:selectionCitation.current?freezeInjections([selectionCitation.current])[0]:undefined,x:Math.min(event.clientX,window.innerWidth-230),y:Math.min(event.clientY,window.innerHeight-130)});}catch(error){notify(errorText(error));}}}>
             {assetsOpen && courseId && <CourseAssets key={courseId} courseId={courseId} onInsert={insertAsset} onPreview={setAssetPreview}/>}
             {isContainer && <div className="folder-contents"><h2>{current.section.kind === 'course' ? '课程内容' : '文件夹内容'}</h2>{nodes.filter(node=>node.parentId===activeId).length ? nodes.filter(node=>node.parentId===activeId).map(node=><button key={node.id} className="folder-child" onClick={()=>{void openSection(node.id);}}><FileText size={15}/><span>{node.title}</span><ChevronRight size={14}/></button>) : <p className="muted">这里还没有内容。上方可以添加材料、文件夹或探索。</p>}</div>}
-            {current.section.kind === 'exercise' && !editing && <section className="exercise-workspace" aria-label="练习作答"><p className="muted small">题目与评分读取原始学习记录，编辑下方 Markdown 不会更改评分依据。</p>{session.exercises.filter(exercise=>!current.section.exerciseEntryId || exercise.entryId===current.section.exerciseEntryId).map(exercise=><ExerciseCard key={exercise.id} exercise={exercise} sessionId={session.id} canGrade={modelReady} onRefresh={async()=>{updateTargetSession(await call<LearningSession>('session_refresh',{sectionId:session.sectionId,sessionId:session.id}));}} onReferenceSelection={(part,entryId,selected,position)=>{void quoteExercise(activeId,session.id,exercise.id,part,entryId,selected,position);}} onAnswer={answer=>submitAnswer(exercise,answer)} onReason={reason=>saveReason(exercise,reason)}/>)}<details className="exercise-markdown"><summary>明确展开参考与完整 Markdown</summary><Markdown text={current.body} courseId={courseId} onAsset={(id,assetId)=>{void openAsset(id,assetId);}}/></details></section>}
+            {current.section.kind === 'exercise' && !editing && <section className="exercise-workspace" aria-label="练习作答"><p className="muted small">题目与评分读取原始学习记录，编辑下方 Markdown 不会更改评分依据。</p>{session.exercises.filter(exercise=>!current.section.exerciseEntryId || exercise.entryId===current.section.exerciseEntryId).map(exercise=><ExerciseCard key={exercise.id} exercise={exercise} sessionId={session.id} canGrade={modelReady} onRefresh={async()=>{updateTargetSession(await call<LearningSession>('session_refresh',{sectionId:session.sectionId,sessionId:session.id}));}} onReferenceSelection={(part,entryId,selected,position,rendered)=>{void quoteExercise(activeId,session.id,exercise.id,part,entryId,selected,position,rendered);}} onAnswer={answer=>submitAnswer(exercise,answer)} onReason={reason=>saveReason(exercise,reason)}/>)}<details className="exercise-markdown"><summary>明确展开参考与完整 Markdown</summary><Markdown text={current.body} courseId={courseId} onAsset={(id,assetId)=>{void openAsset(id,assetId);}}/></details></section>}
             {current.section.kind !== 'exercise' && !isContainer && session.exercises.length > 0 && <details className="legacy-exercises"><summary>本页练习记录 · {session.exercises.length} 题</summary>{[...new Map(session.exercises.filter(exercise=>exercise.entryId).map(exercise=>[exercise.entryId!,exercise])).values()].map(exercise=><button key={exercise.entryId} className="quiet-button" onClick={()=>{void openExerciseEntry(exercise.entryId!);}}>打开练习文档 · {exercise.prompt.slice(0,36)}</button>)}</details>}
             {!editing && current.section.kind !== 'exercise' && <div className="reading-content" tabIndex={0}><Markdown text={current.body} courseId={courseId} onAsset={(id,assetId)=>{void openAsset(id,assetId);}} className={current.body.split('\n')[0].replace(/^#\s+/, '').trim().toLowerCase() === current.section.title.replace(/^\d+\s*[·.、-]\s*/, '').trim().toLowerCase() ? 'hide-redundant-title' : ''} /><div className="reading-end"><span /><BookOpen size={15} /><span /></div></div>}
-            {Object.entries(docs).filter(([id]) => editedIds.has(id)).map(([id, doc]) => <div key={id} className="document-editor" hidden={!editing || activeId !== id}><Suspense fallback={<div className="muted small">正在打开编辑器…</div>}><Editor ref={handle=>{if(handle)editorRefs.current.set(id,handle);else editorRefs.current.delete(id);}} initial={doc.body} onReady={() => { const started = editorStartedAt.current[id]; if (started !== undefined) { recordMetric('editor-ready', performance.now() - started); delete editorStartedAt.current[id]; } }} onChange={body => changeBody(id, body)} onSelection={value=>{if(activeIdRef.current===id && doc.section.kind !== 'exercise')setSelection(value);}} onSave={() => { void save(id); }} /></Suspense></div>)}
+            {Object.entries(docs).filter(([id]) => editedIds.has(id)).map(([id, doc]) => <div key={id} className="document-editor" hidden={!editing || activeId !== id}><Suspense fallback={<div className="muted small">正在打开编辑器…</div>}><Editor ref={handle=>{if(handle)editorRefs.current.set(id,handle);else editorRefs.current.delete(id);}} initial={doc.body} onReady={() => { const started = editorStartedAt.current[id]; if (started !== undefined) { recordMetric('editor-ready', performance.now() - started); delete editorStartedAt.current[id]; } }} onChange={body => changeBody(id, body)} onSelection={(value,start,body)=>{if(activeIdRef.current===id && doc.section.kind !== 'exercise')setSelection(value,locateCitation(body,value,start).locator,body);}} onSave={() => { void save(id); }} /></Suspense></div>)}
           </div>
 
         </> : <div className="welcome"><div className="welcome-symbol"><BookOpen size={32} strokeWidth={1.4} /></div><span className="eyebrow">YOUR OWN LEARNING SPACE</span><h1>从一小节开始，<br />把一个问题读明白。</h1><p>打开你的学习材料，边读边问。<br />小节、讲解和学过的错因，会自然留在一起。</p><button className="primary-button" onClick={() => setImporting(true)}><Plus size={16} />打开或粘贴我的材料</button><span className="welcome-support">支持 Markdown 与纯文本 · 原文保存在本机</span><button className="template-button" onClick={() => { if (!materialDraft.current.body) materialDraft.current = { title: "英语学习 · 每天的一小步（原创示例）", body: sampleBody }; else notify("已保留你未完成的导入草稿，请先保存它。"); setImporting(true); }}><BookOpen size={14} />使用英语学习模板<span>原创示例 · 可编辑 · 非 AI 生成</span></button>{openError && <div className="inline-error">{openError}<button onClick={() => { void openSection(activeId); }}>重试打开</button></div>}<div className="welcome-steps"><span><b>01</b> 读自己的材料</span><span><b>02</b> 随时问与练</span><span><b>03</b> 留下值得复习的</span></div></div>}
@@ -728,7 +796,7 @@ export function App() {
       <section className="utility-page exploration-records" hidden={view!=='explorations'}><button className="text-back" onClick={()=>switchView('lesson')}><ArrowLeft size={14}/>返回学习</button><ExplorationStart key={explorationEntryId} entryId={explorationEntryId} ref={explorationStart} onStart={startExploration}/></section>
       {view==='history-index'&&<SessionHistory onOpen={id=>{void openHistorySession(id);}} onLegacy={()=>{void openLegacyHistory();}}/>}
       {view==='trash'&&<TrashPanel onRestored={()=>{void refreshTree();notify('已恢复原文件、目录关联和学习记录。');}}/>}
-      {view === 'history' && <section className="utility-page history-page"><button className="text-back" onClick={()=>switchView('history-index')}><ArrowLeft size={14}/>回到历史</button>{!historySession ? <p className={historyError ? 'inline-error' : 'context-loading'}>{historyError || '正在读取学习历史…'}</p> : <><h1>{historySession.sectionId ? '学习会话记录' : '旧版探索会话'}</h1><p className="muted">这里只读展示该真实会话，不会带入当前阅读文档。</p>{historySession.sectionId&&<button className="quiet-button" onClick={()=>{void openSection(historySession.sectionId);}}>打开来源文档</button>}{!historySession.messages.length && <p className="muted">这里还没有旧版会话记录。</p>}{historySession.messages.map(message=><article className={`message ${message.role}`} key={message.id} tabIndex={-1} data-assistant-entry={message.role==='assistant'?message.id:undefined} data-assistant-session={historySession.id}><div className="message-label">{message.role==='user'?'我的问题':message.role==='assistant'?'学习助手':'学习记录'}</div>{message.role==='assistant'&&message.runId&&<ToolActivityCards items={(historySession.toolCalls || []).filter(item=>item.runId===message.runId)} onOpen={object=>{void openToolObject(object);}}/>}{message.role === 'user' && <MessageReferences value={message.requestedContext} onOpen={id => { void openSourceDocument(id); }} onOpenAssistant={item => { void openAssistantQuote(item); }}/>}<div className={message.role === 'assistant' ? 'assistant-answer-content' : undefined} tabIndex={message.role === 'assistant' ? 0 : undefined} onContextMenu={event=>{if(message.role==='assistant')assistantMenu(event,message,historySession.id);}} onKeyDown={event=>{if(message.role==='assistant')assistantMenu(event,message,historySession.id);}}><Markdown text={message.content}/></div>{message.role === 'assistant' && <button type="button" className="message-save message-reply" aria-label="回复这条回答" onClick={() => { void replyToAssistant(message, historySession.id); }}><CornerUpLeft size={14}/>回复</button>}</article>)}<ToolActivityCards items={(historySession.toolCalls || []).filter(item=>!historySession.messages.some(message=>message.role==='assistant'&&message.runId===item.runId))} onOpen={object=>{void openToolObject(object);}}/></>}</section>}
+      {view === 'history' && <section className="utility-page history-page"><button className="text-back" onClick={()=>switchView('history-index')}><ArrowLeft size={14}/>回到历史</button>{!historySession ? <p className={historyError ? 'inline-error' : 'context-loading'}>{historyError || '正在读取学习历史…'}</p> : <><h1>{historySession.sectionId ? '学习会话记录' : '旧版探索会话'}</h1><p className="muted">这里只读展示该真实会话，不会带入当前阅读文档。</p>{historySession.sectionId&&<button className="quiet-button" onClick={()=>{void openSection(historySession.sectionId);}}>打开来源文档</button>}{!historySession.messages.length && <p className="muted">这里还没有旧版会话记录。</p>}{historySession.messages.map(message=><article className={`message ${message.role}`} key={message.id} tabIndex={-1} data-assistant-entry={message.role==='assistant'?message.id:undefined} data-assistant-session={historySession.id}><div className="message-label">{message.role==='user'?'我的问题':message.role==='assistant'?'学习助手':'学习记录'}</div>{message.role==='assistant'&&message.runId&&<ToolActivityCards items={(historySession.toolCalls || []).filter(item=>item.runId===message.runId)} onOpen={object=>{void openToolObject(object);}}/>}{message.role === 'user' && <MessageReferences value={message.requestedContext} onOpen={(id,version) => { void openSourceDocument(id,version); }} onOpenAssistant={item => { void openAssistantQuote(item); }}/>}<div className={message.role === 'assistant' ? 'assistant-answer-content' : undefined} tabIndex={message.role === 'assistant' ? 0 : undefined} onContextMenu={event=>{if(message.role==='assistant')assistantMenu(event,message,historySession.id);}} onKeyDown={event=>{if(message.role==='assistant')assistantMenu(event,message,historySession.id);}}><Markdown text={message.content}/></div>{message.role === 'assistant' && <button type="button" className="message-save message-reply" aria-label="回复这条回答" onClick={() => { void replyToAssistant(message, historySession.id); }}><CornerUpLeft size={14}/>回复</button>}</article>)}<ToolActivityCards items={(historySession.toolCalls || []).filter(item=>!historySession.messages.some(message=>message.role==='assistant'&&message.runId===item.runId))} onOpen={object=>{void openToolObject(object);}}/></>}</section>}
       {view === 'settings' && <SettingsPage font={font} model={boot.model} dataPath={boot.dataPath} blocked={!!busyId || modelChanging} sessionId={session.id} onClose={() => switchView(settingsReturnView.current)} onSaved={model => setBoot(old => ({ ...old, model }))} />}
       <footer className="statusbar"><span><span className={`tiny-dot ${nativeAvailable ? '' : 'offline'}`} />{isDemo ? '开发预览' : nativeAvailable ? '本机工作空间' : '等待本机连接'}</span><span>{dirtyCount ? `${dirtyCount} 份草稿待保存` : '每一点理解，都值得留下'}</span><span>⌘ S 保存</span></footer>
     </main>
@@ -743,17 +811,17 @@ export function App() {
         {!modelReady && <div className="model-prompt"><span className="model-prompt-icon"><Sparkles size={16} /></span><div><strong>{modelBlocked ? '当前模型用途受限' : '连接自己的模型，开始对话'}</strong><p>{modelBlocked ? '可在设置中查看限制或配置获准使用的自定义服务。' : '可手动填写服务地址、协议和模型名称。'}</p><button onClick={() => openSettings()}>设置模型连接 <ArrowRight size={13} /></button></div></div>}
         <>
           {!conversation.length && <div className="assistant-empty"><div className="little-line" /><h3>{current?.section.kind === 'exploration' ? '把好问题写成自己的理解。' : '哪里卡住了？'}</h3><p>{current?.section.kind === 'exploration' ? '左侧探索正文由你编辑；助教帮你比较、追问和澄清。' : '词义、句子关系，或一整段的意思，都可以慢慢问。'}</p><div className="starter-questions"><button disabled={!canCompose} onClick={() => { updateComposer('请带我梳理本页的核心问题，先从一个问题开始。'); questionRef.current?.focus(); }}>带我梳理这一页 <ArrowRight size={13} /></button><button disabled={!canCompose} onClick={() => { updateComposer('这份学习材料里，有哪些容易理解错的地方？'); questionRef.current?.focus(); }}>找找容易理解错的地方 <ArrowRight size={13} /></button></div></div>}
-          <div className="messages">{displayedMessages.map(message => <article className={`message ${message.role}`} key={message.clientMessageId || message.id} tabIndex={-1} data-assistant-entry={message.role==='assistant'?message.id:undefined} data-assistant-session={session.id}><div className="message-label">{message.role === 'user' ? '我的问题' : message.role === 'note' ? <><FileText size={12} />学习记录 · AI整理{message.needsConfirmation && <span className="pending-label">待确认</span>}</> : <><Sparkles size={12} />学习助手</>}</div>{message.role==='assistant'&&message.runId&&<ToolActivityCards items={toolCalls.filter(item=>item.runId===message.runId)} onOpen={object=>{void openToolObject(object);}}/>}{message.role === 'user' && <MessageReferences value={message.requestedContext} onOpen={id => { void openSourceDocument(id); }} onOpenAssistant={item => { void openAssistantQuote(item); }}/>}<div className={message.role === 'assistant' ? 'assistant-answer-content' : undefined} tabIndex={message.role === 'assistant' ? 0 : undefined} onContextMenu={event=>{if(message.role==='assistant')assistantMenu(event,message,session.id);}} onKeyDown={event=>{if(message.role==='assistant')assistantMenu(event,message,session.id);}}><Markdown text={message.content} courseId={courseId} onAsset={(id,assetId)=>{void openAsset(id,assetId);}} /></div>{message.role === 'assistant' && <button type="button" className="message-save message-reply" aria-label="回复这条回答" onClick={() => { void replyToAssistant(message, session.id); }}><CornerUpLeft size={14}/>回复</button>}{message.outgoing && message.outgoing.stage !== 'done' && <div className={`message-delivery ${message.outgoing.stage}`} role="status"><span>{sendStageLabel(message.outgoing)}</span>{message.outgoing.error && <p>{message.outgoing.error}</p>}{message.outgoing.stage === 'failed' && <button className="quiet-button" disabled={!!busyId || modelChanging} onClick={() => { void retrySend(message.outgoing!.sendId); }}>{message.outgoing.failureStage === 'unknown' ? '核对生成状态' : message.outgoing.userEntryId ? '重试生成' : '重试保存并生成'}</button>}</div>}{message.role === 'assistant' && (message.context ? <RequestContextView value={{status:'ready',actual:true,context:message.context}} independent={false} label="此条回复的实际来源" onRetry={()=>undefined}/> : <p className="muted small">此条历史回复未记录来源快照。</p>)}{message.sources?.length ? <SourceList sources={message.sources} /> : null}{message.role === 'assistant' && <button className="message-save" onClick={() => setCardDraft({ front: selection || '这一页中值得回忆的问题', back: message.content, sessionId: session.id, sectionId: session.sectionId })}><Plus size={12} />留作复习</button>}{message.role === 'assistant' && current && current.section.kind !== 'exercise' && <button className="message-save" onClick={()=>appendExploration(message.content)}><PencilLine size={12}/>加入笔记正文</button>}</article>)}</div>{conversation.length > 30 && <p className="muted small">显示最近 30 条。完整记录保存在学习文件中。</p>}
+          <div className="messages">{displayedMessages.map(message => <article className={`message ${message.role}`} key={message.clientMessageId || message.id} tabIndex={-1} data-assistant-entry={message.role==='assistant'?message.id:undefined} data-assistant-session={session.id}><div className="message-label">{message.role === 'user' ? '我的问题' : message.role === 'note' ? <><FileText size={12} />学习记录 · AI整理{message.needsConfirmation && <span className="pending-label">待确认</span>}</> : <><Sparkles size={12} />学习助手</>}</div>{message.role==='assistant'&&message.runId&&<ToolActivityCards items={toolCalls.filter(item=>item.runId===message.runId)} onOpen={object=>{void openToolObject(object);}}/>}{message.role === 'user' && <MessageReferences value={message.requestedContext} onOpen={(id,version) => { void openSourceDocument(id,version); }} onOpenAssistant={item => { void openAssistantQuote(item); }}/>}<div className={message.role === 'assistant' ? 'assistant-answer-content' : undefined} tabIndex={message.role === 'assistant' ? 0 : undefined} onContextMenu={event=>{if(message.role==='assistant')assistantMenu(event,message,session.id);}} onKeyDown={event=>{if(message.role==='assistant')assistantMenu(event,message,session.id);}}><Markdown text={message.content} courseId={courseId} onAsset={(id,assetId)=>{void openAsset(id,assetId);}} /></div>{message.role === 'assistant' && <button type="button" className="message-save message-reply" aria-label="回复这条回答" onClick={() => { void replyToAssistant(message, session.id); }}><CornerUpLeft size={14}/>回复</button>}{message.outgoing && message.outgoing.stage !== 'done' && <div className={`message-delivery ${message.outgoing.stage}`} role="status"><span>{sendStageLabel(message.outgoing)}</span>{message.outgoing.error && <p>{message.outgoing.error}</p>}{message.outgoing.stage === 'failed' && <button className="quiet-button" disabled={!!busyId || modelChanging} onClick={() => { void retrySend(message.outgoing!.sendId); }}>{message.outgoing.failureStage === 'unknown' ? '核对生成状态' : message.outgoing.userEntryId ? '重试生成' : '重试保存并生成'}</button>}</div>}{message.role === 'assistant' && (message.context ? <RequestContextView value={{status:'ready',actual:true,context:message.context}} independent={false} label="此条回复的实际来源" onRetry={()=>undefined}/> : <p className="muted small">此条历史回复未记录来源快照。</p>)}{message.sources?.length ? <SourceList sources={message.sources} /> : null}{message.role === 'assistant' && <button className="message-save" onClick={() => setCardDraft({ front: selection || '这一页中值得回忆的问题', back: message.content, sessionId: session.id, sectionId: session.sectionId })}><Plus size={12} />留作复习</button>}{message.role === 'assistant' && current && current.section.kind !== 'exercise' && <button className="message-save" onClick={()=>appendExploration(message.content)}><PencilLine size={12}/>加入笔记正文</button>}</article>)}</div>{conversation.length > 30 && <p className="muted small">显示最近 30 条。完整记录保存在学习文件中。</p>}
         </>
         <ToolActivityCards items={toolCalls.filter(item=>!repliedRuns.has(item.runId))} liveRunId={busyId ? activeRunId : undefined} onOpen={object => { void openToolObject(object); }} />
-        {partial && partial.mode !== 'practice' && partial.sessionId === session.id && busyId && <article className="message assistant partial-message"><div className="message-label"><Sparkles size={12} />正在回复</div><Markdown text={partial.content} /></article>}{partial?.mode === 'practice' && partial.sessionId === session.id && !busyId && aiError && <details className="recovery-message"><summary>查看练习模型原返回（含参考）</summary><pre>{partial.content}</pre></details>}{busyId && <div className="generating" role="status"><LoaderCircle size={15} className="spin" /><div>{partial?.mode === 'practice' ? '正在接收、校验并保存练习…' : '正在等待模型回复…'}<small>来源以核对后的实际清单为准</small></div></div>}{aiError && <div className="inline-error" role="alert"><strong>这次没有得到回复</strong><p>{aiError}</p><span>输入仍保留，可以修改后重试。</span>{practiceFailure?.sourceId === activeId && <button className="quiet-button" disabled={!!busyId} onClick={()=>{void generateExercise(true);}}>{practiceFailure.unknown ? practiceFailure.recovery ? '继续完成保存' : '核对上次练习生成' : '重试生成练习'}</button>}</div>}<div ref={chatEnd} />
+        {partial && partial.mode !== 'practice' && partial.sessionId === session.id && busyId && <article className="message assistant partial-message"><div className="message-label"><Sparkles size={12} />正在回复</div><Markdown text={partial.content} /></article>}{partial?.mode === 'practice' && partial.sessionId === session.id && !busyId && aiError && <details className="recovery-message"><summary>查看练习模型原返回（含参考）</summary><pre>{partial.content}</pre></details>}{busyId && <div className="generating" role="status"><LoaderCircle size={15} className="spin" /><div>{!activeRunId ? '正在核对来源与保存问题…' : partial?.mode === 'practice' ? '正在接收、校验并保存练习…' : '正在等待模型回复…'}<small>来源以核对后的实际清单为准</small></div></div>}{aiError && <div className="inline-error" role="alert"><strong>这次没有得到回复</strong><p>{aiError}</p><span>输入仍保留，可以修改后重试。</span>{practiceFailure?.sourceId === activeId && <button className="quiet-button" disabled={!!busyId} onClick={()=>{void generateExercise(true);}}>{practiceFailure.unknown ? practiceFailure.recovery ? '继续完成保存' : '核对上次练习生成' : '重试生成练习'}</button>}</div>}<div ref={chatEnd} />
       </div>
       <div className="composer-area"><div className="composer"><ComposerReferenceChips references={composerRefs} busy={!!busyId} onRemove={removeComposerReference} onOpenAssistant={item=>{void openAssistantQuote(item);}}/><textarea ref={questionRef} aria-label="向学习助手提问" placeholder={current ? '写下问题，或生成练习的要求…' : '先打开一份材料或探索'} value={composerQuestion} disabled={!canCompose} rows={3} onChange={event => updateComposer(event.target.value)} onCompositionStart={() => { cancelAnimationFrame(composerCommitFrame.current); composerComposing.current = true; }} onCompositionEnd={() => { composerCommitFrame.current = requestAnimationFrame(() => { composerComposing.current = false; }); }} onBlur={() => { cancelAnimationFrame(composerCommitFrame.current); composerComposing.current = false; }} onKeyDown={event => { const action = composerKeyAction(event.nativeEvent, composerComposing.current); if (action === 'native') return; event.preventDefault(); if (action === 'send') void ask(); }} /><div className="composer-bottom"><ComposerToolTierPicker busy={!!busyId} /><ChatModelPicker model={boot.model} busy={!!busyId || modelChanging} onApply={changeModel} onSettings={openSettings} /><button type="button" onClick={()=>{if(busyId)void cancel();else void ask();}} className="send-button" aria-label={busyId ? '停止生成' : modelReady ? '发送问题' : '配置模型后提问'} disabled={!busyId && (!composerQuestion.trim() || modelChanging)}>{busyId ? <Square size={15} /> : <ArrowUp size={17} />}</button></div></div></div>
     </aside>}
 
-    {exerciseQuote && <Dialog title="引用练习分区" description="从当前题的规范原文选择连续内容，不切换编辑页面。" onClose={()=>{exerciseQuoteSequence.current++;setExerciseQuote(null);}}><ExerciseQuote source={exerciseQuote} onAdd={selected=>addExerciseQuote(exerciseQuote,selected)}/></Dialog>}
+    {exerciseQuote && <Dialog title="引用练习分区" description="从当前题的规范原文选择连续内容，不切换编辑页面。" onClose={()=>{exerciseQuoteSequence.current++;setExerciseQuote(null);}}><ExerciseQuote source={exerciseQuote} onAdd={(selected,locator)=>addExerciseQuote(exerciseQuote,selected,locator)}/></Dialog>}
 
-    {assistantReplyMenu && <AssistantReplyMenu value={assistantReplyMenu} onClose={closeAssistantMenu} onReply={()=>{const value=assistantReplyMenu;closeAssistantMenu(false);void replyToAssistant(value.message,value.sessionId,value.selection);}}/>}
+    {assistantReplyMenu && <AssistantReplyMenu value={assistantReplyMenu} onClose={closeAssistantMenu} onReply={()=>{const value=assistantReplyMenu;closeAssistantMenu(false);void replyToAssistant(value.message,value.sessionId,value.selection,value.locator);}}/>}
 
     {insertingContent && current && <Dialog title="插入 HTML、网页或视频" description="原文与链接随笔记一起保存，阅读时可打开隔离预览。" onClose={()=>setInsertingContent(false)}><InsertContent onInsert={text=>{const editor=editing?editorRefs.current.get(activeId):undefined;if(editor)editor.insertText(text);else changeBody(activeId,current.body+text);setInsertingContent(false);}}/></Dialog>}
     {importing && <ImportDialog nodes={nodes} defaultParentId={isContainer ? activeId : current?.section.parentId || undefined} draft={materialDraft} onDraftLoaded={loaded => { workspaceDraftLoaded.current = loaded; if (loaded) clearDraftError('workspace'); }} onClose={() => setImporting(false)} onImported={async section => { if (workspaceDraftLoaded.current) { materialDraft.current = { title: '', body: '' }; if (nativeAvailable) void call('draft_save', { key: 'workspace', data: { importTitle: '', importBody: '' } }).catch(error => reportDraftError('workspace', error)); } setImporting(false); await acceptCreated(section); }} />}
@@ -768,7 +836,7 @@ export function App() {
     {manualExercise && <ManualExerciseDialog sectionId={activeId} sessionId={session.id} onClose={() => setManualExercise(false)} onSaved={result => { updateTargetSession(result.session); setManualExercise(false); void acceptCreated(result.document); notify('练习子文档已保存，可以开始作答。'); }} />}
     {comparison && <Dialog title="对照外部的新版本" description="左侧是仍保留的本地编辑，右侧是当前文件。关闭对照后可以继续整理，或将草稿另存为新小节。" onClose={() => setComparison(null)}><div className="conflict-compare"><div><h3>我的编辑</h3><Markdown text={current?.body || ''} /></div><div><h3>外部文件</h3><Markdown text={comparison.body} /></div></div></Dialog>}
     {cardDraft && <CardDialog draft={cardDraft} sectionId={cardDraft.sectionId ?? session.sectionId} onClose={() => setCardDraft(null)} onSaved={card => { setSessions(old => ({ ...old, [activeId]: { ...session, cards: [...session.cards, card] } })); setCardDraft(null); notify('已留作复习，可从左下角“复习与历史”找回。'); }} />}
-    {injectionMenu&&<div className="tree-context-menu" role="menu" aria-label="材料上下文操作" style={{left:Math.max(8,injectionMenu.x),top:Math.max(8,injectionMenu.y)}} onKeyDown={event=>{if(event.key==='Escape')setInjectionMenu(null);}}><button role="menuitem" disabled={!session.id} onClick={()=>{if(injectionMenu.exercise){const item=injectionMenu.exercise;void quoteExercise(injectionMenu.id,item.sessionId,item.questionId,item.part,item.entryId,injectionMenu.selection||'');}else void injectDocument(injectionMenu.id,injectionMenu.selection);setInjectionMenu(null);}}>{injectionMenu.selection?'将选段加入本次上下文':'将全文加入本次上下文'}</button>{!injectionMenu.exercise&&injections.some(item=>item.documentId===injectionMenu.id)&&<button role="menuitem" onClick={()=>{removeInjection(injectionMenu.id);setInjectionMenu(null);}}>从本次上下文移除</button>}<button role="menuitem" onClick={()=>setInjectionMenu(null)}>关闭</button></div>}
+    {injectionMenu&&<div className="tree-context-menu" role="menu" aria-label="材料上下文操作" style={{left:Math.max(8,injectionMenu.x),top:Math.max(8,injectionMenu.y)}} onKeyDown={event=>{if(event.key==='Escape')setInjectionMenu(null);}}><button role="menuitem" disabled={!session.id} onClick={()=>{if(injectionMenu.exercise){const item=injectionMenu.exercise;void quoteExercise(injectionMenu.id,item.sessionId,item.questionId,item.part,item.entryId,injectionMenu.selection||'',undefined,item.rendered);}else void injectDocument(injectionMenu.id,injectionMenu.selection,injectionMenu.citation);setInjectionMenu(null);}}>{injectionMenu.selection?'将选段加入本次上下文':'将全文加入本次上下文'}</button>{!injectionMenu.exercise&&injections.some(item=>item.documentId===injectionMenu.id)&&<button role="menuitem" onClick={()=>{removeInjection(injectionMenu.id);setInjectionMenu(null);}}>从本次上下文移除</button>}<button role="menuitem" onClick={()=>setInjectionMenu(null)}>关闭</button></div>}
     {toast && <div className="toast" role="status"><Check size={16} /><span>{toast}</span><button className="icon-button" aria-label="关闭提示" onClick={() => setToast('')}><X size={14} /></button></div>}
   </div>;
 }

@@ -165,6 +165,17 @@ impl ContextBridge {
         {
             entries.push(json!({"id":format!("reference:{}",m.id),"kind":"reference","status":"added","sourceId":m.id,"version":m.version,"includedChars":m.included_chars,"reason":"explicit_one_shot"}));
         }
+        for input in request
+            .injections
+            .iter()
+            .filter(|i| i.selection.is_some() && auto_ids.contains(i.document_id.as_str()))
+        {
+            let mut entry = json!({"id":format!("citation:{}",input.document_id),"kind":"reference","status":"added","sourceId":input.document_id,"version":input.expected_version,"includedChars":input.selection.as_ref().unwrap().chars().count(),"reason":"explicit_exact_selection"});
+            if let Some(locator) = &input.locator {
+                entry["locator"] = json!(locator);
+            }
+            entries.push(entry);
+        }
         if !request.selection.is_empty() {
             entries.push(json!({"id":"selection","kind":"reference","status":"added","sourceId":session.section_id,"version":hash(&request.selection),"includedChars":request.selection.chars().count(),"reason":"explicit_one_shot"}));
         }
@@ -282,6 +293,44 @@ impl ContextBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_none_and_exact_locators_preserve_the_real_bridge_wire() {
+        let d = tempfile::tempdir().unwrap();
+        let e = crate::app::Engine::new(d.path().join("lib"), d.path().join("state")).unwrap();
+        let mut c = e.lock().unwrap();
+        let source = c
+            .create_section("合成旧材料", "🙂原句", vec![], vec![])
+            .unwrap();
+        let (session, _) = c.start_session(&source.id, false).unwrap();
+        for locator in [Value::Null, json!({"startChar":1,"endChar":3})] {
+            let input = serde_json::from_value(json!({"documentId":source.id,"expectedVersion":source.version,"selection":"原句","locator":locator})).unwrap();
+            let mut ctx = crate::context::load(&c.content, &source.id, None).unwrap();
+            crate::context::inject(&c.content, &mut ctx, &[input]).unwrap();
+            let projection =
+                ContextBridge::snapshot(&c.state_dir, &c.content, &session, &ctx).unwrap();
+            let request = serde_json::from_value(json!({"sessionId":session.id,"mode":"question","prompt":"解释原句","selection":"","requestId":"legacy_locator_fixture","injections":[{"documentId":source.id,"expectedVersion":source.version,"selection":"原句","locator":locator}]})).unwrap();
+            let frozen = ContextBridge::freeze(
+                &request,
+                &ctx,
+                &session,
+                None,
+                &projection,
+                TimeContext::capture(),
+            )
+            .unwrap();
+            let item = frozen.manifest["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["reason"] == "explicit_exact_selection")
+                .unwrap();
+            if locator.is_null() {
+                assert!(item.get("locator").is_none());
+            } else {
+                assert_eq!(item["locator"], locator);
+            }
+        }
+    }
     #[test]
     fn stable_turn_versioned_and_one_shot_parts_deduplicate_or_fail_before_assembly() {
         let mut store = ContextBridge::default();

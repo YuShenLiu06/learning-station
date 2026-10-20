@@ -2834,6 +2834,7 @@ mod learning_v2_tests {
             exercise_references: vec![],
             assistant_references: vec![],
             injections: vec![context::ContextInjection {
+                locator: None,
                 document_id: ctx.manifest[0].id.clone(),
                 expected_version: "old".into(),
                 selection: None,
@@ -2879,6 +2880,7 @@ mod assistant_reference_snapshot_tests {
             .unwrap();
             let entry = s.entries.last().unwrap();
             let r = context::AssistantReference {
+                locator: None,
                 session_id: s.id.clone(),
                 entry_id: entry.id.clone(),
                 run_id: Some("run_old_source".into()),
@@ -3014,6 +3016,7 @@ mod rendered_exercise_snapshot_tests {
         )
         .unwrap();
         let r = crate::exercise_references::ExerciseReference {
+                locator: None,
             session_id: p.session_id,
             document_id: p.document_id,
             exercise_entry_id: p.exercise_entry_id,

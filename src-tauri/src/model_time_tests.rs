@@ -48,6 +48,7 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
             .find(|entry| entry.kind == "assistant")
             .unwrap();
         let reference = crate::context::AssistantReference {
+            locator: None,
             session_id: saved.id,
             entry_id: entry.id.clone(),
             run_id: Some("run_raw_source".into()),
@@ -78,6 +79,7 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
         )
         .unwrap();
         let exercise_reference = crate::exercise_references::ExerciseReference {
+            locator: None,
             session_id: p.session_id,
             document_id: p.document_id,
             exercise_entry_id: p.exercise_entry_id,
