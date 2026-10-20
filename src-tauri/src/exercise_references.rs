@@ -163,7 +163,7 @@ pub fn project(
     }
     if store.is_trashed(document_id)
         || store.is_trashed(&session.id)
-        || (!session.section_id.is_empty() && store.is_trashed(&session.section_id))
+        || (session.course_id.is_none() && !session.section_id.is_empty() && store.is_trashed(&session.section_id))
     {
         return Err(scope());
     }
@@ -187,7 +187,8 @@ pub fn project(
         .ok_or_else(scope)?;
     if doc.metadata.kind != "exercise"
         || actual_session != Some(session.id.as_str())
-        || actual_source != Some(session.section_id.as_str())
+        || actual_source.is_none()
+        || crate::course_sessions::source(store, session, actual_source.unwrap())? != actual_source.unwrap()
     {
         return Err(scope());
     }
@@ -329,12 +330,14 @@ pub fn validate_references(
     validate_shape(refs)?;
     let mut result = vec![];
     for r in refs {
+        let origin = crate::sessions::get(store, &r.session_id)?;
         if r.session_id != session.id {
-            return Err(scope());
+            if session.course_id.is_none() { return Err(scope()); }
+            crate::course_sessions::source(store, session, &r.document_id)?;
         }
         let p = project(
             store,
-            session,
+            &origin,
             &r.document_id,
             &r.question_id,
             &r.part,
@@ -417,7 +420,14 @@ pub fn validate_manifest(
         if parts.len() != 5 || parts[0] != "exercise-part" || !seen.insert(&item.id) {
             return Err(scope());
         }
-        let p = project(store, session, parts[1], parts[2], parts[3], Some(parts[4]))?;
+        let document = store.read(parts[1])?;
+        let origin_id = document.metadata.extra.get("originSessionId").and_then(|v| v.as_str()).ok_or_else(scope)?.to_owned();
+        let origin = crate::sessions::get(store, &origin_id)?;
+        if origin.id != session.id {
+            if session.course_id.is_none() { return Err(scope()); }
+            crate::course_sessions::source(store, session, parts[1])?;
+        }
+        let p = project(store, &origin, parts[1], parts[2], parts[3], Some(parts[4]))?;
         if p.source_id != item.id
             || p.text_hash != item.version
             || item.included_chars == 0
@@ -760,6 +770,7 @@ mod tests {
         let mut r = reference(&p, "为什么这里用 for？");
         r.text_hash = hash("stale");
         let request = crate::generation::GenerationRequest {
+            document_id: None,
             session_id: x.session.id,
             mode: "question".into(),
             selection: String::new(),

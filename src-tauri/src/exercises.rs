@@ -265,7 +265,7 @@ fn request(request_id: &str) -> Result<()> {
 }
 fn source(store: &ContentStore, session: &Session, id: &str) -> Result<Document> {
     let document = store.read(id)?;
-    if session.section_id != id
+    if crate::course_sessions::source(store, session, id)? != id
         || !matches!(
             document.metadata.kind.as_str(),
             "section" | "knowledge" | "exploration"
@@ -422,8 +422,14 @@ pub fn create(
     store: &mut ContentStore,
     session_id: &str,
     source_document_id: &str,
-    mut data: Value,
+    data: Value,
     request_id: &str,
+) -> Result<Document> {
+    create_from_snapshot(store, session_id, source_document_id, data, request_id, None)
+}
+pub(crate) fn create_from_snapshot(
+    store: &mut ContentStore, session_id: &str, source_document_id: &str,
+    mut data: Value, request_id: &str, frozen: Option<&[ManifestItem]>,
 ) -> Result<Document> {
     request(request_id)?;
     let session = sessions::get(store, session_id)?;
@@ -461,8 +467,7 @@ pub fn create(
         .iter()
         .any(|entry| entry.id == entry_id && entry.kind == "exercise");
     let manifest = stored_manifest(&data, &session.context_manifest)?;
-    let authorized: BTreeSet<_> = session
-        .context_manifest
+    let authorized: BTreeSet<_> = frozen.unwrap_or(&session.context_manifest)
         .iter()
         .map(|item| item.id.as_str())
         .collect();
@@ -568,12 +573,15 @@ pub fn create_manual(
     request_id: &str,
 ) -> Result<ExerciseDocument> {
     let session = sessions::get(store, session_id)?;
-    let data = validate(
+    source(store, &session, source_document_id)?;
+    let manifest = crate::context::load(store, source_document_id, None)?.manifest;
+    let mut data = validate(
         json!({"exercises":[{"question":input.question,"format":input.format,"answers":input.answers,"explanation":input.explanation,"tags":[],"sourceIds":[]}],"summary":"手动创建练习"}),
-        &session.context_manifest,
+        &manifest,
         &format!("manual_{}", &hash(request_id)[..32]),
     )?;
-    let document = create(store, session_id, source_document_id, data, request_id)?;
+    data["contextManifest"] = json!(manifest);
+    let document = create_from_snapshot(store, session_id, source_document_id, data, request_id, Some(&manifest))?;
     get(store, &document.id)
 }
 /// Explicit migration only. Existing question IDs and original Markdown receipts remain untouched.

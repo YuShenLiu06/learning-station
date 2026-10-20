@@ -130,3 +130,10 @@ ToolActivity=`{id,toolCallId,runId,sessionId,name,status:running|succeeded|faile
 保留现有 `app::session_context`、`generation::messages` 与 `task_tool_policy(mode)` 作为流程级组合入口；未来可按 mode 声明 required Skill/context，并将实际加载版本记入上下文清单。必需加载失败必须在模型请求前报错；可选学习资料继续沿用现有可见 warning。当前无 Skill loader/安装/自动扫描能力，不加载用户 coding skills。
 
 生成状态恢复仅把真正不存在的记录返回 `NOT_FOUND`；损坏、不可读或不安全文件分别报原错误并保留，不应视作首次发送。
+
+### M2 课程会话兼容字段
+
+- `Session.courseId?: string`：共享会话固定课程归属；`legacySessionIds?: string[]`：已备份并保留的旧对话索引。
+- `start_session(sectionId, newSession?)`：课程内文档返回同一 session；显式新建不绕过课程固定路由。
+- `load_session_context`、`start_generation` 新增可选 `documentId`，由本轮 activeDocumentId 冻结；未传兼容旧 sectionId 锚点。保存问题的 requestedContext.documentId 与生成重试必须一致。
+- 练习 originSessionId 是原作答/批改账本；与当前聊天 session 可以不同，课程和原始来源均由 Rust 校验。

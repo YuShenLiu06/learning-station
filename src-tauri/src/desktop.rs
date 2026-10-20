@@ -467,6 +467,7 @@ async fn get_exercise_reference(
 async fn load_session_context(
     state: State<'_, Arc<Engine>>,
     session_id: String,
+    document_id: Option<String>,
     selection: Option<String>,
     injections: Option<Vec<context::ContextInjection>>,
     assistant_references: Option<Vec<context::AssistantReference>>,
@@ -474,7 +475,7 @@ async fn load_session_context(
 ) -> Result<Context> {
     work(state.inner().clone(), move |e| {
         let mut core = e.lock()?;
-        let (session, mut context) = core.session_context(&session_id, selection.as_deref())?;
+        let (session, mut context) = core.session_context_for(&session_id, document_id.as_deref(), selection.as_deref())?;
         crate::exercise_references::inject_request(
             &mut core.content,
             &mut context,
@@ -568,6 +569,7 @@ async fn start_generation(
     app: tauri::AppHandle,
     state: State<'_, Arc<Engine>>,
     session_id: String,
+    document_id: Option<String>,
     mode: String,
     selection: String,
     prompt: String,
@@ -583,6 +585,7 @@ async fn start_generation(
     let run = generation::start(
         state.inner().clone(),
         GenerationRequest {
+            document_id,
             session_id,
             mode,
             selection,

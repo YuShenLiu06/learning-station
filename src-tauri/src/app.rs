@@ -637,6 +637,10 @@ impl Core {
         section_id: &str,
         new_session: bool,
     ) -> Result<(Session, Context)> {
+        if let Some(owner) = crate::course_sessions::course(&self.content, section_id)? {
+            if new_session { return Err(CoreError::new("INVALID_INPUT", "课程使用固定共享会话，旧对话仍保留。")); }
+            return crate::course_sessions::open(self, section_id, &owner);
+        }
         if self.content.read(section_id)?.metadata.kind == "exercise" {
             let item = crate::exercises::get(&mut self.content, section_id)?;
             let (_, context) = self.session_context(&item.session.id, None)?;
@@ -744,8 +748,12 @@ impl Core {
         session_id: &str,
         selection: Option<&str>,
     ) -> Result<(Session, Context)> {
+        self.session_context_for(session_id, None, selection)
+    }
+    pub fn session_context_for(&mut self, session_id: &str, document_id: Option<&str>, selection: Option<&str>) -> Result<(Session, Context)> {
         let session = sessions::get(&mut self.content, session_id)?;
-        let mut context = if session.section_id.is_empty() {
+        let source = crate::course_sessions::source(&self.content, &session, document_id.unwrap_or(&session.section_id))?;
+        let mut context = if source.is_empty() {
             if selection.is_some_and(|text| !text.is_empty()) {
                 return Err(CoreError::new(
                     "INVALID_INPUT",
@@ -764,7 +772,7 @@ impl Core {
                 truncated: false,
             }
         } else {
-            context::load(&self.content, &session.section_id, selection)?
+            context::load(&self.content, &source, selection)?
         };
         context::protect_trashed_history(&mut context, &session, &self.content.trashed_ids());
         Ok((session, context))

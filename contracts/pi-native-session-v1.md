@@ -43,3 +43,13 @@
 Rust 在 practice 模式显式开启 `outputValidation`，Node 每次完成最终文本后发送只读 `validate_output {id, content}`；Rust 使用原轮冻结 manifest 校验，回复 `tool_result.result={valid,recoverable,message?}`，不保存对象、不增加权限。两端均最多接受三次校验（首次及最多两次修正），沿用原请求超时与工具预算。
 
 可纠正错误通过 `learning-station-output-validation` 原生 custom message 回传 Agent，包含安全字段路径、原因与长度限制，不伪造新用户问题。未知来源或权限错误不可自动修正；失败原文留在私有原生会话，最终失败文本留在Run。仅校验通过才标记原生记录complete；Rust保存前再次校验并沿既有操作编号幂等写入。该私有事件不注册为模型工具或前端IPC。
+
+## 课程会话路由（M2 / #11）
+
+显式 course 根下的笔记与练习经 `sessionByCourse[courseId]` 恢复同一业务 session；Pi 的目录、header ID、精确重开与幂等协议仍由该业务 ID 决定。无课程的旧笔记和独立探索保持原行为。`Session.courseId` 是固定归属，`sectionId` 仅保留创建时锚点，不能代替本轮材料。
+
+`load_session_context` 与 `start_generation` 接受可选 `documentId`；前端提交时从 activeDocumentId 冻结，经保存问题、重试、生成和练习落盘保持不变。省略时兼容旧锚点。Rust 检查课程归属；练习页面读取来源材料，不将含参考答案的页面正文自动注入。当前来源决定工具及练习目标，切页不改已提交请求。
+
+首次承接旧课程时，先将原 preferences、业务会话目录和对应 Pi 目录备份到私有 `course-session-backups/<sha256(courseId)>/`，完整回执后才建立新课程对话。原对话及来源保持原样，`legacySessionIds` 供界面提示和历史查看；不选一段旧对话覆盖其他记录，不拼接 Pi 历史。备份遇到运行锁、符号链接或读写失败时不切换路由。旧练习仍按 originSessionId 作答/批改，聊天使用课程 session；引用校验同时核实原账本与课程。
+
+Focus 切换时，native 的历史授权集合保留仍属于该课程的已见来源，课程外来源仍须本轮明确提供；回收历史保护仍生效。此集合不注入其他笔记正文，不扩大 Rust ToolScope/read 工具的本轮来源列表。

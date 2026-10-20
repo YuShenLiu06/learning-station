@@ -9,6 +9,8 @@ use std::path::Path;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Preferences {
+    #[serde(default)]
+    pub session_by_course: BTreeMap<String, String>,
     pub active_document_id: Option<String>,
     pub active_session_id: Option<String>,
     #[serde(default)]
@@ -59,6 +61,12 @@ pub fn create_with_id(
     manifest: &[ManifestItem],
     id: &str,
 ) -> Result<Session> {
+    create_scoped(store, section_id, manifest, id, None, &[])
+}
+pub fn create_course(store: &mut ContentStore, section_id: &str, manifest: &[ManifestItem], id: &str, course: &str, legacy: &[String]) -> Result<Session> {
+    create_scoped(store, section_id, manifest, id, Some(course), legacy)
+}
+fn create_scoped(store: &mut ContentStore, section_id: &str, manifest: &[ManifestItem], id: &str, course: Option<&str>, legacy: &[String]) -> Result<Session> {
     if !valid_id(id) || !valid_id(section_id) {
         return Err(CoreError::new("INVALID_INPUT", "会话或来源编号无效。"));
     }
@@ -116,6 +124,11 @@ pub fn create_with_id(
         &format!("{} · 学习记录", section.metadata.title),
         "session",
     );
+    if let Some(course) = course {
+        meta.title = format!("{} · 课程对话", store.read(course)?.metadata.title);
+        meta.extra.insert("courseId".into(), json!(course));
+    }
+    meta.extra.insert("legacySessionIds".into(), json!(legacy));
     meta.links = vec![section_id.into()];
     meta.extra.insert("sectionId".into(), json!(section_id));
     meta.extra
@@ -279,6 +292,8 @@ pub fn get(store: &mut ContentStore, id: &str) -> Result<Session> {
         .map(|e| e.created_at.clone())
         .unwrap_or_else(|| doc.modified_at.clone());
     Ok(Session {
+        course_id: doc.metadata.extra.get("courseId").and_then(Value::as_str).map(str::to_owned),
+        legacy_session_ids: serde_json::from_value(doc.metadata.extra.get("legacySessionIds").cloned().unwrap_or(json!([])))?,
         id: id.into(),
         section_id,
         title: doc.metadata.title,
@@ -532,7 +547,8 @@ pub fn append(
         }
         return Ok(old);
     }
-    if let Some(frozen) = crate::context::requested_context(&entry, Some(&old.section_id))? {
+    if let Some(frozen) = crate::context::requested_context(&entry, old.course_id.is_none().then_some(old.section_id.as_str()))? {
+        crate::course_sessions::source(store, &old, &frozen.document_id)?;
         crate::assistant_references::validate_references(
             store,
             &old,

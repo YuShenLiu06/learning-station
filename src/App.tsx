@@ -119,6 +119,7 @@ export function App() {
   const contextSequence = useRef(0);
   const contextInputs = useRef({ sessionId: '', documentId: '', body: '', version: '', selection: '', injections: '' });
   const actualContextInputs = useRef<typeof contextInputs.current | null>(null);
+  const operationContextInputs = useRef(new Map<string, typeof contextInputs.current>());
   const [rightbar, setRightbar] = useState(true);
   const [selection, setSelectionState] = useState('');
   const selectionStateRef = useRef({ value: '', revision: 0 });
@@ -166,7 +167,7 @@ export function App() {
   const [liveTools, setLiveTools] = useState<Record<string, ToolActivity[]>>({});
   const [activeRunId, setActiveRunId] = useState('');
   const [objectPreview, setObjectPreview] = useState<{ kind: string; id: string; title: string; body?: string; front?: string; back?: string; dueAt?: string; done?: boolean; reminderEnabled?: boolean } | null>(null);
-  useEffect(() => onGenerationProgress(progress => { if (progress.operationId !== busyRef.current) return; if (progress.userEntryConfirmed) { if (progress.mode === 'practice' && progress.userEntryId) confirmedPracticeUsers.current.set(progress.operationId, progress.userEntryId); consumeReferenceSnapshot(progress.operationId); } if (progress.content) setPartial(progress); if (progress.runId) setActiveRunId(progress.runId); if (progress.toolCalls) setLiveTools(old => ({ ...old, [progress.sessionId]: foldToolActivities([...(old[progress.sessionId] || []), ...progress.toolCalls!], progress.sessionId) })); if (progress.context) { if (contextInputs.current.sessionId === progress.sessionId) actualContextInputs.current = contextInputs.current; setContextView({ status: 'ready', actual: true, sessionId: progress.sessionId, context: progress.context }); } else if (progress.manifest) setContextView({ status: 'ready', actual: true, sessionId: progress.sessionId, context: { text: '', manifest: progress.manifest, warnings: [], truncated: false } }); if (progress.contextError) setContextView({ status: 'error', sessionId: progress.sessionId, error: progress.contextError }); }), []);
+  useEffect(() => onGenerationProgress(progress => { if (progress.operationId !== busyRef.current) return; if (progress.userEntryConfirmed) { if (progress.mode === 'practice' && progress.userEntryId) confirmedPracticeUsers.current.set(progress.operationId, progress.userEntryId); consumeReferenceSnapshot(progress.operationId); } if (progress.content) setPartial(progress); if (progress.runId) setActiveRunId(progress.runId); if (progress.toolCalls) setLiveTools(old => ({ ...old, [progress.sessionId]: foldToolActivities([...(old[progress.sessionId] || []), ...progress.toolCalls!], progress.sessionId) })); if (progress.context) { if (contextInputs.current.sessionId === progress.sessionId) actualContextInputs.current = operationContextInputs.current.get(progress.operationId) || null; setContextView({ status: 'ready', actual: true, sessionId: progress.sessionId, context: progress.context }); } else if (progress.manifest) setContextView({ status: 'ready', actual: true, sessionId: progress.sessionId, context: { text: '', manifest: progress.manifest, warnings: [], truncated: false } }); if (progress.contextError) setContextView({ status: 'error', sessionId: progress.sessionId, error: progress.contextError }); }), []);
   const busyRef = useRef('');
   const [aiError, setAiError] = useState('');
   const [importing, setImporting] = useState(false);
@@ -375,15 +376,21 @@ export function App() {
     if (contextView.actual && contextView.sessionId === session.id && actual && Object.keys(inputs).every(key => actual[key as keyof typeof actual] === inputs[key as keyof typeof inputs])) return;
     if (current && current.body !== current.savedBody) { setContextView({ status: 'error', sessionId: session.id, error: '正文有未保存改动，保存后会重新核对来源。' }); return; }
     setContextView({ status: 'loading', sessionId: session.id });
-    const timer = setTimeout(() => { void call<RequestContext>('context_load', { sessionId: session.id, sectionId: session.sectionId, selection: requestSelection, injections: freezeInjections(injections), assistantReferences: freezeAssistantReferences(assistantReferences), exerciseReferences: freezeExerciseReferences(exerciseReferences) }).then(context => { if (sequence === contextSequence.current) setContextView({ status: 'ready', sessionId: session.id, context }); }).catch(error => { if (sequence === contextSequence.current) setContextView({ status: 'error', sessionId: session.id, error: errorText(error) }); }); }, 150);
+    const timer = setTimeout(() => { void call<RequestContext>('context_load', { sessionId: session.id, sectionId: activeId, documentId: activeId, selection: requestSelection, injections: freezeInjections(injections), assistantReferences: freezeAssistantReferences(assistantReferences), exerciseReferences: freezeExerciseReferences(exerciseReferences) }).then(context => { if (sequence === contextSequence.current) setContextView({ status: 'ready', sessionId: session.id, context }); }).catch(error => { if (sequence === contextSequence.current) setContextView({ status: 'error', sessionId: session.id, error: errorText(error) }); }); }, 150);
     return () => clearTimeout(timer);
-  }, [session.id, requestSelection, current?.body, current?.savedBody, current?.section.version, busyId, contextRetry, injectionKey]);
+  }, [session.id, activeId, requestSelection, current?.body, current?.savedBody, current?.section.version, busyId, contextRetry, injectionKey]);
   function updateComposer(value: string) { setQuestion(value); }
   function updateTargetSession(result: LearningSession, _independentTarget = false) {
     const reconciled = reconcileOutgoing(outgoingRef.current, result.messages, result.id);
     updateOutgoing(() => reconciled);
     for (const item of reconciled) if (item.sessionId === result.id && item.userEntryId && result.messages.some(message => message.role === 'user' && message.id === item.userEntryId)) consumeReferenceSnapshot(item.sendId);
-    setSessions(old => ({ ...Object.fromEntries(Object.entries(old).map(([key,value]) => [key, value.id === result.id ? result : value])), [result.sectionId]: result }));
+    setSessions(old => {
+      const next = Object.fromEntries(Object.entries(old).map(([key, value]) => [key,
+        value.id === result.id ? { ...result, sectionId: key, exerciseSessionId: value.exerciseSessionId, exercises: value.exerciseSessionId && value.exerciseSessionId !== result.id ? value.exercises : result.exercises }
+        : value.exerciseSessionId === result.id ? { ...value, exercises: result.exercises } : value]));
+      if (!next[result.sectionId] || next[result.sectionId].id === result.id) next[result.sectionId] = { ...next[result.sectionId], ...result };
+      return next;
+    });
   }
   async function refreshAfterGeneration(target: LearningSession, independentTarget: boolean) {
     const knownNodes = new Set(nodesRef.current.map(node=>node.id));
@@ -400,15 +407,15 @@ export function App() {
     try{const local=docsRef.current[id];if(local&&local.body!==local.savedBody)await prepareSource(id);const document=await call<Section>('section_open',{id});if(!['section','knowledge','exploration'].includes(document.kind||'section'))throw new Error('只可加入学习材料，不能加入目录、练习参考或系统记录。');if(selected&&!document.body.includes(selected))throw new Error('选区与已保存原文不一致，请在原文中重新选择。');const item:ContextInjection={documentId:id,expectedVersion:document.version,...(selected?{selection:selected}:{})};const next={...injectionsRef.current,[targetSession]:addContextInjection(injectionsRef.current[targetSession]||[],item,(assistantReferencesRef.current[targetSession]||[]).length + (exerciseReferencesRef.current[targetSession]||[]).length)};injectionsRef.current=next;setInjectionsBySession(next);if(selected&&activeIdRef.current===id&&visibleSessionRef.current===targetSession&&selectionStateRef.current.revision===selectedRevision&&selectionStateRef.current.value===selected)setSelection('');notify('已显式加入本次上下文，尚未发送模型请求。');}catch(error){notify(errorText(error));}
   }
   function addExerciseQuote(source: ExerciseReferenceSource, selected: string) {
-    if (visibleSessionRef.current !== source.sessionId || activeIdRef.current !== source.documentId) { notify('已切换学习文档，未将旧选段加入新页面。'); return; }
-    try { validateExerciseSelection(source.text, selected); const item: ExerciseReference = { sessionId: source.sessionId, documentId: source.documentId, exerciseEntryId: source.exerciseEntryId, questionId: source.questionId, part: source.part, entryId: source.entryId, textHash: source.textHash, selection: selected }; const next = { ...exerciseReferencesRef.current, [source.sessionId]: addExerciseReference(exerciseReferencesRef.current[source.sessionId] || [], item, (injectionsRef.current[source.sessionId] || []).length + (assistantReferencesRef.current[source.sessionId] || []).length) }; exerciseReferencesRef.current = next; setExerciseReferencesBySession(next); setExerciseQuote(null); setRightbar(true); }
+    if (!visibleSessionRef.current || activeIdRef.current !== source.documentId) { notify('已切换学习文档，未将旧选段加入新页面。'); return; }
+    try { const target = visibleSessionRef.current; validateExerciseSelection(source.text, selected); const item: ExerciseReference = { sessionId: source.sessionId, documentId: source.documentId, exerciseEntryId: source.exerciseEntryId, questionId: source.questionId, part: source.part, entryId: source.entryId, textHash: source.textHash, selection: selected }; const next = { ...exerciseReferencesRef.current, [target]: addExerciseReference(exerciseReferencesRef.current[target] || [], item, (injectionsRef.current[target] || []).length + (assistantReferencesRef.current[target] || []).length) }; exerciseReferencesRef.current = next; setExerciseReferencesBySession(next); setExerciseQuote(null); setRightbar(true); }
     catch (error) { notify(errorText(error)); }
   }
   async function quoteExercise(documentId: string, sessionId: string, questionId: string, part: ExerciseReferencePart, entryId: string | undefined, selected: string, position?: {x:number;y:number}) {
     if (position) { setInjectionMenu({ id: documentId, selection: selected, x: Math.min(position.x, window.innerWidth - 230), y: Math.min(position.y, window.innerHeight - 130), exercise: { sessionId, questionId, part, entryId } }); return; }
-    const sequence = ++exerciseQuoteSequence.current;
+    const sequence = ++exerciseQuoteSequence.current, targetSession = visibleSessionRef.current;
     try { const source = await call<ExerciseReferenceSource>('get_exercise_reference', { sessionId, documentId, questionId, part, ...(entryId ? {entryId} : {}) });
-      if (sequence !== exerciseQuoteSequence.current || visibleSessionRef.current !== sessionId || activeIdRef.current !== documentId) return;
+      if (sequence !== exerciseQuoteSequence.current || visibleSessionRef.current !== targetSession || activeIdRef.current !== documentId) return;
       if (source.text.includes(selected)) addExerciseQuote(source, selected); else setExerciseQuote(source);
     } catch (error) { if (sequence === exerciseQuoteSequence.current) notify(`练习选段未加入：${errorText(error)}`); }
   }
@@ -451,15 +458,15 @@ export function App() {
     let userEntryId = item.userEntryId;
     try {
       if (!userEntryId) {
-        const saved = await call<{ session: LearningSession; userEntryId: string }>('message_save', { sectionId: item.sectionId, sessionId: item.sessionId, question: item.content, selection: item.selection, mode: item.mode, sendId: item.sendId, injections: item.injections || [], assistantReferences: item.assistantReferences || [], exerciseReferences: item.exerciseReferences || [] });
+        const saved = await call<{ session: LearningSession; userEntryId: string }>('message_save', { sectionId: item.sectionId, documentId: item.documentId || item.sectionId, sessionId: item.sessionId, question: item.content, selection: item.selection, mode: item.mode, sendId: item.sendId, injections: item.injections || [], assistantReferences: item.assistantReferences || [], exerciseReferences: item.exerciseReferences || [] });
         userEntryId = saved.userEntryId; patchOutgoing(item.sendId, { userEntryId }); updateTargetSession(saved.session);
       }
       patchOutgoing(item.sendId, { stage: 'preparing' });
       await prepareSource(item.documentId || item.sectionId);
-      const context = await call<RequestContext>('context_load', { sessionId: item.sessionId, sectionId: item.sectionId, selection: item.selection, injections: item.injections || [], assistantReferences: item.assistantReferences || [], exerciseReferences: item.exerciseReferences || [] });
+      const context = await call<RequestContext>('context_load', { sessionId: item.sessionId, sectionId: item.sectionId, documentId: item.documentId || item.sectionId, selection: item.selection, injections: item.injections || [], assistantReferences: item.assistantReferences || [], exerciseReferences: item.exerciseReferences || [] });
       if (visibleSessionRef.current === item.sessionId) setContextView({ status: 'loading', sessionId: item.sessionId, context });
       patchOutgoing(item.sendId, { stage: 'generating' });
-      const result = await call<LearningSession>('session_ask', { sectionId: item.sectionId, sessionId: item.sessionId, mode: item.mode, question: item.content, selection: item.selection, userEntryId, operationId, injections: item.injections || [], assistantReferences: item.assistantReferences || [], exerciseReferences: item.exerciseReferences || [], resume: item.failureStage === 'unknown' });
+      const result = await call<LearningSession>('session_ask', { sectionId: item.sectionId, documentId: item.documentId || item.sectionId, sessionId: item.sessionId, mode: item.mode, question: item.content, selection: item.selection, userEntryId, operationId, injections: item.injections || [], assistantReferences: item.assistantReferences || [], exerciseReferences: item.exerciseReferences || [], resume: item.failureStage === 'unknown' });
       updateTargetSession(result, item.detached); patchOutgoing(item.sendId, { stage: 'done', error: undefined, failureStage: undefined });
     } catch (error) {
       const details = error instanceof StationError ? error.details as { sendStage?: string } | undefined : undefined;
@@ -476,6 +483,7 @@ export function App() {
     if (!canCompose || !session.id) { setAiError('学习会话尚未就绪，请重试打开，问题仍保留。'); return; }
     if (!modelReady) { notify(modelBlocked ? '此模型用途受限，请查看供应商设置。问题仍保留，未发送请求。' : '请先保存供应商连接，问题仍保留。'); openSettings(); return; }
     const operationId = makeId();
+    operationContextInputs.current.set(operationId, { ...contextInputs.current });
     const item: OutgoingMessage = { sendId: makeId(), operationId, sessionId: session.id, sectionId: session.sectionId, detached: false, documentId: activeId, mode: isExplorationDocument(nodesRef.current, activeId, explorationFolderId.current) ? 'explore' : 'explain', content: value, selection: requestSelection, injections: freezeInjections(injectionsRef.current[session.id] || []), assistantReferences: freezeAssistantReferences(assistantReferencesRef.current[session.id] || []), exerciseReferences: freezeExerciseReferences(exerciseReferencesRef.current[session.id] || []), createdAt: new Date().toISOString(), stage: 'saving' };
     busyRef.current = operationId; setBusyId(operationId); setPartial(null); setActiveRunId(''); setAiError('');
     rememberReferenceConsumption(item.sendId, item.sessionId, activeId, item.selection);
@@ -488,6 +496,8 @@ export function App() {
     if (!item || busyRef.current || modelChangingRef.current) return;
     if (!modelReady) { notify('请先检查供应商配置；原消息与新草稿均保留。'); openSettings(); return; }
     const operationId = retryOperation(item, makeId());
+    const frozenInputs = operationContextInputs.current.get(item.operationId);
+    if (frozenInputs) operationContextInputs.current.set(operationId, frozenInputs);
     busyRef.current = operationId; setBusyId(operationId); setPartial(null); setActiveRunId('');
     patchOutgoing(sendId, { operationId, stage: item.userEntryId ? 'generating' : 'saving', error: undefined });
     await executeSend(item, operationId);
@@ -513,18 +523,19 @@ export function App() {
     const frozenAnswers=previous?previous.assistantReferences:freezeAssistantReferences(assistantReferencesRef.current[session.id] || []);
     const frozenExercises=previous?previous.exerciseReferences:freezeExerciseReferences(exerciseReferencesRef.current[session.id] || []);
     if (previous) { const old = referenceConsumption.current.get(previous.operationId); if (old) { referenceConsumption.current.set(id, old); if (id !== previous.operationId) referenceConsumption.current.delete(previous.operationId); } } else rememberReferenceConsumption(id, session.id, activeId, selected);
+    operationContextInputs.current.set(id, operationContextInputs.current.get(previous?.operationId || '') || { ...contextInputs.current });
     busyRef.current = id; setBusyId(id); setPartial(null); setAiError('');
     const sourceId = activeId; let succeeded = false;
-    try { await prepareSource(sourceId); const result = await call<LearningSession>('exercise_generate', { sectionId: sourceId, sessionId: session.id, selection: selected, prompt, injections: frozen, assistantReferences: frozenAnswers, exerciseReferences: frozenExercises, userEntryId: previous?.userEntryId, operationId: id, resume: previous?.unknown === true }); updateTargetSession(result); setPracticeFailure(null); succeeded = true; }
+    try { await prepareSource(sourceId); const result = await call<LearningSession>('exercise_generate', { sectionId: sourceId, documentId: sourceId, sessionId: session.id, selection: selected, prompt, injections: frozen, assistantReferences: frozenAnswers, exerciseReferences: frozenExercises, userEntryId: previous?.userEntryId, operationId: id, resume: previous?.unknown === true }); updateTargetSession(result); setPracticeFailure(null); succeeded = true; }
     catch (error) { const details = error instanceof StationError ? error.details as { sendStage?: string; recovery?: string } | undefined : undefined; const recovery = details?.recovery === 'same-operation'; const unknown = recovery || details?.sendStage === 'unknown'; setPracticeFailure({ operationId: id, sourceId, selection: selected, prompt, injections: frozen, assistantReferences: frozenAnswers, exerciseReferences: frozenExercises, userEntryId: confirmedPracticeUsers.current.get(id) || previous?.userEntryId, unknown, recovery }); if (busyRef.current === id) setAiError(modelFailureMessage(error, 'generation')); }
     finally { const tree = await refreshTree(); await refreshAfterGeneration(session, false); if (busyRef.current === id) { busyRef.current = ''; setBusyId(''); } if (succeeded && activeIdRef.current === sourceId) { const child = tree?.nodes.filter(node => node.parentId === sourceId && node.kind === 'exercise').at(-1); if (child) await openSection(child.id); } }
   }
   async function submitAnswer(exercise: Exercise, answer: string) {
-    const result = await call<LearningSession>('exercise_answer', { sectionId: activeId, sessionId: session.id, exerciseId: exercise.id, entryId: exercise.entryId, answer });
+    const result = await call<LearningSession>('exercise_answer', { sectionId: activeId, sessionId: exercise.sessionId || session.id, exerciseId: exercise.id, entryId: exercise.entryId, answer });
     updateTargetSession(result); return result;
   }
   async function saveReason(exercise: Exercise, reason: string) {
-    const result = await call<LearningSession>('mistake_save', { sectionId: activeId, sessionId: session.id, exerciseId: exercise.id, question: exercise.prompt, reason });
+    const result = await call<LearningSession>('mistake_save', { sectionId: activeId, sessionId: exercise.sessionId || session.id, exerciseId: exercise.id, question: exercise.prompt, reason });
     updateTargetSession(result); notify('错因已保存，下次可按情境找回。');
   }
   async function openLegacyHistory() { await readHistory('legacy_history_open'); }
@@ -714,7 +725,7 @@ export function App() {
           <div className="document-scroll" onMouseUp={selectText} onKeyUp={selectText} onContextMenu={event=>{if(!current||isContainer||current.section.kind==='exercise')return;event.preventDefault();const chosen=window.getSelection()?.toString()||selection;setInjectionMenu({id:activeId,selection:chosen||undefined,x:Math.min(event.clientX,window.innerWidth-230),y:Math.min(event.clientY,window.innerHeight-130)});}}>
             {assetsOpen && courseId && <CourseAssets key={courseId} courseId={courseId} onInsert={insertAsset} onPreview={setAssetPreview}/>}
             {isContainer && <div className="folder-contents"><h2>{current.section.kind === 'course' ? '课程内容' : '文件夹内容'}</h2>{nodes.filter(node=>node.parentId===activeId).length ? nodes.filter(node=>node.parentId===activeId).map(node=><button key={node.id} className="folder-child" onClick={()=>{void openSection(node.id);}}><FileText size={15}/><span>{node.title}</span><ChevronRight size={14}/></button>) : <p className="muted">这里还没有内容。上方可以添加材料、文件夹或探索。</p>}</div>}
-            {current.section.kind === 'exercise' && !editing && <section className="exercise-workspace" aria-label="练习作答"><p className="muted small">题目与评分读取原始学习记录，编辑下方 Markdown 不会更改评分依据。</p>{session.exercises.filter(exercise=>!current.section.exerciseEntryId || exercise.entryId===current.section.exerciseEntryId).map(exercise=><ExerciseCard key={exercise.id} exercise={exercise} sessionId={session.id} canGrade={modelReady} onRefresh={async()=>{updateTargetSession(await call<LearningSession>('session_refresh',{sectionId:session.sectionId,sessionId:session.id}));}} onReferenceSelection={(part,entryId,selected,position)=>{void quoteExercise(activeId,session.id,exercise.id,part,entryId,selected,position);}} onAnswer={answer=>submitAnswer(exercise,answer)} onReason={reason=>saveReason(exercise,reason)}/>)}<details className="exercise-markdown"><summary>明确展开参考与完整 Markdown</summary><Markdown text={current.body} courseId={courseId} onAsset={(id,assetId)=>{void openAsset(id,assetId);}}/></details></section>}
+            {current.section.kind === 'exercise' && !editing && <section className="exercise-workspace" aria-label="练习作答"><p className="muted small">题目与评分读取原始学习记录，编辑下方 Markdown 不会更改评分依据。</p>{session.exercises.filter(exercise=>!current.section.exerciseEntryId || exercise.entryId===current.section.exerciseEntryId).map(exercise=><ExerciseCard key={exercise.id} exercise={exercise} sessionId={exercise.sessionId || session.id} canGrade={modelReady} onRefresh={async()=>{updateTargetSession(await call<LearningSession>('session_refresh',{sectionId:activeId,sessionId:exercise.sessionId || session.id}));}} onReferenceSelection={(part,entryId,selected,position)=>{void quoteExercise(activeId,exercise.sessionId || session.id,exercise.id,part,entryId,selected,position);}} onAnswer={answer=>submitAnswer(exercise,answer)} onReason={reason=>saveReason(exercise,reason)}/>)}<details className="exercise-markdown"><summary>明确展开参考与完整 Markdown</summary><Markdown text={current.body} courseId={courseId} onAsset={(id,assetId)=>{void openAsset(id,assetId);}}/></details></section>}
             {current.section.kind !== 'exercise' && !isContainer && session.exercises.length > 0 && <details className="legacy-exercises"><summary>本页练习记录 · {session.exercises.length} 题</summary>{[...new Map(session.exercises.filter(exercise=>exercise.entryId).map(exercise=>[exercise.entryId!,exercise])).values()].map(exercise=><button key={exercise.entryId} className="quiet-button" onClick={()=>{void openExerciseEntry(exercise.entryId!);}}>打开练习文档 · {exercise.prompt.slice(0,36)}</button>)}</details>}
             {!editing && current.section.kind !== 'exercise' && <div className="reading-content" tabIndex={0}><Markdown text={current.body} courseId={courseId} onAsset={(id,assetId)=>{void openAsset(id,assetId);}} className={current.body.split('\n')[0].replace(/^#\s+/, '').trim().toLowerCase() === current.section.title.replace(/^\d+\s*[·.、-]\s*/, '').trim().toLowerCase() ? 'hide-redundant-title' : ''} /><div className="reading-end"><span /><BookOpen size={15} /><span /></div></div>}
             {Object.entries(docs).filter(([id]) => editedIds.has(id)).map(([id, doc]) => <div key={id} className="document-editor" hidden={!editing || activeId !== id}><Suspense fallback={<div className="muted small">正在打开编辑器…</div>}><Editor ref={handle=>{if(handle)editorRefs.current.set(id,handle);else editorRefs.current.delete(id);}} initial={doc.body} onReady={() => { const started = editorStartedAt.current[id]; if (started !== undefined) { recordMetric('editor-ready', performance.now() - started); delete editorStartedAt.current[id]; } }} onChange={body => changeBody(id, body)} onSelection={value=>{if(activeIdRef.current===id && doc.section.kind !== 'exercise')setSelection(value);}} onSave={() => { void save(id); }} /></Suspense></div>)}
@@ -736,6 +747,7 @@ export function App() {
     {view === 'lesson' && !isContainer && <aside className="assistant-panel"><AssistantResizeHandle width={assistantWidth.width} onChange={assistantWidth.setWidth} /><div className="assistant-heading"><span className="assistant-mark"><Sparkles size={17} /></span><div><h2>一起读明白</h2><p>顺着你的问题，往前一步</p></div></div>
       {assistantWidth.error && <div className="inline-error" role="status">面板宽度尚未保存：{assistantWidth.error}<button onClick={() => { void assistantWidth.flush().catch(() => undefined); }}>重试保存</button></div>}
       <SelectionContextTray references={composerRefs} busy={!!busyId} onRemove={removeComposerReference} onAsk={() => openPanel('explain', '请帮我理解这段内容。')} onPractice={() => openPanel('practice')} onReview={quote => setCardDraft({ front: quote, back: '', sessionId: session.id, sectionId: session.sectionId })}/>
+      {!!session.legacySessionIds?.length && <div className="model-prompt">本课程已使用共享对话。原有 {session.legacySessionIds.length} 段对话已备份并保留。<button className="text-back" onClick={()=>switchView('history-index')}>查看学习历史</button></div>}
       <div className="assistant-scroll">
         <RequestContextView value={contextView.sessionId && contextView.sessionId !== session.id ? { status: 'loading' } : contextView} independent={current?.section.kind === 'exploration'} onRetry={() => setContextRetry(old => old + 1)} />
 

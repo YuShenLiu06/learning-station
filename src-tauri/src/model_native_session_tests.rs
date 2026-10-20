@@ -44,17 +44,16 @@ fn receive(s: &mut std::net::TcpStream) -> Value {
 async fn real_rust_node_pi_native_restart_roles_tool_pairs_and_course_isolation() {
     let dir = tempfile::tempdir().unwrap();
     let mut e = Engine::new(dir.path().join("lib"), dir.path().join("state")).unwrap();
-    let (doc, sid, other) = {
+    let (doc, second_doc, sid, other) = {
         let mut c = e.lock().unwrap();
-        let d = c
-            .create_section("Native source", "MATERIAL_NATIVE_STABLE", vec![], vec![])
-            .unwrap();
+        let owner = crate::library_tree::create(&mut c.content, "course", "Native course", None, "", "native-course-route").unwrap();
+        let d = crate::library_tree::create(&mut c.content, "section", "Native source", Some(&owner.id), "MATERIAL_NATIVE_STABLE", "native-course-note-a").unwrap();
+        let d2 = crate::library_tree::create(&mut c.content, "section", "Second source", Some(&owner.id), "MATERIAL_SECOND_NOTE", "native-course-note-b").unwrap();
         let (s, _) = c.start_session(&d.id, false).unwrap();
-        let o = c
-            .create_section("Other course", "OTHER_COURSE_SOURCE", vec![], vec![])
-            .unwrap();
+        assert_eq!(c.start_session(&d2.id, false).unwrap().0.id, s.id);
+        let o = c.create_section("Other course", "OTHER_COURSE_SOURCE", vec![], vec![]).unwrap();
         let (os, _) = c.start_session(&o.id, false).unwrap();
-        (d.id, s.id, os.id)
+        (d.id, d2.id, s.id, os.id)
     };
     let server = TcpListener::bind("127.0.0.1:0").unwrap();
     server.set_nonblocking(true).unwrap();
@@ -99,6 +98,7 @@ async fn real_rust_node_pi_native_restart_roles_tool_pairs_and_course_isolation(
             e.lock().unwrap().content.refresh().unwrap();
         }
         let active = if round == 2 { &other } else { &sid };
+        let focus = if round == 1 { &second_doc } else { &doc };
         let prompt = if round == 0 {
             format!("QUESTION_NATIVE_0 {}", "x".repeat(6000))
         } else {
@@ -123,7 +123,7 @@ async fn real_rust_node_pi_native_restart_roles_tool_pairs_and_course_isolation(
             )
             .unwrap();
             let user = saved.entries.last().unwrap().id.clone();
-            let (s, ctx) = c.session_context(active, None).unwrap();
+            let (s, ctx) = c.session_context_for(active, (round != 2).then_some(focus.as_str()), None).unwrap();
             let p = ContextBridge::snapshot(&c.state_dir, &c.content, &s, &ctx).unwrap();
             let md = c.content.read(&s.id).unwrap().content;
             (s, ctx, p, user, md, c.state_dir.clone())
@@ -141,7 +141,7 @@ async fn real_rust_node_pi_native_restart_roles_tool_pairs_and_course_isolation(
             &s,
             &run_id,
             &user,
-            ctx.manifest.iter().map(|m| m.id.clone()).collect(),
+            { let c = e.lock().unwrap(); crate::course_sessions::history_sources(&c.content, &s, &ctx.manifest).unwrap() },
             false,
             vec![],
             &md,
@@ -151,6 +151,7 @@ async fn real_rust_node_pi_native_restart_roles_tool_pairs_and_course_isolation(
             first_native = Some(native.directory.clone());
         }
         let request = GenerationRequest {
+            document_id: (round != 2).then(|| focus.clone()),
             session_id: active.clone(),
             mode: "question".into(),
             selection: String::new(),
@@ -172,9 +173,9 @@ async fn real_rust_node_pi_native_restart_roles_tool_pairs_and_course_isolation(
         .unwrap();
         let scope = ToolScope {
             session_id: active.clone(),
-            section_id: s.section_id.clone(),
+            section_id: if round == 2 { s.section_id.clone() } else { focus.clone() },
             run_id,
-            allowed_ids: ctx.manifest.iter().map(|m| m.id.clone()).collect(),
+            allowed_ids: { let c = e.lock().unwrap(); crate::course_sessions::history_sources(&c.content, &s, &ctx.manifest).unwrap() },
         };
         let e2 = e.clone();
         let handler: ToolHandler = Arc::new(move |call| {
@@ -278,6 +279,7 @@ async fn real_rust_node_pi_native_restart_roles_tool_pairs_and_course_isolation(
     };
     let prompt = format!("QUESTION_NATIVE_0 {}", "x".repeat(6000));
     let request = GenerationRequest {
+        document_id: None,
         session_id: sid.clone(),
         mode: "question".into(),
         selection: String::new(),
@@ -302,7 +304,7 @@ async fn real_rust_node_pi_native_restart_roles_tool_pairs_and_course_isolation(
         &s,
         "native_recover_run",
         &first_user,
-        ctx.manifest.iter().map(|m| m.id.clone()).collect(),
+        { let c = e.lock().unwrap(); crate::course_sessions::history_sources(&c.content, &s, &ctx.manifest).unwrap() },
         false,
         vec![],
         &md,
@@ -374,6 +376,8 @@ async fn real_rust_node_pi_native_restart_roles_tool_pairs_and_course_isolation(
     }
     let second = serde_json::to_string(&packets[2]).unwrap();
     assert!(second.contains("FIRST_NATIVE_REPLY"));
+    assert!(second.contains("MATERIAL_SECOND_NOTE"));
+    assert!(second.contains(&second_doc));
     assert!(second.contains("QUESTION_NATIVE_0"));
     assert!(second.contains(&"x".repeat(6000)));
     assert!(!second.contains("learningHistory"));
@@ -558,6 +562,7 @@ async fn rust_node_pi_exercise_tool_receipt_corrects_invalid_output_in_same_nati
         ContextBridge::snapshot(&state, &c.content, &s, &ctx).unwrap()
     };
     let request = GenerationRequest {
+        document_id: None,
         session_id: sid.clone(),
         mode: "question".into(),
         selection: String::new(),

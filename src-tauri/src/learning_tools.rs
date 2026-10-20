@@ -300,7 +300,7 @@ pub fn execute(
     };
     let mut core = engine.lock()?;
     let session = sessions::get(&mut core.content, &scope.session_id)?;
-    if session.section_id != scope.section_id {
+    if crate::course_sessions::source(&core.content, &session, &scope.section_id).map_err(|_| out_of_scope())? != scope.section_id {
         return Err(out_of_scope());
     }
     if scope.section_id.is_empty() {
@@ -354,18 +354,18 @@ pub fn execute(
                 let document = crate::exercises::create(
                     &mut core.content,
                     &session.id,
-                    &session.section_id,
+                    &scope.section_id,
                     data.clone(),
                     &request_id,
                 )?;
                 return Ok(
                     json!({"persisted":true,"documentId":document.id,"exerciseEntryId":entry_id,
-                    "sessionId":session.id,"sectionId":session.section_id,"replayed":true}),
+                    "sessionId":session.id,"sectionId":scope.section_id,"replayed":true}),
                 );
             }
             let document = core.content.read(&entry_id)?;
             let mut receipt = json!({"persisted":true,"entryId":entry_id,"sessionId":session.id,
-                "sectionId":session.section_id,"path":document.path,"needsConfirmation":true,
+                "sectionId":scope.section_id,"path":document.path,"needsConfirmation":true,
                 "kind":document.metadata.extra.get("entryKind"),"replayed":true});
             if let Some(source) = data.get("sourceErrorId") {
                 receipt["existingErrorId"] = source.clone();
@@ -374,7 +374,7 @@ pub fn execute(
         }
     }
     if let Operation::Exercises(args) = &operation {
-        if session.section_id.is_empty() {
+        if scope.section_id.is_empty() {
             return Err(CoreError::new(
                 "SOURCE_REQUIRED",
                 "请从普通探索笔记或学习材料生成练习。",
@@ -397,15 +397,16 @@ pub fn execute(
             data["businessUserEntryId"] = json!(user);
             data["toolArgumentsHash"] = json!(arguments_hash);
         }
-        let document = crate::exercises::create(
+        let document = crate::exercises::create_from_snapshot(
             &mut core.content,
             &session.id,
-            &session.section_id,
+            &scope.section_id,
             data,
             &request_id,
+            Some(&run.context_manifest),
         )?;
         return Ok(
-            json!({"persisted":true,"documentId":document.id,"exerciseEntryId":document.metadata.extra.get("exerciseEntryId"),"sessionId":session.id,"sectionId":session.section_id}),
+            json!({"persisted":true,"documentId":document.id,"exerciseEntryId":document.metadata.extra.get("exerciseEntryId"),"sessionId":session.id,"sectionId":scope.section_id}),
         );
     }
     if let Operation::Todo(value) = operation {
@@ -443,7 +444,7 @@ pub fn execute(
         )?;
         return Ok(
             json!({"persisted":true,"todoId":todo.id,"sessionId":session.id,
-            "sectionId":session.section_id,"dueAt":todo.due_at,"referenceTime":request_clock.as_ref().map(|c|&c.reference_time),"timeZone":request_clock.as_ref().and_then(|c|c.time_zone.as_ref()),"todo":todo}),
+            "sectionId":scope.section_id,"dueAt":todo.due_at,"referenceTime":request_clock.as_ref().map(|c|&c.reference_time),"timeZone":request_clock.as_ref().and_then(|c|c.time_zone.as_ref()),"todo":todo}),
         );
     }
     let section_related_ids = if scope.section_id.is_empty() {
