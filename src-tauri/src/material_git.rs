@@ -2,7 +2,7 @@
 //! material commands, network, UI or model/session acceptance state is involved.
 use crate::{
     content::ContentStore,
-    types::{valid_id, CoreError, Result},
+    types::{valid_id, CoreError, Document, Result},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -19,6 +19,17 @@ pub struct Checkpoint {
     pub course_id: String,
     pub checkpoint_commit_oid: String,
     pub material_tree_oid: String,
+    /// Exclusions recorded by this commit, outside the material content tree.
+    #[serde(default)]
+    pub excluded_files: Vec<ExcludedFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExcludedFile {
+    pub asset_id: String,
+    pub file_name: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -39,8 +50,10 @@ pub struct FileChange {
     pub added: Option<u64>,
     pub deleted: Option<u64>,
     pub binary: bool,
-    /// Complete Git patch for a focused text file only; never truncated.
+    /// Complete UTF8 Git patch for a focused file; see patch_bytes otherwise.
     pub patch: Option<String>,
+    /// Complete native patch when Git emits non-UTF8 bytes; never lossy decoded.
+    pub patch_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,28 +69,48 @@ pub struct MaterialDiff {
 pub struct FrozenMaterials {
     course_id: String,
     entries: BTreeMap<String, Vec<u8>>,
+    excluded_files: Vec<ExcludedFile>,
 }
 
 impl FrozenMaterials {
     /// Call under the application's Core lock, after refreshing its index.
     /// Two equal captures reject observed external edits; this is not a filesystem
     /// transaction. Once returned, later edits cannot alter these owned bytes.
+    /// Each stored document is the exact version used to resolve its ancestry.
     pub fn capture(store: &ContentStore, course_id: &str) -> Result<Self> {
-        let first = Self::collect(store, course_id)?;
-        if first != Self::collect(store, course_id)? {
-            return Err(CoreError::new("CONFLICT", "材料冻结期间发生变化，请重试。"));
+        Self::capture_with(store, course_id, |id| {
+            crate::library_tree::ancestry(store, id)
+        })
+    }
+
+    fn capture_with(
+        store: &ContentStore,
+        course_id: &str,
+        mut resolve: impl FnMut(&str) -> Result<Vec<Document>>,
+    ) -> Result<Self> {
+        let first = Self::collect(store, course_id, &mut resolve)?;
+        if first != Self::collect(store, course_id, &mut resolve)? {
+            return Err(conflict());
         }
         Ok(first)
     }
 
-    fn collect(store: &ContentStore, course_id: &str) -> Result<Self> {
+    fn collect(
+        store: &ContentStore,
+        course_id: &str,
+        resolve: &mut impl FnMut(&str) -> Result<Vec<Document>>,
+    ) -> Result<Self> {
         check_id(course_id)?;
-        if crate::library_tree::course_id(store, course_id)? != course_id {
-            return Err(scope());
-        }
         let mut entries = BTreeMap::new();
         let mut remaining = 64 * 1024 * 1024_usize;
         let mut insert = |path, bytes: Vec<u8>| -> Result<()> {
+            if let Some(previous) = entries.get(&path) {
+                return if previous == &bytes {
+                    Ok(())
+                } else {
+                    Err(conflict())
+                };
+            }
             remaining = remaining.checked_sub(bytes.len()).ok_or_else(limit)?;
             if entries.len() >= 4096 {
                 return Err(limit());
@@ -85,36 +118,56 @@ impl FrozenMaterials {
             entries.insert(path, bytes);
             Ok(())
         };
-        for summary in store.summaries().into_iter().filter(|s| {
-            matches!(
-                s.kind.as_str(),
-                "course" | "folder" | "section" | "knowledge" | "exploration" | "exercise"
-            )
-        }) {
-            // Strict ancestry, not the UI's repaired/fallback tree or courses/ glob.
-            if crate::library_tree::course_id(store, &summary.id)? != course_id {
-                continue;
-            }
-            let document = store.read(&summary.id)?;
-            if document.path != format!("courses/{}.md", document.id) {
+        let ids = std::iter::once(course_id.to_owned()).chain(
+            store
+                .summaries()
+                .into_iter()
+                .filter(|s| {
+                    matches!(
+                        s.kind.as_str(),
+                        "course" | "folder" | "section" | "knowledge" | "exploration" | "exercise"
+                    )
+                })
+                .map(|s| s.id)
+                .filter(|id| id != course_id),
+        );
+        for id in ids {
+            // Scope and stored bytes come from the SAME strict ancestry result.
+            let chain = resolve(&id)?;
+            let root = &chain.last().ok_or_else(scope)?.id;
+            if id == course_id && root != course_id {
                 return Err(scope());
             }
-            insert(
-                format!("documents/{}.md", document.id),
-                document.content.into_bytes(),
-            )?;
-        }
-        for (asset, bytes) in crate::assets::checkpoint_bytes(store, course_id)? {
-            if excluded_name(&asset.file_name) {
+            if root != course_id {
                 continue;
             }
-            let path = format!("attachments/{}/{}", asset.id, asset.file_name);
-            check_path(&path)?;
+            for document in chain {
+                if document.path != format!("courses/{}.md", document.id) {
+                    return Err(scope());
+                }
+                insert(
+                    format!("documents/{}.md", document.id),
+                    document.content.into_bytes(),
+                )?;
+            }
+        }
+        let mut excluded_files = Vec::new();
+        for (asset, bytes) in crate::assets::checkpoint_bytes(store, course_id)? {
+            if let Some(reason) = exclusion_reason(&asset.file_name) {
+                excluded_files.push(ExcludedFile {
+                    asset_id: asset.id,
+                    file_name: asset.file_name,
+                    reason: reason.into(),
+                });
+                continue;
+            }
+            let path = attachment_path(&asset.id, &asset.file_name)?;
             insert(path, bytes)?;
         }
         Ok(Self {
             course_id: course_id.into(),
             entries,
+            excluded_files,
         })
     }
 }
@@ -194,7 +247,16 @@ impl MaterialGit {
         }
         let material = self.tree(&blobs)?;
         let courses = self.tree_entries(&[("tree", &material, &frozen.course_id)])?;
-        let root = self.tree_entries(&[("tree", &courses, "materials")])?;
+        let report = self.text(
+            &["hash-object", "-w", "--no-filters", "--stdin"],
+            &serde_json::to_vec(&frozen.excluded_files)?,
+        )?;
+        let reports =
+            self.tree_entries(&[("blob", &report, &format!("{}.json", frozen.course_id))])?;
+        let root = self.tree_entries(&[
+            ("tree", &courses, "materials"),
+            ("tree", &reports, "material-exclusions"),
+        ])?;
         let mut args = vec!["commit-tree", &root];
         if let Some(parent) = parent {
             self.checkpoint(&frozen.course_id, parent)?;
@@ -233,10 +295,29 @@ impl MaterialGit {
         if self.text(&["cat-file", "-t", &material_tree_oid], &[])? != "tree" {
             return Err(scope());
         }
+        let report_path = format!("material-exclusions/{course_id}.json");
+        let report = self.git(&["ls-tree", "-z", commit_oid, "--", &report_path], &[])?;
+        let excluded_files = if report.is_empty() {
+            Vec::new() // Original v1 checkpoints had no exclusion report.
+        } else {
+            let row = std::str::from_utf8(&report).map_err(|_| scope())?;
+            let (header, name) = row.split_once('\t').ok_or_else(scope)?;
+            let parts: Vec<_> = header.split(' ').collect();
+            if parts.len() != 3
+                || parts[0] != "100644"
+                || parts[1] != "blob"
+                || name != format!("{report_path}\0")
+            {
+                return Err(scope());
+            }
+            check_oid(parts[2])?;
+            serde_json::from_slice(&self.git(&["cat-file", "blob", parts[2]], &[])?)?
+        };
         Ok(Checkpoint {
             course_id: course_id.into(),
             checkpoint_commit_oid: commit_oid.into(),
             material_tree_oid,
+            excluded_files,
         })
     }
 
@@ -338,13 +419,13 @@ impl MaterialGit {
             check_path(&path)?;
             let (added, deleted) = counts.remove(&path).ok_or_else(scope)?;
             let binary = added.is_none() || deleted.is_none();
-            let patch = if !binary && focus == Some(path.as_str()) {
-                Some(
-                    String::from_utf8(diff(&["--patch", "--full-index"], Some(&path))?)
-                        .map_err(|_| scope())?,
-                )
+            let (patch, patch_bytes) = if !binary && focus == Some(path.as_str()) {
+                match String::from_utf8(diff(&["--patch", "--full-index"], Some(&path))?) {
+                    Ok(text) => (Some(text), None),
+                    Err(error) => (None, Some(error.into_bytes())),
+                }
             } else {
-                None
+                (None, None)
             };
             changes.push(FileChange {
                 path,
@@ -353,6 +434,7 @@ impl MaterialGit {
                 deleted,
                 binary,
                 patch,
+                patch_bytes,
             });
         }
         Ok(MaterialDiff {
@@ -414,6 +496,8 @@ impl MaterialGit {
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_ATTR_NOSYSTEM", "1")
             .env("GIT_NO_REPLACE_OBJECTS", "1")
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .env("GIT_ALLOW_PROTOCOL", "")
             .env("GIT_LITERAL_PATHSPECS", "1")
             .env("LC_ALL", "C")
             .env("GIT_AUTHOR_NAME", "Learning Station")
@@ -435,6 +519,8 @@ impl MaterialGit {
                 "core.fsyncMethod=fsync",
                 "-c",
                 "gc.auto=0",
+                "-c",
+                "protocol.allow=never",
             ])
             .args(args)
             .stdin(Stdio::piped())
@@ -488,26 +574,71 @@ fn check_path(path: &str) -> Result<()> {
         Ok(())
     }
 }
-fn excluded_name(name: &str) -> bool {
+/// Canonical logical path, including existing attachment names containing ':'.
+pub fn attachment_path(asset_id: &str, file_name: &str) -> Result<String> {
+    check_id(asset_id)?;
+    if file_name.contains(['/', '\\']) || file_name.contains("..") {
+        return Err(scope());
+    }
+    let encoded = file_name.replace('%', "%25").replace(':', "%3A");
+    let path = format!("attachments/{asset_id}/{encoded}");
+    check_path(&path)?;
+    Ok(path)
+}
+
+fn exclusion_reason(name: &str) -> Option<&'static str> {
     let name = name.to_ascii_lowercase();
-    name.starts_with('.')
-        || [
-            "secret",
-            "credential",
-            "password",
-            "token",
-            "provider",
-            "models",
-            "auth",
-            "config",
-            "api_key",
-            "private_key",
-            "id_rsa",
-            "id_ed25519",
-            "cache",
-        ]
+    if name.starts_with('.') {
+        return Some("hidden_file");
+    }
+    let stem = Path::new(&name)
+        .file_stem()?
+        .to_str()?
+        .replace(['-', '.'], "_");
+    let sensitive = [
+        "secret",
+        "secrets",
+        "credential",
+        "credentials",
+        "password",
+        "passwords",
+        "token",
+        "tokens",
+        "provider",
+        "providers",
+        "models",
+        "auth",
+        "config",
+        "configuration",
+        "api_key",
+        "api_keys",
+        "private_key",
+        "id_rsa",
+        "id_ed25519",
+        "cache",
+    ];
+    let qualifiers = [
+        "config",
+        "backup",
+        "local",
+        "prod",
+        "production",
+        "dev",
+        "test",
+    ];
+    sensitive
         .iter()
-        .any(|word| name.contains(word))
+        .any(|reserved| {
+            stem == *reserved
+                || stem
+                    .strip_prefix(reserved)
+                    .and_then(|rest| rest.strip_prefix('_'))
+                    .is_some_and(|rest| rest.split('_').all(|part| qualifiers.contains(&part)))
+        })
+        .then_some("sensitive_file_name")
+}
+fn conflict() -> CoreError {
+    CoreError::new("CONFLICT", "材料冻结期间发生变化，请重试。")
 }
 fn scope() -> CoreError {
     CoreError::new("MATERIAL_SCOPE", "材料路径、课程归属或固定 Git 对象无效。")

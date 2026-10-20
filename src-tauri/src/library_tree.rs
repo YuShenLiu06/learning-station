@@ -321,7 +321,8 @@ fn parent(metadata: &Metadata) -> Result<Option<String>> {
         _ => Err(hierarchy("Markdown中的parentId不是有效稳定ID。")),
     }
 }
-fn ancestry(store: &ContentStore, id: &str) -> Result<Vec<Document>> {
+/// The returned documents are the exact versions whose metadata resolved scope.
+pub(crate) fn ancestry(store: &ContentStore, id: &str) -> Result<Vec<Document>> {
     checked_id(id)?;
     let mut result = Vec::new();
     let mut visited = BTreeSet::new();

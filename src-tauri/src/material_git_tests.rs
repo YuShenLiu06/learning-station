@@ -2,6 +2,9 @@ use super::*;
 use crate::{assets, library_tree, types::Document};
 use tempfile::TempDir;
 
+#[path = "material_git_regressions.rs"]
+mod regressions;
+
 fn node(store: &mut ContentStore, parent: Option<&str>, body: &str, request: &str) -> Document {
     let kind = if parent.is_some() {
         "section"
