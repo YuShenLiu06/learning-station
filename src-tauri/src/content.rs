@@ -52,6 +52,10 @@ impl ContentStore {
     pub fn is_trashed(&self, id: &str) -> bool {
         self.hidden_ids.contains(id)
     }
+    pub(crate) fn is_path_trashed(&self, relative: &str) -> Result<bool> {
+        self.visibility_guard()?;
+        Ok(self.hidden_paths.contains(relative))
+    }
     pub fn trashed_ids(&self) -> BTreeSet<String> {
         self.hidden_ids.clone()
     }
@@ -299,6 +303,7 @@ impl ContentStore {
         if self.hidden_paths.contains(&normalized) {
             return Err(trashed());
         }
+        crate::course_project::validate_placement(self, &normalized, &metadata)?;
         if self.index.contains_key(&metadata.id) {
             return Err(CoreError::new("ALREADY_EXISTS", "稳定 ID 已存在"));
         }
@@ -332,6 +337,7 @@ impl ContentStore {
                 .entry(key.clone())
                 .or_insert_with(|| value.clone());
         }
+        crate::course_project::validate_placement(self, &current.path, &metadata)?;
         // Creation time and existing provenance survive older clients that omit
         // them. Timestamp edits in a stale editor header are never treated as
         // evidence about the original creation of the source document.

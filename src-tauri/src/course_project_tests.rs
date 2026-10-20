@@ -442,3 +442,268 @@ fn project_create_is_idempotent_and_cross_project_move_never_reparents() {
     ))
     .is_err());
 }
+
+fn special_attachment_name_is_supported(name: &str, request: &str) {
+    let (_dir, mut store) = fixture();
+    course(&mut store, "course_a");
+    retry_busy(|| assets::import(&store, "course_a", "seed.txt", b"seed\n", "name_seed")).unwrap();
+    let imported = retry_busy(|| assets::import(&store, "course_a", name, b"{}", request));
+    let list = retry_busy(|| assets::list(&store, "course_a"));
+    let next =
+        retry_busy(|| assets::import(&store, "course_a", "next.txt", b"next\n", "name_next"));
+    eprintln!(
+        "name_bytes={}; import={:?}; list={:?}; next={:?}",
+        name.len(),
+        imported.as_ref().map(|_| ()).map_err(|e| &e.code),
+        list.as_ref().map(|v| v.len()).map_err(|e| &e.code),
+        next.as_ref().map(|_| ()).map_err(|e| &e.code)
+    );
+    let asset = imported.unwrap();
+    assert_eq!(asset.file_name, name);
+    assert_eq!(
+        retry_busy(|| assets::read(&store, "course_a", &asset.id))
+            .unwrap()
+            .text
+            .as_deref(),
+        Some("{}")
+    );
+    assert_eq!(list.unwrap().len(), 2);
+    next.unwrap();
+    assert_eq!(
+        retry_busy(|| assets::import(&store, "course_a", name, b"{}", request)).unwrap(),
+        asset
+    );
+}
+
+#[test]
+fn receipt_named_attachment_does_not_poison_the_course() {
+    special_attachment_name_is_supported(".asset.json", "receipt_name_request");
+    special_attachment_name_is_supported(".ASSET.JSON", "receipt_case_request");
+}
+
+#[test]
+fn percent_expansion_does_not_poison_the_course() {
+    special_attachment_name_is_supported(&format!("{}.txt", "%".repeat(128)), "long_name_request");
+}
+
+#[test]
+fn native_parent_edit_cannot_grant_a_sibling_course_identity() {
+    let (_dir, mut store) = fixture();
+    course(&mut store, "course_a");
+    course(&mut store, "course_b");
+    let folder = create_material(
+        &mut store,
+        metadata("folder_a", "folder", Some("course_a")),
+        "folder\n",
+    )
+    .unwrap();
+    let child = create_material(
+        &mut store,
+        metadata("child_a", "section", Some("course_a")),
+        "keep bytes\n",
+    )
+    .unwrap();
+    let moved = library_tree::move_node(&mut store, &child.id, Some(&folder.id), 0, &child.version)
+        .unwrap();
+    assert_eq!(moved.path, child.path);
+    assert_eq!(
+        library_tree::course_id(&store, &child.id).unwrap(),
+        "course_a"
+    );
+    let mut external = moved.metadata.clone();
+    external
+        .extra
+        .insert("parentId".into(), serde_json::json!("course_b"));
+    let bytes = content::serialize(&external, &moved.body).unwrap();
+    let path = store.root().join(&child.path);
+    fs::write(&path, &bytes).unwrap();
+    store.refresh().unwrap();
+    assert!(library_tree::course_id(&store, &child.id).is_err());
+    let tree = library_tree::list(&store).unwrap();
+    assert_ne!(
+        tree.nodes
+            .iter()
+            .find(|node| node.id == child.id)
+            .unwrap()
+            .course_id,
+        "course_b"
+    );
+    assert_eq!(fs::read_to_string(path).unwrap(), bytes);
+}
+
+// Reviewer-only synthetic probes, appended solely in the isolated copy.
+#[test]
+fn review51_legacy_child_cannot_move_into_project_without_a_physical_move() {
+    let (_dir, mut store) = fixture();
+    let legacy = store
+        .create(
+            metadata("legacy", "course", None),
+            "legacy\n",
+            "courses/legacy.md",
+        )
+        .unwrap();
+    let old_child = store
+        .create(
+            metadata("legacy_child", "section", Some(&legacy.id)),
+            "old bytes\n",
+            "courses/legacy_child.md",
+        )
+        .unwrap();
+    let project = course(&mut store, "project_b");
+    let moved = library_tree::move_node(
+        &mut store,
+        &old_child.id,
+        Some(&project.id),
+        0,
+        &old_child.version,
+    );
+    if let Ok(ref document) = moved {
+        eprintln!(
+            "legacy_move_success=true; logical_course={}; actual_path={}; project_root={}",
+            library_tree::course_id(&store, &document.id).unwrap(),
+            document.path,
+            course_project_root(store.root(), &project.id)
+                .unwrap()
+                .display()
+        );
+    }
+    assert!(
+        moved.is_err(),
+        "legacy-to-project reparent leaves material outside the new course's physical root"
+    );
+    assert_eq!(
+        store.read(&old_child.id).unwrap().content,
+        old_child.content
+    );
+    assert_eq!(
+        store.read(&old_child.id).unwrap().version,
+        old_child.version
+    );
+}
+
+#[test]
+fn review51_old_nested_courses_document_survives_refresh() {
+    let (_dir, mut store) = fixture();
+    let parent = store
+        .create(
+            metadata("legacy", "course", None),
+            "legacy\n",
+            "courses/legacy.md",
+        )
+        .unwrap();
+    let child = store
+        .create(
+            metadata("old_nested", "section", Some(&parent.id)),
+            "keep me\n",
+            "courses/legacy_materials/old.md",
+        )
+        .unwrap();
+    let original = fs::read(store.root().join(&child.path)).unwrap();
+    store.refresh().unwrap();
+    let read = store.read(&child.id);
+    eprintln!(
+        "old_nested_read_after_refresh={:?}; file_preserved={}",
+        read.as_ref()
+            .map(|d| d.path.as_str())
+            .map_err(|e| e.code.as_str()),
+        fs::read(store.root().join(&child.path)).unwrap() == original
+    );
+    assert!(
+        read.is_ok(),
+        "a previously accepted legacy path disappears from the document index"
+    );
+}
+
+#[test]
+fn review51_legacy_materials_component_does_not_trigger_project_routing() {
+    let (_dir, mut store) = fixture();
+    let parent = store
+        .create(
+            metadata("legacy", "course", None),
+            "legacy\n",
+            "archive/semester/materials/old.md",
+        )
+        .unwrap();
+    let child = store.create(
+        metadata("new_child", "section", Some(&parent.id)),
+        "new child\n",
+        "courses/new_child.md",
+    );
+    eprintln!(
+        "legacy_materials_parent_path={}; child_result={:?}",
+        parent.path,
+        child
+            .as_ref()
+            .map(|d| d.path.as_str())
+            .map_err(|e| e.code.as_str())
+    );
+    assert!(child.is_ok(),"only the third path component was used to mistake a legacy location for a physical project");
+}
+
+#[test]
+fn review51_save_cannot_reassign_a_project_document_to_a_sibling_course() {
+    let (_dir, mut store) = fixture();
+    course(&mut store, "course_a");
+    course(&mut store, "course_b");
+    let child = create_material(
+        &mut store,
+        metadata("child_a", "section", Some("course_a")),
+        "a bytes\n",
+    )
+    .unwrap();
+    let mut changed = child.metadata.clone();
+    changed
+        .extra
+        .insert("parentId".into(), serde_json::json!("course_b"));
+    let saved = store.save(
+        &child.id,
+        &content::serialize(&changed, &child.body).unwrap(),
+        &child.version,
+    );
+    let accepted_cross_scope = saved
+        .as_ref()
+        .is_ok_and(|doc| library_tree::course_id(&store, &doc.id).unwrap() == "course_b");
+    eprintln!(
+        "save_success={}; course_id={:?}; physical_path={}",
+        saved.is_ok(),
+        library_tree::course_id(&store, &child.id),
+        child.path
+    );
+    assert!(
+        !accepted_cross_scope,
+        "save bypasses the new physical-course move guard"
+    );
+    assert!(saved.is_err());
+    assert_eq!(store.read(&child.id).unwrap().content, child.content);
+    assert_eq!(store.read(&child.id).unwrap().version, child.version);
+}
+
+#[test]
+fn review51_project_creation_does_not_report_legacy_path_success() {
+    let (_dir, mut store) = fixture();
+    let old = library_tree::create(
+        &mut store,
+        "course",
+        "same",
+        None,
+        "body",
+        "review_same_request",
+    )
+    .unwrap();
+    let project = library_tree::create_project(&mut store, "same", "body", "review_same_request");
+    eprintln!(
+        "legacy_path={}; create_project_return={:?}",
+        old.path,
+        project
+            .as_ref()
+            .map(|d| d.path.as_str())
+            .map_err(|e| e.code.as_str())
+    );
+    assert!(
+        project.as_ref().is_err()
+            || project
+                .as_ref()
+                .is_ok_and(|d| course_project_root(store.root(), &d.id).is_ok()),
+        "create_project returns success while no project exists"
+    );
+}

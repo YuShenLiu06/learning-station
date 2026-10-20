@@ -65,8 +65,8 @@ impl Drop for LockedRoot {
 }
 
 /// Imports bytes provided by the caller, never a caller-selected system path.
-/// Metadata is the last atomic no-clobber commit marker. A partial/corrupt asset
-/// is left untouched and reported as invalid rather than silently overwritten.
+/// Both body and receipt are synced in a private staging directory before its
+/// atomic publication under the asset lock. Existing assets are never rewritten.
 pub fn import(
     store: &ContentStore,
     course_id: &str,
@@ -122,30 +122,23 @@ pub fn import(
     if existing.len() >= MAX_ASSETS || total + bytes.len() as u64 > MAX_COURSE_BYTES {
         return Err(limit("每门课程最多保存100份资料，总大小不得超过25MiB。"));
     }
-    match create_private_directory(&path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            return existing_receipt(&storage, course_id, &id, &record, project);
-        }
-        Err(error) => return Err(CoreError::io(error)),
-    }
-    checked_directory(&storage, &["assets", course_id, &id], false)?.ok_or_else(invalid_state)?;
     let name = if project {
         editable_name(file_name)
     } else {
         format!("content.{extension}")
     };
-    write_noclobber(&path, &name, bytes)?;
-    write_noclobber(
-        &path,
-        if project {
-            ".asset.json"
-        } else {
-            "metadata.json"
-        },
-        &serde_json::to_vec(&record).map_err(|_| invalid_state())?,
-    )?;
-    sync_directory(&course)?;
+    publish_asset(&course, &id, |staged| {
+        write_noclobber(staged, &name, bytes)?;
+        write_noclobber(
+            staged,
+            if project {
+                ".asset.json"
+            } else {
+                "metadata.json"
+            },
+            &serde_json::to_vec(&record).map_err(|_| invalid_state())?,
+        )
+    })?;
     Ok(record.asset)
 }
 
@@ -356,7 +349,22 @@ pub(crate) fn inspect(file_name: &str, bytes: &[u8]) -> Result<(String, &'static
 }
 
 pub(crate) fn editable_name(name: &str) -> String {
-    name.replace('%', "%25").replace(':', "%3A")
+    let encoded = name.replace('%', "%25").replace(':', "%3A");
+    if encoded.eq_ignore_ascii_case(".asset.json") || encoded.len() > 255 {
+        // The caller has already validated the allowlisted extension. Keep the
+        // original name in the receipt, and retain hidden-name exclusion.
+        let extension = name
+            .rsplit('.')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        format!(
+            "{}content.{extension}",
+            if name.starts_with('.') { "." } else { "" }
+        )
+    } else {
+        encoded
+    }
 }
 
 fn payload_hash(asset: &Asset) -> Result<String> {
@@ -384,6 +392,7 @@ fn existing_receipt(
     {
         return Err(conflict());
     }
+    sync_directory(&root.join("assets").join(course_id))?;
     Ok(requested.asset.clone())
 }
 
@@ -399,6 +408,13 @@ fn list_course(root: &Path, course_id: &str, project: bool) -> Result<Vec<Asset>
             .file_name()
             .into_string()
             .map_err(|_| invalid_state())?;
+        if id.starts_with(".import-") {
+            let metadata = fs::symlink_metadata(entry.path()).map_err(CoreError::io)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(unsafe_path());
+            }
+            continue; // A crash may leave unpublished staging; never expose or delete it.
+        }
         validate_asset_id(&id)?;
         if assets.len() >= MAX_ASSETS {
             return Err(limit("课程资料超过100份，未读取或写入更多内容。"));
@@ -640,6 +656,30 @@ fn create_private_directory(path: &Path) -> std::io::Result<()> {
     builder.create(path)
 }
 
+// The caller holds both application and on-disk asset locks. Publishing the
+// same-filesystem directory keeps readers from observing only one of its files.
+fn publish_asset(course: &Path, id: &str, write: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
+    let staged = tempfile::Builder::new()
+        .prefix(".import-")
+        .tempdir_in(course)
+        .map_err(CoreError::io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(staged.path(), fs::Permissions::from_mode(0o700))
+            .map_err(CoreError::io)?;
+    }
+    write(staged.path())?;
+    let destination = course.join(id);
+    match fs::symlink_metadata(&destination) {
+        Ok(_) => return Err(conflict()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(CoreError::io(error)),
+    }
+    fs::rename(staged.path(), &destination).map_err(CoreError::io)?;
+    sync_directory(course)
+}
+
 fn write_noclobber(directory: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     let metadata = fs::symlink_metadata(directory).map_err(CoreError::io)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -765,6 +805,35 @@ mod tests {
         )
         .unwrap();
         (directory, store, course.id, section.id, other.id)
+    }
+
+    #[test]
+    fn failed_staging_and_crash_leftovers_do_not_publish_or_block_assets() {
+        let (_dir, store, course, _, _) = fixture();
+        let seed = import(&store, &course, "seed.txt", b"seed", "staging_seed").unwrap();
+        let directory = store.root().join("assets").join(&course);
+        let id = format!("asset_{}", &digest(b"staging_failed")[..32]);
+        let error = publish_asset(&directory, &id, |staged| {
+            write_noclobber(staged, "content.txt", b"uncommitted")?;
+            Err(CoreError::new("IO", "synthetic receipt write failure"))
+        })
+        .unwrap_err();
+        assert_eq!(error.code, "IO");
+        assert!(!directory.join(&id).exists());
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        let pending = directory.join(".import-crashed");
+        fs::create_dir(&pending).unwrap();
+        fs::write(pending.join("content.txt"), b"unpublished").unwrap();
+        assert_eq!(list(&store, &course).unwrap(), vec![seed]);
+        let next = import(&store, &course, "next.txt", b"next", "staging_next").unwrap();
+        assert_eq!(list(&store, &course).unwrap().len(), 2);
+        let error = publish_asset(&directory, &next.id, |_| Ok(())).unwrap_err();
+        assert_eq!(error.code, "CONFLICT");
+        assert_eq!(
+            read(&store, &course, &next.id).unwrap().text.as_deref(),
+            Some("next")
+        );
+        assert!(pending.is_dir()); // Unknown crash data is retained, not silently removed.
     }
 
     #[test]
