@@ -1,6 +1,7 @@
 import { cloneCitation, readLocator } from './citation.ts';
 import type { AssistantReference, ContextInjection, ExerciseReference, RequestedContext } from './types';
 import { exerciseReferenceKey } from './exerciseReferences.ts';
+import { readCitationContext } from './citationContext.ts';
 const validId = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/u.test(value);
 const bytes = (value: string) => new TextEncoder().encode(value).length;
 export function freezeRequestedContext(documentId: string, selection: string, injections: ContextInjection[] = [], assistantReferences: AssistantReference[] = [], exerciseReferences: ExerciseReference[] = []): RequestedContext {
@@ -44,6 +45,6 @@ function parseRequestedContext(value: unknown, entrySelection = ''): RequestedCo
  return { documentId: data.documentId, selection: data.selection, injections, ...(assistantReferences.length ? { assistantReferences } : {}), ...(exerciseReferences.length ? { exerciseReferences } : {}) };
 }
 
-export function readRequestedContext(value: unknown, entrySelection = ''): RequestedContext | undefined {
- try { return parseRequestedContext(value, entrySelection); } catch { return; }
+export function readRequestedContext(value: unknown, entrySelection = '', auxiliary?: unknown): RequestedContext | undefined {
+ try { const parsed = parseRequestedContext(value, entrySelection); if (!parsed || auxiliary === undefined) return parsed; const citationContext = readCitationContext(auxiliary); return { ...parsed, ...(citationContext ? { citationContext } : { citationContextError: true }) }; } catch { return; }
 }
