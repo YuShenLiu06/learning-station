@@ -163,6 +163,9 @@ impl ContextBridge {
             .chain(&ctx.assistant_reference_manifest)
             .chain(&ctx.exercise_reference_manifest)
         {
+            if crate::citation_context::has_quote(ctx, &m.id) {
+                continue;
+            }
             entries.push(json!({"id":format!("reference:{}",m.id),"kind":"reference","status":"added","sourceId":m.id,"version":m.version,"includedChars":m.included_chars,"reason":"explicit_one_shot"}));
         }
         for input in request
@@ -170,11 +173,27 @@ impl ContextBridge {
             .iter()
             .filter(|i| i.selection.is_some() && auto_ids.contains(i.document_id.as_str()))
         {
+            if crate::citation_context::has_quote(ctx, &input.document_id) {
+                continue;
+            }
             let mut entry = json!({"id":format!("citation:{}",input.document_id),"kind":"reference","status":"added","sourceId":input.document_id,"version":input.expected_version,"includedChars":input.selection.as_ref().unwrap().chars().count(),"reason":"explicit_exact_selection"});
             if let Some(locator) = &input.locator {
                 entry["locator"] = json!(locator);
             }
             entries.push(entry);
+        }
+        entries.extend(crate::citation_context::inventory(ctx));
+        for input in request
+            .injections
+            .iter()
+            .filter(|i| i.selection.is_none() && auto_ids.contains(i.document_id.as_str()))
+        {
+            let m = ctx
+                .automatic_materials
+                .iter()
+                .find(|m| m.id == input.document_id)
+                .unwrap();
+            entries.push(json!({"id":format!("explicit-full:{}",m.id),"kind":"reference","status":"retained","sourceId":m.id,"version":m.version,"includedChars":m.text.chars().count(),"sourceMarkers":["citation","material"],"reason":"explicit_full_material_already_projected"}));
         }
         if !request.selection.is_empty() {
             entries.push(json!({"id":"selection","kind":"reference","status":"added","sourceId":session.section_id,"version":hash(&request.selection),"includedChars":request.selection.chars().count(),"reason":"explicit_one_shot"}));

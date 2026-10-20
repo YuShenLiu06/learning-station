@@ -14,7 +14,7 @@ const MAX_FRAMES: usize = 8;
 const MAX_DIFF_LINES: usize = 4096;
 
 /// The offsets address a captured Context.text, not marker text parsed from untrusted Markdown.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MaterialSnapshot {
     pub id: String,
     pub path: String,
@@ -24,7 +24,13 @@ pub struct MaterialSnapshot {
     pub total_bytes: usize,
     pub start: usize,
     pub end: usize,
+    /// Unicode scalars preceding the body in text; zero for body-only and text-asset providers.
+    #[serde(default, skip_serializing_if = "body_starts_at_zero")]
+    pub body_start_char: usize,
     pub asset_course: Option<String>,
+}
+fn body_starts_at_zero(value: &usize) -> bool {
+    *value == 0
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -470,6 +476,7 @@ impl Prepared {
                 value["range"] = json!(s.range());
                 value["text"] = json!(s.text);
                 value["textHash"] = json!(hash(&s.text));
+                value["bodyStartChar"] = json!(s.body_start_char);
                 value
             })
             .collect()
@@ -524,7 +531,7 @@ impl Prepared {
             let status=match mode {"unchanged"=>"retained","diff"=>"updated",
                 _ if update["reason"].as_str().is_some_and(|r|r!="baseline_unavailable") || self.stats["reason"]=="projection_budget"=>"reloaded",_=>"added"};
             json!({"id":s.id,"kind":"material","status":status,"sourceId":s.id,"version":s.version,
-                "textHash":hash(&s.text),"includedChars":s.text.chars().count(),"range":s.range(),
+                "textHash":hash(&s.text),"includedChars":s.text.chars().count(),"range":s.range(),"bodyStartChar":s.body_start_char,"coordinateSpace":if s.body_start_char==0{"body"}else{"serialized-document"},
                 "reason":update["reason"].as_str().or(self.stats["reason"].as_str()).unwrap_or("full_baseline")})
         }).collect()
     }
