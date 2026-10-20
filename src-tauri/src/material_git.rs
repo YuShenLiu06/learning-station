@@ -266,7 +266,8 @@ impl FrozenMaterials {
                 continue;
             }
             for document in chain {
-                if document.path != format!("courses/{}.md", document.id) {
+                if document.path != format!("courses/{}.md", document.id)
+                    && !(document.metadata.kind == "exercise" && document.path == format!("exercises/{}.md", document.id)) {
                     return Err(scope());
                 }
                 insert(
@@ -968,3 +969,6 @@ mod tests;
 #[cfg(test)]
 #[path = "course_git_tests.rs"]
 mod course_tests;
+
+#[cfg(test)]
+pub(crate) use tests::retry_busy;

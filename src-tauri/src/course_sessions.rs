@@ -550,6 +550,7 @@ mod tests {
             create(&mut c, &owner.id, "practice-no-source").unwrap()
         };
         let request = crate::generation::GenerationRequest {
+            focus: None,
             document_id: Some("".into()), session_id: session.id.clone(), mode: "practice".into(),
             selection: "".into(), prompt: "Create exercises".into(), request_id: "practice-empty-source".into(),
             user_entry_id: None, injections: vec![], assistant_references: vec![], exercise_references: vec![],

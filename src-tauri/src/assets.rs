@@ -1314,7 +1314,7 @@ mod lock_lifecycle_tests {
             let mut child = None;
             let outcome =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
-                    let root = lock_root(&store, true)?.unwrap();
+                    let root = lock_root(store.root(), true)?.unwrap();
                     child = Some(InheritedFile::hold(&root._lock));
                     match exit {
                         "error" => Err(invalid_state()),
@@ -1327,11 +1327,11 @@ mod lock_lifecycle_tests {
                 "unwind" => assert!(outcome.is_err()),
                 _ => outcome.unwrap().unwrap(),
             }
-            let next = lock_root(&store, false).unwrap().unwrap();
+            let next = lock_root(store.root(), false).unwrap().unwrap();
             child.take().unwrap().finish();
             // Closing an inherited descriptor of the old owner must not unlock
             // the next owner, which uses a different open-file-description.
-            assert_eq!(lock_root(&store, false).err().unwrap().code, "BUSY");
+            assert_eq!(lock_root(store.root(), false).err().unwrap().code, "BUSY");
             drop(next);
         }
     }
@@ -1344,11 +1344,11 @@ mod lock_lifecycle_tests {
             directory.path().join("state"),
         )
         .unwrap();
-        let owner = lock_root(&store, true).unwrap().unwrap();
+        let owner = lock_root(store.root(), true).unwrap().unwrap();
         for _ in 0..2 {
-            assert_eq!(lock_root(&store, false).err().unwrap().code, "BUSY");
+            assert_eq!(lock_root(store.root(), false).err().unwrap().code, "BUSY");
         }
         drop(owner);
-        assert!(lock_root(&store, false).unwrap().is_some());
+        assert!(lock_root(store.root(), false).unwrap().is_some());
     }
 }

@@ -58,6 +58,7 @@ async fn course_start_without_focus_keeps_readable_versions_separate_from_explic
         (a, b, first, second, root)
     };
     let mut request = GenerationRequest {
+            focus: None,
         session_id: first.id.clone(),
         document_id: Some(a.id.clone()),
         mode: "explain".into(),

@@ -29,3 +29,5 @@ let diff = git.compare(course_id, previous_commit_oid, &cp.checkpoint_commit_oid
 原生命令依据：[mktree](https://git-scm.com/docs/git-mktree)、[diff](https://git-scm.com/docs/git-diff)、[update-ref](https://git-scm.com/docs/git-update-ref)、[fsync](https://git-scm.com/docs/git-config#Documentation/git-config.txt-corefsync)。
 
 首轮修复回归包含确定性原子替换、祖先版本冲突、promisor/ext transport 禁止、正常教学名称/持久排除报告、存量冒号与百分号路径，以及前8192字节无NUL的可解码2×2 JPEG（17,017字节合成 fixture，非截图）的完整非UTF8 patch。附件锁占用返回可重试 BUSY，不创建检查点、不推进基准；锁释放后可重新执行只读 capture。回归显式验证此生命周期，测试夹具仅对 BUSY 做2秒内的有界重试，其他错误立即失败。无关损坏祖先的可用性、重复附件读验优化和同UID动态symlink窗口不在本轮修复范围。
+
+#12 接入补充：应用原生练习位于 `exercises/<id>.md`；仅 `kind=exercise` 且该精确路径与 `courses/<id>.md` 同样经严格祖先链校验后映射为 `documents/<id>.md`。这不开放任意旧路径或会话状态文件。

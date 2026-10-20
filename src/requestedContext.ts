@@ -1,10 +1,11 @@
 import { cloneCitation, readLocator } from './citation.ts';
-import type { AssistantReference, ContextInjection, ExerciseReference, RequestedContext } from './types';
+import type { AssistantReference, ContextInjection, ExerciseReference, RequestedContext, FocusSnapshot } from './types';
+import { readFocus } from './focus.ts';
 import { exerciseReferenceKey } from './exerciseReferences.ts';
 const validId = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/u.test(value);
 const bytes = (value: string) => new TextEncoder().encode(value).length;
-export function freezeRequestedContext(documentId: string, selection: string, injections: ContextInjection[] = [], assistantReferences: AssistantReference[] = [], exerciseReferences: ExerciseReference[] = []): RequestedContext {
- return { documentId, selection, injections: injections.map(cloneCitation), ...(assistantReferences.length ? { assistantReferences: assistantReferences.map(cloneCitation) } : {}), ...(exerciseReferences.length ? { exerciseReferences: exerciseReferences.map(cloneCitation) } : {}) };
+export function freezeRequestedContext(documentId: string, selection: string, injections: ContextInjection[] = [], assistantReferences: AssistantReference[] = [], exerciseReferences: ExerciseReference[] = [], focus?: FocusSnapshot): RequestedContext {
+ return { ...(focus ? { focus: structuredClone(focus) } : {}), documentId: focus?.documentId ?? documentId, selection, injections: injections.map(cloneCitation), ...(assistantReferences.length ? { assistantReferences: assistantReferences.map(cloneCitation) } : {}), ...(exerciseReferences.length ? { exerciseReferences: exerciseReferences.map(cloneCitation) } : {}) };
 }
 // This is the persisted request intent, never a substitute for a Run's actual manifest.
 function parseRequestedContext(value: unknown, entrySelection = ''): RequestedContext | undefined {
@@ -41,7 +42,8 @@ function parseRequestedContext(value: unknown, entrySelection = ''): RequestedCo
    const key = exerciseReferenceKey(reference); if (seenExercise.has(key)) return; seenExercise.add(key); exerciseReferences.push(reference);
   }
  }
- return { documentId: data.documentId, selection: data.selection, injections, ...(assistantReferences.length ? { assistantReferences } : {}), ...(exerciseReferences.length ? { exerciseReferences } : {}) };
+ const focus = readFocus(data.focus); if (data.focus != null && (!focus || focus.documentId !== data.documentId)) return;
+ return { ...(focus ? { focus } : {}), documentId: data.documentId, selection: data.selection, injections, ...(assistantReferences.length ? { assistantReferences } : {}), ...(exerciseReferences.length ? { exerciseReferences } : {}) };
 }
 
 export function readRequestedContext(value: unknown, entrySelection = ''): RequestedContext | undefined {

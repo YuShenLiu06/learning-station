@@ -82,3 +82,8 @@ Focus 切换时，native 的历史授权集合保留仍属于该课程的已见�
 创建与选择也返回 `Session`，仅更新会话偏好，不修改阅读文档。bootstrap 增加 `lastSessionId`、`lastCourseId`，原有字段继续保留。原 `sessionByCourse` 保留旧固定会话映射；新 `activeSessionByCourse` 记录每课程最近选择。旧会话 ID、原生私有目录及 Markdown 历史不变，新会话使用独立 Pi 绑定；无选择且存在多个候选时明确要求选择，不以最新文件猜测恢复目标。
 
 探索额外上下文复用 `ExplorationContext`，由业务入口输出 `origin=exploration-entry` 和 `originalUserEntryId`；原问题取自与确定性会话、笔记及条目ID匹配的真实入口条目，不按模式、目录或第一条用户消息猜身份。无真实标记时不生成额外场景，普通课程会话不携带此上下文。旧持久记录新增字段默认空，保留兼容读取。
+## 本轮 Focus
+
+本轮 metadata 携带 [Focus v1](focus-v1.md) 的冻结对象，含课程、焦点文档、原来源文档、视图及固定 Git OID。它与本次 nativeMaterials 来自同次冻结；重试沿原 Focus，Pi 仍独占消息/压缩管理。本层不建立材料接收基准。
+
+Focus 的 `metadataOnlySourceIds` 由 Rust 冻结 Context 生成并限制在本轮授权来源内。Pi 排除这些来源此前的自动材料投影，保留普通历史与用户主动引用；后续恢复文本时重新载入真实完整基准。Git binary 判定仅控制自动投影，不替代 read 工具的类型与授权校验。

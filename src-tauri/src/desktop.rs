@@ -480,6 +480,10 @@ async fn get_exercise_reference(
     .await
 }
 #[tauri::command]
+async fn freeze_focus(state: State<'_, Arc<Engine>>, request: crate::focus::FreezeRequest) -> Result<crate::focus::Focus> {
+    work(state.inner().clone(), move |e| { let mut core = e.lock()?; crate::focus::freeze(&mut core, request) }).await
+}
+#[tauri::command]
 async fn load_session_context(
     state: State<'_, Arc<Engine>>,
     session_id: String,
@@ -585,6 +589,7 @@ async fn start_generation(
     app: tauri::AppHandle,
     state: State<'_, Arc<Engine>>,
     session_id: String,
+    focus: Option<crate::focus::Focus>,
     document_id: Option<String>,
     mode: String,
     selection: String,
@@ -601,6 +606,7 @@ async fn start_generation(
     let run = generation::start(
         state.inner().clone(),
         GenerationRequest {
+            focus,
             document_id,
             session_id,
             mode,
@@ -1051,6 +1057,7 @@ pub fn run() {
             start_session,
             start_exploration,
             load_session_context,
+            freeze_focus,
             get_exercise_reference,
             get_ui_preferences,
             save_ui_preferences,
