@@ -8,7 +8,7 @@
 - Rust：Markdown/学习对象、授权与版本快照、Keychain、模型配置、准确映射、运行与业务回执、落盘同步。
 - React：沿用原 IPC 与来源快照；不读写 Pi 文件或密钥。
 
-`RequestContext.nativeSession` 内部字段：`directory`（Rust已核实的私有目录）、`learningSessionId`、`runId`、`userEntryId`、`authorizedSourceIds`、`protectHistory`、`legacyRecords`。前端不能提供这些路径或扩大范围。
+`RequestContext.nativeSession` 内部字段：`directory`（Rust已核实的私有目录）、`learningSessionId`、`runId`、`userEntryId`、`authorizedSourceIds`、`protectHistory`、可选 `historyBoundaryKey`、`legacyRecords`。前端不能提供这些路径或扩大范围。
 
 每个学习会话使用 `state/pi-native/sha256(sessionId)/binding.json`，绑定固定 `transcript.jsonl`。绑定不存在但目录非空、已初始化文件丢失、格式损坏或符号链接均失败。Node 独占锁只恢复已确认死亡的旧进程；不能抢活跃会话。
 
@@ -53,3 +53,13 @@ Rust 在 practice 模式显式开启 `outputValidation`，Node 每次完成最�
 首次承接旧课程时，先将原 preferences、业务会话目录和对应 Pi 目录备份到私有 `course-session-backups/<sha256(courseId)>/`，完整回执后才建立新课程对话。原对话及来源保持原样，`legacySessionIds` 供界面提示和历史查看；不选一段旧对话覆盖其他记录，不拼接 Pi 历史。备份遇到运行锁、符号链接或读写失败时不切换路由。旧练习仍按 originSessionId 作答/批改，聊天使用课程 session；引用校验同时核实原账本与课程。
 
 Focus 切换时，native 的历史授权集合保留仍属于该课程的已见来源，课程外来源仍须本轮明确提供；回收历史保护仍生效。此集合不注入其他笔记正文，不扩大 Rust ToolScope/read 工具的本轮来源列表。
+
+### 来源、移动与回收边界
+
+练习页面是可编辑视图。来源解析核对稳定页面 ID、originSessionId、exerciseEntryId、页面摘要与真实 exercise entry；来源取自原账本，不一致返回 CONTEXT_CONFLICT。旧账本缺来源时才兼容原单篇锚点。请求接受时 Rust 把归一化来源保存到可选 Run.sourceDocumentId 与问题记录；在途改页、切页和结果保存不重新选择来源。
+
+工具入口核对真实 run 的冻结 manifest、归一化来源和当前课程归属；原有档位、路径、版本、配额及回执约束继续执行。错题按原题账本取源，手动复习卡保存创建来源，旧单篇缺字段才回退原锚点。
+
+材料连同练习子树跨课程移动后，原账本及 Pi 历史保持原位；只读题目/已保存作答/公开反馈核实原账本，注入当前对话时另核实目标课程。单独跨课程移动练习在修改前拒绝。其他课程仍有活动练习依赖原账本时，回收原课程返回 SOURCE_IN_USE，先处理依赖或移回来源材料。
+
+共享会话按固定 courseId 回收；单篇材料仅收纳该材料、练习及明确来源的复习对象。整课程回收和恢复保留稳定会话 ID 与准确 Pi 绑定。课程历史保护的 historyBoundaryKey 是已排除来源集合的摘要；同一回收边界只排除旧历史一次，后续仍获授权的对话可继续保留。来源撤权或排除集合变化会重新建立权限边界，旧原始记录不删除。

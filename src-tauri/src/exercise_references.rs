@@ -188,7 +188,6 @@ pub fn project(
     if doc.metadata.kind != "exercise"
         || actual_session != Some(session.id.as_str())
         || actual_source.is_none()
-        || crate::course_sessions::source(store, session, actual_source.unwrap())? != actual_source.unwrap()
     {
         return Err(scope());
     }
@@ -331,10 +330,8 @@ pub fn validate_references(
     let mut result = vec![];
     for r in refs {
         let origin = crate::sessions::get(store, &r.session_id)?;
-        if r.session_id != session.id {
-            if session.course_id.is_none() { return Err(scope()); }
-            crate::course_sessions::source(store, session, &r.document_id)?;
-        }
+        if r.session_id != session.id && session.course_id.is_none() { return Err(scope()); }
+        crate::course_sessions::source(store, session, &r.document_id)?;
         let p = project(
             store,
             &origin,
@@ -423,10 +420,8 @@ pub fn validate_manifest(
         let document = store.read(parts[1])?;
         let origin_id = document.metadata.extra.get("originSessionId").and_then(|v| v.as_str()).ok_or_else(scope)?.to_owned();
         let origin = crate::sessions::get(store, &origin_id)?;
-        if origin.id != session.id {
-            if session.course_id.is_none() { return Err(scope()); }
-            crate::course_sessions::source(store, session, parts[1])?;
-        }
+        if origin.id != session.id && session.course_id.is_none() { return Err(scope()); }
+        crate::course_sessions::source(store, session, parts[1])?;
         let p = project(store, &origin, parts[1], parts[2], parts[3], Some(parts[4]))?;
         if p.source_id != item.id
             || p.text_hash != item.version

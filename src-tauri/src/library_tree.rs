@@ -296,6 +296,13 @@ pub fn move_node(
             "节点已被其他操作更新，请刷新后再移动。",
         ));
     }
+    if current.metadata.kind == "exercise" {
+        let origin = crate::exercises::origin(store, &current)?;
+        let source_root = course_id(store, &origin.source_document_id)?;
+        if parent_id.map(|id| course_id(store, id)).transpose()?.as_deref() != Some(source_root.as_str()) {
+            return Err(hierarchy("练习不能单独跨课程移动，请连同来源材料一起移动；原页面和账本未改变。"));
+        }
+    }
     let parent_depth = validate_parent(store, id, &current.metadata.kind, parent_id)?;
     let height = subtree_height(store, id)?;
     if parent_depth + height > MAX_DEPTH {

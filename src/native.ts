@@ -60,13 +60,13 @@ function learning(value: NativeSession, documentId = value.sectionId): LearningS
       exercises.push({ sessionId: value.id, id: exercise.id, entryId: entry.id, prompt: exercise.question, answer: attempt?.content, feedback: feedback?.content, correct: typeof feedback?.data?.correct === 'boolean' ? feedback.data.correct : undefined, format: (raw as { format?: 'exact' | 'self' }).format === 'exact' ? 'exact' : 'self', reference: ((raw as { answers?: string[] }).answers || []).join(' / '), explanation: String((raw as { explanation?: string }).explanation || ''), attemptId: attempt?.id, feedbackEntryId: feedback?.id, rubric: (raw as { rubric?: Rubric }).rubric, aiGrade: feedback?.data?.method === 'ai' && (feedback.data.aiGrade as GradeResult | undefined)?.attemptId === attempt?.id ? feedback.data.aiGrade as GradeResult : undefined, cause: typeof cause === 'string' ? cause : '', causeUpdatedAt: causeEntry?.createdAt });
     }
   }
-  const toCard = (entry: Entry): ReviewCard => ({ id: entry.id, sessionId: value.id, sectionId: value.sectionId, front: String(entry.data?.front ?? entry.content), back: String(entry.data?.back ?? ''), source: documents.get(value.sectionId)?.metadata.title || '学习记录' });
+  const toCard = (entry: Entry): ReviewCard => ({ id: entry.id, sessionId: value.id, sectionId: String(entry.data?.sourceDocumentId || (value.courseId ? '' : value.sectionId)), front: String(entry.data?.front ?? entry.content), back: String(entry.data?.back ?? ''), source: documents.get(String(entry.data?.sourceDocumentId || (value.courseId ? '' : value.sectionId)))?.metadata.title || '学习记录' });
   const origin = exerciseSessions.get(documentId);
   const ledger = origin && (sessionIds.get(origin.id) || origin);
   return { id: value.id, sectionId: documentId, courseId: value.courseId, legacySessionIds: value.legacySessionIds, ...(ledger ? { exerciseSessionId: ledger.id } : {}), sources: sources(value.contextManifest), contextAssistantReferenceManifest: value.contextAssistantReferenceManifest, contextExerciseReferenceManifest: value.contextExerciseReferenceManifest,
     messages: sessionMessages(value.entries), toolCalls: historicalTools(value.entries, value.id),
     exercises: ledger && ledger.id !== value.id ? learning(ledger).exercises : exercises,
-    mistakes: value.entries.filter(entry => entry.kind === 'error').map(entry => ({ id: entry.id, question: String(entry.data?.front ?? entry.content), reason: String(entry.data?.cause ?? ''), sectionId: value.sectionId })),
+    mistakes: value.entries.filter(entry => entry.kind === 'error').map(entry => ({ id: entry.id, question: String(entry.data?.front ?? entry.content), reason: String(entry.data?.cause ?? ''), sectionId: String(entry.data?.sourceDocumentId || (value.courseId ? '' : value.sectionId)) })),
     cards: value.entries.filter(entry => entry.kind === 'error' || entry.data?.reviewCard === true).map(toCard),
   };
 }
@@ -239,7 +239,7 @@ export async function nativeCall(command: string, payload: Record<string, unknow
       const reason = String(payload.reason);
       return learning(await append(String(payload.sectionId), 'error', reason, { exerciseId: payload.exerciseId, front: question?.question || payload.question, back: `${reference}\n\n我的错因：${reason}`, referenceBack: reference, cause: reason, causeConfirmed: true, tags: [] }, previous ? [previous.id] : [], undefined, value.id));
     }
-    case 'card_create': { const value = await append(String(payload.sectionId), 'note', `${payload.front}\n\n${payload.back || ''}`, { front: payload.front, back: payload.back, tags: [], reviewCard: true }, [], undefined, payload.sessionId ? String(payload.sessionId) : undefined); const result = learning(value); return result.cards.at(-1); }
+    case 'card_create': { const value = await append(String(payload.sectionId), 'note', `${payload.front}\n\n${payload.back || ''}`, { front: payload.front, back: payload.back, tags: [], reviewCard: true, sourceDocumentId: String(payload.sectionId || '') }, [], undefined, payload.sessionId ? String(payload.sessionId) : undefined); const result = learning(value); return result.cards.at(-1); }
     case 'review_list': return ipc('list_review_items', { query: String(payload.query || ''), courseId: payload.courseId || undefined });
     case 'review_state': return ipc('set_review_state', payload);
     case 'review_export': return ipc('export_review_items', { ids: payload.ids });

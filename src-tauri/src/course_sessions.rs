@@ -23,13 +23,7 @@ pub fn source(store: &ContentStore, session: &Session, document: &str) -> Result
     }
     let doc = store.read(document)?;
     let source = if doc.metadata.kind == "exercise" {
-        doc.metadata
-            .extra
-            .get("sourceDocumentId")
-            .and_then(|v| v.as_str())
-            .filter(|id| valid_id(id))
-            .ok_or_else(scope)?
-            .to_owned()
+        crate::exercises::origin(store, &doc)?.source_document_id
     } else {
         document.to_owned()
     };
@@ -121,9 +115,7 @@ pub fn open(core: &mut Core, document: &str, owner: &str) -> Result<(Session, Co
             legacy.sort();
             backup(core, owner, &legacy)?;
             let focus = if core.content.read(document)?.metadata.kind == "exercise" {
-                crate::exercises::get(&mut core.content, document)?
-                    .session
-                    .section_id
+                crate::exercises::origin(&core.content, &core.content.read(document)?)?.source_document_id
             } else {
                 document.to_owned()
             };

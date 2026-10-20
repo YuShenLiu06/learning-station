@@ -548,7 +548,11 @@ pub fn append(
         return Ok(old);
     }
     if let Some(frozen) = crate::context::requested_context(&entry, old.course_id.is_none().then_some(old.section_id.as_str()))? {
-        crate::course_sessions::source(store, &old, &frozen.document_id)?;
+        let source = crate::course_sessions::source(store, &old, &frozen.document_id)?;
+        if entry.data.as_ref().and_then(|d| d.get("sourceDocumentId")).and_then(Value::as_str).is_some_and(|id| id != source) {
+            return Err(CoreError::new("CONTEXT_CONFLICT", "问题的冻结来源与当前材料不一致，未改变原请求。"));
+        }
+        entry.data.as_mut().unwrap()["sourceDocumentId"] = json!(source);
         crate::assistant_references::validate_references(
             store,
             &old,
@@ -748,6 +752,16 @@ pub fn append(
                     }
                 }
             }
+        }
+    }
+    if entry.kind == "error" || entry.data.as_ref().is_some_and(|d| d["reviewCard"] == true) {
+        let data = entry.data.as_ref().cloned().unwrap_or_else(|| json!({}));
+        let mut source = record_source(&old, &data);
+        if !source.is_empty() {
+            if data.get("exerciseId").is_none() || data["origin"] == "pi-tool" {
+                source = crate::course_sessions::source(store, &old, &source)?;
+            }
+            entry.data.get_or_insert_with(|| json!({}))["sourceDocumentId"] = json!(source);
         }
     }
     entry.id = id;
@@ -1104,10 +1118,21 @@ pub fn review_items(store: &mut ContentStore, query: &str) -> Result<Vec<Value>>
     items.truncate(200);
     Ok(items)
 }
+// Exercise ownership comes from the original question entry, never the session anchor.
+fn record_source(session: &Session, data: &Value) -> String {
+    if let Some(question) = data.get("exerciseId").and_then(Value::as_str) {
+        if let Some(exercise) = session.entries.iter().filter(|e| e.kind == "exercise").find(|e| e.data.as_ref().and_then(|d| d.get("exercises")).and_then(Value::as_array).is_some_and(|qs| qs.iter().any(|q| q["id"].as_str() == Some(question)))) {
+            return exercise.data.as_ref().and_then(|d| d.get("sourceDocumentId")).and_then(Value::as_str).unwrap_or(if session.course_id.is_none() { &session.section_id } else { "" }).to_owned();
+        }
+    }
+    data.get("sourceDocumentId").and_then(Value::as_str).filter(|id| valid_id(id))
+        .unwrap_or(if session.course_id.is_none() { &session.section_id } else { "" }).to_owned()
+}
 /// Complete bounded-library candidates for exact-ID operations, independent from UI search limits.
 pub fn review_items_all(store: &mut ContentStore) -> Result<Vec<Value>> {
     let summaries = store.summaries();
     let mut grouped: BTreeMap<String, Value> = BTreeMap::new();
+    let mut session_cache = BTreeMap::new();
     for summary in summaries.into_iter().filter(|s| s.kind == "entry") {
         let doc = store.read(&summary.id)?;
         let kind = doc
@@ -1145,20 +1170,9 @@ pub fn review_items_all(store: &mut ContentStore) -> Result<Vec<Value>> {
             .unwrap_or("")
             .to_string();
         let section_id = if valid_id(&session_id) {
-            store
-                .read_relative(&format!("sessions/{session_id}/session.md"))
-                .ok()
-                .and_then(|d| {
-                    d.metadata
-                        .extra
-                        .get("sectionId")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
+            if !session_cache.contains_key(&session_id) { if let Ok(session) = get(store, &session_id) { session_cache.insert(session_id.clone(), session); } }
+            session_cache.get(&session_id).map(|session| record_source(session, &data)).unwrap_or_default()
+        } else { String::new() };
         let key = if kind == "error" {
             format!(
                 "{}:{}",

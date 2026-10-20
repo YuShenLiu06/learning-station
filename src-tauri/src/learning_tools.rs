@@ -586,6 +586,7 @@ pub fn execute(
         Operation::Query(_) | Operation::Todo(_) | Operation::Exercises(_)
         | Operation::ListSkills | Operation::LoadSkill(_) => unreachable!(),
     };
+    if let Some(data) = entry.data.as_mut() { data["sourceDocumentId"] = json!(scope.section_id); }
     if let Some(user) = &business_user {
         let data = entry.data.as_mut().ok_or_else(invalid)?;
         data["businessUserEntryId"] = json!(user);

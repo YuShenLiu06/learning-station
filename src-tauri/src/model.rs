@@ -2169,6 +2169,15 @@ mod tests {
                 .create_section("受控工具fixture", "Workspace tool fixture body.", vec![], vec![])
                 .unwrap();
             let (session, context) = core.start_session(&section.id, false).unwrap();
+            let run: crate::generation::Run = serde_json::from_value(json!({
+                "id":"run_authorized_wire","sessionId":session.id,"sourceDocumentId":section.id,
+                "mode":"question","status":"running","content":"","error":null,
+                "createdAt":crate::types::timestamp(),"updatedAt":crate::types::timestamp(),"requestDigest":"fixture",
+                "contextSnapshotVersion":1,"contextManifest":context.manifest
+            })).unwrap();
+            engine.runs.lock().unwrap().insert(run.id.clone(), crate::generation::ManagedRun {
+                run, cancel: Arc::new(AtomicBool::new(false)),
+            });
             ToolScope {
                 session_id: session.id,
                 section_id: section.id,

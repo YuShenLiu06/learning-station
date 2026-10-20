@@ -225,10 +225,15 @@ pub(crate) fn execute(
     let Some(required) = required_rank(name) else {
         return Err(not_allowed());
     };
+    let run = crate::generation::get(engine, &scope.run_id)?;
+    if run.session_id != scope.session_id || run.context_snapshot_version != 1
+        || run.source_document_id.as_ref().is_some_and(|id| id != &scope.section_id)
+        || !scope.section_id.is_empty() && !run.context_manifest.iter().any(|m| m.id == scope.section_id)
+        || scope.allowed_ids.iter().any(|id| !run.context_manifest.iter().any(|m| &m.id == id)) { return Err(out_of_scope()); }
     let state_dir = {
         let mut core = engine.lock()?;
         let session = crate::sessions::get(&mut core.content, &scope.session_id)?;
-        if session.section_id != scope.section_id {
+        if crate::course_sessions::source(&core.content, &session, &scope.section_id).map_err(|_| out_of_scope())? != scope.section_id {
             return Err(out_of_scope());
         }
         core.state_dir.clone()
@@ -694,6 +699,7 @@ mod tests {
                 "contextManifest":context.manifest
             }))
             .unwrap();
+            crate::app::atomic_json(&core.state_dir.join("runs").join(format!("{}.json", run.id)), &run).unwrap();
             engine.runs.lock().unwrap().insert(
                 run.id.clone(),
                 crate::generation::ManagedRun {
@@ -1108,5 +1114,63 @@ mod tests {
         let replay = run(&engine, &scope, "quota-0", "write", json!({"path": "f0.md", "content": "x"})).unwrap();
         assert_eq!(replay["replayed"], true);
         let _ = std::io::stdout().flush();
+    }
+}
+
+#[cfg(test)]
+mod m2_independent_review {
+    use crate::{app::{Engine,UiPreferences}, library_tree, learning_tools::ToolScope, types::*};
+    use serde_json::json;
+    #[test]
+    fn second_note_tools_keep_frozen_scope_receipts_and_sources() {
+        let d=tempfile::tempdir().unwrap();
+        let e=Engine::new(d.path().join("library"),d.path().join("state")).unwrap();
+        e.save_ui_preferences(UiPreferences{tool_authorization_tier:"read".into(),..UiPreferences::default()}).unwrap();
+        let scope={
+            let mut c=e.lock().unwrap();
+            let owner=library_tree::create(&mut c.content,"course","Owner",None,"","tool-owner").unwrap();
+            let a=library_tree::create(&mut c.content,"section","A",Some(&owner.id),"A content","tool-note-a").unwrap();
+            let b=library_tree::create(&mut c.content,"section","B",Some(&owner.id),"B content","tool-note-b").unwrap();
+            let s=c.start_session(&a.id,false).unwrap().0;
+            let ctx=c.session_context_for(&s.id,Some(&b.id),None).unwrap().1;
+            let run: crate::generation::Run=serde_json::from_value(json!({
+                "id":"tool_run_second_note","sessionId":s.id,"sourceDocumentId":b.id,"mode":"question","status":"succeeded",
+                "content":"","error":null,"createdAt":timestamp(),"updatedAt":timestamp(),
+                "requestDigest":"fixture","contextSnapshotVersion":1,"contextManifest":ctx.manifest
+            })).unwrap();
+            e.runs.lock().unwrap().insert(run.id.clone(),crate::generation::ManagedRun{run,cancel:std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))});
+            ToolScope{session_id:s.id,section_id:b.id,run_id:"tool_run_second_note".into(),allowed_ids:ctx.manifest.into_iter().map(|m|m.id).collect()}
+        };
+        let r=super::execute(&e,&scope,"read-second-note","read",json!({"sourceId":scope.section_id}));
+        println!("authorized read on second note: {:?}",r);
+        assert!(r.is_ok(),"authorized source read must follow frozen focus, not session creation anchor");
+        e.save_ui_preferences(UiPreferences{tool_authorization_tier:"write".into(),..UiPreferences::default()}).unwrap();
+        let written=super::execute(&e,&scope,"write-second-note","write",json!({"path":"answer.txt","content":"synthetic B"})).unwrap();
+        assert_eq!(written["persisted"],true);
+        assert_eq!(super::execute(&e,&scope,"write-second-note","write",json!({"path":"answer.txt","content":"synthetic B"})).unwrap()["replayed"],true);
+        assert!(super::execute(&e,&scope,"write-escape-note","write",json!({"path":"../escape","content":"x"})).is_err());
+        e.save_ui_preferences(UiPreferences{tool_authorization_tier:"bash".into(),..UiPreferences::default()}).unwrap();
+        assert_eq!(super::execute(&e,&scope,"bash-second-note","bash",json!({"command":"printf synthetic"})).unwrap()["stdout"],"synthetic");
+        let invalid={let mut c=e.lock().unwrap();let other=library_tree::create(&mut c.content,"section","Not frozen",None,"other","not-frozen-tool-note").unwrap();ToolScope{section_id:other.id,..scope.clone()}};
+        assert_eq!(super::execute(&e,&invalid,"wrong-focus-read","read",json!({"sourceId":invalid.section_id})).unwrap_err().code,"TOOL_SCOPE");
+        let mut non_frozen=scope.clone();non_frozen.allowed_ids.push("not_in_manifest".into());
+        assert_eq!(super::execute(&e,&non_frozen,"wrong-frozen-write","write",json!({"path":"x.txt","content":"x"})).unwrap_err().code,"TOOL_SCOPE");
+        let anchor={let mut c=e.lock().unwrap();crate::sessions::get(&mut c.content,&scope.session_id).unwrap().section_id};
+        let old_focus=ToolScope{section_id:anchor,..scope.clone()};
+        assert_eq!(super::execute(&e,&old_focus,"non-frozen-course-focus","read",json!({"sourceId":old_focus.section_id})).unwrap_err().code,"TOOL_SCOPE");
+        for (name,args) in [
+            ("create_note",json!({"content":"Synthetic B note"})),
+            ("create_todo",json!({"title":"Synthetic B todo"})),
+            ("generate_exercises",json!({"requirements":"B practice","exercises":[{"question":"B?","format":"exact","answers":["B"],"explanation":"B explanation","tags":[],"sourceIds":[scope.section_id]}],"summary":"B"})),
+        ] {
+            let call=crate::model::ToolCall{id:format!("second-note-{name}"),name:name.into(),args};
+            let saved=crate::learning_tools::execute(&e,&scope,&call.id,name,call.args.clone()).unwrap();
+            assert_eq!(saved["sectionId"],scope.section_id);
+            let recovered=crate::native_session::recover(&e,&scope.session_id,&scope.run_id,&call).unwrap();
+            assert_eq!(recovered["sectionId"],scope.section_id);
+            assert_eq!(recovered["recovered"],true);
+        }
+        e.save_ui_preferences(UiPreferences::default()).unwrap();
+        assert_eq!(super::execute(&e,&scope,"revoked-second-note","read",json!({"sourceId":scope.section_id})).unwrap_err().code,"TOOL_NOT_ALLOWED");
     }
 }

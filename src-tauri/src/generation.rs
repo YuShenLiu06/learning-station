@@ -35,6 +35,8 @@ pub struct GenerationRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Run {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_document_id: Option<String>,
     pub id: String,
     pub session_id: String,
     pub mode: String,
@@ -253,10 +255,11 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
     // Serialize source validation and queued-run reservation with recycle/restore operations.
     // Taking this mutex does not read a Keychain item; credentials are resolved only after context.
     let model_store = engine.model.lock().await;
-    let (ctx, session, exploration_context, projection) = {
+    let (ctx, session, exploration_context, projection, source_id) = {
         let mut core = engine.lock()?;
         let (session, mut ctx) =
             core.session_context_for(&request.session_id, request.document_id.as_deref(), Some(&request.selection))?;
+        let source_id = crate::course_sessions::source(&core.content, &session, request.document_id.as_deref().unwrap_or(&session.section_id))?;
         if let Some(entry_id) = &request.user_entry_id {
             validate_reused_user(
                 &session,
@@ -272,6 +275,9 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
                 .iter()
                 .find(|entry| &entry.id == entry_id)
                 .ok_or_else(|| CoreError::new("NOT_FOUND", "原问题记录不存在。"))?;
+            if entry.data.as_ref().and_then(|d| d.get("sourceDocumentId")).and_then(Value::as_str).is_some_and(|id| id != source_id) {
+                return Err(CoreError::new("CONTEXT_CONFLICT", "原问题的冻结来源已变化，未使用新页面替换原请求。"));
+            }
             if let Some(frozen) = context::requested_context(entry, None)? {
                 if frozen.document_id != request.document_id.as_deref().unwrap_or(&session.section_id)
                     || serde_json::to_value(frozen.exercise_references)?
@@ -322,7 +328,7 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
         } else {
             None
         };
-        (ctx, session, intent, projection)
+        (ctx, session, intent, projection, source_id)
     };
     // Resolve visible sources and recycle-bin protections before touching this app's credential.
     // The authorization tier comes only from local user preferences; a read failure stays closed.
@@ -377,6 +383,7 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
     let credentials = model_store.credentials()?;
     let stamp = timestamp();
     let run = Run {
+        source_document_id: Some(source_id.clone()),
         id: id.clone(),
         session_id: request.session_id.clone(),
         mode: request.mode.clone(),
@@ -442,7 +449,8 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
         );
     }
     drop(model_store); // Model selection cannot race credential capture and queued-run insertion.
-    let user_entry = generation_user_entry(&request, &session, &id);
+    let mut user_entry = generation_user_entry(&request, &session, &id);
+    user_entry.data.as_mut().unwrap()["sourceDocumentId"] = json!(source_id);
     record_user_and_resume(
         &engine,
         &session.id,
@@ -450,7 +458,6 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
         &id,
         request.user_entry_id.as_deref(),
     )?;
-    let source_id = { let core = engine.lock()?; crate::course_sessions::source(&core.content, &session, request.document_id.as_deref().unwrap_or(&session.section_id))? };
     let tool_scope = crate::learning_tools::ToolScope {
         session_id: session.id.clone(),
         section_id: source_id,
@@ -756,6 +763,50 @@ mod course_source_tests {
         assert_ne!(children[0].parent_id.as_deref(), Some(a.id.as_str()));
         assert_eq!(retry.entries.iter().filter(|e| e.kind == "user").count(), 1);
         assert_eq!(retry.entries.iter().find(|e| e.kind == "exercise").unwrap().data.as_ref().unwrap()["sourceDocumentId"], b.id);
+    }
+    #[tokio::test]
+    async fn in_flight_page_edits_cannot_redirect_practice_or_saved_question_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(dir.path().join("library"), dir.path().join("state")).unwrap();
+        let (session, source, page, other, ctx) = {
+            let mut c = engine.lock().unwrap();
+            let owner = crate::library_tree::create(&mut c.content, "course", "Course", None, "", "inflight-course-owner").unwrap();
+            let a = crate::library_tree::create(&mut c.content, "section", "A", Some(&owner.id), "A material", "inflight-note-a").unwrap();
+            let b = crate::library_tree::create(&mut c.content, "section", "B", Some(&owner.id), "B material", "inflight-note-b").unwrap();
+            let session = c.start_session(&a.id, false).unwrap().0;
+            let page = exercises::create_manual(&mut c.content, &session.id, &a.id, exercises::ManualExercise {
+                question: "Original A?".into(), format: "exact".into(), answers: vec!["A".into()], explanation: "A explanation".into(),
+            }, "inflight-original-exercise").unwrap().document;
+            let ctx = c.session_context_for(&session.id, Some(&page.id), None).unwrap().1;
+            (session, a, page, b, ctx)
+        };
+        let request = GenerationRequest { document_id: Some(page.id.clone()), session_id: session.id.clone(), mode: "practice".into(), selection: "".into(), prompt: "Practice original source".into(), request_id: "inflight-practice-operation".into(), user_entry_id: None, injections: vec![], assistant_references: vec![], exercise_references: vec![] };
+        let run_id = "run_inflight_source";
+        let user = generation_user_entry(&request, &session, run_id);
+        {
+            let mut c = engine.lock().unwrap();
+            let saved = sessions::append(&mut c.content, &session.id, user, None, "inflight-saved-question").unwrap();
+            assert_eq!(saved.entries.last().unwrap().data.as_ref().unwrap()["sourceDocumentId"], source.id);
+            let mut meta = page.metadata.clone(); meta.extra.insert("sourceDocumentId".into(), json!(other.id));
+            c.content.save(&page.id, &crate::content::serialize(&meta, &page.body).unwrap(), &page.version).unwrap();
+        }
+        let run: Run = serde_json::from_value(json!({
+            "id":run_id,"sessionId":session.id,"sourceDocumentId":source.id,"mode":"practice","status":"running",
+            "content":"","error":null,"createdAt":timestamp(),"updatedAt":timestamp(),"requestDigest":"fixture",
+            "contextSnapshotVersion":1,"contextManifest":ctx.manifest
+        })).unwrap();
+        engine.runs.lock().unwrap().insert(run_id.into(), ManagedRun { run, cancel: Arc::new(AtomicBool::new(false)) });
+        let mut retry = request.clone(); retry.request_id = "inflight-retry-question".into();
+        retry.user_entry_id = Some(format!("entry_{}", &hash("inflight-saved-question")[..32]));
+        assert_eq!(start(engine.clone(), retry, Arc::new(|_| {})).await.unwrap_err().code, "CONTEXT_CONFLICT");
+        let text = json!({"exercises":[{"question":"Frozen A?","format":"exact","answers":["A"],"explanation":"A explanation","tags":[],"sourceIds":[source.id]}],"summary":"Frozen A"}).to_string();
+        save_result(&engine, &request, &ctx, run_id, &text).unwrap();
+        save_result(&engine, &request, &ctx, run_id, &text).unwrap();
+        let c = engine.lock().unwrap();
+        let tree = crate::library_tree::list(&c.content).unwrap();
+        let created: Vec<_> = tree.nodes.iter().filter(|n| n.kind == "exercise" && n.id != page.id).collect();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].parent_id.as_deref(), Some(source.id.as_str()));
     }
 }
 
@@ -1121,6 +1172,7 @@ fn save_result(
         .get(run_id)
         .map(|managed| managed.run.learning_skills.clone())
         .unwrap_or_default();
+    let frozen_source = engine.runs.lock().map_err(|_| CoreError::new("BUSY", "运行记录正在使用。"))?.get(run_id).and_then(|r| r.run.source_document_id.clone());
     if request.mode == "practice" {
         let mut data = practice(text, &ctx.manifest, run_id)?;
         data["contextManifest"] = json!(ctx.manifest);
@@ -1136,7 +1188,7 @@ fn save_result(
         let output_request = format!("{run_id}-output");
         let entry_id = format!("entry_{}", &hash(&output_request)[..32]);
         let mut expected = data.clone();
-        let source_id = crate::course_sessions::source(&core.content, &session, request.document_id.as_deref().unwrap_or(&session.section_id))?;
+        let source_id = crate::course_sessions::source(&core.content, &session, frozen_source.as_deref().or(request.document_id.as_deref()).unwrap_or(&session.section_id))?;
         expected["sourceDocumentId"] = json!(source_id);
         if let Err(mut error) = exercises::create_from_snapshot(
             &mut core.content,
@@ -1269,6 +1321,7 @@ mod prestart_tests {
         let stamp = timestamp();
         let id = "run_prestart_test";
         let run = Run {
+            source_document_id: None,
             id: id.into(),
             session_id: session.id.clone(),
             mode: "explain".into(),
@@ -1585,6 +1638,7 @@ mod lifecycle_tests {
     use super::*;
     fn run(session_id: &str) -> Run {
         Run {
+            source_document_id: None,
             id: "run_lifecycle".into(),
             session_id: session_id.into(),
             mode: "question".into(),
@@ -2039,6 +2093,7 @@ mod exercise_repair_tests {
         assert!(failure.message.contains("练习内容已保存"));
         fs::remove_dir(&child_path).unwrap();
         let old = Run {
+            source_document_id: None,
             id: id.clone(),
             session_id: session.id.clone(),
             mode: "practice".into(),
@@ -2710,6 +2765,7 @@ mod recycle_integration_tests {
         }
         let id = format!("run_{}", &hash(&request.request_id)[..32]);
         let old = Run {
+            source_document_id: None,
             id: id.clone(),
             session_id: session.id.clone(),
             mode: "practice".into(),
