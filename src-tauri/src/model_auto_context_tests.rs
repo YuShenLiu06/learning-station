@@ -366,7 +366,7 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
     let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
     let server = thread::spawn(move || {
         let mut packets = vec![];
-        for _ in 0..6 {
+        for _ in 0..7 {
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
             let (mut socket, _) = loop { match listener.accept() {
                 Ok(v) => break v,
@@ -380,7 +380,7 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
         packets
     });
     let mut first = String::new();
-    for round in 0..6 {
+    for round in 0..7 {
         let document = if round == 2 { &b } else { &a };
         let (focus, messages, native) = {
             let mut c = e.lock().unwrap();
@@ -411,6 +411,7 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
             if round == 2 { assert!(body_previous.is_none()); }
             if round == 3 { assert_ne!(previous.as_deref(), Some(first.as_str()));assert_eq!(body_previous.as_deref(), Some(first.as_str())); }
             if round == 5 { assert!(previous.is_none() && body_previous.is_none()); }
+            if round == 6 { assert!(body_previous.is_none()); }
             let mut core=engine.lock()?;
             let session=sessions::get(&mut core.content,&session_id)?;
             let value=crate::material_changes::for_focus(&mut core,&session,&focus,previous.as_deref(),body_previous.as_deref())?;
@@ -419,7 +420,15 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
             assert_eq!(value["focused"]["bodyStartChar"].as_u64().unwrap() as usize,text[..text.len()-body.len()].chars().count());
             Ok(value)
         });
+        let transcript = std::path::PathBuf::from(&native.directory).join("transcript.jsonl");
         generate_scoped(ModelCredentials::new(ModelSettings { provider:"custom".into(), protocol:PROTOCOL.into(), base_url:endpoint.clone(), model:"fixture".into(), ..ModelSettings::default() }, "synthetic-fixed-git-only".into()).unwrap(), messages, Arc::new(AtomicBool::new(false)), |_|{}, None, ToolPolicy::legacy(false), vec![], Some(RequestContext { material_changes:Some(handler), native_session:Some(native), ..RequestContext::capture() })).await.unwrap();
+        if round == 4 {
+            // Invoke the real Pi API, rather than constructing Rust history or a cache.
+            let root=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+            let status=std::process::Command::new(root.join("runtime/node")).current_dir(root.join("pi-sidecar"))
+                .args(["--input-type=module","-e","import {SessionManager} from '@earendil-works/pi-coding-agent';const m=SessionManager.open(process.argv[1]);m.appendCompaction('Synthetic summary is not exact source text',m.getEntries().filter(e=>e.type==='message').at(-1).id,100);"])
+                .arg(&transcript).status().unwrap();assert!(status.success());
+        }
     }
     let packets = server.join().unwrap();
     for (round,packet) in packets.iter().enumerate() {
@@ -427,7 +436,7 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
         let turn=payloads.iter().find(|p|p["focus"].is_object()).unwrap();
         assert!(turn["focus"]["paragraphs"].as_array().unwrap().iter().all(|p|p.get("text").is_none()));
         assert!(turn["context"].as_str().unwrap().contains("materialRange"));
-        assert!(turn["contextBridgeManifest"]["entries"].as_array().unwrap().iter().any(|e|e["sourceMarkers"]==json!(["citation","material"])));
+        assert!(turn["contextBridgeManifest"]["entries"].as_array().unwrap().iter().any(|e|e["sourceMarkers"]==json!(["citation","material","focus"])));
         if round>=3 {assert!(!turn.to_string().contains("A_FIXED_CHANGED_GIT_BODY"));}
     }
     for packet in &packets[..2] { let text=packet.to_string();assert!(!text.contains("B_NOT_YET_FOCUSED_BODY")&&!text.contains("B_FIXED_SECOND_BODY"));assert_eq!(text.matches("A_FIXED_FIRST_BODY").count(),1); }
@@ -437,8 +446,10 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
     assert_eq!(packets[3]["messages"].as_array().unwrap().len(),packets[4]["messages"].as_array().unwrap().len()-2);
     assert!(!packets[5].to_string().contains("B_FIXED_SECOND_BODY"));
     assert!(packets[5].to_string().contains("A_FIXED_CHANGED_GIT_BODY"));
-    let frames: Vec<Value> = packets[5]["messages"].as_array().unwrap().iter().filter_map(|m| { let text=m["content"].as_str().map(str::to_owned).unwrap_or_else(||m["content"].as_array().into_iter().flatten().filter_map(|p|p["text"].as_str()).collect::<String>()); serde_json::from_str::<Value>(&text).ok() }).filter(|v| v["type"]=="automatic_material_projection").inspect(|v|assert!(v["bodyStartChar"].as_u64().unwrap()>0)).flat_map(|v|v["frames"].as_array().cloned().unwrap_or_default()).collect();
+    for packet in &packets[5..] {
+    let frames: Vec<Value> = packet["messages"].as_array().unwrap().iter().filter_map(|m| { let text=m["content"].as_str().map(str::to_owned).unwrap_or_else(||m["content"].as_array().into_iter().flatten().filter_map(|p|p["text"].as_str()).collect::<String>()); serde_json::from_str::<Value>(&text).ok() }).filter(|v| v["type"]=="automatic_material_projection").inspect(|v|assert!(v["bodyStartChar"].as_u64().unwrap()>0)).flat_map(|v|v["frames"].as_array().cloned().unwrap_or_default()).collect();
     assert!(!frames.is_empty() && frames.iter().all(|f|f["kind"]=="full"));
+    }
     assert!(packets[3].to_string().contains("A_FIXED_CHANGED_GIT_BODY"));
     assert!(packets.iter().all(|packet|!packet.to_string().contains("UNFROZEN_WORKSPACE_BODY_MUST_NOT_LEAK")));
 }

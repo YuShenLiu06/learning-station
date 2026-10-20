@@ -26,4 +26,4 @@ Changes 消息与原 request/run/user/native entry 绑定。实际准备请求�
 
 full commit、材料 tree、课程仓归属与各 session 接收身份分开。本层不提交聊天或做联合回滚。
 
-验证只使用合成课程、真实本地 Git、锁版 Pi 和 localhost。固定计算、Node资源/正文投影、实际私有管道分别报告；同一 Frozen/generation 接缝与前端/build分别验证；最终SHA CI、Citation补充组合与本人GUI验收仍须独立完成。
+验证只使用合成课程、真实本地 Git、锁版 Pi 和 localhost。固定计算、Node资源/正文投影、实际私有管道分别报告；同一 Frozen/generation 接缝与前端/build分别验证；已正常组合Citation be33fd5，七轮实际请求验证其materialRange和双来源、Focus元数据去正文及压缩恢复；最终SHA CI与本人GUI验收仍须独立完成。

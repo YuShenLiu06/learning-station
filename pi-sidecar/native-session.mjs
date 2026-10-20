@@ -209,12 +209,13 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
         const item=inventory.entries.find(e=>e.sourceId===source.id&&e.kind==='material');if(item){item.status=status;item.reason=status==='retained'?'native_projection_contains_baseline':status==='updated'?'native_projection_verified_diff':'native_baseline_reload';}
       }
       for(const entry of manager.buildSessionProjection().entries){if(entry.sourceEntry.type==='custom_message'&&entry.sourceEntry.customType==='learning-station-turn'&&entry.messages.length)manager.appendContextEdit(entry.sourceEntry.id,null);}
-      const projectedMaterial=manager.buildSessionProjection().entries.filter(e=>e.messages.length&&e.sourceEntry.type==='custom_message'&&['learning-station-material','learning-station-changes'].includes(e.sourceEntry.customType)).flatMap(e=>e.messages.map(text)).join('\n')+(envelope.nativeReferences??'')+(loadChanges?'':(envelope.focus?.paragraphs??[]).map(p=>p.text??'').join(''));
+      const focusBodyProjected=currentSources.some(s=>s.id===(envelope.focus?.asset?.id??envelope.focus?.documentId)&&s.range?.complete&&(!envelope.focus?.documentVersion||s.version===envelope.focus.documentVersion));
+      const projectedMaterial=manager.buildSessionProjection().entries.filter(e=>e.messages.length&&e.sourceEntry.type==='custom_message'&&['learning-station-material','learning-station-changes'].includes(e.sourceEntry.customType)).flatMap(e=>e.messages.map(text)).join('\n')+(envelope.nativeReferences??'')+(focusBodyProjected?'':(envelope.focus?.paragraphs??[]).map(p=>p.text??'').join(''));
       inventory.projectedChars=[...projectedMaterial].length;inventory.projectedBytes=Buffer.byteLength(projectedMaterial);
       const turn={...envelope};delete turn.nativeMaterials;delete turn.learningHistory;delete turn.historyManifest;delete turn.context;delete turn.question;
-      // The fixed full/diff frames above own the automatic Focus body. Keep the
+      // The verified full/diff frames above own the automatic Focus body. Keep the
       // frozen source untouched; repeating visible text here bypasses that chain.
-      if(loadChanges&&currentSources.length&&turn.focus?.paragraphs){turn.focus={...turn.focus,paragraphs:turn.focus.paragraphs.map(({text,...location})=>location)};for(const item of inventory.entries)if(item.kind==='turn'&&(item.id==='focus'||item.id.startsWith('focus:'))){item.includedChars=0;item.reason='focus_location';}}
+      if(focusBodyProjected&&turn.focus?.paragraphs){turn.focus={...turn.focus,paragraphs:turn.focus.paragraphs.map(({text,...location})=>location)};for(const item of inventory.entries)if(item.kind==='turn'&&(item.id==='focus'||item.id.startsWith('focus:'))){item.includedChars=0;item.reason='focus_location';}}
       turn.context=envelope.nativeReferences??'';delete turn.nativeReferences;turn.contextBridgeManifest=inventory;
       manager.appendCustomMessageEntry('learning-station-turn',JSON.stringify(turn),false,{runId:spec.runId});
       agent.state.messages=manager.buildSessionContext().messages;

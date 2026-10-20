@@ -26,7 +26,7 @@ type FocusSnapshot = {
 
 ## 请求、运行与恢复
 
-普通发送与快捷练习先冻结，再保存 `RequestedContext.focus`；`GenerationRequest.focus`、Run、Pi 本轮 metadata、assistant 自身来源清单保存同一对象。聚焦附件在同次 Context.manifest 登记真实身份和实际字符数；图片/PDF 登记0字符元数据。ContextBridge 的 focus turn 条目记录真实来源、版本及段落范围，与 Pi 实际清单、Run 和 assistant 同源。Git 判为 binary 的自动材料从 Context 正文及 nativeMaterials 一并移除，清单保留身份/版本并记0字符；Focus.paragraphs 为空。ContextBridge 的 metadataOnlySourceIds 只使 Pi 排除同来源的旧自动材料投影，不擦除普通会话、主动工具结果或用户明确引用。支持的 UTF-8 Markdown 即使 Git 判 binary，已授权主动 read 仍按原固定 OID 返回；自动投影规则不扩大或取消 read 档位。附件 read 依据已验证 MIME 仅支持文本/Markdown/CSV/JSON，图片字节即使可解码为 UTF-8 仍拒绝；PDF 导入未支持。真实材料读取和 query/read 工具按本 Run 的固定 OID；权限档位、回收可见性和课程归属仍独立校验，不因历史快照扩大授权。
+普通发送与快捷练习先冻结，再保存 `RequestedContext.focus`；`GenerationRequest.focus`、Run、assistant 自身来源清单保留同一完整审计对象；目标正文已有完整材料投影时，Pi本轮metadata只保留位置与范围，不重复段落text，实际字符数排除该副本。聚焦附件在同次 Context.manifest 登记真实身份和实际字符数；图片/PDF 登记0字符元数据。ContextBridge 的 focus turn 条目记录真实来源、版本及段落范围，与 Pi 实际清单、Run 和 assistant 同源。Git 判为 binary 的自动材料从 Context 正文及 nativeMaterials 一并移除，清单保留身份/版本并记0字符；Focus.paragraphs 为空。ContextBridge 的 metadataOnlySourceIds 只使 Pi 排除同来源的旧自动材料投影，不擦除普通会话、主动工具结果或用户明确引用。支持的 UTF-8 Markdown 即使 Git 判 binary，已授权主动 read 仍按原固定 OID 返回；自动投影规则不扩大或取消 read 档位。附件 read 依据已验证 MIME 仅支持文本/Markdown/CSV/JSON，图片字节即使可解码为 UTF-8 仍拒绝；PDF 导入未支持。真实材料读取和 query/read 工具按本 Run 的固定 OID；权限档位、回收可见性和课程归属仍独立校验，不因历史快照扩大授权。
 
 切页后的进度只更新该 operation 保存的文档来源显示，不能把最新页面当作旧请求状态。取消不删除快照；重试沿原 Focus/引用，工作区编辑不会混入旧请求。未知结果沿原 operation 核对。旧记录缺 Focus 明确显示未记录；既有无课程 legacy 会话保留兼容发送路径，不伪造 Git Focus。
 

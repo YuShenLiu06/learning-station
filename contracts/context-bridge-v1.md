@@ -50,6 +50,6 @@ type ContextBridgeManifest = {
 Focus由独立冻结接口传入，仍自动加载聚焦正文；本层空来源只取消无Focus开局的自动笔记加载，不取消Focus正文或显式Citation补充。Focus首次或Pi实际上下文缺基准时完整提供；有效全文基准存在时可沿固定Git OID提交聚焦diff，无变化不重复，接收基准按会话独立并由Pi实际投影/回执确认，Git提交不算模型已收。
 ## Focus
 
-`GenerationRequest.focus`、`Run.focus` 与 assistant 自身 `entry.data.focus` 使用 [Focus v1](focus-v1.md) 的同一个冻结对象；Pi turn metadata 接收同一值。Focus 不从最新 Session 或页面回填。queued Focus 表示已冻结请求，不冒充 Pi 已接收材料基线。
+`GenerationRequest.focus`、`Run.focus` 与 assistant 自身 `entry.data.focus` 使用 [Focus v1](focus-v1.md) 的同一个冻结对象；审计快照保留完整Focus；目标完整正文已由材料投影供给时，Pi turn metadata仅保留身份、位置和范围，不重复段落text，字符数按实际投影统计。Focus 不从最新 Session 或页面回填。queued Focus 表示已冻结请求，不冒充 Pi 已接收材料基线。
 
 Focus 使用同 checkpoint 的 Git binary 判定移除自动材料正文，清单保留0字符元数据；`metadataOnlySourceIds` 同步排除 Pi 旧自动材料投影。用户明确选区/引用及经授权的主动文本 read 沿各自原协议，不能把元数据身份当作图片正文读取权限。

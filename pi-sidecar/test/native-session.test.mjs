@@ -18,10 +18,10 @@ test('a course trash boundary excludes old material once and retains later permi
 test('frozen Focus remains on the native turn across cancelled-run retry without another user message',async()=>{
  const s=spec(),focus={id:hash('focus'),courseId:'course_1',documentId:'doc_1',sourceDocumentId:'doc_1',path:'documents/doc_1.md',type:'markdown',view:'read',commitHash:'1'.repeat(40),materialTreeOid:'2'.repeat(40),excludedFiles:[],paragraphs:[{start:0,end:8,text:'Material'}]};
  const focusEntry={id:'focus:0',kind:'turn',status:'added',sourceId:'doc_1',version:'v1',includedChars:8,range:{startChar:0,endChar:8,complete:true,totalBytes:8},reason:'focus_visible_body'};const inventory={...envelope.contextBridgeManifest,entries:[...envelope.contextBridgeManifest.entries,focusEntry]};let actual;
- let n=await openNativeSession(s,{...options(),onManifest:m=>{actual=m;}});await n.applyContext({...envelope,contextBridgeManifest:inventory,focus:structuredClone(focus)});assert.deepEqual(actual.entries.find(e=>e.id==='focus:0'),focusEntry);await n.prompt('First question');n.close();
+ let n=await openNativeSession(s,{...options(),onManifest:m=>{actual=m;}});await n.applyContext({...envelope,contextBridgeManifest:inventory,focus:structuredClone(focus)});assert.deepEqual(actual.entries.find(e=>e.id==='focus:0'),{...focusEntry,includedChars:0,reason:'focus_location'});await n.prompt('First question');n.close();
  let observed;n=await openNativeSession({...s,runId:'run_retry_focus'},options(fixture(c=>observed=c)));await n.applyContext({...envelope,contextBridgeManifest:inventory,focus:structuredClone(focus)});await n.prompt('First question');
  const turns=n.manager.buildSessionProjection().entries.filter(e=>e.messages.length&&e.sourceEntry.type==='custom_message'&&e.sourceEntry.customType==='learning-station-turn');
- assert.equal(turns.length,1);assert.deepEqual(JSON.parse(turns[0].sourceEntry.content).focus,focus);assert.deepEqual(JSON.parse(turns[0].sourceEntry.content).contextBridgeManifest.entries.find(e=>e.id==='focus:0'),focusEntry);assert(JSON.stringify(observed.messages).includes('documents/doc_1.md'));assert.equal(n.manager.getEntries().filter(e=>e.type==='message'&&e.message.role==='user').length,1);n.close();
+ assert.equal(turns.length,1);assert.deepEqual(JSON.parse(turns[0].sourceEntry.content).focus,{...focus,paragraphs:[{start:0,end:8}]});assert.deepEqual(JSON.parse(turns[0].sourceEntry.content).contextBridgeManifest.entries.find(e=>e.id==='focus:0'),{...focusEntry,includedChars:0,reason:'focus_location'});assert(JSON.stringify(observed.messages).includes('documents/doc_1.md'));assert.equal(n.manager.getEntries().filter(e=>e.type==='message'&&e.message.role==='user').length,1);n.close();
 });
 test('metadata-only material removes its old automatic body while keeping ordinary native conversation and explicit references',async()=>{
  const s=spec(),old='R2_OLD_AUTOMATIC_BODY_MARKER',source={...envelope.nativeMaterials[0],text:old,textHash:hash(old),frames:[{kind:'full',version:'v1',textHash:hash(old),text:old}]};let n=await openNativeSession(s,options());await n.applyContext({...envelope,nativeMaterials:[source]});await n.prompt('First question');await n.complete('Fixture answer');n.close();
@@ -184,4 +184,17 @@ test('registered and unregistered excluded course files keep separate auditable 
  const s=spec();let manifest;const excludedFiles=['private.env','nested/private.env'].map(fileName=>({assetId:'',fileName,reason:'sensitive_file_name'}));excludedFiles.push(...['private.env','.asset.json'].map(fileName=>({assetId:'asset_fixture',fileName,reason:'sensitive_file_name'})));
  const n=await openNativeSession(s,{...options(),onManifest:m=>manifest=m,loadChanges:async r=>changeReply(r.baseCommitOid,focused('doc_1','Body'),[],{checkpoint:{courseId:'course_fixture',checkpointCommitOid:cp1,materialTreeOid:tree,excludedFiles}})});
  await n.applyContext(changesEnvelope());const excluded=manifest.entries.filter(e=>e.reason==='excluded:sensitive_file_name');assert.equal(new Set(excluded.map(e=>e.id)).size,4);assert.deepEqual(excluded.map(e=>e.fileName),excludedFiles.map(e=>e.fileName));assert(excluded.slice(0,2).every(e=>e.sourceId===undefined));assert(excluded.slice(2).every(e=>e.sourceId==='asset_fixture'));assert(excluded.every(e=>e.includedChars===0));n.close();
+});
+
+test('legacy nativeMaterials Focus removes metadata body from actual full/diff/unchanged and compaction requests',async()=>{
+ const s=spec();let seen;const changed='LEGACY_FOCUS_CHANGED_BODY',source={...envelope.nativeMaterials[0],version:'v2',text:changed,textHash:hash(changed),frames:[...envelope.nativeMaterials[0].frames,{kind:'diff',version:'v2',baseHash:hash('Material'),textHash:hash(changed),unifiedDiff:'LEGACY_COMPLETE_DIFF'}]};
+ for(let i=0;i<4;i++){
+  const body=i<1?'Material':changed;const n=await openNativeSession({...s,runId:'legacy_focus_'+i,userEntryId:'legacy_user_'+i},options(fixture(c=>seen=c)));
+  const current={...envelope,nativeMaterials:i===0?envelope.nativeMaterials:[source],focus:{documentId:'doc_1',paragraphs:[{start:0,end:body.length,text:body}]}};
+  await n.applyContext(current);await n.prompt('Legacy Focus '+i);assert.equal(current.focus.paragraphs[0].text,body);
+  const turn=seen.messages.map(m=>{try{return JSON.parse(text(m));}catch{return {};}}).find(v=>v.focus);assert.deepEqual(turn.focus.paragraphs,[{start:0,end:body.length}]);assert(!JSON.stringify(turn).includes(body));
+  const frame=JSON.parse(materialEntries(n).at(-1).content).frames[0];assert.equal(frame.kind,i===1||i===2?'diff':'full');
+  if(i===2)n.manager.appendCompaction('Synthetic summary is not a body',n.manager.getEntries().filter(e=>e.type==='message').at(-1).id,100);
+  n.close();
+ }
 });
