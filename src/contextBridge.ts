@@ -13,7 +13,7 @@ export function readContextBridgeManifest(value: unknown): ContextBridgeManifest
    range = { startChar: item.range.startChar, endChar: item.range.endChar, complete: item.range.complete, totalBytes: item.range.totalBytes };
   }
   let locator: ContextBridgeManifest['entries'][number]['locator'];
-  if (item.locator !== undefined) {
+  if (item.locator != null) {
    if (!record(item.locator) || !count(item.locator.startChar) || !count(item.locator.endChar) || item.includedChars === 0 || item.locator.endChar - item.locator.startChar !== item.includedChars) return;
    locator = { startChar: item.locator.startChar, endChar: item.locator.endChar };
   }

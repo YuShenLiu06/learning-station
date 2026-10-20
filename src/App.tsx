@@ -128,7 +128,7 @@ export function App() {
   const selectionCitation = useRef<ContextInjection | undefined>(undefined);
   const selectionDraftBody = useRef<string | undefined>(undefined);
   const selectionSourceBody = useRef<string | undefined>(undefined);
-  const preparingReferences = useRef(false);
+  const preparingOperation = useRef('');
   function setSelection(value: string, locator?: CitationLocator, sourceBody?: string) {
     if (value) { const doc = docsRef.current[activeIdRef.current]; if (!doc) return; const body = sourceBody ?? doc.body; const located = locator ? { selection: value, locator } : locateCitation(body, value); selectionCitation.current = { documentId: activeIdRef.current, expectedVersion: doc.section.version, ...located }; selectionDraftBody.current = body !== doc.savedBody ? body : undefined; selectionSourceBody.current = body; }
     else { selectionCitation.current = undefined; selectionDraftBody.current = undefined; selectionSourceBody.current = undefined; }
@@ -352,12 +352,17 @@ export function App() {
       if (docsRef.current[id].body !== docsRef.current[id].savedBody) throw new Error('正文尚未保存，请先处理保存提示。当前选句与问题仍保留。');
     }
   }
-  async function prepareReferences(documentId: string, targetSession: string) {
-    if (preparingReferences.current) return;
-    preparingReferences.current = true;
+  function releaseOperation(id: string) {
+    if (busyRef.current !== id) return false;
+    busyRef.current = ''; setBusyId('');
+    return true;
+  }
+  async function prepareReferences(documentId: string, targetSession: string, operationId: string) {
+    if (busyRef.current !== operationId) return;
+    preparingOperation.current = operationId;
     const revision = selectionStateRef.current.revision;
     const queues = [injectionsRef.current[targetSession], assistantReferencesRef.current[targetSession], exerciseReferencesRef.current[targetSession]] as const;
-    const unchanged = () => activeIdRef.current === documentId && visibleSessionRef.current === targetSession && revision === selectionStateRef.current.revision && queues[0] === injectionsRef.current[targetSession] && queues[1] === assistantReferencesRef.current[targetSession] && queues[2] === exerciseReferencesRef.current[targetSession];
+    const unchanged = () => busyRef.current === operationId && activeIdRef.current === documentId && visibleSessionRef.current === targetSession && revision === selectionStateRef.current.revision && queues[0] === injectionsRef.current[targetSession] && queues[1] === assistantReferencesRef.current[targetSession] && queues[2] === exerciseReferencesRef.current[targetSession];
     try {
       await prepareSource(documentId);
       if (!unchanged()) throw new Error('页面或引用已变化，请核对后发送；问题与引用仍保留。');
@@ -365,7 +370,7 @@ export function App() {
       await call<RequestContext>('context_load', { sessionId: targetSession, sectionId: sessions[documentId]?.sectionId || documentId, documentId, selection: '', injections: frozen, assistantReferences: freezeAssistantReferences(queues[1]), exerciseReferences: freezeExerciseReferences(queues[2]) });
       if (!unchanged() || JSON.stringify(frozen) !== JSON.stringify(materialReferences(targetSession))) throw new Error('核对期间正文、页面或引用已变化，请重新发送；输入仍保留。');
       return frozen;
-    } finally { preparingReferences.current = false; }
+    } finally { if (preparingOperation.current === operationId) preparingOperation.current = ''; }
   }
   useEffect(() => {
     if (!nativeAvailable) return;
@@ -508,9 +513,11 @@ export function App() {
         userEntryId = saved.userEntryId; patchOutgoing(item.sendId, { userEntryId }); updateTargetSession(saved.session);
       }
       patchOutgoing(item.sendId, { stage: 'preparing' });
-      await prepareSource(item.documentId || item.sectionId);
-      const context = await call<RequestContext>('context_load', { sessionId: item.sessionId, sectionId: item.sectionId, selection: item.selection, injections: item.injections || [], assistantReferences: item.assistantReferences || [], exerciseReferences: item.exerciseReferences || [] });
-      if (visibleSessionRef.current === item.sessionId) setContextView({ status: 'loading', sessionId: item.sessionId, context });
+      if (item.failureStage !== 'unknown') {
+        await prepareSource(item.documentId || item.sectionId);
+        const context = await call<RequestContext>('context_load', { sessionId: item.sessionId, sectionId: item.sectionId, selection: item.selection, injections: item.injections || [], assistantReferences: item.assistantReferences || [], exerciseReferences: item.exerciseReferences || [] });
+        if (visibleSessionRef.current === item.sessionId) setContextView({ status: 'loading', sessionId: item.sessionId, context });
+      }
       patchOutgoing(item.sendId, { stage: 'generating' });
       const result = await call<LearningSession>('session_ask', { sectionId: item.sectionId, sessionId: item.sessionId, mode: item.mode, question: item.content, selection: item.selection, userEntryId, operationId, injections: item.injections || [], assistantReferences: item.assistantReferences || [], exerciseReferences: item.exerciseReferences || [], resume: item.failureStage === 'unknown' });
       updateTargetSession(result, item.detached); patchOutgoing(item.sendId, { stage: 'done', error: undefined, failureStage: undefined });
@@ -519,7 +526,7 @@ export function App() {
       patchOutgoing(item.sendId, { stage: 'failed', userEntryId, error: modelFailureMessage(error, 'generation'), failureStage: !userEntryId ? 'save' : details?.sendStage === 'unknown' ? 'unknown' : 'generation' });
     } finally {
       await refreshAfterGeneration(target, item.detached);
-      if (busyRef.current === operationId) { busyRef.current = ''; setBusyId(''); }
+      releaseOperation(operationId);
     }
   }
   async function ask(preset?: string) {
@@ -528,10 +535,11 @@ export function App() {
     if (modelChangingRef.current) { notify('正在更换模型，请稍候再提问。'); return; }
     if (!canCompose || !session.id) { setAiError('学习会话尚未就绪，请重试打开，问题仍保留。'); return; }
     if (!modelReady) { notify(modelBlocked ? '此模型用途受限，请查看供应商设置。问题仍保留，未发送请求。' : '请先保存供应商连接，问题仍保留。'); openSettings(); return; }
-    let frozenMaterials: ContextInjection[] | undefined; try { frozenMaterials = await prepareReferences(activeId, session.id); if (!frozenMaterials) return; } catch (error) { notify(errorText(error)); return; }
     const operationId = makeId();
-    const item: OutgoingMessage = { sendId: makeId(), operationId, sessionId: session.id, sectionId: session.sectionId, detached: false, documentId: activeId, mode: isExplorationDocument(nodesRef.current, activeId, explorationFolderId.current) ? 'explore' : 'explain', content: value, selection: requestSelection, injections: frozenMaterials, assistantReferences: freezeAssistantReferences(assistantReferencesRef.current[session.id] || []), exerciseReferences: freezeExerciseReferences(exerciseReferencesRef.current[session.id] || []), createdAt: new Date().toISOString(), stage: 'saving' };
     busyRef.current = operationId; setBusyId(operationId); setPartial(null); setActiveRunId(''); setAiError('');
+    let frozenMaterials: ContextInjection[] | undefined; try { frozenMaterials = await prepareReferences(activeId, session.id, operationId); } catch (error) { if (releaseOperation(operationId)) notify(errorText(error)); return; }
+    if (!frozenMaterials || busyRef.current !== operationId) { releaseOperation(operationId); return; }
+    const item: OutgoingMessage = { sendId: makeId(), operationId, sessionId: session.id, sectionId: session.sectionId, detached: false, documentId: activeId, mode: isExplorationDocument(nodesRef.current, activeId, explorationFolderId.current) ? 'explore' : 'explain', content: value, selection: requestSelection, injections: frozenMaterials, assistantReferences: freezeAssistantReferences(assistantReferencesRef.current[session.id] || []), exerciseReferences: freezeExerciseReferences(exerciseReferencesRef.current[session.id] || []), createdAt: new Date().toISOString(), stage: 'saving' };
     rememberReferenceConsumption(item.sendId, item.sessionId, activeId, visibleSelection);
     updateOutgoing(items => [...items, item]);
     setQuestion(old => old.trim() === value ? '' : old);
@@ -553,6 +561,7 @@ export function App() {
 
   async function cancel() {
     const id = busyRef.current; if (!id) return;
+    if (preparingOperation.current === id) { preparingOperation.current = ''; releaseOperation(id); notify('已停止本次提问，问题与引用仍保留；正文保存可能继续完成。'); return; }
     try { await call('operation_cancel', { operationId: id }); notify('已请求停止生成，已保存的对话仍保留。'); }
     catch (error) { notify(`停止请求未确认：${errorText(error)}`); }
   }
@@ -563,16 +572,17 @@ export function App() {
     if (!retry && practiceFailure?.sourceId === activeId && practiceFailure.unknown) { notify('上次练习结果未确认，请先核对原请求。'); return; }
     const previous = retry && practiceFailure?.sourceId === activeId ? practiceFailure : null;
     const id = previous?.unknown ? previous.operationId : makeId(); const selected = previous ? previous.selection : requestSelection;
-    let frozen: ContextInjection[] | undefined; try { frozen = previous ? previous.injections : await prepareReferences(activeId, session.id); if (!frozen) return; } catch (error) { notify(errorText(error)); return; }
+    busyRef.current = id; setBusyId(id); setPartial(null); setActiveRunId(''); setAiError('');
+    let frozen: ContextInjection[] | undefined; try { frozen = previous ? previous.injections : await prepareReferences(activeId, session.id, id); } catch (error) { if (releaseOperation(id)) notify(errorText(error)); return; }
+    if (!frozen || busyRef.current !== id) { releaseOperation(id); return; }
     const prompt=previous?previous.prompt:composerQuestion.trim();
     const frozenAnswers=previous?previous.assistantReferences:freezeAssistantReferences(assistantReferencesRef.current[session.id] || []);
     const frozenExercises=previous?previous.exerciseReferences:freezeExerciseReferences(exerciseReferencesRef.current[session.id] || []);
     if (previous) { const old = referenceConsumption.current.get(previous.operationId); if (old) { referenceConsumption.current.set(id, old); if (id !== previous.operationId) referenceConsumption.current.delete(previous.operationId); } } else rememberReferenceConsumption(id, session.id, activeId, visibleSelection);
-    busyRef.current = id; setBusyId(id); setPartial(null); setAiError('');
     const sourceId = activeId; let succeeded = false;
-    try { await prepareSource(sourceId); const result = await call<LearningSession>('exercise_generate', { sectionId: sourceId, sessionId: session.id, selection: selected, prompt, injections: frozen, assistantReferences: frozenAnswers, exerciseReferences: frozenExercises, userEntryId: previous?.userEntryId, operationId: id, resume: previous?.unknown === true }); updateTargetSession(result); setPracticeFailure(null); succeeded = true; }
+    try { if (!previous?.unknown) await prepareSource(sourceId); const result = await call<LearningSession>('exercise_generate', { sectionId: sourceId, sessionId: session.id, selection: selected, prompt, injections: frozen, assistantReferences: frozenAnswers, exerciseReferences: frozenExercises, userEntryId: previous?.userEntryId, operationId: id, resume: previous?.unknown === true }); updateTargetSession(result); setPracticeFailure(null); succeeded = true; }
     catch (error) { const details = error instanceof StationError ? error.details as { sendStage?: string; recovery?: string } | undefined : undefined; const recovery = details?.recovery === 'same-operation'; const unknown = recovery || details?.sendStage === 'unknown'; setPracticeFailure({ operationId: id, sourceId, selection: selected, prompt, injections: frozen, assistantReferences: frozenAnswers, exerciseReferences: frozenExercises, userEntryId: confirmedPracticeUsers.current.get(id) || previous?.userEntryId, unknown, recovery }); if (busyRef.current === id) setAiError(modelFailureMessage(error, 'generation')); }
-    finally { const tree = await refreshTree(); await refreshAfterGeneration(session, false); if (busyRef.current === id) { busyRef.current = ''; setBusyId(''); } if (succeeded && activeIdRef.current === sourceId) { const child = tree?.nodes.filter(node => node.parentId === sourceId && node.kind === 'exercise').at(-1); if (child) await openSection(child.id); } }
+    finally { const tree = await refreshTree(); await refreshAfterGeneration(session, false); releaseOperation(id); if (succeeded && activeIdRef.current === sourceId) { const child = tree?.nodes.filter(node => node.parentId === sourceId && node.kind === 'exercise').at(-1); if (child) await openSection(child.id); } }
   }
   async function submitAnswer(exercise: Exercise, answer: string) {
     const result = await call<LearningSession>('exercise_answer', { sectionId: activeId, sessionId: session.id, exerciseId: exercise.id, entryId: exercise.entryId, answer });
@@ -804,7 +814,7 @@ export function App() {
           <div className="messages">{displayedMessages.map(message => <article className={`message ${message.role}`} key={message.clientMessageId || message.id} tabIndex={-1} data-assistant-entry={message.role==='assistant'?message.id:undefined} data-assistant-session={session.id}><div className="message-label">{message.role === 'user' ? '我的问题' : message.role === 'note' ? <><FileText size={12} />学习记录 · AI整理{message.needsConfirmation && <span className="pending-label">待确认</span>}</> : <><Sparkles size={12} />学习助手</>}</div>{message.role==='assistant'&&message.runId&&<ToolActivityCards items={toolCalls.filter(item=>item.runId===message.runId)} onOpen={object=>{void openToolObject(object);}}/>}{message.role === 'user' && <MessageReferences value={message.requestedContext} onOpen={(id,version) => { void openSourceDocument(id,version); }} onOpenAssistant={item => { void openAssistantQuote(item); }}/>}<div className={message.role === 'assistant' ? 'assistant-answer-content' : undefined} tabIndex={message.role === 'assistant' ? 0 : undefined} onContextMenu={event=>{if(message.role==='assistant')assistantMenu(event,message,session.id);}} onKeyDown={event=>{if(message.role==='assistant')assistantMenu(event,message,session.id);}}><Markdown text={message.content} courseId={courseId} onAsset={(id,assetId)=>{void openAsset(id,assetId);}} /></div>{message.role === 'assistant' && <button type="button" className="message-save message-reply" aria-label="回复这条回答" onClick={() => { void replyToAssistant(message, session.id); }}><CornerUpLeft size={14}/>回复</button>}{message.outgoing && message.outgoing.stage !== 'done' && <div className={`message-delivery ${message.outgoing.stage}`} role="status"><span>{sendStageLabel(message.outgoing)}</span>{message.outgoing.error && <p>{message.outgoing.error}</p>}{message.outgoing.stage === 'failed' && <button className="quiet-button" disabled={!!busyId || modelChanging} onClick={() => { void retrySend(message.outgoing!.sendId); }}>{message.outgoing.failureStage === 'unknown' ? '核对生成状态' : message.outgoing.userEntryId ? '重试生成' : '重试保存并生成'}</button>}</div>}{message.role === 'assistant' && (message.context ? <RequestContextView value={{status:'ready',actual:true,context:message.context}} independent={false} label="此条回复的实际来源" onRetry={()=>undefined}/> : <p className="muted small">此条历史回复未记录来源快照。</p>)}{message.sources?.length ? <SourceList sources={message.sources} /> : null}{message.role === 'assistant' && <button className="message-save" onClick={() => setCardDraft({ front: selection || '这一页中值得回忆的问题', back: message.content, sessionId: session.id, sectionId: session.sectionId })}><Plus size={12} />留作复习</button>}{message.role === 'assistant' && current && current.section.kind !== 'exercise' && <button className="message-save" onClick={()=>appendExploration(message.content)}><PencilLine size={12}/>加入笔记正文</button>}</article>)}</div>{conversation.length > 30 && <p className="muted small">显示最近 30 条。完整记录保存在学习文件中。</p>}
         </>
         <ToolActivityCards items={toolCalls.filter(item=>!repliedRuns.has(item.runId))} liveRunId={busyId ? activeRunId : undefined} onOpen={object => { void openToolObject(object); }} />
-        {partial && partial.mode !== 'practice' && partial.sessionId === session.id && busyId && <article className="message assistant partial-message"><div className="message-label"><Sparkles size={12} />正在回复</div><Markdown text={partial.content} /></article>}{partial?.mode === 'practice' && partial.sessionId === session.id && !busyId && aiError && <details className="recovery-message"><summary>查看练习模型原返回（含参考）</summary><pre>{partial.content}</pre></details>}{busyId && <div className="generating" role="status"><LoaderCircle size={15} className="spin" /><div>{partial?.mode === 'practice' ? '正在接收、校验并保存练习…' : '正在等待模型回复…'}<small>来源以核对后的实际清单为准</small></div></div>}{aiError && <div className="inline-error" role="alert"><strong>这次没有得到回复</strong><p>{aiError}</p><span>输入仍保留，可以修改后重试。</span>{practiceFailure?.sourceId === activeId && <button className="quiet-button" disabled={!!busyId} onClick={()=>{void generateExercise(true);}}>{practiceFailure.unknown ? practiceFailure.recovery ? '继续完成保存' : '核对上次练习生成' : '重试生成练习'}</button>}</div>}<div ref={chatEnd} />
+        {partial && partial.mode !== 'practice' && partial.sessionId === session.id && busyId && <article className="message assistant partial-message"><div className="message-label"><Sparkles size={12} />正在回复</div><Markdown text={partial.content} /></article>}{partial?.mode === 'practice' && partial.sessionId === session.id && !busyId && aiError && <details className="recovery-message"><summary>查看练习模型原返回（含参考）</summary><pre>{partial.content}</pre></details>}{busyId && <div className="generating" role="status"><LoaderCircle size={15} className="spin" /><div>{!activeRunId ? '正在核对来源与保存问题…' : partial?.mode === 'practice' ? '正在接收、校验并保存练习…' : '正在等待模型回复…'}<small>来源以核对后的实际清单为准</small></div></div>}{aiError && <div className="inline-error" role="alert"><strong>这次没有得到回复</strong><p>{aiError}</p><span>输入仍保留，可以修改后重试。</span>{practiceFailure?.sourceId === activeId && <button className="quiet-button" disabled={!!busyId} onClick={()=>{void generateExercise(true);}}>{practiceFailure.unknown ? practiceFailure.recovery ? '继续完成保存' : '核对上次练习生成' : '重试生成练习'}</button>}</div>}<div ref={chatEnd} />
       </div>
       <div className="composer-area"><div className="composer"><ComposerReferenceChips references={composerRefs} busy={!!busyId} onRemove={removeComposerReference} onOpenAssistant={item=>{void openAssistantQuote(item);}}/><textarea ref={questionRef} aria-label="向学习助手提问" placeholder={current ? '写下问题，或生成练习的要求…' : '先打开一份材料或探索'} value={composerQuestion} disabled={!canCompose} rows={3} onChange={event => updateComposer(event.target.value)} onCompositionStart={() => { cancelAnimationFrame(composerCommitFrame.current); composerComposing.current = true; }} onCompositionEnd={() => { composerCommitFrame.current = requestAnimationFrame(() => { composerComposing.current = false; }); }} onBlur={() => { cancelAnimationFrame(composerCommitFrame.current); composerComposing.current = false; }} onKeyDown={event => { const action = composerKeyAction(event.nativeEvent, composerComposing.current); if (action === 'native') return; event.preventDefault(); if (action === 'send') void ask(); }} /><div className="composer-bottom"><ComposerToolTierPicker busy={!!busyId} /><ChatModelPicker model={boot.model} busy={!!busyId || modelChanging} onApply={changeModel} onSettings={openSettings} /><button type="button" onClick={()=>{if(busyId)void cancel();else void ask();}} className="send-button" aria-label={busyId ? '停止生成' : modelReady ? '发送问题' : '配置模型后提问'} disabled={!busyId && (!composerQuestion.trim() || modelChanging)}>{busyId ? <Square size={15} /> : <ArrowUp size={17} />}</button></div></div></div>
     </aside>}
