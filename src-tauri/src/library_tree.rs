@@ -95,6 +95,32 @@ pub fn list(store: &ContentStore) -> Result<LibraryTree> {
         nodes.insert(node.id.clone(), node);
     }
     let ids: Vec<String> = nodes.keys().cloned().collect();
+    let physical: BTreeMap<_, _> = nodes
+        .values()
+        .map(|node| {
+            crate::course_project::project_course(store, &node.path, &node.id)
+                .map(|course| (node.id.clone(), course))
+        })
+        .collect::<Result<_>>()?;
+    for id in &ids {
+        let node = &nodes[id];
+        let owner = &physical[id];
+        let parent_owner = node
+            .parent_id
+            .as_ref()
+            .and_then(|id| physical.get(id))
+            .cloned()
+            .flatten();
+        if owner != &parent_owner
+            && (owner.is_some() || parent_owner.is_some())
+            && owner.as_deref() != Some(id.as_str())
+        {
+            warnings.push(format!(
+                "PHYSICAL_PARENT: {id} 的父节点与材料目录不一致，按物理课程显示"
+            ));
+            nodes.get_mut(id).unwrap().parent_id = owner.clone();
+        }
+    }
     for id in &ids {
         let node = &nodes[id];
         let warning = if node.kind == "course" && node.parent_id.is_some() {
@@ -240,14 +266,17 @@ fn create_impl(
         crate::course_project::material_path(&id, &id)?
     } else if let Some(parent) = parent_id {
         let document = store.read(parent)?;
-        if document.path.split('/').nth(2) == Some("materials") {
-            crate::course_project::material_path(&course_id(store, parent)?, &id)?
+        if let Some(course) =
+            crate::course_project::project_course(store, &document.path, &document.id)?
+        {
+            crate::course_project::material_path(&course, &id)?
         } else {
             format!("courses/{id}.md")
         }
     } else {
         format!("courses/{id}.md")
     };
+    let expects_project = crate::course_project::project_course(store, &relative, &id)?.is_some();
     let existing = match store.read(&id) {
         Ok(document) => Some(document),
         Err(error) if error.code == "NOT_FOUND" => {
@@ -265,6 +294,16 @@ fn create_impl(
         Err(error) => return Err(error),
     };
     if let Some(existing) = existing {
+        if expects_project && existing.path != relative {
+            return Err(CoreError::new(
+                "COURSE_PROJECT_REQUIRED",
+                "原请求仍对应旧路径，未创建或迁移独立课程项目。",
+            ));
+        }
+        if expects_project {
+            crate::course_project::validate_placement(store, &existing.path, &existing.metadata)?;
+        }
+
         if existing.id != id
             || existing
                 .metadata
@@ -329,14 +368,6 @@ pub fn move_node(
             "节点已被其他操作更新，请刷新后再移动。",
         ));
     }
-    if current.path.split('/').nth(2) == Some("materials") && current.metadata.kind != "course" {
-        let target_course = parent_id
-            .map(|parent| course_id(store, parent))
-            .transpose()?;
-        if target_course.as_deref() != Some(course_id(store, id)?.as_str()) {
-            return Err(hierarchy("独立课程材料不能通过重新挂载跨课程移动。"));
-        }
-    }
     let parent_depth = validate_parent(store, id, &current.metadata.kind, parent_id)?;
     let height = subtree_height(store, id)?;
     if parent_depth + height > MAX_DEPTH {
@@ -387,6 +418,19 @@ pub(crate) fn ancestry(store: &ContentStore, id: &str) -> Result<Vec<Document>> 
             return Err(hierarchy("课程只能位于根层级。"));
         }
         result.push(document);
+    }
+    let root = result.last().ok_or_else(|| hierarchy("父节点链为空。"))?;
+    let owner = crate::course_project::project_course(store, &root.path, &root.id)?;
+    if owner
+        .as_ref()
+        .is_some_and(|id| id != &root.id || root.metadata.kind != "course")
+    {
+        return Err(hierarchy("材料必须归属其物理课程。"));
+    }
+    for document in &result {
+        if crate::course_project::project_course(store, &document.path, &document.id)? != owner {
+            return Err(hierarchy("父节点链不能跨越物理课程。"));
+        }
     }
     Ok(result)
 }

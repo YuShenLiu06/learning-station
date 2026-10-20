@@ -335,7 +335,7 @@ fn inspect(file_name: &str, bytes: &[u8]) -> Result<(String, &'static str)> {
 
 pub(crate) fn editable_name(name: &str) -> String {
     let encoded = name.replace('%', "%25").replace(':', "%3A");
-    if encoded == ".asset.json" || encoded.len() > 255 {
+    if encoded.eq_ignore_ascii_case(".asset.json") || encoded.len() > 255 {
         // The caller has already validated the allowlisted extension. Keep the
         // original name in the receipt, and retain hidden-name exclusion.
         let extension = name
@@ -648,6 +648,12 @@ fn publish_asset(course: &Path, id: &str, write: impl FnOnce(&Path) -> Result<()
         .prefix(".import-")
         .tempdir_in(course)
         .map_err(CoreError::io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(staged.path(), fs::Permissions::from_mode(0o700))
+            .map_err(CoreError::io)?;
+    }
     write(staged.path())?;
     let destination = course.join(id);
     match fs::symlink_metadata(&destination) {
