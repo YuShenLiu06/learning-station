@@ -526,6 +526,64 @@ mod tests {
         let old=crate::authorized_tools::execute(&e,&scope,"read-editable-original","read",json!({"sourceId":asset.id})).unwrap();
         assert_eq!(old["content"],"OLD fixed attachment");assert_eq!(old["version"],f.document_version);assert_eq!(old["delivery"],"tool-result");assert_eq!(old["range"]["complete"],true);
     }
+    fn query_scope(e: &Engine, frozen: &Frozen, run_id: &str) -> ToolScope {
+        let catalog = frozen.course_read_manifest.as_ref().unwrap();
+        let run: Run = serde_json::from_value(json!({"id":run_id,"sourceDocumentId":frozen.focus.source_document_id,"focus":frozen.focus,"sessionId":frozen.focus.session_id,"mode":"explain","status":"running","content":"","createdAt":"fixture","updatedAt":"fixture","requestDigest":"fixture","contextSnapshotVersion":1,"contextManifest":frozen.context.manifest,"courseReadManifest":catalog})).unwrap();
+        let scope = ToolScope { session_id: run.session_id.clone(), section_id: frozen.focus.source_document_id.clone(), run_id: run.id.clone(), allowed_ids: catalog.iter().map(|m| m.id.clone()).collect() };
+        e.runs.lock().unwrap().insert(run.id.clone(), ManagedRun { run, cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)) });
+        scope
+    }
+    #[test]
+    fn catalog_query_finds_unprojected_text_by_id_and_keyword_at_the_original_oid() {
+        let (_dir,e,a,b,sid)=setup();let mut c=e.lock().unwrap();
+        let d=c.content.read(&a).unwrap();let mut metadata=d.metadata;metadata.links=vec![b.clone()];
+        c.content.save(&a,&content::serialize(&metadata,&d.body).unwrap(),&d.version).unwrap();
+        let d=c.content.read(&b).unwrap();let old=c.content.save(&b,&content::serialize(&d.metadata,"AUTHORIZED_UNSENT_B 原文🧪").unwrap(),&d.version).unwrap();
+        let r=request(&c,&sid,&a);let f=freeze(&mut c,r).unwrap();let session=crate::sessions::get(&mut c.content,&sid).unwrap();let frozen=load(&mut c,&session,&f).unwrap();
+        assert!(!frozen.context.manifest.iter().any(|m|m.id==b));assert!(!frozen.context.text.contains("AUTHORIZED_UNSENT_B"));
+        assert!(frozen.course_read_manifest.as_ref().unwrap().iter().any(|m|m.id==b&&m.included_chars==0));
+        let scope=query_scope(&e,&frozen,"run_catalog_query");
+        c.content.save(&b,&content::serialize(&old.metadata,"NEW_WORKSPACE_B").unwrap(),&old.version).unwrap();drop(c);
+        for (call,args) in [("catalog-query-id",json!({"knowledgeId":b})),("catalog-query-keyword",json!({"query":"AUTHORIZED_UNSENT_B"}))] {
+            let result=crate::learning_tools::execute(&e,&scope,call,"query_related_knowledge",args).unwrap();
+            assert_eq!(result["results"][0]["id"],b);assert_eq!(result["results"][0]["version"],old.version);
+            assert!(result["results"][0]["excerpt"].as_str().unwrap().contains("AUTHORIZED_UNSENT_B"));assert!(!result.to_string().contains("NEW_WORKSPACE_B"));
+        }
+        let mut c=e.lock().unwrap();let current=load(&mut c,&session,&f).unwrap();assert!(!current.context.manifest.iter().any(|m|m.id==b));
+        assert!(crate::sessions::get(&mut c.content,&sid).unwrap().entries.is_empty());
+    }
+    #[test]
+    fn catalog_query_rejects_new_foreign_answer_revoked_and_forged_sources() {
+        let (_dir,e,a,b,sid)=setup();let mut c=e.lock().unwrap();let owner=crate::library_tree::course_id(&c.content,&a).unwrap();
+        let foreign=crate::library_tree::create_project(&mut c.content,"Foreign","","query-foreign-course").unwrap();
+        let x=crate::library_tree::create(&mut c.content,"section","Foreign",Some(&foreign.id),"PRIVATE_FOREIGN_QUERY","query-foreign-note").unwrap();
+        let exercise=crate::exercises::create_manual(&mut c.content,&sid,&a,crate::exercises::ManualExercise{question:"Q?".into(),format:"exact".into(),answers:vec!["PRIVATE_QUERY_ANSWER".into()],explanation:"PRIVATE_QUERY_REASON".into()},"query-answer-exercise").unwrap();
+        let r=request(&c,&sid,&a);let f=freeze(&mut c,r).unwrap();let session=crate::sessions::get(&mut c.content,&sid).unwrap();let frozen=load(&mut c,&session,&f).unwrap();
+        let scope=query_scope(&e,&frozen,"run_catalog_rejections");
+        let new=crate::library_tree::create(&mut c.content,"section","Late",Some(&owner),"NEW_UNAUTHORIZED_QUERY","query-late-note").unwrap();drop(c);
+        for (call,id) in [("query-new",new.id),("query-foreign",x.id),("query-answer",exercise.document.id)] {
+            assert_eq!(crate::learning_tools::execute(&e,&scope,call,"query_related_knowledge",json!({"knowledgeId":id})).unwrap_err().code,"TOOL_SCOPE");
+        }
+        let mut narrower=scope.clone();narrower.allowed_ids.retain(|id|id!=&b);
+        assert_eq!(crate::learning_tools::execute(&e,&narrower,"query-restricted","query_related_knowledge",json!({"knowledgeId":b})).unwrap_err().code,"TOOL_SCOPE");
+        let mut forged=scope.clone();forged.allowed_ids.push("forged_catalog_source".into());
+        assert_eq!(crate::learning_tools::execute(&e,&forged,"query-forged-scope","query_related_knowledge",json!({"knowledgeId":b})).unwrap_err().code,"TOOL_SCOPE");
+        let mut c=e.lock().unwrap();let preview=crate::trash::preview(&mut c.content,&b).unwrap();crate::trash::trash(&mut c.content,&b,&preview.version,"query-recycle-b").unwrap();drop(c);
+        assert_eq!(crate::learning_tools::execute(&e,&scope,"query-revoked","query_related_knowledge",json!({"knowledgeId":b})).unwrap_err().code,"TOOL_SCOPE");
+        let response=crate::learning_tools::execute(&e,&scope,"query-revoked-keyword","query_related_knowledge",json!({"query":"原文"})).unwrap();
+        assert!(!response["results"].as_array().unwrap().iter().any(|item|item["id"]==b));assert!(!response.to_string().contains("PRIVATE_QUERY"));
+    }
+    #[test]
+    fn catalog_query_retains_scan_and_excerpt_budgets_without_claiming_full_text() {
+        let (_dir,e,a,b,sid)=setup();let mut c=e.lock().unwrap();let d=c.content.read(&b).unwrap();
+        c.content.save(&b,&content::serialize(&d.metadata,&format!("{}TAIL_OUTSIDE_QUERY_BUDGET","界".repeat(70000))).unwrap(),&d.version).unwrap();
+        let r=request(&c,&sid,&a);let f=freeze(&mut c,r).unwrap();let session=crate::sessions::get(&mut c.content,&sid).unwrap();let frozen=load(&mut c,&session,&f).unwrap();let scope=query_scope(&e,&frozen,"run_catalog_query_budget");drop(c);
+        let result=crate::learning_tools::execute(&e,&scope,"query-prefix-budget","query_related_knowledge",json!({"knowledgeId":b})).unwrap();
+        assert!(result["truncated"].as_bool().unwrap());assert!(result["results"][0]["excerpt"].as_str().unwrap().len()<=2000);
+        assert_eq!(result["manifest"][0]["includedChars"].as_u64().unwrap() as usize,result["results"][0]["excerpt"].as_str().unwrap().chars().count());
+        let tail=crate::learning_tools::execute(&e,&scope,"query-tail-budget","query_related_knowledge",json!({"query":"TAIL_OUTSIDE_QUERY_BUDGET"})).unwrap();
+        assert!(tail["truncated"].as_bool().unwrap());assert!(tail["results"].as_array().unwrap().is_empty());
+    }
     #[test]
     fn read_rejects_all_image_mimes_including_complete_valid_utf8_gif() {
         let (_dir,e,a,_b,sid) = setup();
