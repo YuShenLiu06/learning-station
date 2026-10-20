@@ -794,6 +794,7 @@ mod tests {
             &c.content,
             &mut ctx,
             &[context::ContextInjection {
+                locator: None,
                 document_id: other.id,
                 expected_version: other.version,
                 selection: None,

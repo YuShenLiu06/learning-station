@@ -5,6 +5,7 @@ pub mod automatic_context;
 pub mod content;
 pub mod content_url;
 pub mod context;
+pub mod citation;
 pub mod context_bridge;
 #[cfg(feature = "desktop")]
 mod desktop;

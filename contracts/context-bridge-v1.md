@@ -15,6 +15,7 @@ type ContextBridgeManifest = {
     version: string;
     textHash?: string;
     includedChars: number;
+    locator?: {startChar: number; endChar: number};
     range?: {startChar: number; endChar: number; complete: boolean; totalBytes: number};
     reason: string;
   }>;
@@ -30,3 +31,5 @@ type ContextBridgeManifest = {
 ## 内嵌内容
 
 `learning-embed` 块是现有笔记正文的一部分，不增加 bridge 的授权、网络抓取或来源编号。网页/视频链接不自动变为知识来源；AI 回答引用的编号不能冒充 `manifest` 中的材料编号。
+
+显式材料选区采用 [Citation](citation-v1.md) 的 quoted_material 块；若同一来源已在自动材料中，保留一个材料 manifest 项，并以 citation:<id> 的 reference 项标记选区及位置。两类生命周期仍分开；本切片未接入 Focus 或 Git 版本差量去重。

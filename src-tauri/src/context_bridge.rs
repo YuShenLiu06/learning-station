@@ -165,6 +165,13 @@ impl ContextBridge {
         {
             entries.push(json!({"id":format!("reference:{}",m.id),"kind":"reference","status":"added","sourceId":m.id,"version":m.version,"includedChars":m.included_chars,"reason":"explicit_one_shot"}));
         }
+        for input in request
+            .injections
+            .iter()
+            .filter(|i| i.selection.is_some() && auto_ids.contains(i.document_id.as_str()))
+        {
+            entries.push(json!({"id":format!("citation:{}",input.document_id),"kind":"reference","status":"added","sourceId":input.document_id,"version":input.expected_version,"includedChars":input.selection.as_ref().unwrap().chars().count(),"locator":input.locator,"reason":"explicit_exact_selection"}));
+        }
         if !request.selection.is_empty() {
             entries.push(json!({"id":"selection","kind":"reference","status":"added","sourceId":session.section_id,"version":hash(&request.selection),"includedChars":request.selection.chars().count(),"reason":"explicit_one_shot"}));
         }
