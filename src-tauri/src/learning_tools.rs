@@ -335,9 +335,15 @@ pub fn execute(
     if let Operation::Query(query) = operation {
         let frozen = if let Some(run) = &focus_run {
             if run.session_id != scope.session_id { return Err(out_of_scope()); }
+            if let Some(focus) = &run.focus {
+                if run.context_snapshot_version != 1 || focus.source_document_id != scope.section_id
+                    || scope.allowed_ids.iter().any(|id| !run.read_scope_manifest().iter().any(|m| &m.id == id)) {
+                    return Err(out_of_scope());
+                }
+            }
             run.focus.as_ref().map(|f| crate::focus::load(&mut core, &session, f)).transpose()?
         } else { None };
-        return query_knowledge(&core, scope, query, frozen.as_ref());
+        return query_knowledge(&core, &session, scope, query, frozen.as_ref());
     }
     if let Some(user) = &business_user {
         if !session
@@ -672,6 +678,7 @@ fn load_skill(engine: &Engine, scope: &ToolScope, id: &str) -> Result<Value> {
 
 fn query_knowledge(
     core: &crate::app::Core,
+    session: &Session,
     scope: &ToolScope,
     query: QueryKnowledge,
     frozen: Option<&crate::focus::Frozen>,
@@ -692,25 +699,45 @@ fn query_knowledge(
     {
         return Err(out_of_scope());
     }
-    let context = if let Some(frozen) = frozen { frozen.context.clone() } else { context::load(store, &scope.section_id, None)? };
+    // An authorized catalog is a candidate list, never evidence that its text was sent.
+    let catalog = frozen.and_then(|f| f.course_read_manifest.as_ref());
+    let (candidates, mut truncated) = if let Some(catalog) = catalog {
+        (catalog.clone(), false)
+    } else {
+        let context = if let Some(frozen) = frozen { frozen.context.clone() } else { context::load(store, &scope.section_id, None)? };
+        (context.manifest, context.truncated)
+    };
     if query
         .knowledge_id
         .as_ref()
-        .is_some_and(|id| !context.manifest.iter().any(|item| &item.id == id))
+        .is_some_and(|id| !candidates.iter().any(|item| &item.id == id))
     {
         return Err(out_of_scope());
     }
     let needle = query.query.as_deref().map(str::to_lowercase);
     let mut results = Vec::<Value>::new();
     let mut manifest = Vec::<ManifestItem>::new();
-    let mut truncated = context.truncated;
-    for item in context.manifest {
+    let mut remaining = context::MAX_CONTEXT_CHARS;
+    let mut scanned = 0;
+    for item in candidates {
         if !allowed.contains(item.id.as_str())
             || query.knowledge_id.as_ref().is_some_and(|id| id != &item.id)
         {
             continue;
         }
-        if frozen.is_some_and(|f| f.asset_path(&item.id).is_some()) { continue; }
+        if frozen.is_some() {
+            let visible = !frozen.is_some_and(|f| f.asset_path(&item.id).is_some())
+                && crate::course_sessions::source(store, session, &item.id).is_ok_and(|id| id == item.id)
+                && store.read(&item.id).is_ok_and(|doc| matches!(doc.metadata.kind.as_str(), "section" | "knowledge"));
+            if !visible {
+                if query.knowledge_id.is_some() { return Err(out_of_scope()); }
+                continue;
+            }
+        }
+        if catalog.is_some() && (scanned == context::MAX_CONTEXT_DOCUMENTS || remaining == 0) {
+            truncated = true;
+            break;
+        }
         let document = if let Some(frozen) = frozen { crate::focus::read_document(core, &frozen.focus, &item.id)? } else { store.read(&item.id)? };
         if !matches!(document.metadata.kind.as_str(), "section" | "knowledge") {
             continue;
@@ -721,9 +748,15 @@ fn query_knowledge(
                 "关联资料已在查询期间更新，请重新查询。",
             ));
         }
-        // Search and expose only the prefix included by the bounded context
-        // loader; a query cannot reach omitted material beyond its budget.
-        let included: String = document.content.chars().take(item.included_chars).collect();
+        // Catalog zeroes describe prior delivery, not a read budget. Read a fixed
+        // bounded prefix; legacy contexts retain their already bounded ranges.
+        let limit = if catalog.is_some() { remaining } else { item.included_chars };
+        let included: String = document.content.chars().take(limit).collect();
+        if catalog.is_some() {
+            scanned += 1;
+            remaining -= included.chars().count();
+            truncated |= included.len() < document.content.len();
+        }
         let lower = included.to_lowercase();
         if needle
             .as_ref()
