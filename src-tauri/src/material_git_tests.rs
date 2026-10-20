@@ -5,6 +5,18 @@ use tempfile::TempDir;
 #[path = "material_git_regressions.rs"]
 mod regressions;
 
+fn retry_busy<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match operation() {
+            Err(error) if error.code == "BUSY" && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
+}
+
 fn node(store: &mut ContentStore, parent: Option<&str>, body: &str, request: &str) -> Document {
     let kind = if parent.is_some() {
         "section"
@@ -41,17 +53,7 @@ impl Fixture {
         }
     }
     fn freeze(&self) -> FrozenMaterials {
-        // BUSY is a valid read-only capture outcome under concurrent OS locks.
-        // Retry only that outcome; permanent contention and all other errors fail.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        loop {
-            match FrozenMaterials::capture(&self.store, &self.course.id) {
-                Err(error) if error.code == "BUSY" && std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                result => return result.unwrap(),
-            }
-        }
+        retry_busy(|| FrozenMaterials::capture(&self.store, &self.course.id)).unwrap()
     }
     fn commit(&self, parent: Option<&str>) -> Checkpoint {
         self.git.commit(&self.freeze(), parent).unwrap()
@@ -77,7 +79,9 @@ impl Fixture {
             .unwrap()
     }
     fn import(&self, name: &str, bytes: &[u8], request: &str) -> assets::Asset {
-        assets::import(&self.store, &self.course.id, name, bytes, request).unwrap()
+        // Import's BUSY sites precede asset writes. Keep the same payload and
+        // request ID; other errors (including uncertain IO) are never retried.
+        retry_busy(|| assets::import(&self.store, &self.course.id, name, bytes, request)).unwrap()
     }
     fn child_path(&self) -> String {
         format!("documents/{}.md", self.child.id)
