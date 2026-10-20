@@ -31,6 +31,9 @@ pub(crate) fn project_root(
     let Some(owner) = &session.course_id else {
         return Ok(None);
     };
+    // Recycle retains physical files for restoration. Reuse the existing
+    // visibility/ledger guard before handing Pi a course cwd.
+    store.read(owner)?;
     match crate::course_project::course_project_root(store.root(), owner) {
         Ok(root) => {
             // Reuse the course Git service; Pi's native .agents discovery needs

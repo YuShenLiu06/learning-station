@@ -12,7 +12,7 @@
 
 课程项目适配另支持可选 `projectRoot` 与 `agentDir`：课程根只作为 Pi cwd，`directory` 仍为当前 session 专属存储。Rust 核实 canonical 真实目录，并显式提供允许的用户 agentDir；缺省保持旧会话资源行为。课程业务接入必须消费 `course_project_root`，不能接受前端任意绝对路径。普通开局不遍历笔记全文；Focus 仍经现有 `nativeMaterials` 投影接收全文或差量，显式引用继续走 `nativeReferences`。已收到的正文与真实工具历史保留，不因没有新的 Focus 重置基准。
 
-生产课程绑定复用 `course_project_root(libraryRoot, courseId)` 与 `MaterialGit::init_course`；课程根来自已核实的 Session.courseId，前端不提供路径。独立课程的 `.git` 在 loader 发现前就绪；同课程多个 session 共享 cwd，但 transcript/receipt 仍各自独立。旧平铺课程返回无项目绑定，不复制或迁移；损坏/非法项目根按原错误失败。此绑定需要课程目录/Git、原生资源适配及多会话消费层共同存在；接口存在不等于 Focus/Changes 生产者或 UI 已验收。
+生产课程绑定复用 `course_project_root(libraryRoot, courseId)` 与 `MaterialGit::init_course`；课程根来自已核实的 Session.courseId，前端不提供路径。交出 cwd 前先经 ContentStore 的课程读取门禁，已回收课程或陈旧回收 ledger 必须失败，不能因物理文件仍保留就当作可见。独立课程的 `.git` 在 loader 发现前就绪；同课程多个 session 共享 cwd，但 transcript/receipt 仍各自独立。旧平铺课程返回无项目绑定，不复制或迁移；损坏/非法项目根按原错误失败。此绑定需要课程目录/Git、原生资源适配及多会话消费层共同存在；接口存在不等于 Focus/Changes 生产者或 UI 已验收。
 
 项目资源使用锁版 Pi 的 `DefaultResourceLoader`：保留父级 AGENTS 与课程/用户 skills、prompt templates 等文本发现，使用显式应用 system prompt override，不另造 parser 或缓存。SettingsManager 仍为内存配置，不加载外部可执行 extensions、自动包安装或用户凭据。原生 `/skill` 展开保留原始输入哈希与实际 user entry 映射，同一问题重试复用已接受的展开文本。
 
