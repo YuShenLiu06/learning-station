@@ -185,6 +185,16 @@ pub fn course_id(store: &ContentStore, id: &str) -> Result<String> {
     Ok(ancestry(store, id)?.last().unwrap().id.clone())
 }
 
+/// Explicit new-course entry point; legacy create remains migration-free.
+pub fn create_project(
+    store: &mut ContentStore,
+    title: &str,
+    body: &str,
+    request_id: &str,
+) -> Result<Document> {
+    create_impl(store, "course", title, None, body, request_id, true)
+}
+
 pub fn create(
     store: &mut ContentStore,
     kind: &str,
@@ -192,6 +202,18 @@ pub fn create(
     parent_id: Option<&str>,
     body: &str,
     request_id: &str,
+) -> Result<Document> {
+    create_impl(store, kind, title, parent_id, body, request_id, false)
+}
+
+fn create_impl(
+    store: &mut ContentStore,
+    kind: &str,
+    title: &str,
+    parent_id: Option<&str>,
+    body: &str,
+    request_id: &str,
+    project: bool,
 ) -> Result<Document> {
     if !matches!(kind, "course" | "folder" | "section" | "exploration")
         || title.trim().is_empty()
@@ -214,7 +236,18 @@ pub fn create(
     let digest = hash(&serde_json::to_string(
         &json!({"kind":kind,"title":title,"parentId":parent_id,"body":body}),
     )?);
-    let relative = format!("courses/{id}.md");
+    let relative = if project {
+        crate::course_project::material_path(&id, &id)?
+    } else if let Some(parent) = parent_id {
+        let document = store.read(parent)?;
+        if document.path.split('/').nth(2) == Some("materials") {
+            crate::course_project::material_path(&course_id(store, parent)?, &id)?
+        } else {
+            format!("courses/{id}.md")
+        }
+    } else {
+        format!("courses/{id}.md")
+    };
     let existing = match store.read(&id) {
         Ok(document) => Some(document),
         Err(error) if error.code == "NOT_FOUND" => {
@@ -295,6 +328,14 @@ pub fn move_node(
             "CONFLICT",
             "节点已被其他操作更新，请刷新后再移动。",
         ));
+    }
+    if current.path.split('/').nth(2) == Some("materials") && current.metadata.kind != "course" {
+        let target_course = parent_id
+            .map(|parent| course_id(store, parent))
+            .transpose()?;
+        if target_course.as_deref() != Some(course_id(store, id)?.as_str()) {
+            return Err(hierarchy("独立课程材料不能通过重新挂载跨课程移动。"));
+        }
     }
     let parent_depth = validate_parent(store, id, &current.metadata.kind, parent_id)?;
     let height = subtree_height(store, id)?;
