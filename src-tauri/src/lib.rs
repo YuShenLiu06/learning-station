@@ -34,6 +34,7 @@ pub mod exploration;
 pub mod trash;
 
 pub mod grading;
+pub mod material_git;
 
 pub mod anki;
 

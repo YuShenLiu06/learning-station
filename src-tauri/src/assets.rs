@@ -131,6 +131,22 @@ pub fn list(store: &ContentStore, course_id: &str) -> Result<Vec<Asset>> {
     list_course(store.root(), course_id)
 }
 
+/// Full, validated inert bytes for a checkpoint; never the truncated preview.
+pub(crate) fn checkpoint_bytes(store: &ContentStore, course_id: &str) -> Result<Vec<(Asset, Vec<u8>)>> {
+    validate_course(store, course_id)?;
+    let _process = OPERATIONS.lock().map_err(|_| busy())?;
+    let Some(_root) = lock_root(store, false)? else {
+        return Ok(vec![]);
+    };
+    list_course(store.root(), course_id)?
+        .iter()
+        .map(|asset| {
+            load_asset(store.root(), course_id, &asset.id)
+                .map(|(record, bytes)| (record.asset, bytes))
+        })
+        .collect()
+}
+
 pub fn read(store: &ContentStore, course_id: &str, asset_id: &str) -> Result<AssetPreview> {
     validate_course(store, course_id)?;
     validate_asset_id(asset_id)?;
