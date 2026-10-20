@@ -274,13 +274,15 @@ fn secrets_configs_caches_source_and_transcripts_are_excluded() {
         .unwrap();
     }
     f.import("provider-config.json", b"{}", "fixture_config");
-    assets::import(
-        &f.store,
-        &f.other.id,
-        "other.txt",
-        b"private-other",
-        "fixture_other_asset",
-    )
+    retry_busy(|| {
+        assets::import(
+            &f.store,
+            &f.other.id,
+            "other.txt",
+            b"private-other",
+            "fixture_other_asset",
+        )
+    })
     .unwrap();
     let next = f.commit(Some(&first.checkpoint_commit_oid));
     assert_eq!(first.material_tree_oid, next.material_tree_oid);

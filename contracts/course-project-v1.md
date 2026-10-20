@@ -17,3 +17,23 @@
 
 本层不改 UI、Pi session/entry 身份、资源发现、工具权限、Git 历史或聊天摄入。
 测试仅使用临时合成数据；回退本层代码前保留整个课程目录，新数据不会被自动删除。
+
+## 独立 Git 检查点
+
+`MaterialGit::init_course(libraryRoot, courseId)` 只初始化新物理课程的普通 `.git/`；
+`open_course` 校验课程绑定、独立 objects/refs，拒绝共享 worktree、alternates、symlink/hardlink 或其他课程仓库。
+不重置既有仓库，不自动初始化/迁移旧库。`MaterialGit::open` 仅只读兼容旧 bare 快照；旧创建器仅在合成测试编译。
+
+`FrozenMaterials::capture_project(store, courseId)` 冻结该课程当前 `materials/` 文件；两次捕获相同才返回。
+无文件系统事务承诺；返回后 owned bytes 不受后续编辑影响。附件采用物理路径，不再生成第二套可编辑投影。
+仅纳入既有允许清单中的文本/代码/图片；排除隐藏文件、密钥/供应商配置名称、缓存、嵌套 Git 源码仓库和未知扩展。
+材料外的 Pi/其他文件不自动摄入。排除报告位于材料树外，已知附件保留 assetId，未注册物理路径的 assetId 为空。
+
+`commit(frozen, parentCommitOid?)` 成功发布持久 ref 后才返回 Checkpoint；失败保留旧回执，未发布对象不代表快照成功。
+checkpointCommitOid 定位整个检查点；materialTreeOid 从 `COMMIT:materials` 派生；文件 blob OID 按需从 files 获取。
+父提交的材料外树项原样保留，预留多个 Pi session 同仓，但不捕获当前聊天或实现联合回滚。
+transcript-only 提交改变 checkpointCommitOid 而保持 materialTreeOid；不把 commit OID 写入自身内容。
+
+files/read/checkpoint/compare 均使用固定 OID；read 返回完整原始字节。
+compare 复用原生 name-status/numstat；聚焦文本返回完整 UTF-8 patch（非 UTF-8 patch 使用完整 patchBytes），二进制仅文件变化。
+基础层不静默截断；后续发送层若超容量须显式说明。Git 禁止外部 diff/textconv/hooks、网络和 lazy fetch。
