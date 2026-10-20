@@ -442,3 +442,45 @@ fn project_create_is_idempotent_and_cross_project_move_never_reparents() {
     ))
     .is_err());
 }
+
+fn special_attachment_name_is_supported(name: &str, request: &str) {
+    let (_dir, mut store) = fixture();
+    course(&mut store, "course_a");
+    retry_busy(|| assets::import(&store, "course_a", "seed.txt", b"seed\n", "name_seed")).unwrap();
+    let imported = retry_busy(|| assets::import(&store, "course_a", name, b"{}", request));
+    let list = retry_busy(|| assets::list(&store, "course_a"));
+    let next =
+        retry_busy(|| assets::import(&store, "course_a", "next.txt", b"next\n", "name_next"));
+    eprintln!(
+        "name_bytes={}; import={:?}; list={:?}; next={:?}",
+        name.len(),
+        imported.as_ref().map(|_| ()).map_err(|e| &e.code),
+        list.as_ref().map(|v| v.len()).map_err(|e| &e.code),
+        next.as_ref().map(|_| ()).map_err(|e| &e.code)
+    );
+    let asset = imported.unwrap();
+    assert_eq!(asset.file_name, name);
+    assert_eq!(
+        retry_busy(|| assets::read(&store, "course_a", &asset.id))
+            .unwrap()
+            .text
+            .as_deref(),
+        Some("{}")
+    );
+    assert_eq!(list.unwrap().len(), 2);
+    next.unwrap();
+    assert_eq!(
+        retry_busy(|| assets::import(&store, "course_a", name, b"{}", request)).unwrap(),
+        asset
+    );
+}
+
+#[test]
+fn receipt_named_attachment_does_not_poison_the_course() {
+    special_attachment_name_is_supported(".asset.json", "receipt_name_request");
+}
+
+#[test]
+fn percent_expansion_does_not_poison_the_course() {
+    special_attachment_name_is_supported(&format!("{}.txt", "%".repeat(128)), "long_name_request");
+}

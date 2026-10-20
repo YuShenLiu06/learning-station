@@ -8,7 +8,8 @@
 - `course_project::create_material(store, Metadata, body)`：显式创建物理课程/其子文档。
 - 文档唯一正文：`materials/documents/<stableId>.md`。已有子文档创建入口按父课程归一化到此处。
 - 附件唯一正文：`materials/assets/<courseId>/<assetId>/<escapedOriginalName>`。
-  `%` 编码 `%25`，`:` 编码 `%3A`；不接受路径成分。
+  `%` 编码 `%25`，`:` 编码 `%3A`；不接受路径成分。编码超 255 字节或与回执重名时用 `content.<ext>`（隐藏名用 `.content.<ext>`），原名仍保留在回执。
+- 导入先在隐藏 `.import-*` 目录写齐并同步正文/回执，再在附件锁内原子发布。失败不留下可见半成品；崩溃遗留暂存不进入列表或材料，保留待核对，不自动删除。
 - `.asset.json` 是原始导入回执。原生编辑直接修改正文，read/list 返回当前 hash/size；相同请求重试返回原导入回执，不覆盖编辑。
 - 文档索引只扫描物理课程的 `materials/documents/`；附件、隐藏文件及材料外会话/Git 状态不成为文档。
 - 原生编辑文档后，已有 read 立即读当前文件，陈旧 save 返回 CONFLICT。
