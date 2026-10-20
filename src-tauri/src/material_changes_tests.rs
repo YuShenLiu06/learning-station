@@ -333,3 +333,18 @@ fn course_notification_old_and_focus_body_old_compare_independently() {
     assert!(missing["changes"][0]["patch"].is_null());
     assert!(missing["focused"]["text"].as_str().unwrap().contains("A final fixed version"));
 }
+
+#[test]
+fn git_binary_classification_is_authoritative_even_when_utf8_contains_no_nul() {
+    let f = Fixture::new();
+    let path = format!("documents/{}.md", f.a.id);
+    let root = crate::course_project::course_project_root(f.store.root(), &f.course.id).unwrap();
+    std::fs::create_dir_all(root.join(".git/info")).unwrap();
+    std::fs::write(root.join(".git/info/attributes"), format!("{path} -diff\n")).unwrap();
+    let checkpoint = f.checkpoint(None);
+    let native = f.git.compare(&f.course.id, None, &checkpoint.checkpoint_commit_oid, None).unwrap();
+    assert!(native.changes.iter().find(|c| c.path == path).unwrap().binary);
+    let value = f.project(&checkpoint, None, Some((&f.a.id, &path)), BUDGET).unwrap();
+    assert_eq!(value["focused"]["textUnavailable"], "binary");
+    assert!(value["focused"]["text"].is_null());
+}

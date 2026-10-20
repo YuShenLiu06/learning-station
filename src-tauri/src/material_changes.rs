@@ -60,7 +60,9 @@ pub fn prepare(
             .ok_or_else(|| CoreError::new("MATERIAL_SCOPE", "聚焦材料不在本次固定版本。"))?;
         let bytes = git.read(course, commit, path)?;
         focused = json!({"id":id,"path":path,"gitCommitOid":commit,"gitBlobOid":file.blob_oid,"totalBytes":bytes.len()});
-        let binary = bytes.iter().take(8000).any(|b| *b == 0);
+        let binary = git.compare(course, None, commit, None)?.changes.into_iter()
+            .find(|change| change.path == path)
+            .ok_or_else(|| CoreError::new("MATERIAL_SCOPE", "固定版本缺少 Git 文件状态。"))?.binary;
         match String::from_utf8(bytes) {
             Ok(_) if binary => {
                 focused["textUnavailable"] = json!("binary");

@@ -10,7 +10,7 @@
 
 返回 checkpoint 保留 courseId/checkpointCommitOid/materialTreeOid/excludedFiles，完整 focused 保留真实来源 id/path、内容 SHA version、独立 gitCommitOid/gitBlobOid、text/textHash/range。全文是固定 Git 文件的原始 UTF-8 文本；range 为此文本的字符坐标。Focus 可见段落和 Citation 的正文坐标不能仅凭同 sourceId/version 就假定与含前置信息的 Git 文件坐标相同；引用作者须按真实范围对齐，去重保留双来源。
 
-非聚焦只给文件名/name-status/numstat。聚焦完整原生 Git patch 不静默截断；非 UTF-8 patchBytes 保留在材料服务，发送层明确 patchUnavailable/patchByteLength，不乱码替换或丢文件。二进制只文件状态。无法自动展示的 Focus 类型由冻结/消费边界校验；主动受支持 read 仍走正常权限和工具结果，不用 diff 缓存替身。
+非聚焦只给文件名/name-status/numstat。聚焦完整原生 Git patch 不静默截断；非 UTF-8 patchBytes 保留在材料服务，发送层明确 patchUnavailable/patchByteLength，不乱码替换或丢文件。二进制只文件状态，通用计算从固定NEW checkpoint原生Git分类取得，不用NUL猜；最终wrapper仅对markdown/text且!Focus.binary提供正文，沿封存类型边界。主动受支持read仍走正常权限和工具结果，不用diff缓存替身。
 
 fixedVersion 只含课程、固定 commit OID 和材料相对路径；删除指向删除前版本。附件路径取固定 files/read 的真实安全投影，不拼主机路径。排除清单保留真实文件名/原因；未注册文件可没有 assetId，清单仍逐项保留独立身份，不捏造可读 sourceId。
 
