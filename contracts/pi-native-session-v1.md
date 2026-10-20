@@ -12,7 +12,7 @@
 
 课程项目适配另支持可选 `projectRoot` 与 `agentDir`：课程根只作为 Pi cwd，`directory` 仍为当前 session 专属存储。Rust 核实 canonical 真实目录，并显式提供允许的用户 agentDir；缺省保持旧会话资源行为。课程业务接入必须消费 `course_project_root`，不能接受前端任意绝对路径。普通开局不遍历笔记全文；Focus 仍经现有 `nativeMaterials` 投影接收全文或差量，显式引用继续走 `nativeReferences`。已收到的正文与真实工具历史保留，不因没有新的 Focus 重置基准。
 
-Changes 接口提供首次全文、后续完整 Git diff。显式引用继续走 `nativeReferences`。仅旧无 Git 身份的 automatic material custom 从有效投影排除，已验证的 Focus 投影及原始会话/真实工具历史保留。
+Changes 接口提供首次全文、后续完整 Git diff。显式引用继续走 `nativeReferences`。`metadataOnlySourceIds` 只排除所列来源的旧自动材料投影；不会仅因材料缺少 Git 身份而清空有效历史。其余正文、会话与真实工具历史按既有投影及授权边界保留，撤权修复由独立 PR57 收口。
 
 Changes 私有适配发送 `material_changes {id,baseCommitOid,focusBaseCommitOid}`：前者来自本 session 原请求核对后的课程变化通知，后者来自当前有效完整正文投影的 Git commit，缺失为 null。两者独立，A→B→A 不把 B 时收到的通知当作 A 正文。复用原生材料条目的 full→diff 链与压缩恢复，不增加缓存；基准缺失/不完整时恢复全文，无变化不重复。Rust 固定 OLD/NEW 比较通过已提交 Focus 课程仓路由接入，同一Frozen供generation与for_focus使用；不在Rust保存新的正文接收缓存。
 
