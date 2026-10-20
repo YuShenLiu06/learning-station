@@ -20,6 +20,8 @@ flowchart LR
 
 `generation::start` 调用 `snapshot/freeze`，私有 stdin 传递 `nativeMaterials`、`nativeReferences`、本轮元数据与问题。适配器把材料/本轮状态写为明确的不可信 custom message，把本次问题写为真实 user 消息。旧模型历史由 Pi 恢复，不在此 JSON 中重建角色。批改、连接测试等原有无历史单轮任务保持隔离。
 
+普通聊天与探索使用同一学习工具策略；工具集合与 Skill 正文、Focus/Citation/Changes/Time 的投影分开，制卡不需模式切换或先加载指导。question/explain 仍兼容已有请求与记录，不再注入“当前模式”作为聊天行为分流；场景指导沿现有单一快照入口提供，本次不新增上下文投影或会话映射。
+
 ## 生命周期
 
 | 内容 | 行为 |

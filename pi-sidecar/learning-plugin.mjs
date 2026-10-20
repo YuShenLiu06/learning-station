@@ -13,9 +13,11 @@ export const AUTHORIZATION_TOOLS = Object.freeze({
   write: Object.freeze(['read', 'write']),
   bash: Object.freeze(['read', 'write', 'bash']),
 });
+// Both wire labels represent the same chat task, including reopened sessions.
+const CHAT_POLICY = Object.freeze({ allowedTools: LEARNING_PLUGIN.tools, maxCalls: 6 });
 export const MODE_POLICIES = Object.freeze({
-  question: { allowedTools: ['query_related_knowledge', 'record_question', 'create_note', 'create_todo', 'generate_exercises', 'list_learning_skills', 'load_learning_skill'], maxCalls: 4 },
-  explain: { allowedTools: [...LEARNING_PLUGIN.tools], maxCalls: 6 },
+  question: CHAT_POLICY,
+  explain: CHAT_POLICY,
   practice: { allowedTools: ['query_related_knowledge', 'list_learning_skills', 'load_learning_skill'], maxCalls: 2 },
   feedback: { allowedTools: [], maxCalls: 0 },
   grading: { allowedTools: [], maxCalls: 0 },
@@ -74,7 +76,7 @@ const definitions = [
     description: '按id返回一条内置学习指导的完整正文，经工具结果通道提供，不进入系统提示。skillId只能来自list_learning_skills返回的目录，不接受路径。本轮已加载或已随模式注入的指导只返回简短提示，不重复正文。',
     parameters: Type.Object({ skillId: string(128) }, { additionalProperties: false }) },
   { name: 'create_review_card', label: '创建复习卡片',
-    description: '按用户明确要求，把正反面内容保存为当前会话的复习卡片；只有Rust返回persisted:true才算成功。',
+    description: '按用户明确要求，把正反面内容保存为当前会话的本地复习卡片，无需切换模式或加载指导；只有Rust返回persisted:true及entryId才算成功，不代表已同步Anki。',
     parameters: Type.Object({ front: string(8000), back: string(12000), tags: Type.Optional(Type.Array(string(64), { maxItems: 12 })) }, { additionalProperties: false }) },
   { name: 'create_todo', label: '创建待办',
     description: '按用户明确要求创建当前会话待办。经过时长优先用relativeMinutes（1至525600整数分钟），程序按本次固定时间计算并校验；绝对dueAt可选且必须带时区的RFC3339。reminderEnabled仅在本轮用户明确要求提醒时传true，默认false；启用时必须提供晚于当前时间的提醒时间。成功以Rust持久化回执为准。',
