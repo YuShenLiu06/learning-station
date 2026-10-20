@@ -747,6 +747,7 @@ impl Core {
         Ok((
             session,
             Context {
+                citation_context: None,
                 automatic_materials: vec![],
                 exercise_reference_manifest: vec![],
                 assistant_reference_manifest: vec![],
@@ -777,6 +778,7 @@ impl Core {
                 ));
             }
             Context {
+                citation_context: None,
                 automatic_materials: vec![],
                 exercise_reference_manifest: vec![],
                 assistant_reference_manifest: vec![],

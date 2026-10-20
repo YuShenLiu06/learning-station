@@ -112,6 +112,8 @@ pub struct ManifestItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Context {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub citation_context: Option<crate::citation_context::CitationContext>,
     #[serde(skip)]
     pub automatic_materials: Vec<crate::automatic_context::MaterialSnapshot>,
     pub text: String,

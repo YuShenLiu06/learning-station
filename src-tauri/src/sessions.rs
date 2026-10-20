@@ -371,6 +371,7 @@ pub fn set_context_manifest(
 ) -> Result<Session> {
     let session = get(store, session_id)?;
     let mut context = Context {
+        citation_context: None,
         automatic_materials: vec![],
         text: String::new(),
         manifest: manifest.to_vec(),
@@ -521,9 +522,19 @@ fn validate_entry(entry: &Entry) -> Result<()> {
 pub fn append(
     store: &mut ContentStore,
     session_id: &str,
+    entry: Entry,
+    expected: Option<&str>,
+    request_id: &str,
+) -> Result<Session> {
+    append_citation(store, session_id, entry, expected, request_id, None)
+}
+pub(crate) fn append_citation(
+    store: &mut ContentStore,
+    session_id: &str,
     mut entry: Entry,
     expected: Option<&str>,
     request_id: &str,
+    citation: Option<&crate::citation_context::CitationContext>,
 ) -> Result<Session> {
     if request_id.len() < 8 || request_id.len() > 128 {
         return Err(CoreError::new("INVALID_INPUT", "请求缺少防重复编号。"));
@@ -556,6 +567,17 @@ pub fn append(
         }
         return Ok(old);
     }
+    if entry.kind == "user"
+        && entry
+            .data
+            .as_ref()
+            .is_some_and(|d| d.get("citationContext").is_some())
+    {
+        return Err(CoreError::new(
+            "INVALID_CONTEXT_REQUEST",
+            "补充引用快照只能由来源校验后生成，不能由客户端提供。",
+        ));
+    }
     if let Some(frozen) = crate::context::requested_context(&entry, old.course_id.is_none().then_some(old.section_id.as_str()))? {
         let source = crate::course_sessions::source(store, &old, &frozen.document_id)?;
         crate::course_sessions::validate_injections(store, &old, &frozen.injections)?;
@@ -563,12 +585,28 @@ pub fn append(
             return Err(CoreError::new("CONTEXT_CONFLICT", "问题的冻结来源与当前材料不一致，未改变原请求。"));
         }
         entry.data.as_mut().unwrap()["sourceDocumentId"] = json!(source);
+
         crate::assistant_references::validate_references(
             store,
             &old,
             &frozen.assistant_references,
         )?;
         crate::exercise_references::validate_references(store, &old, &frozen.exercise_references)?;
+        let citation = if let Some(citation) = citation {
+            // Internal callers supply the already verified same-request Context. Focus
+            // may refer to fixed Git bytes after the editable workspace has changed.
+            citation.clone()
+        } else {
+            crate::citation_context::freeze(
+                store,
+                &old,
+                &frozen.injections,
+                &frozen.assistant_references,
+                &frozen.exercise_references,
+            )?
+        };
+        if !citation.references.is_empty(){entry.data.as_mut().unwrap()["citationContext"] = serde_json::to_value(citation)?;}
+        validate_entry(&entry)?;
     }
     if entry.kind == "exercise" {
         let questions = entry

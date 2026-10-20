@@ -563,8 +563,8 @@ async fn append_entry(
     request_id: String,
 ) -> Result<Session> {
     work(state.inner().clone(), move |e| {
-        sessions::append(
-            &mut e.lock()?.content,
+        crate::focus::append_entry(
+            &mut *e.lock()?,
             &session_id,
             entry,
             Some(&expected_version),

@@ -392,11 +392,12 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
             }
             let sid = if round == 5 { crate::course_sessions::create(&mut c, &course, "wire_new_session").unwrap().id } else { sid.clone() };
             let doc = c.content.read(document).unwrap();
-            let focus = crate::focus::freeze(&mut c, crate::focus::FreezeRequest { session_id:sid.clone(), input:crate::focus::Input { document_id:document.clone(), expected_body:doc.body, expected_version:Some(doc.version), view:"read".into(), ranges:vec![crate::focus::Range{start:0,end:4}], question_id:None, asset_id:None }, selection:String::new(), injections:vec![], assistant_references:vec![], exercise_references:vec![] }).unwrap();
+            let injection = context::ContextInjection { document_id:doc.id.clone(), expected_version:doc.version.clone(), selection:Some(doc.body.chars().take(4).collect()), locator:Some(crate::citation::Locator{start_char:0,end_char:4}) };
+            let focus = crate::focus::freeze(&mut c, crate::focus::FreezeRequest { session_id:sid.clone(), input:crate::focus::Input { document_id:document.clone(), expected_body:doc.body, expected_version:Some(doc.version), view:"read".into(), ranges:vec![crate::focus::Range{start:0,end:4}], question_id:None, asset_id:None }, selection:String::new(), injections:vec![injection.clone()], assistant_references:vec![], exercise_references:vec![] }).unwrap();
             let session = sessions::get(&mut c.content, &sid).unwrap();
             let frozen = crate::focus::load(&mut c, &session, &focus).unwrap();
             let projection = crate::automatic_context::prepare_current(&frozen.context);
-            let request = GenerationRequest { focus:Some(focus.clone()), document_id:Some(document.clone()), session_id:sid.clone(), mode:"question".into(), selection:String::new(), prompt:format!("Fixed Changes {round}"), request_id:format!("wire_request_{round}"), user_entry_id:None, injections:vec![], assistant_references:vec![], exercise_references:vec![] };
+            let request = GenerationRequest { focus:Some(focus.clone()), document_id:Some(document.clone()), session_id:sid.clone(), mode:"question".into(), selection:String::new(), prompt:format!("Fixed Changes {round}"), request_id:format!("wire_request_{round}"), user_entry_id:None, injections:vec![injection], assistant_references:vec![], exercise_references:vec![] };
             let messages = ContextBridge::freeze(&request,&frozen.context,&session,None,&projection,crate::time_context::TimeContext::capture()).unwrap().messages;
             assert_eq!(frozen.course_read_manifest.as_ref().unwrap().iter().find(|m|m.id==*document).unwrap().version,focus.document_version);
             let markdown = c.content.read(&sid).unwrap().content;
@@ -421,6 +422,14 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
         generate_scoped(ModelCredentials::new(ModelSettings { provider:"custom".into(), protocol:PROTOCOL.into(), base_url:endpoint.clone(), model:"fixture".into(), ..ModelSettings::default() }, "synthetic-fixed-git-only".into()).unwrap(), messages, Arc::new(AtomicBool::new(false)), |_|{}, None, ToolPolicy::legacy(false), vec![], Some(RequestContext { material_changes:Some(handler), native_session:Some(native), ..RequestContext::capture() })).await.unwrap();
     }
     let packets = server.join().unwrap();
+    for (round,packet) in packets.iter().enumerate() {
+        let payloads:Vec<Value>=packet["messages"].as_array().unwrap().iter().filter_map(|m| {let text=m["content"].as_str().map(str::to_owned).unwrap_or_else(||m["content"].as_array().into_iter().flatten().filter_map(|p|p["text"].as_str()).collect::<String>());serde_json::from_str(&text).ok()}).collect();
+        let turn=payloads.iter().find(|p|p["focus"].is_object()).unwrap();
+        assert!(turn["focus"]["paragraphs"].as_array().unwrap().iter().all(|p|p.get("text").is_none()));
+        assert!(turn["context"].as_str().unwrap().contains("materialRange"));
+        assert!(turn["contextBridgeManifest"]["entries"].as_array().unwrap().iter().any(|e|e["sourceMarkers"]==json!(["citation","material"])));
+        if round>=3 {assert!(!turn.to_string().contains("A_FIXED_CHANGED_GIT_BODY"));}
+    }
     for packet in &packets[..2] { let text=packet.to_string();assert!(!text.contains("B_NOT_YET_FOCUSED_BODY")&&!text.contains("B_FIXED_SECOND_BODY"));assert_eq!(text.matches("A_FIXED_FIRST_BODY").count(),1); }
     assert!(packets[2].to_string().contains("B_FIXED_SECOND_BODY"));
     assert!(packets[2].to_string().contains("automatic_material_projection"));
