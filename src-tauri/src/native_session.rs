@@ -24,6 +24,24 @@ pub struct NativeSession {
     pub history_boundary_key: Option<String>,
     pub legacy_records: Vec<Value>,
 }
+pub(crate) fn project_root(
+    store: &crate::content::ContentStore,
+    session: &Session,
+) -> Result<Option<PathBuf>> {
+    let Some(owner) = &session.course_id else {
+        return Ok(None);
+    };
+    match crate::course_project::course_project_root(store.root(), owner) {
+        Ok(root) => {
+            // Reuse the course Git service; Pi's native .agents discovery needs
+            // this real project boundary before walking ancestor directories.
+            crate::material_git::MaterialGit::init_course(store.root(), owner)?;
+            Ok(Some(root))
+        }
+        Err(error) if error.code == "COURSE_PROJECT_REQUIRED" => Ok(None),
+        Err(error) => Err(error),
+    }
+}
 pub fn error() -> CoreError {
     CoreError::new(
         "NATIVE_SESSION_INVALID",
@@ -544,3 +562,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "native_course_project_tests.rs"]
+mod course_project_tests;

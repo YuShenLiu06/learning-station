@@ -12,6 +12,8 @@
 
 课程项目适配另支持可选 `projectRoot` 与 `agentDir`：课程根只作为 Pi cwd，`directory` 仍为当前 session 专属存储。Rust 核实 canonical 真实目录，并显式提供允许的用户 agentDir；缺省保持旧会话资源行为。课程业务接入必须消费 `course_project_root`，不能接受前端任意绝对路径。普通开局不遍历笔记全文；Focus 仍经现有 `nativeMaterials` 投影接收全文或差量，显式引用继续走 `nativeReferences`。已收到的正文与真实工具历史保留，不因没有新的 Focus 重置基准。
 
+生产课程绑定复用 `course_project_root(libraryRoot, courseId)` 与 `MaterialGit::init_course`；课程根来自已核实的 Session.courseId，前端不提供路径。独立课程的 `.git` 在 loader 发现前就绪；同课程多个 session 共享 cwd，但 transcript/receipt 仍各自独立。旧平铺课程返回无项目绑定，不复制或迁移；损坏/非法项目根按原错误失败。此绑定需要课程目录/Git、原生资源适配及多会话消费层共同存在；接口存在不等于 Focus/Changes 生产者或 UI 已验收。
+
 项目资源使用锁版 Pi 的 `DefaultResourceLoader`：保留父级 AGENTS 与课程/用户 skills、prompt templates 等文本发现，使用显式应用 system prompt override，不另造 parser 或缓存。SettingsManager 仍为内存配置，不加载外部可执行 extensions、自动包安装或用户凭据。原生 `/skill` 展开保留原始输入哈希与实际 user entry 映射，同一问题重试复用已接受的展开文本。
 
 cwd 与 Node 目录读取参数都不是强隔离：真实锁版 read/Bash 可读取兄弟 fixture，Node 24 的预存 symlink 也可绕过目录范围。基础原生 read/Bash 不启用，现有 Rust 工具校验不变；不新增 sandbox/插件。Node 只增加课程、父级说明文件候选与允许用户文本资源的只读范围，不增加写入或 child-process 权限。上述行为用合成 fixture 验证，不代表 GUI、真实模型或课程整合已验收。

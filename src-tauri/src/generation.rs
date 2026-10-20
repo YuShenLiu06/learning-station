@@ -372,7 +372,7 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
     let native_session = {
         let core = engine.lock()?;
         let markdown = core.content.read(&session.id)?.content;
-        crate::native_session::prepare(
+        let mut native = crate::native_session::prepare(
             &core.state_dir,
             &session,
             &id,
@@ -381,7 +381,9 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
             context::history_is_protected(&ctx),
             native_legacy_records(&session, Some(&native_user_id)),
             &markdown,
-        )?
+        )?;
+        native.project_root = crate::native_session::project_root(&core.content, &session)?;
+        native
     };
     let credentials = model_store.credentials()?;
     let stamp = timestamp();
