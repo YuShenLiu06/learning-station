@@ -108,6 +108,7 @@ pub fn inject_request(
             "资料与AI回答的附加引用合计最多8份。",
         ));
     }
+    crate::course_sessions::validate_injections(store, session, injections)?;
     validate_references(store, session, refs)?;
     if !refs.is_empty() && context::history_is_protected(ctx) {
         return Err(CoreError::new(

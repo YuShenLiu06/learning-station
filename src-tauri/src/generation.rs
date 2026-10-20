@@ -259,7 +259,10 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
         let mut core = engine.lock()?;
         let (session, mut ctx) =
             core.session_context_for(&request.session_id, request.document_id.as_deref(), Some(&request.selection))?;
-        let source_id = crate::course_sessions::source(&core.content, &session, request.document_id.as_deref().unwrap_or(&session.section_id))?;
+        let source_id = crate::course_sessions::source(&core.content, &session, crate::course_sessions::request_document(&session, request.document_id.as_deref()))?;
+        if request.mode == "practice" && source_id.is_empty() {
+            return Err(CoreError::new("SOURCE_REQUIRED", "请先选择本课程材料再生成练习；普通对话没有默认材料来源。"));
+        }
         if let Some(entry_id) = &request.user_entry_id {
             validate_reused_user(
                 &session,
@@ -279,7 +282,7 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
                 return Err(CoreError::new("CONTEXT_CONFLICT", "原问题的冻结来源已变化，未使用新页面替换原请求。"));
             }
             if let Some(frozen) = context::requested_context(entry, None)? {
-                if frozen.document_id != request.document_id.as_deref().unwrap_or(&session.section_id)
+                if frozen.document_id != crate::course_sessions::request_document(&session, request.document_id.as_deref())
                     || serde_json::to_value(frozen.exercise_references)?
                     != serde_json::to_value(&request.exercise_references)?
                     || serde_json::to_value(frozen.assistant_references)?
@@ -722,7 +725,7 @@ fn generation_user_entry(request: &GenerationRequest, session: &Session, id: &st
         selection: (!request.selection.is_empty()).then_some(request.selection.clone()),
         related_ids: vec![],
         data: Some(
-            json!({"mode":request.mode,"runId":id,"requestedContext":{"documentId":request.document_id.as_deref().unwrap_or(&session.section_id),"selection":request.selection,"injections":request.injections,"assistantReferences":request.assistant_references,"exerciseReferences":request.exercise_references}}),
+            json!({"mode":request.mode,"runId":id,"requestedContext":{"documentId":crate::course_sessions::request_document(&session, request.document_id.as_deref()),"selection":request.selection,"injections":request.injections,"assistantReferences":request.assistant_references,"exerciseReferences":request.exercise_references}}),
         ),
     }
 }
@@ -1188,7 +1191,7 @@ fn save_result(
         let output_request = format!("{run_id}-output");
         let entry_id = format!("entry_{}", &hash(&output_request)[..32]);
         let mut expected = data.clone();
-        let source_id = crate::course_sessions::source(&core.content, &session, frozen_source.as_deref().or(request.document_id.as_deref()).unwrap_or(&session.section_id))?;
+        let source_id = crate::course_sessions::source(&core.content, &session, crate::course_sessions::request_document(&session, frozen_source.as_deref().or(request.document_id.as_deref())))?;
         expected["sourceDocumentId"] = json!(source_id);
         if let Err(mut error) = exercises::create_from_snapshot(
             &mut core.content,

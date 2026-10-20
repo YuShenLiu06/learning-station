@@ -20,6 +20,10 @@ flowchart LR
 
 `generation::start` 调用 `snapshot/freeze`，私有 stdin 传递 `nativeMaterials`、`nativeReferences`、本轮元数据与问题。适配器把材料/本轮状态写为明确的不可信 custom message，把本次问题写为真实 user 消息。旧模型历史由 Pi 恢复，不在此 JSON 中重建角色。批改、连接测试等原有无历史单轮任务保持隔离。
 
+课程内可以建立多个独立会话；`Session.courseId` 固定归属，`activeSessionByCourse` 只保存用户选择，不授予材料权限。旧固定课程会话及其 Pi 绑定保留为已有一条，不重编号、不拼接历史。创建、选择和改名不切换阅读文档；改名核对完整会话版本。
+
+课程聊天请求的 `documentId` 为空或省略时不自动注入当前笔记或首次锚点。显式探索材料时才传真实文档编号并沿用冻结快照；附加引用也须属于本课程，独立探索保留已有显式引用语义。普通课聊不因切换笔记或会话增加来源。无明确材料来源的练习在模型调用和工具写入前返回 `SOURCE_REQUIRED`，不伪造练习父节点。
+
 ## 生命周期
 
 | 内容 | 行为 |
