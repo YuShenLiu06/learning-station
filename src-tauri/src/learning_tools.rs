@@ -277,7 +277,7 @@ pub fn execute(
             || scope
                 .allowed_ids
                 .iter()
-                .any(|id| !run.context_manifest.iter().any(|m| &m.id == id))
+                .any(|id| !run.read_scope_manifest().iter().any(|m| &m.id == id))
         {
             return Err(out_of_scope());
         }
@@ -756,7 +756,7 @@ fn validate_scope(scope: &ToolScope, call_id: &str) -> Result<()> {
     if !valid_id(&scope.session_id)
         || (!scope.section_id.is_empty() && !valid_id(&scope.section_id))
         || !valid_id(&scope.run_id)
-        || scope.allowed_ids.len() > 32
+        || scope.allowed_ids.len() > context::MAX_READ_SCOPE_SOURCES
         || scope.allowed_ids.iter().any(|id| !valid_id(id))
         || call_id.is_empty()
         || call_id.chars().count() > 256

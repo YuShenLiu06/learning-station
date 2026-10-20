@@ -45,3 +45,48 @@ test('output correction is a program custom message and never duplicates the ori
  assert.equal(calls,2);assert.equal(entries.filter(e=>e.type==='message'&&e.message.role==='user'&&text(e.message)==='First question').length,1);
  assert(entries.some(e=>e.type==='custom_message'&&e.customType==='learning-station-output-validation'));
 });
+
+
+test('revoking a catalog-only source excludes received read results and compacted summaries', async () => {
+  for (const compact of [false, true]) {
+    const s = spec();
+    const empty = {...envelope, nativeMaterials: [], nativeReferences: '', contextBridgeManifest: {version: 1, entries: []}};
+    let n;
+    const stream = eventsStream(c => c.messages.some(m => m.role === 'toolResult')
+      ? [{type: 'text', text: 'TOOL_ONLY_PRIVATE_ANSWER'}]
+      : [{type: 'toolCall', id: 'read_catalog_source', name: 'read', arguments: {sourceId: 'doc_1'}}]);
+    const tool = {
+      name: 'read', label: 'Read', description: 'Read a frozen authorized source',
+      parameters: {type: 'object', properties: {sourceId: {type: 'string'}}, required: ['sourceId']},
+      async execute(id, args, signal) {
+        const reply = await n.requestTool({id, name: 'read', args}, signal);
+        return {content: [{type: 'text', text: JSON.stringify(reply.result)}], details: {}};
+      },
+    };
+    n = await openNativeSession(s, {
+      ...options(stream), tools: [tool], requestTool: async () => ({result: {
+        sourceId: 'doc_1', version: 'v1', content: 'TOOL_ONLY_PRIVATE_BODY',
+        includedInInitialContext: false, delivery: 'tool-result',
+      }}),
+    });
+    await n.applyContext(empty);
+    assert(!n.manager.buildSessionProjection().messages.some(m => text(m).includes('automatic_material_projection')));
+    await n.prompt('Read the authorized source');
+    await n.complete('TOOL_ONLY_PRIVATE_ANSWER');
+    assert(n.manager.getEntries().some(e => e.type === 'message' && e.message.role === 'toolResult' && text(e.message).includes('TOOL_ONLY_PRIVATE_BODY')));
+    if (compact) {
+      const kept = n.manager.appendCustomMessageEntry('fixture-after-read', 'Permitted marker', false, {});
+      n.manager.appendCompaction('TOOL_ONLY_PRIVATE_SUMMARY', kept, 1000);
+    }
+    n.close();
+    let observed;
+    n = await openNativeSession({...s, runId: 'catalog_revoke', userEntryId: 'catalog_revoke_user', authorizedSourceIds: []}, options(fixture(c => observed = c)));
+    await n.applyContext(empty);
+    await n.prompt('Continue without the revoked source');
+    n.close();
+    const wire = JSON.stringify(observed.messages);
+    for (const secret of ['TOOL_ONLY_PRIVATE_BODY', 'TOOL_ONLY_PRIVATE_ANSWER', 'TOOL_ONLY_PRIVATE_SUMMARY']) assert(!wire.includes(secret));
+    assert(wire.includes('Continue without the revoked source'));
+    assert(fs.readFileSync(path.join(s.directory, 'transcript.jsonl'), 'utf8').includes('TOOL_ONLY_PRIVATE_BODY'));
+  }
+});
