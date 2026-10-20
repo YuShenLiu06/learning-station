@@ -11,6 +11,8 @@ use std::path::Path;
 pub struct Preferences {
     #[serde(default)]
     pub session_by_course: BTreeMap<String, String>,
+    #[serde(default)]
+    pub active_session_by_course: BTreeMap<String, String>,
     pub active_document_id: Option<String>,
     pub active_session_id: Option<String>,
     #[serde(default)]
@@ -67,7 +69,8 @@ pub fn create_course(store: &mut ContentStore, section_id: &str, manifest: &[Man
     create_scoped(store, section_id, manifest, id, Some(course), legacy)
 }
 fn create_scoped(store: &mut ContentStore, section_id: &str, manifest: &[ManifestItem], id: &str, course: Option<&str>, legacy: &[String]) -> Result<Session> {
-    if !valid_id(id) || !valid_id(section_id) {
+    if !valid_id(id) || (!section_id.is_empty() && !valid_id(section_id))
+        || (section_id.is_empty() && course.is_none()) {
         return Err(CoreError::new("INVALID_INPUT", "会话或来源编号无效。"));
     }
     if store.is_trashed(id) || store.is_trashed(section_id) {
@@ -88,6 +91,7 @@ fn create_scoped(store: &mut ContentStore, section_id: &str, manifest: &[Manifes
                     .get("sectionId")
                     .and_then(Value::as_str)
                     != Some(section_id)
+                || existing.metadata.extra.get("courseId").and_then(Value::as_str) != course
             {
                 return Err(CoreError::new(
                     "CONFLICT",
@@ -99,8 +103,8 @@ fn create_scoped(store: &mut ContentStore, section_id: &str, manifest: &[Manifes
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    let section = store.read(section_id)?;
-    if !matches!(
+    let section = store.read(if section_id.is_empty() { course.unwrap() } else { section_id })?;
+    if !(section_id.is_empty() && course.is_some() && section.metadata.kind == "course") && !matches!(
         section.metadata.kind.as_str(),
         "section" | "knowledge" | "exploration"
     ) {
@@ -125,14 +129,18 @@ fn create_scoped(store: &mut ContentStore, section_id: &str, manifest: &[Manifes
         "session",
     );
     if let Some(course) = course {
-        meta.title = format!("{} · 课程对话", store.read(course)?.metadata.title);
+        meta.title = if section_id.is_empty() {
+            let count = store.summaries().iter().filter(|d| d.kind == "session")
+                .filter(|d| store.read(&d.id).is_ok_and(|d| d.metadata.extra.get("courseId").and_then(Value::as_str) == Some(course))).count();
+            format!("新对话 {}", count + 1)
+        } else { format!("{} · 课程对话", store.read(course)?.metadata.title) };
         meta.extra.insert("courseId".into(), json!(course));
     }
     meta.extra.insert("legacySessionIds".into(), json!(legacy));
-    meta.links = vec![section_id.into()];
+    meta.links = if section_id.is_empty() { vec![] } else { vec![section_id.into()] };
     meta.extra.insert("sectionId".into(), json!(section_id));
     meta.extra
-        .insert("associateCurrentSection".into(), json!(true));
+        .insert("associateCurrentSection".into(), json!(!section_id.is_empty()));
     meta.extra.insert("createdAt".into(), json!(timestamp()));
     meta.extra.insert("contextManifest".into(), json!(manifest));
     let body=format!("# {}\n\n本次学习记录。每条提问、练习和作答存于同目录 entries/ 的 Markdown 文件；课程正文不被改写。\n",meta.title);
@@ -178,6 +186,7 @@ pub fn get(store: &mut ContentStore, id: &str) -> Result<Session> {
         .ok_or_else(|| CoreError::new("INVALID_DOCUMENT", "学习记录缺少小节编号。"))?
         .to_string();
     if section_id.is_empty()
+        && doc.metadata.extra.get("courseId").and_then(Value::as_str).is_none()
         && (doc
             .metadata
             .extra
@@ -401,7 +410,7 @@ pub fn set_context_snapshot_explicit(
             "排除的历史来源编号无效或过多。",
         ));
     }
-    if session.section_id.is_empty() && !context.manifest.is_empty() && !explicit {
+    if session.course_id.is_none() && session.section_id.is_empty() && !context.manifest.is_empty() && !explicit {
         return Err(CoreError::new(
             "INVALID_INPUT",
             "独立探索不能写入课程来源。",
@@ -549,6 +558,7 @@ pub fn append(
     }
     if let Some(frozen) = crate::context::requested_context(&entry, old.course_id.is_none().then_some(old.section_id.as_str()))? {
         let source = crate::course_sessions::source(store, &old, &frozen.document_id)?;
+        crate::course_sessions::validate_injections(store, &old, &frozen.injections)?;
         if entry.data.as_ref().and_then(|d| d.get("sourceDocumentId")).and_then(Value::as_str).is_some_and(|id| id != source) {
             return Err(CoreError::new("CONTEXT_CONFLICT", "问题的冻结来源与当前材料不一致，未改变原请求。"));
         }

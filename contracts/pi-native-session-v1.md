@@ -1,6 +1,6 @@
 # Pi 原生会话 v1
 
-仅应用内部私有管道；不新增前端 IPC、模型权限或任意路径接口。锁定 `@earendil-works/pi-coding-agent`、agent-core、pi-ai 均为1.3.0。
+原生会话部分仅使用应用内部私有管道，不新增模型权限或任意路径接口。锁定 `@earendil-works/pi-coding-agent`、agent-core、pi-ai 均为1.3.0。
 
 ## 持有关系
 
@@ -65,3 +65,12 @@ Focus 切换时，native 的历史授权集合保留仍属于该课程的已见�
 共享会话按固定 courseId 回收；单篇材料仅收纳该材料、练习及明确来源的复习对象。整课程回收和恢复保留稳定会话 ID 与准确 Pi 绑定。课程历史保护的 historyBoundaryKey 是已排除来源集合的摘要；同一回收边界只排除旧历史一次，后续仍获授权的对话可继续保留。来源撤权或排除集合变化会重新建立权限边界，旧原始记录不删除。
 
 恢复也按本次提交后的可见性核对练习原 session/entry：同批恢复的账本允许，仍在其他回收记录的依赖返回 DEPENDENCY_TRASHED 及明确恢复目标。失败保持原回收记录，同 requestId 可在依赖恢复后重试；不读取隐藏账本给模型，不隐式恢复原课程或改写 Pi 绑定。
+
+## 课程多会话业务 IPC
+
+- `course_sessions(courseId)` 返回 `{courseId, activeSessionId, sessions: DocumentSummary[]}`。
+- `course_session_create(courseId, requestId)` 幂等创建无材料锚点的新会话，并选中它。
+- `course_session_select(courseId, sessionId)` 核对固定 `Session.courseId` 后选中已有会话。
+- `course_session_rename(courseId, sessionId, title, expectedVersion)` 核对 `Session.version` 后修改名称；返回已有 `Session` 结构。
+
+创建与选择也返回 `Session`，仅更新会话偏好，不修改阅读文档。bootstrap 增加 `lastSessionId`、`lastCourseId`，原有字段继续保留。原 `sessionByCourse` 保留旧固定会话映射；新 `activeSessionByCourse` 记录每课程最近选择。旧会话 ID、原生私有目录及 Markdown 历史不变，新会话使用独立 Pi 绑定；无选择且存在多个候选时明确要求选择，不以最新文件猜测恢复目标。

@@ -79,6 +79,22 @@ async fn list_sessions(state: State<'_, Arc<Engine>>) -> Result<Vec<DocumentSumm
     .await
 }
 #[tauri::command]
+async fn course_sessions(state: State<'_, Arc<Engine>>, course_id: String) -> Result<crate::course_sessions::CourseSessions> {
+    work(state.inner().clone(), move |e| { let mut core = e.lock()?; crate::course_sessions::list(&mut core, &course_id) }).await
+}
+#[tauri::command]
+async fn course_session_create(state: State<'_, Arc<Engine>>, course_id: String, request_id: String) -> Result<Session> {
+    work(state.inner().clone(), move |e| { let mut core = e.lock()?; crate::course_sessions::create(&mut core, &course_id, &request_id) }).await
+}
+#[tauri::command]
+async fn course_session_select(state: State<'_, Arc<Engine>>, course_id: String, session_id: String) -> Result<Session> {
+    work(state.inner().clone(), move |e| { let mut core = e.lock()?; crate::course_sessions::select(&mut core, &course_id, &session_id) }).await
+}
+#[tauri::command]
+async fn course_session_rename(state: State<'_, Arc<Engine>>, course_id: String, session_id: String, title: String, expected_version: String) -> Result<Session> {
+    work(state.inner().clone(), move |e| { let mut core = e.lock()?; crate::course_sessions::rename(&mut core, &course_id, &session_id, &title, &expected_version) }).await
+}
+#[tauri::command]
 async fn create_exploration_note(
     state: State<'_, Arc<Engine>>,
     question: String,
@@ -1007,6 +1023,10 @@ pub fn run() {
             get_app_state,
             get_library_tree,
             list_sessions,
+            course_sessions,
+            course_session_create,
+            course_session_select,
+            course_session_rename,
             create_exploration_note,
             preview_library_trash,
             list_library_trash,

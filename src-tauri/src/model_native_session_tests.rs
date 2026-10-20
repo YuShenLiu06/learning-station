@@ -42,6 +42,13 @@ fn receive(s: &mut std::net::TcpStream) -> Value {
 }
 #[tokio::test]
 async fn real_rust_node_pi_native_restart_roles_tool_pairs_and_course_isolation() {
+    native_restart_case(false).await;
+}
+#[tokio::test]
+async fn real_rust_node_pi_multiple_chats_in_one_course_keep_separate_native_history() {
+    native_restart_case(true).await;
+}
+async fn native_restart_case(same_course: bool) {
     let dir = tempfile::tempdir().unwrap();
     let mut e = Engine::new(dir.path().join("lib"), dir.path().join("state")).unwrap();
     let (doc, second_doc, sid, other) = {
@@ -51,8 +58,12 @@ async fn real_rust_node_pi_native_restart_roles_tool_pairs_and_course_isolation(
         let d2 = crate::library_tree::create(&mut c.content, "section", "Second source", Some(&owner.id), "MATERIAL_SECOND_NOTE", "native-course-note-b").unwrap();
         let (s, _) = c.start_session(&d.id, false).unwrap();
         assert_eq!(c.start_session(&d2.id, false).unwrap().0.id, s.id);
-        let o = c.create_section("Other course", "OTHER_COURSE_SOURCE", vec![], vec![]).unwrap();
-        let (os, _) = c.start_session(&o.id, false).unwrap();
+        let os = if same_course {
+            crate::course_sessions::create(&mut c, &owner.id, "native-separate-course-chat").unwrap()
+        } else {
+            let o = c.create_section("Other course", "OTHER_COURSE_SOURCE", vec![], vec![]).unwrap();
+            c.start_session(&o.id, false).unwrap().0
+        };
         (d.id, d2.id, s.id, os.id)
     };
     let server = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -389,6 +400,12 @@ async fn real_rust_node_pi_native_restart_roles_tool_pairs_and_course_isolation(
     assert!(!serde_json::to_string(&packets[3])
         .unwrap()
         .contains("FIRST_NATIVE_REPLY"));
+    if same_course {
+        let other_packet = serde_json::to_string(&packets[3]).unwrap();
+        assert!(!other_packet.contains("MATERIAL_NATIVE_STABLE"));
+        assert!(!other_packet.contains("MATERIAL_SECOND_NOTE"));
+        assert!(!other_packet.contains("QUESTION_NATIVE_0"));
+    }
     assert_eq!(packets[4]["model"], "changed-fixture");
     assert!(inventory.lock().unwrap().iter().any(|m| m["entries"]
         .as_array()
