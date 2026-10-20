@@ -112,6 +112,70 @@ fn busy_attachment_storage_keeps_the_old_receipt_and_can_retry_after_unlock() {
 }
 
 #[test]
+fn busy_import_writes_no_asset_and_recovers_one_receipt_for_the_same_request() {
+    let f = Fixture::new();
+    let seed = f.import("seed.txt", b"seed\n", "import_seed");
+    let course = f.store.root().join("assets").join(&f.course.id);
+    let seed_directory = course.join(&seed.id);
+    let before_metadata = fs::read(seed_directory.join("metadata.json")).unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(f.store.root().join("assets/.assets.lock"))
+        .unwrap();
+    retry_busy(|| match lock.try_lock() {
+        Ok(()) => Ok(()),
+        Err(fs::TryLockError::WouldBlock) => Err(CoreError::new("BUSY", "fixture lock contention")),
+        Err(fs::TryLockError::Error(error)) => Err(CoreError::io(error)),
+    })
+    .unwrap();
+    let request = "import_busy_same_request";
+    let name = "lesson.txt";
+    let payload = b"import after unlock\n";
+    let mut attempts = 0;
+    let imported = retry_busy(|| {
+        attempts += 1;
+        let result = assets::import(&f.store, &f.course.id, name, payload, request);
+        if attempts == 1 {
+            assert_eq!(result.as_ref().unwrap_err().code, "BUSY");
+            assert_eq!(fs::read_dir(&course).unwrap().count(), 1);
+            assert_eq!(
+                fs::read(seed_directory.join("content.txt")).unwrap(),
+                b"seed\n"
+            );
+            assert_eq!(
+                fs::read(seed_directory.join("metadata.json")).unwrap(),
+                before_metadata
+            );
+            lock.unlock().unwrap();
+        }
+        result
+    })
+    .unwrap();
+    assert!(attempts >= 2);
+    assert_eq!(f.import(name, payload, request), imported);
+    assert_eq!(fs::read_dir(&course).unwrap().count(), 2);
+    assert_eq!(
+        fs::read(course.join(imported.id).join("content.txt")).unwrap(),
+        payload
+    );
+}
+
+#[test]
+fn busy_test_retry_returns_every_other_error_on_the_first_attempt() {
+    for code in ["IO", "CONFLICT", "NETWORK", "MATERIAL_GIT"] {
+        let mut attempts = 0;
+        let error = retry_busy::<()>(|| {
+            attempts += 1;
+            Err(CoreError::new(code, "synthetic error"))
+        })
+        .unwrap_err();
+        assert_eq!(error.code, code);
+        assert_eq!(attempts, 1);
+    }
+}
+
+#[test]
 fn teaching_names_survive_and_exclusions_are_readable_from_the_commit() {
     let f = Fixture::new();
     let original = f.commit(None);
