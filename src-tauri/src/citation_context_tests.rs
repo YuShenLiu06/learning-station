@@ -179,6 +179,71 @@ mod cases {
             .contains("NEW_MESSAGE_VERSION"));
     }
     #[test]
+    fn unordered_list_space_and_tab_separators_stop_each_supported_layout() {
+        for marker in ["-", "*", "+"] {
+            for separator in [" ", "\t"] {
+                for layout in ["\n", "\n\n", "\n\nneighbor paragraph\n"] {
+                    for newline in ["\n", "\r\n"] {
+                        let text = format!("Near before🙂\n\nprefix😀 chosen suffix{layout}{marker}{separator}OUTSIDE_LIST\n\nFAR_AFTER").replace('\n', newline);
+                        let frozen = plain(&text, "chosen");
+                        assert_eq!(frozen.quoted_text, "chosen");
+                        assert_eq!(frozen.source.version, hash(&text));
+                        assert_eq!(
+                            serde_json::to_value(&frozen.locator).unwrap(),
+                            json!(locator(&text, "chosen"))
+                        );
+                        let auxiliary = frozen
+                            .supplemental_context
+                            .iter()
+                            .map(|p| p.text.as_str())
+                            .collect::<String>();
+                        assert!(
+                            !auxiliary.contains("OUTSIDE_LIST"),
+                            "crossed {marker:?}{separator:?} with {layout:?}"
+                        );
+                        assert!(!auxiliary.contains("FAR_AFTER"));
+                        for part in &frozen.supplemental_context {
+                            assert_eq!(
+                                part.text,
+                                text.chars()
+                                    .skip(part.range.start_char)
+                                    .take(part.range.end_char - part.range.start_char)
+                                    .collect::<String>()
+                            );
+                            assert_eq!(part.source.included_chars, part.text.chars().count());
+                            assert!(!part.truncated);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn existing_numeric_boundaries_and_fenced_tab_markers_remain_unchanged() {
+        for marker in ["1. ", "1.\t", "1) ", "1)\t", "10.\t", "0) "] {
+            for gap in ["\n", "\n\n"] {
+                let frozen = plain(
+                    &format!("prefix😀 chosen suffix{gap}{marker}OUTSIDE_LIST\n\nFAR_AFTER"),
+                    "chosen",
+                );
+                assert_eq!(frozen.quoted_text, "chosen");
+                let auxiliary = serde_json::to_string(&frozen.supplemental_context).unwrap();
+                assert!(!auxiliary.contains("OUTSIDE_LIST"));
+                assert!(!auxiliary.contains("FAR_AFTER"));
+            }
+        }
+        let frozen = plain("OUTSIDE_BEFORE\n\n```text\n-\tLITERAL_TAB_MARKER\nprefix😀 chosen suffix\n===\n```\n\nOUTSIDE_AFTER", "chosen");
+        let auxiliary = frozen
+            .supplemental_context
+            .iter()
+            .map(|p| p.text.as_str())
+            .collect::<String>();
+        assert!(auxiliary.contains("-\tLITERAL_TAB_MARKER"));
+        assert!(auxiliary.contains("==="));
+        assert!(!auxiliary.contains("OUTSIDE_BEFORE"));
+        assert!(!auxiliary.contains("OUTSIDE_AFTER"));
+    }
+    #[test]
     fn adjacent_paragraph_lists_also_stop_supplement_expansion() {
         for marker in ["- ", "* ", "+ ", "1. ", "  - "] {
             let text = format!("prefix chosen suffix\n\nneighbor paragraph\n{marker}OUTSIDE_LIST\n\nFAR_AFTER_LIST");

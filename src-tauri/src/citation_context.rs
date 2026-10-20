@@ -106,9 +106,7 @@ fn located(text: &str, quote: &str, locator: Option<&Locator>) -> Option<Locator
 fn ordinary(line: &str) -> bool {
     let s = line.trim_start();
     !s.starts_with(['#', '>', '|', '<', '`', '~'])
-        && !s.starts_with("- ")
-        && !s.starts_with("* ")
-        && !s.starts_with("+ ")
+        && !matches!(s.as_bytes(), [b'-' | b'*' | b'+', b' ' | b'\t', ..])
         && !s.chars().next().is_some_and(|c| c.is_ascii_digit())
 }
 /// Exact source offsets, blank-line paragraph boundaries, and opaque fenced blocks.
