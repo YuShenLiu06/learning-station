@@ -52,8 +52,16 @@ struct StoredAsset {
 
 struct LockedRoot {
     path: PathBuf,
-    // Advisory OS locking is released on process exit, including a crash.
+    // Constructed only after this file has acquired the advisory lock.
     _lock: File,
+}
+
+impl Drop for LockedRoot {
+    fn drop(&mut self) {
+        // close alone may leave a spawned child's inherited descriptor holding
+        // this lock. Release our ownership before File closes and OPERATIONS drops.
+        let _ = self._lock.unlock();
+    }
 }
 
 /// Imports bytes provided by the caller, never a caller-selected system path.
@@ -1222,5 +1230,194 @@ mod tests {
         ] {
             assert_eq!(base64(input), encoded);
         }
+    }
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod lock_lifecycle_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::mpsc;
+    use std::thread::{self, JoinHandle};
+    use std::time::{Duration, Instant};
+
+    struct InheritedFile {
+        child: Child,
+        output: Option<JoinHandle<()>>,
+    }
+
+    impl InheritedFile {
+        fn hold(file: &File) -> Self {
+            let fd = file.as_raw_fd();
+            let metadata = file.metadata().unwrap();
+            let ready = format!(
+                "ASSET_LOCK_CHILD_READY:{}:{}",
+                metadata.dev(),
+                metadata.ino()
+            );
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "assets::lock_lifecycle_tests::inherited_asset_lock_child",
+                    "--nocapture",
+                ])
+                .env("LEARNING_STATION_ASSET_TEST_FD", fd.to_string())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            // Only the child changes CLOEXEC, immediately before exec. The parent
+            // retains its flags; no unrelated test's executable inherits this FD.
+            unsafe {
+                command.pre_exec(move || {
+                    unsafe extern "C" {
+                        fn fcntl(fd: i32, command: i32, ...) -> i32;
+                    }
+                    const F_GETFD: i32 = 1;
+                    const F_SETFD: i32 = 2;
+                    const FD_CLOEXEC: i32 = 1;
+                    let flags = fcntl(fd, F_GETFD);
+                    if flags < 0 || fcntl(fd, F_SETFD, flags & !FD_CLOEXEC) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut child = command.spawn().unwrap();
+            let output = child.stdout.take().unwrap();
+            let (sender, receiver) = mpsc::channel();
+            let output = thread::spawn(move || {
+                for line in BufReader::new(output)
+                    .lines()
+                    .map_while(std::result::Result::ok)
+                {
+                    if line.contains(&ready) {
+                        let _ = sender.send(());
+                    }
+                }
+            });
+            let holder = Self {
+                child,
+                output: Some(output),
+            };
+            receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+            holder
+        }
+
+        fn finish(mut self) {
+            self.child.stdin.take().unwrap().write_all(b"x").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    assert!(status.success());
+                    break;
+                }
+                assert!(Instant::now() < deadline, "inherited-FD child did not exit");
+                thread::sleep(Duration::from_millis(5));
+            }
+            self.output.take().unwrap().join().unwrap();
+        }
+    }
+
+    impl Drop for InheritedFile {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            if let Some(output) = self.output.take() {
+                let _ = output.join();
+            }
+        }
+    }
+
+    #[test]
+    fn inherited_asset_lock_child() {
+        let Ok(fd) = std::env::var("LEARNING_STATION_ASSET_TEST_FD") else {
+            return;
+        };
+        let file = unsafe { File::from_raw_fd(fd.parse().unwrap()) };
+        let metadata = file.metadata().unwrap();
+        println!(
+            "ASSET_LOCK_CHILD_READY:{}:{}",
+            metadata.dev(),
+            metadata.ino()
+        );
+        std::io::stdout().flush().unwrap();
+        std::io::stdin().read_exact(&mut [0]).unwrap();
+        drop(file);
+    }
+
+    #[test]
+    fn close_only_control_keeps_lock_until_inherited_descriptor_closes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.lock");
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.try_lock().unwrap();
+        let child = InheritedFile::hold(&file);
+        drop(file);
+        let contender = File::options().read(true).write(true).open(path).unwrap();
+        assert!(matches!(
+            contender.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        child.finish();
+    }
+
+    #[test]
+    fn guard_releases_inherited_lock_on_return_error_and_unwind() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ContentStore::new(
+            directory.path().join("library"),
+            directory.path().join("state"),
+        )
+        .unwrap();
+        for exit in ["return", "error", "unwind"] {
+            let mut child = None;
+            let outcome =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                    let root = lock_root(store.root(), true)?.unwrap();
+                    child = Some(InheritedFile::hold(&root._lock));
+                    match exit {
+                        "error" => Err(invalid_state()),
+                        "unwind" => panic!("synthetic asset-guard unwind"),
+                        _ => Ok(()),
+                    }
+                }));
+            match exit {
+                "error" => assert!(outcome.unwrap().is_err()),
+                "unwind" => assert!(outcome.is_err()),
+                _ => outcome.unwrap().unwrap(),
+            }
+            let next = lock_root(store.root(), false).unwrap().unwrap();
+            child.take().unwrap().finish();
+            // Closing an inherited descriptor of the old owner must not unlock
+            // the next owner, which uses a different open-file-description.
+            assert_eq!(lock_root(store.root(), false).err().unwrap().code, "BUSY");
+            drop(next);
+        }
+    }
+
+    #[test]
+    fn failed_acquisition_does_not_unlock_the_existing_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ContentStore::new(
+            directory.path().join("library"),
+            directory.path().join("state"),
+        )
+        .unwrap();
+        let owner = lock_root(store.root(), true).unwrap().unwrap();
+        for _ in 0..2 {
+            assert_eq!(lock_root(store.root(), false).err().unwrap().code, "BUSY");
+        }
+        drop(owner);
+        assert!(lock_root(store.root(), false).unwrap().is_some());
     }
 }
