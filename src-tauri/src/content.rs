@@ -128,7 +128,9 @@ impl ContentStore {
                 }
                 // Uploaded source/code may include arbitrary Markdown examples.
                 // The root assets directory is not part of the course index.
-                if path == self.root.join("assets") {
+                if path == self.root.join("assets")
+                    || !crate::course_project::indexable(&self.root, &path)
+                {
                     continue;
                 }
                 let meta = fs::symlink_metadata(&path).map_err(CoreError::io)?;
@@ -289,6 +291,8 @@ impl ContentStore {
         if self.hidden_ids.contains(&metadata.id) || self.hidden_paths.contains(relative) {
             return Err(trashed());
         }
+        let routed = crate::course_project::routed_path(self, &metadata)?;
+        let relative = routed.as_deref().unwrap_or(relative);
         let target = self.checked_path(relative, true)?;
         let normalized =
             relative_string(target.strip_prefix(&self.root).map_err(|_| unsafe_path())?)?;

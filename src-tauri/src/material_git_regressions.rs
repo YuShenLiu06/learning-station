@@ -132,24 +132,24 @@ fn busy_import_writes_no_asset_and_recovers_one_receipt_for_the_same_request() {
     let request = "import_busy_same_request";
     let name = "lesson.txt";
     let payload = b"import after unlock\n";
-    let mut attempts = 0;
+    let result = assets::import(&f.store, &f.course.id, name, payload, request);
+    assert_eq!(result.unwrap_err().code, "BUSY");
+    assert_eq!(fs::read_dir(&course).unwrap().count(), 1);
+    assert_eq!(
+        fs::read(seed_directory.join("content.txt")).unwrap(),
+        b"seed\n"
+    );
+    assert_eq!(
+        fs::read(seed_directory.join("metadata.json")).unwrap(),
+        before_metadata
+    );
+    lock.unlock().unwrap();
+    // The intentional locked attempt may wait on other fixtures' process
+    // mutex. Start the bounded recovery window only after releasing our lock.
+    let mut attempts = 1;
     let imported = retry_busy(|| {
         attempts += 1;
-        let result = assets::import(&f.store, &f.course.id, name, payload, request);
-        if attempts == 1 {
-            assert_eq!(result.as_ref().unwrap_err().code, "BUSY");
-            assert_eq!(fs::read_dir(&course).unwrap().count(), 1);
-            assert_eq!(
-                fs::read(seed_directory.join("content.txt")).unwrap(),
-                b"seed\n"
-            );
-            assert_eq!(
-                fs::read(seed_directory.join("metadata.json")).unwrap(),
-                before_metadata
-            );
-            lock.unlock().unwrap();
-        }
-        result
+        assets::import(&f.store, &f.course.id, name, payload, request)
     })
     .unwrap();
     assert!(attempts >= 2);

@@ -6,6 +6,7 @@ pub mod content;
 pub mod content_url;
 pub mod context;
 pub mod context_bridge;
+pub mod course_project;
 #[cfg(feature = "desktop")]
 mod desktop;
 pub mod drafts;
