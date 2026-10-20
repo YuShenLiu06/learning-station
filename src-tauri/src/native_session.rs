@@ -11,6 +11,10 @@ use std::{
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NativeSession {
     pub directory: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_dir: Option<PathBuf>,
     pub learning_session_id: String,
     pub run_id: String,
     pub user_entry_id: String,
@@ -118,6 +122,8 @@ pub fn prepare(
     };
     Ok(NativeSession {
         directory,
+        project_root: None,
+        agent_dir: None,
         learning_session_id: session.id.clone(),
         run_id: run.into(),
         user_entry_id: user.into(),

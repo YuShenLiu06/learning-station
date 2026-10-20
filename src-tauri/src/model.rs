@@ -847,6 +847,97 @@ pub async fn generate_scoped(
     )
     .await
 }
+fn configured_agent_dir(sidecar_dir: &Path) -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    if let Some(path) = std::env::var_os("PI_CODING_AGENT_DIR") {
+        let path = PathBuf::from(path);
+        if path == Path::new("~") {
+            return home;
+        }
+        if let Ok(rest) = path.strip_prefix("~/") {
+            return home.join(rest);
+        }
+        return if path.is_absolute() {
+            path
+        } else {
+            sidecar_dir.join(path)
+        };
+    }
+    home.join(".pi/agent")
+}
+
+/// Read-only SDK resource paths for native project discovery. Project root is recursive;
+/// outside it, only known ancestor instruction filenames and user resource directories pass.
+fn native_project_read_allowlist(
+    project_root: &Path,
+    agent_dir: &Path,
+    home: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut paths = vec![project_root.to_path_buf()];
+    let context_names = [
+        "AGENTS.override.md",
+        "AGENTS.md",
+        "AGENTS.MD",
+        "CLAUDE.md",
+        "CLAUDE.MD",
+    ];
+    let mut dir = project_root.to_path_buf();
+    loop {
+        for name in context_names {
+            paths.push(dir.join(name));
+        }
+        let parent = match dir.parent() {
+            Some(parent) if parent != dir => parent,
+            _ => break,
+        };
+        dir = parent.to_path_buf();
+    }
+    for name in [
+        "SYSTEM.md",
+        "APPEND_SYSTEM.md",
+        "AGENTS.override.md",
+        "AGENTS.md",
+        "AGENTS.MD",
+        "CLAUDE.md",
+        "CLAUDE.MD",
+    ] {
+        paths.push(agent_dir.join(name));
+    }
+    for name in ["skills", "prompts", "themes", "extensions"] {
+        paths.push(agent_dir.join(name));
+    }
+    if let Some(home) = home.filter(|home| home.is_absolute()) {
+        paths.push(home.join(".agents/skills"));
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+#[cfg(test)]
+mod native_project_scope_tests {
+    use super::native_project_read_allowlist;
+    use std::path::Path;
+
+    #[test]
+    fn project_scope_does_not_grant_sibling_course_or_user_auth_file() {
+        let root = Path::new("/fixture/library/courses/course-a");
+        let agent = Path::new("/fixture/home/.pi/agent");
+        let home = Path::new("/fixture/home");
+        let paths = native_project_read_allowlist(root, agent, Some(home));
+
+        assert!(paths.contains(&root.to_path_buf()));
+        assert!(paths.contains(&agent.join("skills")));
+        assert!(paths.contains(&home.join(".agents/skills")));
+        assert!(
+            !paths.contains(&Path::new("/fixture/library/courses/course-b/notes.md").to_path_buf())
+        );
+        assert!(!paths.contains(&agent.join("auth.json")));
+    }
+}
+
 async fn run_sidecar(
     mut credentials: ModelCredentials,
     messages: Vec<Value>,
@@ -858,7 +949,7 @@ async fn run_sidecar(
     skills: Vec<crate::learning_skills::SkillSnapshot>,
     request_context: Option<RequestContext>,
 ) -> Result<String> {
-    let request_context = request_context.unwrap_or_else(RequestContext::capture);
+    let mut request_context = request_context.unwrap_or_else(RequestContext::capture);
     request_context.time.validate()?;
     ensure_usage_allowed(&credentials.settings)?;
     let diagnostic_path = credentials.diagnostic_path.take();
@@ -875,6 +966,11 @@ async fn run_sidecar(
         .cloned()
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../pi-sidecar"));
     let directory = std::fs::canonicalize(directory).map_err(|_| runtime_error())?;
+    if let Some(native) = request_context.native_session.as_mut() {
+        if native.project_root.is_some() {
+            native.agent_dir.get_or_insert_with(|| configured_agent_dir(&directory));
+        }
+    }
     if !node_path().is_file()
         || !directory.join("sidecar.mjs").is_file()
         || !directory.join("harness.mjs").is_file()
@@ -932,6 +1028,26 @@ async fn run_sidecar(
         command
             .arg(format!("--allow-fs-read={}", native.directory.display()))
             .arg(format!("--allow-fs-write={}", native.directory.display()));
+        if let Some(project_root) = &native.project_root {
+            let canonical_root =
+                std::fs::canonicalize(project_root).map_err(|_| runtime_error())?;
+            if !project_root.is_absolute()
+                || &canonical_root != project_root
+                || !std::fs::symlink_metadata(&canonical_root)
+                    .map(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+                    .unwrap_or(false)
+            {
+                return Err(runtime_error());
+            }
+            let agent_dir = native.agent_dir.as_ref().ok_or_else(runtime_error)?;
+            if !agent_dir.is_absolute() {
+                return Err(runtime_error());
+            }
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            for path in native_project_read_allowlist(&canonical_root, agent_dir, home.as_deref()) {
+                command.arg(format!("--allow-fs-read={}", path.display()));
+            }
+        }
     }
     let mut child = command
         .arg(directory.join("sidecar.mjs"))

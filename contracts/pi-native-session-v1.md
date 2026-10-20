@@ -10,6 +10,12 @@
 
 `RequestContext.nativeSession` 内部字段：`directory`（Rust已核实的私有目录）、`learningSessionId`、`runId`、`userEntryId`、`authorizedSourceIds`、`protectHistory`、`legacyRecords`。前端不能提供这些路径或扩大范围。
 
+课程项目适配另支持可选 `projectRoot` 与 `agentDir`：课程根只作为 Pi cwd，`directory` 仍为当前 session 专属存储。Rust 核实 canonical 真实目录，并显式提供允许的用户 agentDir；缺省保持旧会话资源行为。课程业务接入必须消费 `course_project_root`，不能接受前端任意绝对路径。`projectRoot` 请求不接受自动笔记正文或 material 清单，显式引用继续走 `nativeReferences`；旧 automatic material custom 只从有效投影排除，不删除原始会话或真实工具历史。
+
+项目资源使用锁版 Pi 的 `DefaultResourceLoader`：保留父级 AGENTS 与课程/用户 skills、prompt templates 等文本发现，使用显式应用 system prompt override，不另造 parser 或缓存。SettingsManager 仍为内存配置，不加载外部可执行 extensions、自动包安装或用户凭据。原生 `/skill` 展开保留原始输入哈希与实际 user entry 映射，同一问题重试复用已接受的展开文本。
+
+cwd 与 Node 目录读取参数都不是强隔离：真实锁版 read/Bash 可读取兄弟 fixture，Node 24 的预存 symlink 也可绕过目录范围。基础原生 read/Bash 不启用，现有 Rust 工具校验不变；不新增 sandbox/插件。Node 只增加课程、父级说明文件候选与允许用户文本资源的只读范围，不增加写入或 child-process 权限。上述行为用合成 fixture 验证，不代表 GUI、真实模型或课程整合已验收。
+
 每个学习会话使用 `state/pi-native/sha256(sessionId)/binding.json`，绑定固定 `transcript.jsonl`。绑定不存在但目录非空、已初始化文件丢失、格式损坏或符号链接均失败。Node 独占锁只恢复已确认死亡的旧进程；不能抢活跃会话。
 
 首次迁移先不可覆盖地保存 `legacy-backup.md/json`；原 Markdown 保持原位。旧业务记录只作为明确标注的不可信引用，不冒充真实旧 assistant/toolResult。迁移失败保留原文件与备份，旧验收包仍可打开原业务库；不得删除未知文件来“修复”。
@@ -28,7 +34,7 @@
 
 ## 模型及资源
 
-固定显式 ModelRuntime、内存凭据、`modelsPath=null`、禁止模型目录网络刷新。资源加载器返回空外部扩展/模板/全局指导/Agents文件，应用仅传既有学习指导。基础工具表为空，精确开放应用任务策略允许的工具；普通聊天与探索（兼容 question/explain）共用完整学习工具集合与每轮6次预算，始终包含 create_review_card/create_error，不以 Skill 加载作为开关。Rust 的策略构建与校验复用同一白名单，Pi 独立校验并注册相同集合；重开会话按当前策略重建工具表。制卡仅保存本地卡片，不能据此宣称同步 Anki；`edit/grep/find/ls/powershell`均不注册。`read/write/bash`仅在本机设置的工具授权档位（off/read/write/bash，默认off，仅question/explain模式）开启后受控注册，随toolPolicy.authorization由Rust下发；参数与结果仍由Rust校验，read只读本轮manifest已授权来源或会话工作区文件，write只写会话工作区（路径/配额/符号链接受限），bash只在会话工作区以受限环境执行（固定PATH、无HOME、超时与输出有上限），write/bash以持久回执台账幂等，恢复只读台账不重执行。Node权限模式不允许创建子进程（bash由Rust进程执行，不经Node）。
+固定显式 ModelRuntime、内存凭据、`modelsPath=null`、禁止模型目录网络刷新。旧会话资源加载器返回空外部扩展/模板/全局指导/Agents文件，应用仅传既有学习指导；课程项目按上节复用原生文本资源。基础工具表为空，精确开放应用任务策略允许的工具；普通聊天与探索（兼容 question/explain）共用完整学习工具集合与每轮6次预算，始终包含 create_review_card/create_error，不以 Skill 加载作为开关。Rust 的策略构建与校验复用同一白名单，Pi 独立校验并注册相同集合；重开会话按当前策略重建工具表。制卡仅保存本地卡片，不能据此宣称同步 Anki；`edit/grep/find/ls/powershell`均不注册。`read/write/bash`仅在本机设置的工具授权档位（off/read/write/bash，默认off，仅question/explain模式）开启后受控注册，随toolPolicy.authorization由Rust下发；参数与结果仍由Rust校验，read只读本轮manifest已授权来源或会话工作区文件，write只写会话工作区（路径/配额/符号链接受限），bash只在会话工作区以受限环境执行（固定PATH、无HOME、超时与输出有上限），write/bash以持久回执台账幂等，恢复只读台账不重执行。Node权限模式不允许创建子进程（bash由Rust进程执行，不经Node）。
 
 `list_learning_skills`/`load_learning_skill`是仅question/explain/practice模式注册的只读工具，不挂任何授权档位：它们只读随包 `skills/` 固定允许清单（三个稳定id），复用主动快照同一路径校验（根内canonicalize、拒符号链接、16KiB、frontmatter合法），目录仅返回id/名称/描述不含正文，正文经工具结果通道返回且受工具结果预算约束，超出按SKILL_INVALID单工具拒绝。清单外或含路径成分的 id 分别以 TOOL_SCOPE／INVALID_TOOL_INPUT 拒绝，均不触盘。同run重复load同一指导只返回简短提示（含sha256）；该指导已随模式或工具注册注入时返回"已在指导中"，不重复正文；去重台账按run维度挂Rust，新run或该run压缩完成后可重新取正文。ready事件的learningSkills版本回执语义不变，仍只认主动注入快照，按需加载不进入该回执。
 
