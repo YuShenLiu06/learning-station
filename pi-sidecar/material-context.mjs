@@ -51,6 +51,7 @@ export async function registerMaterialContext({manager,spec,loadChanges,envelope
         }
       }
       for(const source of currentSources){
+        if(source.projectionError)throw new NativeSessionError('CONTEXT_CONFLICT');
         if(typeof source.text!=='string'||sha(source.text)!==source.textHash||!spec.authorizedSourceIds.includes(source.id))throw new NativeSessionError();
         const {active,last}=materialBaseline(source.id);
         let status=manager.getEntries().some(e=>e.type==='custom_message'&&e.customType==='learning-station-material'&&e.details?.sourceId===source.id)?'reloaded':'added',frames=[{kind:'full',version:source.version,textHash:source.textHash,text:source.text}];
@@ -63,7 +64,7 @@ export async function registerMaterialContext({manager,spec,loadChanges,envelope
           if(frames[0].kind==='full')for(const entry of active)bridge.exclude(entry.sourceEntry.id);
           bridge.message('focus','已授权材料的完整正文或真实 Git 差量','learning-station-material',{type:'automatic_material_projection',id:source.id,...(source.path?{path:source.path}:{}),version:source.version,range:source.range,...(source.bodyStartChar?{bodyStartChar:source.bodyStartChar}:{}),frames},{sourceId:source.id,...(source.path?{path:source.path}:{}),textHash:source.textHash,version:source.version,range:source.range,...(source.gitCommitOid?{gitCommitOid:source.gitCommitOid,gitBlobOid:source.gitBlobOid}:{})});
         }
-        const item=inventory.entries.find(e=>e.sourceId===source.id&&e.kind==='material');if(item){item.status=status;item.reason=status==='retained'?'native_projection_contains_baseline':status==='updated'?'native_projection_verified_diff':'native_baseline_reload';}
+        const item=inventory.entries.find(e=>e.sourceId===source.id&&e.kind==='material');if(item){item.includedChars=[...source.text].length;item.range=source.range;item.bodyStartChar=source.bodyStartChar??0;item.coordinateSpace=source.bodyStartChar?'serialized-document':'body';item.status=status;item.reason=status==='retained'?'native_projection_contains_baseline':status==='updated'?'native_projection_verified_diff':'native_baseline_reload';}
       }
       for(const item of inventory.entries)if(item.kind==='turn'&&(item.id==='focus'||item.id.startsWith('focus:'))&&currentSources.length){item.includedChars=0;item.reason='focus_location';}
       if(envelope.focus) {

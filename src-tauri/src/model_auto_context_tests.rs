@@ -426,8 +426,9 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
             let session=sessions::get(&mut core.content,&session_id)?;
             let value=crate::material_changes::for_focus(&mut core,&session,&focus,previous.as_deref(),body_previous.as_deref())?;
             let text=value["focused"]["text"].as_str().unwrap();
-            let (_,body)=crate::content::parse(text)?;
-            assert_eq!(value["focused"]["bodyStartChar"].as_u64().unwrap() as usize,text[..text.len()-body.len()].chars().count());
+            assert_eq!(value["focused"]["bodyStartChar"],0);
+            assert_eq!(value["focused"]["textHash"],hash(text));
+            assert!(!text.contains("createRequestDigest"));
             Ok(value)
         });
         let transcript = std::path::PathBuf::from(&native.directory).join("transcript.jsonl");
@@ -445,6 +446,7 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
     if let Some(folder)=std::env::var_os("LS_CHANGES_WIRE_EVIDENCE") { let folder=std::path::PathBuf::from(folder);std::fs::create_dir_all(&folder).unwrap();std::fs::write(folder.join("requests.json"),serde_json::to_vec_pretty(&packets).unwrap()).unwrap(); }
 
     for (round,packet) in packets.iter().enumerate() {
+        for internal in ["createRequestDigest", "timestampSource", "createdAt", "updatedAt", "parentId"] { assert!(!packet.to_string().contains(internal), "internal field leaked: {internal}"); }
         let payloads:Vec<Value>=packet["messages"].as_array().unwrap().iter().filter_map(|m| {let text=m["content"].as_str().map(str::to_owned).unwrap_or_else(||m["content"].as_array().into_iter().flatten().filter_map(|p|p["text"].as_str()).collect::<String>());serde_json::from_str(&text).ok()}).collect();
         for patch in payloads.iter().flat_map(|p|p["frames"].as_array().into_iter().flatten()).filter_map(|f|f["unifiedDiff"].as_str()) {
             let encoded=serde_json::to_string(patch).unwrap();
@@ -464,7 +466,7 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
     assert!(!packets[5].to_string().contains("B_FIXED_SECOND_BODY"));
     assert!(packets[5].to_string().contains("A_FIXED_CHANGED_GIT_BODY"));
     for packet in &packets[5..] {
-    let frames: Vec<Value> = packet["messages"].as_array().unwrap().iter().filter_map(|m| { let text=m["content"].as_str().map(str::to_owned).unwrap_or_else(||m["content"].as_array().into_iter().flatten().filter_map(|p|p["text"].as_str()).collect::<String>()); serde_json::from_str::<Value>(&text).ok() }).filter(|v| v["type"]=="automatic_material_projection").inspect(|v|assert!(v["bodyStartChar"].as_u64().unwrap()>0)).flat_map(|v|v["frames"].as_array().cloned().unwrap_or_default()).collect();
+    let frames: Vec<Value> = packet["messages"].as_array().unwrap().iter().filter_map(|m| { let text=m["content"].as_str().map(str::to_owned).unwrap_or_else(||m["content"].as_array().into_iter().flatten().filter_map(|p|p["text"].as_str()).collect::<String>()); serde_json::from_str::<Value>(&text).ok() }).filter(|v| v["type"]=="automatic_material_projection").inspect(|v|assert!(v.get("bodyStartChar").is_none())).flat_map(|v|v["frames"].as_array().cloned().unwrap_or_default()).collect();
     assert!(!frames.is_empty() && frames.iter().all(|f|f["kind"]=="full"));
     }
     assert!(packets[3].to_string().contains("A_FIXED_CHANGED_GIT_BODY"));

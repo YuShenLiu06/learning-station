@@ -241,3 +241,8 @@ test('reopening a native session removes superseded application system rules whi
  assert(!getCurrentSystemPrompt(seen.messages).includes('SUPERSEDED_APPLICATION_RULES'));
  assert(!getCurrentSystemPrompt(seen.messages).includes('expert coding assistant'));
 });
+
+test('invalid body projection fails explicitly without advancing a baseline or sending a request',async()=>{
+ const s=spec();let requests=0;const n=await openNativeSession(s,options(fixture(()=>requests++)));
+ try {await assert.rejects(n.applyContext({...envelope,nativeMaterials:[{...envelope.nativeMaterials[0],projectionError:'CONTEXT_CONFLICT'}]}),e=>e.code==='CONTEXT_CONFLICT');assert.equal(requests,0);assert.equal(materialEntries(n).length,0);}finally{n.close();}
+});

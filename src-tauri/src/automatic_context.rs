@@ -496,6 +496,7 @@ impl Prepared {
             .enumerate()
             .map(|(index, s)| {
                 let mut source = s.clone();
+                let mut projection_error = false;
                 let body_chain = if s.body_start_char > 0 {
                     match crate::content::parse(&s.text) {
                         Ok((_, body)) if s.text.chars().count() - body.chars().count() == s.body_start_char => {
@@ -507,6 +508,7 @@ impl Prepared {
                             source.text.clear();
                             source.complete = false;
                             source.total_bytes = 0;
+                            projection_error = true;
                         }
                     }
                     source.body_start_char = 0;
@@ -521,6 +523,7 @@ impl Prepared {
                 value["text"] = json!(source.text);
                 value["textHash"] = json!(hash(&source.text));
                 value["bodyStartChar"] = json!(source.body_start_char);
+                if projection_error { value["projectionError"] = json!("CONTEXT_CONFLICT"); }
                 value
             })
             .collect()
@@ -972,6 +975,7 @@ mod tests {
         broken.automatic_materials[0].text = "```json\nPRIVATE_UNCLOSED_METADATA".into();
         let safe = next.native_materials(&broken).remove(0);
         assert_eq!(safe["text"], "");
+        assert_eq!(safe["projectionError"], "CONTEXT_CONFLICT");
         assert_eq!(safe["range"]["complete"], false);
         assert!(!safe.to_string().contains("PRIVATE_UNCLOSED_METADATA"));
     }

@@ -67,6 +67,7 @@ impl ContextBridge {
         time.validate()?;
         let metadata_only_ids: Vec<_> = ctx.manifest.iter().filter(|m| m.included_chars == 0 && !ctx.automatic_materials.iter().any(|a|a.id==m.id)).map(|m|m.id.clone()).collect();
         let (_, references) = projection.provider_texts(ctx)?;
+        let references = crate::citation_context::bridge_references(&references, ctx)?;
         let question = if request.prompt.trim().is_empty() { crate::generation::default_request(&request.mode) } else { &request.prompt };
         let mut store = Self::default();
         store.add(&crate::time_context::bridge_part(&time))?;

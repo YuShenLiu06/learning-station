@@ -32,6 +32,8 @@ test('final SDK wire allows only registered supplements in declared order and on
     const seed=await openNativeSession({directory,learningSessionId:'architecture_session',runId:'seed_run',userEntryId:'seed_user',authorizedSourceIds:['doc_1'],protectHistory:false,legacyRecords:[]},{model,systemPrompt:'SUPERSEDED_APPLICATION_RULES',tools:[],apiKey:'synthetic-architecture-key',thinkingLevel:'off',streamFn:()=>{
       const stream=createAssistantMessageEventStream();queueMicrotask(()=>{stream.push({type:'done',reason:'stop',message:{role:'assistant',content:[{type:'text',text:'Earlier genuine answer'}],api:model.api,provider:model.provider,model:model.id,usage:{input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}},stopReason:'stop',timestamp:Date.now()}});stream.end();});return stream;
     }});
+    seed.manager.appendCustomMessageEntry('learning-station-material',JSON.stringify({type:'automatic_material_projection',frames:[{kind:'full',text:'OLD_INTERNAL_METADATA_MUST_NOT_SURVIVE'}]}),false,{sourceId:'doc_1'});
+    seed.manager.appendCustomMessageEntry('learning-station-changes',JSON.stringify({checkpoint:{internal:'OLD_INTERNAL_CHECKPOINT_MUST_NOT_SURVIVE'}}),false,{});
     await seed.prompt('PREVIOUS_NATIVE_QUESTION');await seed.complete('Earlier genuine answer');seed.close();
     for(let round=0;round<4;round++) {
       if(round===3) {
@@ -52,11 +54,13 @@ test('final SDK wire allows only registered supplements in declared order and on
       const packet=packets[round],texts=packet.messages.map(content),serialized=JSON.stringify(packet);
       assert.equal(texts.filter(text=>text===question).length,1);
       if(round<3)assert(texts.includes('PREVIOUS_NATIVE_QUESTION'));
-      for(const forbidden of ['DO_NOT_SEND_','automaticProjection','turnState','materialRole','projectionVersion','contextBridgeManifest','MUST_NOT_SEND_','MUST_NOT_DUPLICATE_','学习指导（','工具授权档位','跨学科学习助手','SUPERSEDED_APPLICATION_RULES','expert coding assistant','Pi documentation'])assert(!serialized.includes(forbidden),forbidden);
+      for(const forbidden of ['DO_NOT_SEND_','automaticProjection','turnState','materialRole','projectionVersion','contextBridgeManifest','MUST_NOT_SEND_','MUST_NOT_DUPLICATE_','学习指导（','工具授权档位','跨学科学习助手','SUPERSEDED_APPLICATION_RULES','expert coding assistant','Pi documentation','OLD_INTERNAL_'])assert(!serialized.includes(forbidden),forbidden);
       const capture=captures[round];assert.deepEqual(capture.body,packet);
       const application=capture.sources.filter(s=>s.origin==='bridge');
       assert(application.every(s=>s.registrationKey&&s.description&&s.runId));
       const keys=application.map(s=>s.registrationKey),priority=['current_time','references','focus','material_changes'];
+      assert(keys.every(key=>priority.includes(key)),'no undeclared application key');
+      for(const source of capture.sources.filter(s=>s.origin==='unknown')){const role=source.path[0]==='messages'?packet.messages[source.path[1]].role:'system';if(['assistant','tool'].includes(role))continue;let value=packet;for(const at of source.path)value=value[at];if(source.start!==undefined)value=value.slice(source.start,source.end);assert.equal(value.trim(),'','no unregistered application text at the final wire boundary');}
       assert.deepEqual(keys,[...keys].sort((a,b)=>priority.indexOf(a)-priority.indexOf(b)));
       assert.equal(keys.filter(key=>key==='current_time').length,1);
       assert.equal(texts.filter(text=>text.includes('EXACT_QUOTE')).length,round===0?1:0);

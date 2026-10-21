@@ -747,7 +747,7 @@ mod cases {
                 let r = &part["textFrom"]["materialRange"];
                 let a = r["startChar"].as_u64().unwrap() as usize;
                 let b = r["endChar"].as_u64().unwrap() as usize;
-                doc.content.chars().skip(a).take(b - a).collect::<String>()
+                doc.body.chars().skip(a).take(b - a).collect::<String>()
             })
             .collect::<String>();
         assert_eq!(reconstructed, "selected。");

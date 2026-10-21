@@ -786,6 +786,15 @@ impl MaterialGit {
         self.text(&["mktree", "-z"], &input)
     }
 
+    /// Git computes the exact diff of authorized model-visible bodies; fixed file OIDs
+    /// still identify the original objects. No textconv, hooks, shell or network.
+    pub(crate) fn compare_bodies(&self, old: &str, new: &str) -> Result<String> {
+        let old_oid = self.text(&["hash-object", "-w", "--stdin"], old.as_bytes())?;
+        let new_oid = self.text(&["hash-object", "-w", "--stdin"], new.as_bytes())?;
+        check_oid(&old_oid)?; check_oid(&new_oid)?;
+        String::from_utf8(self.git(&["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames", &old_oid, &new_oid], &[])?).map_err(|_| git_error())
+    }
+
     fn text(&self, args: &[&str], input: &[u8]) -> Result<String> {
         String::from_utf8(self.git(args, input)?)
             .map(|s| s.trim().to_owned())

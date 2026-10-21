@@ -940,3 +940,38 @@ pub fn inventory(ctx: &Context) -> Vec<Value> {
 #[cfg(test)]
 #[path = "citation_context_tests.rs"]
 mod tests;
+
+/// Translate only protocol-owned material pointers from stored-file coordinates to
+/// model-visible body coordinates. Quoted text and code strings remain untouched.
+pub(crate) fn bridge_references(text: &str, ctx: &Context) -> Result<String> {
+    fn rebase(value: &mut Value, ctx: &Context) -> Result<()> {
+        if let Some(pointer) = value.get_mut("textFrom").filter(|v|v["provider"]=="material") {
+            if let Some(source) = ctx.automatic_materials.iter().find(|s|pointer["sourceId"]==s.id && pointer["version"]==s.version) {
+                for key in ["startChar", "endChar"] {
+                    if let Some(at) = pointer["materialRange"][key].as_u64() {
+                        pointer["materialRange"][key] = json!(at.checked_sub(source.body_start_char as u64).ok_or_else(||CoreError::new("CONTEXT_CONFLICT", "引用正文坐标无效。"))?);
+                    }
+                }
+            }
+        }
+        match value {
+            Value::Array(items) => for item in items { rebase(item, ctx)?; },
+            Value::Object(items) => for item in items.values_mut() { rebase(item, ctx)?; },
+            _ => {}
+        }
+        Ok(())
+    }
+    let mut result = String::new();
+    for line in text.split_inclusive('\n') {
+        if let Ok(mut value) = serde_json::from_str::<Value>(line) {
+            if value["type"].as_str().is_some_and(|t|t.starts_with("quoted_")) {
+                rebase(&mut value, ctx)?;
+                result.push_str(&serde_json::to_string(&value)?);
+                if line.ends_with('\n') { result.push('\n'); }
+                continue;
+            }
+        }
+        result.push_str(line);
+    }
+    Ok(result)
+}

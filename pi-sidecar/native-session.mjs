@@ -153,6 +153,9 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
     }
     manager.appendCustomEntry('learning-station-scope',{sourceIds:spec.authorizedSourceIds,historyBoundaryKey:spec.historyBoundaryKey});
     agent.state.messages=manager.buildSessionContext().messages;
+    // Older application projections carried raw internal metadata and no registry identity.
+    // Retire only those custom projections; Pi keeps the actual user/tool/assistant history.
+    for(const entry of manager.buildSessionProjection().entries)if(entry.messages.length&&entry.sourceEntry.type==='custom_message'&&['learning-station-material','learning-station-changes','learning-station-turn'].includes(entry.sourceEntry.customType)&&!entry.sourceEntry.details?.bridgeKey)manager.appendContextEdit(entry.sourceEntry.id,null);
     // Old per-turn references are not silently injected into later requests.
     for(const entry of manager.buildSessionProjection().entries){if(entry.sourceEntry.type==='custom_message'&&entry.sourceEntry.customType==='learning-station-turn'&&entry.messages.length)manager.appendContextEdit(entry.sourceEntry.id,null);}
     agent.state.messages=manager.buildSessionContext().messages;
@@ -202,7 +205,7 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
     const userIdentity=nativeId=>{const owner=manager.getEntries().find(e=>e.type==='custom'&&e.customType==='learning-station-user'&&e.data?.nativeId===nativeId)?.data;return owner?{userEntryId:owner.userEntryId,...(owner.runId?{runId:owner.runId}:{})}:{};};
     return {session,agent,manager,applyContext,record,debugRegistrations:()=>bridge.registrations(),
       debugSources:()=>manager.buildSessionProjection().entries.flatMap(entry=>entry.messages.map(message=>({
-        value:text(message),origin:message.role==='custom'?(['learning-station-material','learning-station-turn','learning-station-changes','learning-station-focus'].includes(message.customType)?'bridge':'unknown'):({user:'user',assistant:'model',toolResult:'tool',compactionSummary:'pi',branchSummary:'pi'}[message.role]??'unknown'),
+        value:text(convertToLlm([message])[0]??message),origin:message.role==='custom'?(['learning-station-material','learning-station-turn','learning-station-changes','learning-station-focus'].includes(message.customType)?'bridge':'unknown'):({user:'user',assistant:'model',toolResult:'tool',compactionSummary:'pi',branchSummary:'pi'}[message.role]??'unknown'),
         ...(entry.sourceEntry.details?.bridgeKey?{registrationKey:entry.sourceEntry.details.bridgeKey,description:entry.sourceEntry.details.bridgeDescription,runId:entry.sourceEntry.details.runId,userEntryId:entry.sourceEntry.details.userEntryId}:message.role==='user'?{registrationKey:'question',description:'Pi 原生用户输入',...userIdentity(entry.sourceEntry.id)}:{}),
         name:message.customType??message.role,sourcePath:`native/${entry.sourceEntry.id}/${message.customType??message.role}`,
       }))),

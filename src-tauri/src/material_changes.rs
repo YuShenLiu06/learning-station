@@ -19,11 +19,21 @@ pub fn for_focus(
         &focus.commit_hash, previous, focus_previous, text, 512 * 1024)?;
     if focus.r#type == "markdown" {
         if let Some(text) = value["focused"]["text"].as_str() {
-            // parse returns the actual suffix after the validated metadata fence;
-            // repeated body text in metadata cannot change this coordinate.
             let (_, body) = crate::content::parse(text)?;
-            let offset = text[..text.len() - body.len()].chars().count();
-            value["focused"]["bodyStartChar"] = json!(offset);
+            let body = body.to_owned();
+            value["focused"]["textHash"] = json!(hash(&body));
+            value["focused"]["range"] = json!({"startChar":0,"endChar":body.chars().count(),"complete":true,"totalBytes":body.len()});
+            value["focused"]["bodyStartChar"] = json!(0);
+            value["focused"]["text"] = json!(body);
+            if let Some(previous) = focus_previous {
+                let git = crate::focus::open_materials(core, focus)?;
+                if let Some(old) = git.files(&focus.course_id, previous)?.into_iter().find(|f|f.path==focus.path) {
+                    let old_text = String::from_utf8(git.read(&focus.course_id, previous, &focus.path)?).map_err(|_| CoreError::new("CONTEXT_CONFLICT", "旧正文不是有效文本，不能生成差量。"))?;
+                    let (_, old_body) = crate::content::parse(&old_text)?;
+                    let patch = git.compare_bodies(&old_body, &body)?;
+                    value["focused"]["gitChange"] = json!({"baseCommitOid":previous,"baseBlobOid":old.blob_oid,"unifiedDiff":patch});
+                }
+            }
         }
     }
     Ok(value)
