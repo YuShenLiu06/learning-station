@@ -61,7 +61,8 @@ export async function registerMaterialContext({manager,spec,loadChanges,envelope
           else {const at=source.frames?.findIndex(f=>f.textHash===last.textHash)??-1;if(at>=0&&source.frames.length>at+1){frames=source.frames.slice(at+1);status='updated';}}
         }
         if(frames.length){
-          if(frames[0].kind==='full')for(const entry of active)bridge.exclude(entry.sourceEntry.id);
+          // A new full frame resets the body baseline at this turn; it must not
+          // remove the version that an earlier question actually received.
           bridge.message('focus','已授权材料的完整正文或真实 Git 差量','learning-station-material',{type:'automatic_material_projection',id:source.id,...(source.path?{path:source.path}:{}),version:source.version,range:source.range,...(source.bodyStartChar?{bodyStartChar:source.bodyStartChar}:{}),frames},{sourceId:source.id,...(source.path?{path:source.path}:{}),textHash:source.textHash,version:source.version,range:source.range,...(source.gitCommitOid?{gitCommitOid:source.gitCommitOid,gitBlobOid:source.gitBlobOid}:{})});
         }
         const item=inventory.entries.find(e=>e.sourceId===source.id&&e.kind==='material');if(item){item.includedChars=[...source.text].length;item.range=source.range;item.bodyStartChar=source.bodyStartChar??0;item.coordinateSpace=source.bodyStartChar?'serialized-document':'body';item.status=status;item.reason=status==='retained'?'native_projection_contains_baseline':status==='updated'?'native_projection_verified_diff':'native_baseline_reload';}

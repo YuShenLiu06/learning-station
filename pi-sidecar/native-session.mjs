@@ -156,18 +156,23 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
     // Older application projections carried raw internal metadata and no registry identity.
     // Retire only those custom projections; Pi keeps the actual user/tool/assistant history.
     for(const entry of manager.buildSessionProjection().entries)if(entry.messages.length&&entry.sourceEntry.type==='custom_message'&&['learning-station-material','learning-station-changes','learning-station-turn'].includes(entry.sourceEntry.customType)&&!entry.sourceEntry.details?.bridgeKey)manager.appendContextEdit(entry.sourceEntry.id,null);
-    // Old per-turn references are not silently injected into later requests.
-    for(const entry of manager.buildSessionProjection().entries){if(entry.sourceEntry.type==='custom_message'&&entry.sourceEntry.customType==='learning-station-turn'&&entry.messages.length)manager.appendContextEdit(entry.sourceEntry.id,null);}
     agent.state.messages=manager.buildSessionContext().messages;
     const bridge=new ContextBridge(manager,{runId:spec.runId,userEntryId:spec.userEntryId});
     const nativeTransform=agent.transformContext;
     agent.transformContext=async(messages,signal)=>bridge.ordered(await nativeTransform?.(messages,signal)??messages);
-    let currentTurn;
-    const applyContext=async input=>{
+    let currentTurn,pendingProjection=Promise.resolve();
+    const projectContext=async input=>{
       const envelope=decodeBridgeInput(input);
       if(containsSecret(envelope,apiKey))throw new NativeSessionError('AUTH');
       currentTurn=input;
-      for(const entry of manager.buildSessionProjection().entries)if(entry.messages.length&&entry.sourceEntry.type==='custom_message'&&['learning-station-turn','learning-station-focus'].includes(entry.sourceEntry.customType))bridge.exclude(entry.sourceEntry.id);
+      // Replacing the same saved question is idempotent; earlier questions keep
+      // their own frozen context in Pi history. Safety/compaction edits still apply.
+      for(const entry of manager.buildSessionProjection().entries){
+        const source=entry.sourceEntry;
+        if(!entry.messages.length||source.type!=='custom_message'||source.details?.userEntryId!==spec.userEntryId)continue;
+        if(['learning-station-turn','learning-station-focus'].includes(source.customType)
+          ||source.customType==='learning-station-changes'&&!manager.getEntries().some(r=>r.type==='custom'&&r.customType==='learning-station-changes-request'&&r.data?.changesEntryId===source.id))bridge.exclude(source.id);
+      }
       const clock=envelope.currentTime??(timeContext?{referenceTime:timeContext.referenceTime,timeZone:timeContext.timeZone}:undefined);
       if(clock)bridge.message('current_time','本轮冻结时间与时区','learning-station-turn',clock);
       if(envelope.nativeReferences)bridge.message('references','用户本轮明确提供的引用及必要补充','learning-station-turn',envelope.nativeReferences);
@@ -179,7 +184,15 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
       agent.state.messages=manager.buildSessionContext().messages;
       await onManifest?.(inventory);
     };
-    let pendingProjection=Promise.resolve();
+    const applyContext=input=>{
+      // Capture before the first asynchronous provider/receipt. A later UI edit
+      // cannot change this turn or the snapshot reused after Pi compaction.
+      const frozen=structuredClone(input);
+      const projection=pendingProjection.then(()=>projectContext(frozen));
+      pendingProjection=projection;
+      void projection.catch(()=>{});
+      return projection;
+    };
     const nativePrepare=agent.prepareRequest;
     agent.prepareRequest=async (...args)=>{await pendingProjection;return nativePrepare?.(...args);};
     const unsub=session.subscribe(event=>{
@@ -211,6 +224,7 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
       }))),
       async requestTool(call,signal){manager.appendCustomEntry('learning-station-tool',{runId:spec.runId,callId:call.id,argsHash:sha(JSON.stringify(stable(call.args)))});sync(file);await checkpoint();return requestTool(call,signal);},
       async prompt(question){
+        await pendingProjection;
         if(question.includes(apiKey))throw new NativeSessionError('AUTH');
         const inputHash=sha(question);if(record.inputHash&&record.inputHash!==inputHash)throw new NativeSessionError();record.inputHash=inputHash;
         if(record.status==='complete')return {cached:record.finalContent};
