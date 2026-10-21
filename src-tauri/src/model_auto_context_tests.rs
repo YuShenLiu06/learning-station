@@ -159,7 +159,7 @@ async fn context_bridge_real_pi_wire_replays_full_diff_once_per_tool_loop_and_fa
             selection: String::new(),
             prompt,
             request_id: format!("bridge_op_{round}"),
-            user_entry_id: Some(user),
+            user_entry_id: Some(user.clone()),
             injections: vec![],
             assistant_references: vec![],
             exercise_references: vec![],
@@ -211,6 +211,12 @@ async fn context_bridge_real_pi_wire_replays_full_diff_once_per_tool_loop_and_fa
             .join("state/automatic-context")
             .join(format!("{sid}.json"));
         let prior = std::fs::read(&key_path).ok();
+        let native = {
+            let c = e.lock().unwrap();
+            let markdown = c.content.read(&sid).unwrap().content;
+            crate::native_session::prepare(&c.state_dir, &s, &format!("bridge_run_{round}"),
+                &user, ctx.manifest.iter().map(|m|m.id.clone()).collect(), false, vec![], &markdown).unwrap()
+        };
         let result = generate_scoped(
             ModelCredentials::new(
                 ModelSettings {
@@ -239,7 +245,7 @@ async fn context_bridge_real_pi_wire_replays_full_diff_once_per_tool_loop_and_fa
             Some(RequestContext {
                 debug_identity: None, debug_registrations: None,
                 output_validator: None,
-                native_session: None,
+                native_session: Some(native),
                 context_observer: None,
                 tool_recovery: None,
                 material_changes: None,
@@ -283,13 +289,15 @@ async fn context_bridge_real_pi_wire_replays_full_diff_once_per_tool_loop_and_fa
             json!(serde_json::to_vec(&packets[packet_index]).unwrap().len());
     }
     // Within a live tool loop Pi receives the original question through its user entry once.
-    let first_user = packets[0]["messages"].as_array().unwrap().iter().find(|m| m["role"] == "user" && m["content"] == "Fixture question 0").expect("normal user question");
+    let message_text = |m: &Value| m["content"].as_str().map(str::to_owned).unwrap_or_else(||
+        m["content"].as_array().into_iter().flatten().filter_map(|p|p["text"].as_str()).collect::<String>());
+    let first_user = packets[0]["messages"].as_array().unwrap().iter().find(|m| m["role"] == "user" && message_text(m) == "Fixture question 0").expect("normal user question");
     for packet in &packets[..3] {
         let matching = packet["messages"]
             .as_array()
             .unwrap()
             .iter()
-            .filter(|m| m["role"] == "user" && m["content"] == first_user["content"])
+            .filter(|m| m["role"] == "user" && message_text(m) == message_text(first_user))
             .count();
         assert_eq!(matching, 1);
         assert_eq!(packet["max_tokens"], 8192);
@@ -302,7 +310,7 @@ async fn context_bridge_real_pi_wire_replays_full_diff_once_per_tool_loop_and_fa
         .collect::<Vec<_>>();
     assert_eq!(tools.len(), 2);
     for tool in tools {
-        let t = tool["content"].as_str().unwrap();
+        let t = message_text(tool);
         assert!(t.contains("Original public course statement"));
         assert!(!t.contains("unifiedDiff"));
         assert!(!t.contains("readcache"));
@@ -337,7 +345,7 @@ async fn changes_capacity_and_binary_focus_rejections_survive_the_actual_sidecar
         };
         let cp = "a".repeat(40); let tree = "b".repeat(40);
         let focus = json!({"courseId":"capacity_course","commitHash":cp,"materialTreeOid":tree,"paragraphs":if expected == "CONTEXT_CONFLICT" {json!([{ "text":"SYNTHETIC_BINARY_BODY_MUST_NOT_SEND" }])} else {json!([])}});
-        let messages = vec![json!({"role":"user","content":json!({"bridge":[{"key":"focus","value":focus},{"key":"references","value":""},{"key":"question","value":"Retain this original question"}],"contextBridgeManifest":{"version":1,"entries":[]}}).to_string()})];
+        let messages = vec![json!({"role":"user","content":json!({"bridge":[{"key":"focus","description":"本轮聚焦快照","value":focus},{"key":"references","description":"本轮明确引用","value":""},{"key":"question","description":"本轮用户问题","value":"Retain this original question"}],"contextBridgeManifest":{"version":1,"entries":[]}}).to_string()})];
         let value = json!({"checkpoint":{"courseId":"capacity_course","checkpointCommitOid":cp,"materialTreeOid":tree,"excludedFiles":[]},"baseCommitOid":null,"focused":null,"complete":true,"changes":(0..257).map(|n|json!({"path":format!("documents/{n}.md"),"status":"M"})).collect::<Vec<_>>()});
         let value = if expected == "CONTEXT_CONFLICT" {json!({"checkpoint":{"courseId":"capacity_course","checkpointCommitOid":cp,"materialTreeOid":tree,"excludedFiles":[]},"baseCommitOid":null,"focused":{"textUnavailable":"binary"},"complete":true,"changes":[]})} else {value};
         let result = generate_scoped(ModelCredentials::new(ModelSettings { provider:"custom".into(), protocol:PROTOCOL.into(), base_url:"http://127.0.0.1:1/v1".into(), model:"fixture".into(), ..ModelSettings::default() }, "synthetic-capacity-not-real".into()).unwrap(), messages, Arc::new(AtomicBool::new(false)), |_|panic!("Changes rejection must precede model output"), None, ToolPolicy::legacy(false), vec![], Some(RequestContext {
