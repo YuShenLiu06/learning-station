@@ -559,6 +559,7 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
             policy,
             skills,
             Some(model::RequestContext {
+                debug_registrations: frozen_prompt.debug_registrations,
                 debug_identity: Some(json!({"courseId":session.course_id,"sessionId":session.id,"runId":id,"requestId":request.request_id,"userEntryId":native_session.user_entry_id,"retry":debug_retry})),
                 output_validator: (request.mode == "practice").then(|| {
                     let manifest = ctx.manifest.clone();

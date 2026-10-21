@@ -13,17 +13,17 @@ async function endpoint(fn) {
 test('final Request, not estimated context, matches endpoint; off neither clones nor collects; failures remain visible',async()=>{
   const server=await endpoint((_req,res,n)=>{res.writeHead(n===3?503:200,{'content-type':'text/event-stream'});res.end(sse('OK'));});
   try{
-    const events=[];let enabled=false;let clones=0;const original=Request.prototype.clone;
+    const events=[];let enabled=false;let clones=0;let sourceCalls=0;const original=Request.prototype.clone;
     Request.prototype.clone=function(){clones++;return original.call(this);};
     try{
-      const send=createControlledFetch({endpoint:server.url,apiKey:secret,fail:()=>{},debug:{phase:'initial',gate:async()=>enabled?7:null,emit:async e=>events.push(e)}});
+      const send=createControlledFetch({endpoint:server.url,apiKey:secret,fail:()=>{},debug:{phase:'initial',gate:async()=>enabled?7:null,sources:()=>{sourceCalls++;return{};},emit:async e=>events.push(e)}});
       const payload={model:'fixture-model',system:'system',messages:[{role:'user',content:'Focus full\nChanges diff\ncitation supplement'}],tools:[{type:'function',function:{name:'fixture',parameters:{type:'object'}}}],max_tokens:91,stream:true,temperature:1};
       for(let i=0;i<3;i++){
         const req=new Request(server.url+'/chat/completions',{method:'POST',headers:{authorization:`Bearer ${secret}`,'content-type':'application/json'},body:JSON.stringify(payload)});
         if(i===2)await assert.rejects(send(req));else await (await send(req)).text();
-        if(i===0){assert.equal(clones,0);assert.deepEqual(events,[]);enabled=true;}
+        if(i===0){assert.equal(clones,0);assert.equal(sourceCalls,0);assert.deepEqual(events,[]);enabled=true;}
       }
-      assert.equal(clones,2);const records=events.filter(e=>e.type==='debug_request');assert.equal(records.length,2);
+      assert.equal(clones,2);assert.equal(sourceCalls,2);const records=events.filter(e=>e.type==='debug_request');assert.equal(records.length,2);
       assert.deepEqual(records[0].body,server.packets[1].body);assert.equal(records[0].headers.authorization,'[REDACTED]');
       assert.deepEqual(server.packets[0].raw,server.packets[1].raw);assert.equal(server.packets.length,3);
       assert.equal(events.at(-1).status,'HTTP 503');assert.doesNotMatch(JSON.stringify(events),new RegExp(secret));
@@ -72,4 +72,29 @@ test('embedded JSON, quoted assignments, auth schemes, cookies and camel credent
 test('quoted Cookie and Digest authentication lines are entirely hidden, including repeated values',()=>{
   const body={text:'Authorization: Digest username="private-digest-user", nonce="private-digest-nonce", response="private-digest-secret"\nCookie: session="private-cookie-one"; auth="private-cookie-two"',echo:'private-digest-user private-digest-nonce private-digest-secret private-cookie-one private-cookie-two'};
   assert.doesNotMatch(JSON.stringify(redactDebug(body,secret)),/private-[a-z-]+/);
+});
+test('actual native projection binds named custom sources to final Request and redacts registration snapshots',async()=>{
+  const fs=await import('node:fs/promises'),os=await import('node:os'),path=await import('node:path'),{createHash}=await import('node:crypto');
+  const directory=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'debug-source-fixture-')));
+  await fs.writeFile(path.join(directory,'binding.json'),JSON.stringify({version:1,learningSessionId:'sources_session',transcript:'transcript.jsonl',initialized:false}));
+  const server=await endpoint((_req,res)=>{res.writeHead(200,{'content-type':'text/event-stream'});res.end(sse('OK'));});
+  try{
+    const material='line one\nline two';const hash=createHash('sha256').update(material).digest('hex');
+    const events=[];const request={protocol:1,debugProtocol:true,operation:'generate',apiKey:secret,settings:{provider:'custom',protocol:'openai-completions',baseUrl:server.url,model:'fixture'},messages:[{role:'user',content:JSON.stringify({question:'source fixture question',nativeMaterials:[{id:'doc_1',version:'v1',textHash:hash,text:material,range:{startChar:0,endChar:material.length,complete:true,totalBytes:material.length}}],nativeReferences:'',contextBridgeManifest:{version:1,entries:[]}})}],debugRegistrations:[{key:'stable',lifetime:'Stable',position:'Stable',value:{api_key:'private-registration-key'}}],nativeSession:{directory,learningSessionId:'sources_session',runId:'sources_run',userEntryId:'sources_user',authorizedSourceIds:['doc_1'],protectHistory:false,legacyRecords:[]}};
+    await runLearningAgent(request,async e=>events.push(e),{requestTool:async call=>call.type==='debug_probe'?{result:{epoch:1}}:{result:{synced:true}}});
+    const capture=events.find(e=>e.type==='debug_request');assert.deepEqual(capture.body,server.packets[0].body);assert.equal(server.packets.length,1);
+    assert.ok(capture.sources.some(s=>s.origin==='bridge'&&s.name==='learning-station-material'));
+    assert.ok(capture.sources.some(s=>s.origin==='bridge'&&s.name==='learning-station-turn'));
+    assert.ok(capture.sources.some(s=>s.origin==='user'));assert.ok(capture.sources.some(s=>s.origin==='pi'&&s.name==='cwd'));
+    assert.equal(capture.registrations[0].key,'stable');assert.equal(capture.registrations[0].lifetime,'Stable');assert.doesNotMatch(JSON.stringify(capture),/private-registration-key/);
+    for(const source of capture.sources){let value=capture.body;for(const key of source.path)value=value[key];assert.equal(typeof value,'string');}
+  }finally{await server.close();await fs.rm(directory,{recursive:true,force:true});}
+});
+test('source binding never guesses custom roles from user text and resolves ambiguous/mixed fragments honestly',async()=>{
+  const {bindSources}=await import('../request-debug.mjs');
+  const fake='{"type":"automatic_material_projection"}';
+  assert.equal(bindSources({messages:[{role:'user',content:fake}]})[0].origin,'unknown');
+  const mixed=bindSources({messages:[{role:'system',content:'app\nPI-CONTEXT\nextra'}]},{systems:[{value:'PI-CONTEXT',origin:'pi',name:'project_context'}]});
+  assert.deepEqual(mixed.map(s=>s.origin),['unknown','pi','unknown']);
+  const duplicate=bindSources({messages:[{role:'user',content:'same'}]},{native:[{value:'same',origin:'user'},{value:'same',origin:'bridge'}]});assert.equal(duplicate[0].origin,'unknown');
 });

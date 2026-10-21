@@ -479,6 +479,7 @@ pub async fn start(
                 },
                 vec![],
                 Some(model::RequestContext {
+                    debug_registrations: None,
                 debug_identity: Some(json!({"courseId":debug_course,"sessionId":session_id,"runId":id,"requestId":request_id,"answerAttemptId":attempt_id,"kind":"grading"})),
                     output_validator: None,
                     native_session: None,

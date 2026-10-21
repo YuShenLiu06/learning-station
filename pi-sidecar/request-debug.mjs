@@ -34,7 +34,26 @@ export function redactDebug(value, apiKey = '', extraSecrets = []) {
   }
   return visit(value);
 }
-export async function snapshotRequest(request, apiKey) {
+export function bindSources(body, trace={}) {
+  const fragments=[];
+  function visit(value,path,system=false) {
+    if(typeof value==='string') {
+      const candidates=(trace.native??[]).filter(item=>item.value===value&&value);
+      if(candidates.length===1){const {value:ignored,...source}=candidates[0];fragments.push({path,...source});return;}
+      if(system) {
+        const matches=(trace.systems??[]).flatMap(source=>{const at=value.indexOf(source.value);return source.value&&at>=0&&value.indexOf(source.value,at+1)<0?[{path,start:at,end:at+source.value.length,origin:source.origin,name:source.name,sourcePath:source.sourcePath}]:[];});
+        if(matches.length){let cursor=0;for(const item of matches.sort((a,b)=>a.start-b.start)){if(item.start<cursor)continue;if(item.start>cursor)fragments.push({path,start:cursor,end:item.start,origin:'unknown',name:'未注册 / 未映射片段'});fragments.push(item);cursor=item.end;}if(cursor<value.length)fragments.push({path,start:cursor,end:value.length,origin:'unknown',name:'未注册 / 未映射片段'});return;}
+      }
+      fragments.push({path,origin:'unknown',name:'未知 / 未追踪',sourcePath:'unmapped'});return;
+    }
+    if(Array.isArray(value))value.forEach((item,index)=>visit(item,[...path,index],system));
+    else if(value&&typeof value==='object')for(const [key,item]of Object.entries(value))if(key==='content'||key==='text'||key==='system')visit(item,[...path,key],system);
+  }
+  if(body.system!==undefined)visit(body.system,['system'],true);
+  for(const [index,message]of (body.messages??[]).entries())visit(message.content,['messages',index,'content'],['system','developer'].includes(message.role));
+  return fragments;
+}
+export async function snapshotRequest(request, apiKey, debug={}) {
   const headerSecrets=[...request.headers].filter(([key])=>/auth|api[-_]?key|credential|cookie|secret|token|password/i.test(key)).flatMap(([,value])=>[value,...value.split(/[;= ]/u).filter(part=>part.length>3)]);
   const headers = redactDebug(Object.fromEntries([...request.headers].map(([key,value]) => [key, /^(content-type|accept|anthropic-version)$/i.test(key) ? value : '[REDACTED]'])),apiKey,headerSecrets);
   const size = Number(request.headers.get('content-length'));
@@ -50,7 +69,15 @@ export async function snapshotRequest(request, apiKey) {
   }
   const body=Buffer.concat(chunks).toString('utf8');
   let parsed; try { parsed=JSON.parse(body); } catch { return {headers,complete:false,bodyBytes:bytes,omitted:'非 JSON 请求体，未显示',body:null}; }
-  const safe=redactDebug(parsed,apiKey,headerSecrets);
+  let trace={};try{trace=debug.sources?.()??{};}catch{}
+  // Do not copy/redact the whole session history into debug metadata: retain only
+  // exact candidate strings present in this bounded, final wire payload.
+  const texts=[];const collect=value=>{if(typeof value==='string')texts.push(value);else if(value&&typeof value==='object')Object.values(value).forEach(collect);};collect(parsed);
+  const values=new Set(texts);
+  trace={native:(trace.native??[]).filter(item=>values.has(item.value)),systems:(trace.systems??[]).filter(item=>typeof item.value==='string'&&item.value&&texts.some(text=>text.includes(item.value)))};
+  const safe=redactDebug({body:parsed,registrations:debug.registrations??null,trace},apiKey,headerSecrets);
+  safe.sources=bindSources(safe.body,safe.trace);
+  delete safe.trace;
   if(Buffer.byteLength(JSON.stringify(safe))>2*DEBUG_BODY_LIMIT)return {headers,complete:false,bodyBytes:bytes,omitted:'整个请求体：脱敏后超过 512 KiB 展示上限',body:null};
-  return {headers,complete:true,bodyBytes:bytes,body:safe};
+  return {headers,complete:true,bodyBytes:bytes,body:safe.body,registrations:safe.registrations,sources:safe.sources};
 }

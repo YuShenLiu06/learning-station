@@ -152,3 +152,6 @@ label select{display:block;background:#fff;border:1px solid #dce5ce;border-radiu
 .debug-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 16px 0 8px; }
 .debug-tabs [aria-pressed="true"] { background: var(--paper-deep, #e8e0d2); }
 .request-debug pre { max-height: 65vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 14px; border: 1px solid var(--line, #ddd4c6); background: var(--paper, #f7f3ea); font-size: 12px; line-height: 1.65; user-select: text; }
+.debug-sources h3 { margin-top: 20px; color: #805a31; }
+.debug-sources summary { cursor: pointer; overflow-wrap: anywhere; padding: 7px 0; }
+.debug-sources summary strong { color: #286b8a; }

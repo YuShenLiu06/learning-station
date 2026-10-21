@@ -814,6 +814,7 @@ pub type MaterialChangesHandler = Arc<dyn Fn(Option<String>, Option<String>) -> 
 #[derive(Clone)]
 pub struct RequestContext {
     pub debug_identity: Option<Value>,
+    pub debug_registrations: Option<Value>,
     pub material_changes: Option<MaterialChangesHandler>,
     pub time: crate::time_context::TimeContext,
     pub exploration: Option<crate::exploration::ExplorationContext>,
@@ -827,6 +828,7 @@ impl RequestContext {
     fn capture() -> Self {
         Self {
             debug_identity: None,
+            debug_registrations: None,
             material_changes: None,
             time: crate::time_context::TimeContext::capture(),
             exploration: None,
@@ -1016,6 +1018,8 @@ async fn run_sidecar(
     struct Input<'a> {
         protocol: u8,
         debug_protocol: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        debug_registrations: Option<&'a Value>,
         operation: &'a str,
         settings: &'a ModelSettings,
         api_key: &'a str,
@@ -1029,9 +1033,10 @@ async fn run_sidecar(
         output_validation: bool,
         material_changes: bool,
     }
-    let mut input = serde_json::to_vec(&Input {
+    let mut sidecar_input = Input {
         protocol: 1,
         debug_protocol: true,
+        debug_registrations: request_context.debug_registrations.as_ref(),
         operation,
         settings: &credentials.settings,
         api_key: &credentials.api_key,
@@ -1046,8 +1051,12 @@ async fn run_sidecar(
         native_session: request_context.native_session.as_ref(),
         output_validation: request_context.output_validator.is_some(),
         material_changes: request_context.material_changes.is_some(),
-    })
-    .map_err(|_| sidecar_error("INVALID_INPUT"))?;
+    };
+    let mut input = serde_json::to_vec(&sidecar_input).map_err(|_| sidecar_error("INVALID_INPUT"))?;
+    if input.len()>4*MAX_OUTPUT-1 && sidecar_input.debug_registrations.is_some() {
+        input.fill(0);sidecar_input.debug_registrations=None;
+        input=serde_json::to_vec(&sidecar_input).map_err(|_|sidecar_error("INVALID_INPUT"))?;
+    }
     if input.len() > 4 * MAX_OUTPUT - 1 {
         input.fill(0);
         return Err(sidecar_error("INVALID_INPUT"));
@@ -2235,7 +2244,7 @@ mod tests {
             request_debug::set(enabled);
             let (credentials,server)=fixture(complete,true);
             let identity=json!({"courseId":"debug-course","sessionId":"debug-session","runId":"debug-run","requestId":"debug-request","retry":true});
-            let result=generate_scoped(credentials,vec![json!({"role":"user","content":"debug-wire-boundary-synthetic"})],Arc::new(AtomicBool::new(false)),|_|{},None,ToolPolicy::legacy(false),vec![],Some(RequestContext{debug_identity:Some(identity.clone()),..RequestContext::capture()})).await;
+            let result=generate_scoped(credentials,vec![json!({"role":"user","content":"debug-wire-boundary-synthetic"})],Arc::new(AtomicBool::new(false)),|_|{},None,ToolPolicy::legacy(false),vec![],Some(RequestContext{debug_identity:Some(identity.clone()),debug_registrations:enabled.then(||json!([{"key":"actual_provider","lifetime":"OneShot","position":"References","value":"wire registration"}])),..RequestContext::capture()})).await;
             let snapshot=request_debug::snapshot();
             request_debug::set(false);
             server.join().unwrap();
@@ -2246,6 +2255,7 @@ mod tests {
             assert_eq!(records[0]["body"]["max_tokens"],6144);
             assert_eq!(records[0]["headers"]["authorization"],"[REDACTED]");
             assert_eq!(records[0]["status"],"HTTP 200");
+            assert_eq!(records[0]["registrations"][0]["key"],"actual_provider");
             for key in ["courseId","sessionId","runId","requestId","retry"]{assert_eq!(records[0]["identity"][key],identity[key]);}
             assert!(!records[0].to_string().contains("fixture-secret"));
             assert_eq!(records[0]["runOutcome"],if complete {"complete"} else {"MODEL_INCOMPLETE"});

@@ -157,7 +157,7 @@ export function createControlledFetch({ endpoint, apiKey, fail, protocol = 'open
         const epoch=await debug.gate();
         if (epoch !== null && epoch !== undefined) {
           capture={epoch,id:randomUUID(),time:new Date().toISOString(),complete:false,body:null,omitted:'捕获失败，未显示请求体'};
-          try {Object.assign(capture,await snapshotRequest(request,apiKey));}catch{}
+          try {Object.assign(capture,await snapshotRequest(request,apiKey,{registrations:debug.registrations,sources:debug.sources}));}catch{}
         }
       } catch {} // Observability must never change model/tool behavior.
     }
@@ -310,6 +310,8 @@ export async function runLearningAgent(request, emit, { signal, streamFn: fixtur
   const debugFor = context => request.debugProtocol === true && requestTool ? {
     phase:context.messages.at(-1)?.role==='toolResult'?'tool_continuation':debugOrdinal===0?'initial':'continuation',
     gate:async()=>{debugOrdinal++; const reply=await requestTool({type:'debug_probe',id:'debug_'+randomUUID()});return reply?.result?.epoch;},
+    registrations:request.debugRegistrations,
+    sources:()=>({native:native?.debugSources?.()??[],systems:context.messages.filter(m=>m.role==='system'&&m.sections).flatMap(m=>Object.entries(m.sections).filter(([,value])=>typeof value==='string').map(([name,value])=>({value,name,origin:name==='preamble'?'unknown':'pi',sourcePath:`Pi/system.sections/${name}`})))}),
     emit,
   } : undefined;
   const productionStream = (selectedModel, context, options) => (model.api === 'anthropic-messages' ? streamAnthropic : streamSimple)(selectedModel, context, {

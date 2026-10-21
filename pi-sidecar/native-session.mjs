@@ -247,6 +247,10 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
       if(event.type==='message_end')await checkpoint();
     });
     return {session,agent,manager,applyContext,record,
+      debugSources:()=>manager.buildSessionProjection().entries.flatMap(entry=>entry.messages.map(message=>({
+        value:text(message),origin:message.role==='custom'?(['learning-station-material','learning-station-turn','learning-station-changes'].includes(message.customType)?'bridge':'unknown'):({user:'user',assistant:'model',toolResult:'tool',compactionSummary:'pi',branchSummary:'pi'}[message.role]??'unknown'),
+        name:message.customType??message.role,sourcePath:`native/${entry.sourceEntry.id}/${message.customType??message.role}`,
+      }))),
       async requestTool(call,signal){manager.appendCustomEntry('learning-station-tool',{runId:spec.runId,callId:call.id,argsHash:sha(JSON.stringify(stable(call.args)))});sync(file);await checkpoint();return requestTool(call,signal);},
       async prompt(question){
         if(question.includes(apiKey))throw new NativeSessionError('AUTH');

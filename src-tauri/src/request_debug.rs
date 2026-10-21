@@ -53,6 +53,7 @@ impl DebugState {
 }
 fn state() -> &'static Mutex<DebugState> { static STATE:OnceLock<Mutex<DebugState>>=OnceLock::new(); STATE.get_or_init(||Mutex::new(DebugState::default())) }
 pub fn set(enabled: bool) -> Value { let mut s=state().lock().unwrap_or_else(|e|e.into_inner()); s.set(enabled); s.snapshot() }
+pub fn enabled() -> bool { state().lock().unwrap_or_else(|e|e.into_inner()).enabled }
 pub fn snapshot() -> Value { state().lock().unwrap_or_else(|e|e.into_inner()).snapshot() }
 pub fn clear_session(session: &str) {
     let mut s=state().lock().unwrap_or_else(|e|e.into_inner());

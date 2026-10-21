@@ -49,6 +49,7 @@ pub struct FrozenPrompt {
     pub messages: Vec<Value>,
     pub time: TimeContext,
     pub manifest: Value,
+    pub debug_registrations: Option<Value>,
 }
 impl ContextBridge {
     pub fn add(&mut self, provider: &dyn ContextProvider) -> Result<()> {
@@ -84,6 +85,14 @@ impl ContextBridge {
         }
         self.parts.insert(part.key, part);
         Ok(())
+    }
+    pub fn debug_registrations(&self) -> Value {
+        Value::Array(self.parts.values().map(|part| {
+            let mut item=json!({"key":part.key,"lifetime":format!("{:?}",part.lifetime),"position":format!("{:?}",part.position)});
+            if part.value.to_string().len()<=8192 {item["value"]=part.value.clone();}
+            else {item["omitted"]=json!("注册值超过8 KiB；最终投影请看原始请求");}
+            item
+        }).collect())
     }
     pub fn snapshot(
         state: &Path,
@@ -249,7 +258,9 @@ impl ContextBridge {
             ));
         }
         messages[0]["content"] = json!(actual);
+        let debug_registrations=crate::request_debug::enabled().then(||store.debug_registrations());
         Ok(FrozenPrompt {
+            debug_registrations,
             messages,
             time,
             manifest,
@@ -376,6 +387,13 @@ mod tests {
                 assert_eq!(item["locator"], locator);
             }
         }
+    }
+    #[test]
+    fn debug_snapshot_uses_actual_registration_keys_and_original_attributes() {
+        let mut bridge=ContextBridge::default();
+        bridge.add(&PromptPart{key:"actual_provider",lifetime:Lifetime::OneShot,position:Position::References,value:json!("line one\nline two")}).unwrap();
+        let snapshot=bridge.debug_registrations();
+        assert_eq!(snapshot[0]["key"],"actual_provider");assert_eq!(snapshot[0]["lifetime"],"OneShot");assert_eq!(snapshot[0]["position"],"References");assert_eq!(snapshot[0]["value"],"line one\nline two");
     }
     #[test]
     fn stable_turn_versioned_and_one_shot_parts_deduplicate_or_fail_before_assembly() {

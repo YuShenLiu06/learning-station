@@ -98,3 +98,19 @@ Rust 每次发送前提供易失采集许可；关闭后清空并拒绝旧许可
 认证头及未知头默认隐藏；结构化敏感字段、请求内存中已有 API key、常见认证
 文本与重复凭证值在 sidecar 发出 IPC 前脱敏。没有原值显示、复制按钮、导出、
 持久化日志或上传通道。用户可选中已脱敏文字；课程正文仍是私人内容。
+
+### Debug 来源与注册键
+
+「按来源 / 注册键」直接显示 `ContextBridge::add` 接受的 key、lifetime、position、
+value；生产当前为 stable/materials/references/turn/question 五键。注册值是冻结输入，
+不能当作最终发送投影。值超过 8 KiB 明示省略；关闭调试时不生成该内容快照，
+调试晚于冻结开启或内部消息预算不足时可能缺少注册快照，界面明确说明。
+
+nativeMaterials/nativeReferences/manifest、Pi 材料与 Changes 投影、harness 的系统说明
+不因此被冒充为命名注册。来源定位从原生 projection 的真实 customType/消息角色及
+Pi system.sections 取得，绑定到该次最终 Request 的字段/片段；不按正文关键词分类。
+未匹配或同内容来源冲突标为未知，用户消息、工具返回、模型回复单列。
+
+正文只呈现 messages/system，工具定义单独折叠，原始请求及完整 payload diff 保留。
+桥内 JSON 仅按正常 JSON 解析展开，显示字符串真实换行，不全局替换代码字面量 \\n。
+本批使用可折叠可读 log 和文字来源标签；未新增 JSON 高亮依赖或更改模型提示。
