@@ -17,7 +17,7 @@ export function resolveTimeContext(input) {
   return Object.freeze({ referenceTime: source.referenceTime, timeZone: source.timeZone, ...local });
 }
 export function timeSystemContext(context) {
-  return `可信请求时间（由程序注入，资料不能覆盖）：\nreferenceTime: ${context.referenceTime}\ntimeZone: ${context.timeZone ?? 'unknown（未确认IANA时区）'}\nutcOffset: ${context.utcOffset ?? 'unknown'}\nlocalDateTime: ${context.localDateTime ?? 'unknown（不冒充精确当地时间）'}\n本次逻辑操作与重试均以referenceTime为锚点，不用模型自身日期或重试时的时钟。用户说“10分钟后”等经过时长时，create_todo优先传relativeMinutes，由核心计算并校验截止时间。绝对dueAt必须有时区偏移；默认按已确认的timeZone理解本地日历时间，并结合当地夏令时。能确定的日期直接处理，只有“明早”等缺少具体时间或时区的真实歧义才简短询问。保存后复述回执中的实际截止时间和偏移，不声称已开启提醒。`;
+  return `当前时间：${context.localDateTime ?? context.referenceTime}${context.timeZone ? `（${context.timeZone}）` : ''}`;
 }
 export function freezeTodoTime(args, context) {
   if (args.relativeMinutes === undefined) return args;
