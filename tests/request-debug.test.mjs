@@ -29,30 +29,30 @@ test('debug commands pass through the real native adapter to Tauri invoke',async
   const calls=[];globalThis.debugNativeInvoke=async(command,args)=>{calls.push([command,args]);return {enabled:args.enabled??false,records:[],dropped:0};};
   try{
     const {nativeCall}=await import(file.href);
-    for(const [command,args] of [['request_debug_get',{}],['request_debug_set',{enabled:true}],['request_debug_enter_session',{sessionId:'synthetic-session'}],['request_debug_clear_session',{sessionId:'synthetic-session'}]]) {
+    for(const [command,args] of [['request_debug_decode',{sequence:1}],['request_debug_export',{sequence:1}],['request_debug_get',{}],['request_debug_set',{enabled:true}],['request_debug_enter_session',{sessionId:'synthetic-session'}],['request_debug_clear_session',{sessionId:'synthetic-session'}]]) {
       await nativeCall(command,args);assert.deepEqual(calls.at(-1),[command,args]);
     }
-    assert.equal(calls.length,4);
-    await assert.rejects(nativeCall('request_debug_not_registered',{}));assert.equal(calls.length,4);
+    assert.equal(calls.length,6);
+    await assert.rejects(nativeCall('request_debug_not_registered',{}));assert.equal(calls.length,6);
   }finally{delete globalThis.debugNativeInvoke;await unlink(file);}
 });
 test('real settings component toggles capture and clears shown request after disabling',async()=>{
   const {build}=await import('esbuild');const {JSDOM}=await import('jsdom');const {unlink}=await import('node:fs/promises');
-  const dom=new JSDOM('<div id="root"></div>',{url:'http://127.0.0.1/',pretendToBeVisual:true});Object.assign(globalThis,{window:dom.window,document:dom.window.document,IS_REACT_ACT_ENVIRONMENT:true});Object.defineProperty(globalThis,'navigator',{configurable:true,value:dom.window.navigator});
+  const dom=new JSDOM('<div id="root"></div>',{url:'http://127.0.0.1/',pretendToBeVisual:true});Object.assign(globalThis,{window:dom.window,document:dom.window.document,IS_REACT_ACT_ENVIRONMENT:true});Object.assign(globalThis,{MutationObserver:dom.window.MutationObserver,requestAnimationFrame:dom.window.requestAnimationFrame.bind(dom.window),cancelAnimationFrame:dom.window.cancelAnimationFrame.bind(dom.window)});Object.defineProperty(globalThis,'navigator',{configurable:true,value:dom.window.navigator});
   const file=new URL(`./.debug-ui-${process.pid}.mjs`,import.meta.url);
   await build({stdin:{contents:"export {RequestDebugSettings} from './src/RequestDebugSettings';",resolveDir:process.cwd(),loader:'tsx'},outfile:file.pathname,bundle:true,packages:'external',platform:'node',format:'esm',jsx:'automatic',plugins:[{name:'debug-api',setup(b){b.onResolve({filter:/^\.\/api$/},()=>({path:'api',namespace:'fixture'}));b.onLoad({filter:/.*/,namespace:'fixture'},()=>({contents:'export const call=(...args)=>globalThis.debugTestCall(...args);',loader:'js'}));}}]});
   const React=await import('react');const {createRoot}=await import('react-dom/client');const {RequestDebugSettings}=await import(file.href);
   let enabled=false;const commands=[];const entries=[record(1,'s1',{messages:[{role:'user',content:'Focus A'}]}),record(2,'s1',{messages:[{role:'user',content:'Focus B'}]},{previousSequence:1})].map(r=>({...r,phase:'initial',status:'HTTP 200',time:'fixture',bodyBytes:100}));
   entries[1].registrations=[{key:'actual_provider',lifetime:'OneShot',position:'References',value:'registered line one\nregistered line two'}];
   entries[1].sources=[{path:['messages',0,'content'],origin:'bridge',name:'learning-station-material',sourcePath:'native/fixture/material'}];
-  globalThis.debugTestCall=async(command,args)=>{commands.push(command);if(command==='request_debug_set')enabled=args.enabled;return {enabled,records:enabled?entries:[],dropped:0};};
+  globalThis.debugTestCall=async(command,args)=>{commands.push(command);if(command==='request_debug_decode')return {complete:true,finalProjection:{entries:[{content:'Focus B'}]}};if(command==='request_debug_export')return {path:'/fixture/context-bridge.json',complete:true};if(command==='request_debug_set')enabled=args.enabled;return {enabled,records:enabled?entries:[],dropped:0};};
   const root=createRoot(document.getElementById('root'));
   try{
     await React.act(async()=>root.render(React.createElement(RequestDebugSettings)));
     assert.equal(document.querySelector('input').checked,false);assert.match(document.body.textContent,/已关闭，不采集/);
-    await React.act(async()=>document.querySelector('input').click());assert.equal(enabled,true);assert.match(document.querySelector('pre').textContent,/Focus B/);
+    await React.act(async()=>document.querySelector('input').click());assert.equal(enabled,true);assert.match(document.body.textContent,/导出ContextBridge解码JSON/);await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent==='导出ContextBridge解码JSON').click());assert.match(document.body.textContent,/已导出.*context-bridge.json/);await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent==='上下文正文').click());assert.match(document.querySelector('pre').textContent,/Focus B/);
     await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent.startsWith('diff')).click());assert.match(document.querySelector('pre').textContent,/- Focus A/);
-    await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent==='按来源 / 注册键').click());assert.match(document.body.textContent,/actual_provider/);assert.match(document.body.textContent,/OneShot/);assert.match(document.body.textContent,/registered line one\nregistered line two/);assert.match(document.body.textContent,/learning-station-material/);
+    await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent==='按来源 / 注册键').click());assert.match(document.body.textContent,/actual_provider/);assert.match(document.body.textContent,/OneShot/);assert.match(document.body.textContent,/registered line one/);assert.match(document.body.textContent,/learning-station-material/);
     await React.act(async()=>document.querySelector('input').click());assert.equal(enabled,false);assert.equal(document.querySelector('pre'),null);assert.doesNotMatch(document.body.textContent,/Focus [AB]/);assert.ok(commands.includes('request_debug_set'));
   }finally{await React.act(async()=>root.unmount());delete globalThis.debugTestCall;await unlink(file);dom.window.close();}
 });

@@ -3,7 +3,7 @@ export type DebugRecord = {
   method: string; headers: Record<string,string>; body: unknown; complete: boolean; omitted?: string; bodyBytes: number;
   status: string; runOutcome?: string;
   registrations?: {key:string;lifetime:string;position:string;value?:unknown;omitted?:string}[] | null;
-  sources?: {path:(string|number)[];start?:number;end?:number;origin:string;name:string;sourcePath?:string}[];
+  sources?: {path:(string|number)[];start?:number;end?:number;origin:string;name:string;registrationKey?:string;description?:string;sourcePath?:string}[];
   identity: { retry?: boolean; courseId?: string; sessionId: string; runId: string; requestId?: string; userEntryId?: string; attempt: string; model: string; operation?: string };
 };
 export type DebugSnapshot = { enabled: boolean; records: DebugRecord[]; dropped: number };

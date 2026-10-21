@@ -155,3 +155,18 @@ label select{display:block;background:#fff;border:1px solid #dce5ce;border-radiu
 .debug-sources h3 { margin-top: 20px; color: #805a31; }
 .debug-sources summary { cursor: pointer; overflow-wrap: anywhere; padding: 7px 0; }
 .debug-sources summary strong { color: #286b8a; }
+.debug-json { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; margin: 12px 0; }
+.debug-json-toolbar, .debug-export-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.debug-json-toolbar { padding: 8px; border-bottom: 1px solid var(--line); background: #f3ede2; }
+.debug-json-toolbar button { font-size: 12px; padding: 6px 9px; }
+.debug-json .cm-search input { width: auto; max-width: 180px; }
+.debug-request-identity { margin: 12px 0; }
+.debug-request-identity summary { cursor: pointer; color: var(--muted); }
+.debug-export-row { margin-top: 16px; }
+.debug-export-row .inline-error { margin: 0; }
+.debug-export-result { overflow-wrap: anywhere; padding: 12px; background: #e8eee3; border: 1px solid #b4c5aa; border-radius: 6px; }
+.debug-source-kind { font-weight: 600; color: #805a31; }
+.debug-json .cm-panel.cm-search { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 10px 32px 10px 10px; }
+.debug-json .cm-search label { display: inline-flex; align-items: center; gap: 4px; width: auto; margin: 0; font-size: 12px; }
+.debug-json .cm-search input[type="checkbox"] { width: auto; margin: 0; }
+.debug-json .cm-search button { padding: 4px 7px; border: 1px solid var(--line); background: var(--paper); border-radius: 4px; font-size: 12px; }
