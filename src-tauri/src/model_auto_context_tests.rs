@@ -462,7 +462,16 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
     assert!(packets[2].to_string().contains("B_FIXED_SECOND_BODY"));
     assert!(packets[2].to_string().contains("automatic_material_projection"));
     assert!(packets[3].to_string().contains("unifiedDiff"));
-    assert_eq!(packets[3]["messages"].as_array().unwrap().len(),packets[4]["messages"].as_array().unwrap().len()-2);
+    let previous = packets[3]["messages"].as_array().unwrap();
+    let unchanged = packets[4]["messages"].as_array().unwrap();
+    assert_eq!(&unchanged[..previous.len()], previous.as_slice(), "unchanged Focus must preserve the exact earlier wire prefix, including historical time, references and locations");
+    let projections = |messages: &[Value]| messages.iter().filter(|m| m.to_string().contains("automatic_material_projection")).count();
+    assert_eq!(projections(unchanged), projections(previous), "unchanged Focus must not append another body");
+    let suffix = &unchanged[previous.len()..];
+    assert_eq!(suffix.first().unwrap()["role"], "assistant", "previous answer remains after its original question");
+    assert!(suffix.iter().any(|m|m.to_string().contains("referenceTime")), "new turn appends its own clock instead of replacing the earlier one");
+    assert!(suffix.iter().any(|m|m.to_string().contains("materialRange")), "new turn retains its own explicit citation");
+    assert!(suffix.last().unwrap().to_string().contains("Fixed Changes 4"));
     assert!(!packets[5].to_string().contains("B_FIXED_SECOND_BODY"));
     assert!(packets[5].to_string().contains("A_FIXED_CHANGED_GIT_BODY"));
     for packet in &packets[5..] {

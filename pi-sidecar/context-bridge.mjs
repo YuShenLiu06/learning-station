@@ -26,19 +26,33 @@ export class ContextBridge {
     }
     this.pending=[];this.removed.clear();
   }
-  // Operate only on registered application messages supplied by Pi's own projection.
-  // Keep every native user/tool/assistant entry and its relative order unchanged.
+  // Anchor each turn to Pi's durable user entry, never to matching question text
+  // or to the latest user. Compaction remains authoritative when an anchor is gone.
   ordered(messages) {
-    const supplements=messages.filter(m=>m.role==='custom'&&m.details?.bridgeKey);
-    if (!supplements.length) return messages;
-    supplements.sort((a,b)=>order.indexOf(a.details.bridgeKey)-order.indexOf(b.details.bridgeKey));
-    const ordinary=messages.filter(m=>!supplements.includes(m));
-    let at=ordinary.findLastIndex(m=>m.role==='user');
-    if(at<0)at=ordinary.length;
-    return [...ordinary.slice(0,at),...supplements,...ordinary.slice(at)];
+    const anchors=new Map();
+    for(const entry of this.manager.getEntries()) {
+      if(entry.type!=='custom'||entry.customType!=='learning-station-user')continue;
+      const native=this.manager.getEntry(entry.data?.nativeId);
+      if(native?.type!=='message'||native.message.role!=='user')continue;
+      const at=messages.indexOf(native.message);
+      if(at>=0)anchors.set(entry.data.userEntryId,at);
+    }
+    const blocks=new Map(),moved=new Set();
+    for(const message of messages) {
+      if(message.role!=='custom'||!message.details?.bridgeKey)continue;
+      const at=anchors.get(message.details.userEntryId);
+      if(at===undefined)continue;
+      if(!blocks.has(at))blocks.set(at,[]);
+      blocks.get(at).push(message);moved.add(message);
+    }
+    return messages.flatMap((message,index)=>[
+      ...(blocks.get(index)??[]).sort((a,b)=>order.indexOf(a.details.bridgeKey)-order.indexOf(b.details.bridgeKey)),
+      ...(moved.has(message)?[]:[message]),
+    ]);
   }
   registrations() {
-    return this.manager.buildSessionProjection().entries.filter(e=>e.messages.length&&e.sourceEntry.details?.bridgeKey).sort((a,b)=>order.indexOf(a.sourceEntry.details.bridgeKey)-order.indexOf(b.sourceEntry.details.bridgeKey)).map((entry,position)=>({key:entry.sourceEntry.details.bridgeKey,description:entry.sourceEntry.details.bridgeDescription,value:entry.sourceEntry.details.bridgeKey==='references'?entry.sourceEntry.content:JSON.parse(entry.sourceEntry.content),position,runId:entry.sourceEntry.details.runId,userEntryId:entry.sourceEntry.details.userEntryId}));
+    const projection=this.manager.buildSessionProjection(),ordered=this.ordered(projection.messages);
+    return projection.entries.filter(e=>e.messages.length&&e.sourceEntry.details?.bridgeKey).sort((a,b)=>ordered.indexOf(a.messages[0])-ordered.indexOf(b.messages[0])).map((entry,position)=>({key:entry.sourceEntry.details.bridgeKey,description:entry.sourceEntry.details.bridgeDescription,value:entry.sourceEntry.details.bridgeKey==='references'?entry.sourceEntry.content:JSON.parse(entry.sourceEntry.content),position,runId:entry.sourceEntry.details.runId,userEntryId:entry.sourceEntry.details.userEntryId}));
   }
 }
 
