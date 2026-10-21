@@ -1,4 +1,5 @@
-//! Volatile debug records only. No filesystem, DB, telemetry, or logging sink.
+//! Volatile debug records; only an explicit export action writes a sanitized JSON file.
+pub mod export;
 use serde_json::{json, Value};
 use std::sync::{Mutex, OnceLock};
 const MAX_RECORDS: usize = 40;

@@ -250,6 +250,7 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
       debugSources:()=>manager.buildSessionProjection().entries.flatMap(entry=>entry.messages.map(message=>({
         value:text(message),origin:message.role==='custom'?(['learning-station-material','learning-station-turn','learning-station-changes'].includes(message.customType)?'bridge':'unknown'):({user:'user',assistant:'model',toolResult:'tool',compactionSummary:'pi',branchSummary:'pi'}[message.role]??'unknown'),
         name:message.customType??message.role,sourcePath:`native/${entry.sourceEntry.id}/${message.customType??message.role}`,
+        ...(message.role==='user'&&entry.sourceEntry.id===record.userNativeId?{registrationKey:'question'}:{}),
       }))),
       async requestTool(call,signal){manager.appendCustomEntry('learning-station-tool',{runId:spec.runId,callId:call.id,argsHash:sha(JSON.stringify(stable(call.args)))});sync(file);await checkpoint();return requestTool(call,signal);},
       async prompt(question){

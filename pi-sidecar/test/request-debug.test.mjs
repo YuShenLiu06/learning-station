@@ -85,7 +85,7 @@ test('actual native projection binds named custom sources to final Request and r
     const capture=events.find(e=>e.type==='debug_request');assert.deepEqual(capture.body,server.packets[0].body);assert.equal(server.packets.length,1);
     assert.ok(capture.sources.some(s=>s.origin==='bridge'&&s.name==='learning-station-material'));
     assert.ok(capture.sources.some(s=>s.origin==='bridge'&&s.name==='learning-station-turn'));
-    assert.ok(capture.sources.some(s=>s.origin==='user'));assert.ok(capture.sources.some(s=>s.origin==='pi'&&s.name==='cwd'));
+    assert.ok(capture.sources.some(s=>s.origin==='user'&&s.registrationKey==='question'));assert.ok(capture.sources.some(s=>s.origin==='pi'&&s.name==='cwd'));
     assert.equal(capture.registrations[0].key,'stable');assert.equal(capture.registrations[0].lifetime,'Stable');assert.doesNotMatch(JSON.stringify(capture),/private-registration-key/);
     for(const source of capture.sources){let value=capture.body;for(const key of source.path)value=value[key];assert.equal(typeof value,'string');}
   }finally{await server.close();await fs.rm(directory,{recursive:true,force:true});}
