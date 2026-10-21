@@ -50,7 +50,7 @@ fn socket_body(socket: &mut std::net::TcpStream) -> Value {
     serde_json::from_slice(&bytes[start..start + len]).unwrap()
 }
 #[tokio::test]
-async fn context_bridge_real_pi_wire_replays_full_diff_once_per_tool_loop_and_failed_retry() {
+async fn context_bridge_real_pi_wire_replays_legacy_full_once_per_tool_loop_and_failed_retry() {
     let dir = tempfile::tempdir().unwrap();
     let e = Engine::new(dir.path().join("library"), dir.path().join("state")).unwrap();
     let (doc, sid) = {
@@ -315,6 +315,16 @@ async fn context_bridge_real_pi_wire_replays_full_diff_once_per_tool_loop_and_fa
         assert!(!t.contains("unifiedDiff"));
         assert!(!t.contains("readcache"));
     }
+    let legacy_full = |packet: &Value| packet["messages"].as_array().unwrap().iter().map(&message_text).filter(|t|t.starts_with("以下为笔记全文（未绑定 Git 版本）\n")).collect::<Vec<_>>();
+    for packet in &packets {
+        let full = legacy_full(packet);
+        assert!(!full.is_empty());
+        assert!(full.iter().all(|t|!t.contains("unifiedDiff")&&!t.contains("@@ -")));
+        assert!(!packet.to_string().contains("automatic_material_projection"));
+    }
+    for packet in &packets[..4] { let full=legacy_full(packet);assert_eq!(full.len(),1);assert!(full[0].ends_with(&course_body())); }
+    assert_eq!(legacy_full(&packets[5]),legacy_full(&packets[6]),"retry with unchanged legacy bytes cannot append another full body");
+    assert!(legacy_full(&packets[7]).last().unwrap().ends_with(&course_body().replace("Original public course statement","Completely rewritten new content")));
     assert_eq!(sizes[0]["mode"], "full");
     assert_eq!(sizes[1]["mode"], "unchanged");
     assert_eq!(sizes[1]["newMaterialBytes"], 0);
@@ -346,8 +356,8 @@ async fn changes_capacity_and_binary_focus_rejections_survive_the_actual_sidecar
         let cp = "a".repeat(40); let tree = "b".repeat(40);
         let focus = json!({"courseId":"capacity_course","commitHash":cp,"materialTreeOid":tree,"paragraphs":if expected == "CONTEXT_CONFLICT" {json!([{ "text":"SYNTHETIC_BINARY_BODY_MUST_NOT_SEND" }])} else {json!([])}});
         let messages = vec![json!({"role":"user","content":json!({"bridge":[{"key":"focus","description":"本轮聚焦快照","value":focus},{"key":"references","description":"本轮明确引用","value":""},{"key":"question","description":"本轮用户问题","value":"Retain this original question"}],"contextBridgeManifest":{"version":1,"entries":[]}}).to_string()})];
-        let value = json!({"checkpoint":{"courseId":"capacity_course","checkpointCommitOid":cp,"materialTreeOid":tree,"excludedFiles":[]},"baseCommitOid":null,"focused":null,"complete":true,"changes":(0..257).map(|n|json!({"path":format!("documents/{n}.md"),"status":"M"})).collect::<Vec<_>>()});
-        let value = if expected == "CONTEXT_CONFLICT" {json!({"checkpoint":{"courseId":"capacity_course","checkpointCommitOid":cp,"materialTreeOid":tree,"excludedFiles":[]},"baseCommitOid":null,"focused":{"textUnavailable":"binary"},"complete":true,"changes":[]})} else {value};
+        let value = json!({"checkpoint":{"courseId":"capacity_course","checkpointCommitOid":cp,"materialTreeOid":tree,"excludedFiles":[]},"baseCommitOid":null,"stat":"","focusPath":"materials/documents/focus.md","focused":null,"complete":true,"changes":(0..257).map(|n|json!({"path":format!("documents/{n}.md"),"status":"M"})).collect::<Vec<_>>()});
+        let value = if expected == "CONTEXT_CONFLICT" {json!({"checkpoint":{"courseId":"capacity_course","checkpointCommitOid":cp,"materialTreeOid":tree,"excludedFiles":[]},"baseCommitOid":null,"stat":"","focusPath":"materials/documents/focus.md","focused":{"textUnavailable":"binary"},"complete":true,"changes":[]})} else {value};
         let result = generate_scoped(ModelCredentials::new(ModelSettings { provider:"custom".into(), protocol:PROTOCOL.into(), base_url:"http://127.0.0.1:1/v1".into(), model:"fixture".into(), ..ModelSettings::default() }, "synthetic-capacity-not-real".into()).unwrap(), messages, Arc::new(AtomicBool::new(false)), |_|panic!("Changes rejection must precede model output"), None, ToolPolicy::legacy(false), vec![], Some(RequestContext {
                 debug_identity: None, debug_registrations: None, material_changes:Some(Arc::new(move |_,_|Ok(value.clone()))), native_session:Some(native), ..RequestContext::capture() })).await;
         assert_eq!(result.unwrap_err().code, expected);
@@ -390,6 +400,8 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
         packets
     });
     let mut first = String::new();
+    let mut focuses = Vec::new();
+    let deliveries = Arc::new(std::sync::Mutex::new(Vec::<(usize, Value)>::new()));
     for round in 0..7 {
         let document = if round == 2 { &b } else { &a };
         let (focus, messages, native) = {
@@ -403,7 +415,7 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
             let sid = if round == 5 { crate::course_sessions::create(&mut c, &course, "wire_new_session").unwrap().id } else { sid.clone() };
             let doc = c.content.read(document).unwrap();
             let injection = context::ContextInjection { document_id:doc.id.clone(), expected_version:doc.version.clone(), selection:Some(doc.body.chars().take(4).collect()), locator:Some(crate::citation::Locator{start_char:0,end_char:4}) };
-            let focus = crate::focus::freeze(&mut c, crate::focus::FreezeRequest { session_id:sid.clone(), input:crate::focus::Input { document_id:document.clone(), expected_body:doc.body, expected_version:Some(doc.version), view:"read".into(), ranges:vec![crate::focus::Range{start:0,end:4}], question_id:None, asset_id:None }, selection:String::new(), injections:vec![injection.clone()], assistant_references:vec![], exercise_references:vec![] }).unwrap();
+            let focus = crate::focus::freeze(&mut c, crate::focus::FreezeRequest { session_id:sid.clone(), input:crate::focus::Input { document_id:document.clone(), expected_body:doc.body, expected_version:Some(doc.version), view:"read".into(), ranges:vec![crate::focus::Range{start:0,end:8}], question_id:None, asset_id:None }, selection:String::new(), injections:vec![injection.clone()], assistant_references:vec![], exercise_references:vec![] }).unwrap();
             let session = sessions::get(&mut c.content, &sid).unwrap();
             let frozen = crate::focus::load(&mut c, &session, &focus).unwrap();
             let projection = crate::automatic_context::prepare_current(&frozen.context);
@@ -416,6 +428,8 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
             (focus, messages, native)
         };
         if round == 0 { first = focus.commit_hash.clone(); }
+        focuses.push(focus.clone());
+        let deliveries = deliveries.clone();
         let engine = e.clone();let first = first.clone();let session_id=native.learning_session_id.clone();
         let handler: MaterialChangesHandler = Arc::new(move |previous, body_previous| {
             if round == 2 { assert!(body_previous.is_none()); }
@@ -429,6 +443,7 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
             assert_eq!(value["focused"]["bodyStartChar"],0);
             assert_eq!(value["focused"]["textHash"],hash(text));
             assert!(!text.contains("createRequestDigest"));
+            deliveries.lock().unwrap().push((round, value.clone()));
             Ok(value)
         });
         let transcript = std::path::PathBuf::from(&native.directory).join("transcript.jsonl");
@@ -445,38 +460,59 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
     let packets = server.join().unwrap();
     if let Some(folder)=std::env::var_os("LS_CHANGES_WIRE_EVIDENCE") { let folder=std::path::PathBuf::from(folder);std::fs::create_dir_all(&folder).unwrap();std::fs::write(folder.join("requests.json"),serde_json::to_vec_pretty(&packets).unwrap()).unwrap(); }
 
+    let message_text = |m: &Value| m["content"].as_str().map(str::to_owned).unwrap_or_else(||
+        m["content"].as_array().into_iter().flatten().filter_map(|p|p["text"].as_str()).collect::<String>());
+    let deliveries = deliveries.lock().unwrap();
     for (round,packet) in packets.iter().enumerate() {
-        for internal in ["createRequestDigest", "timestampSource", "createdAt", "updatedAt", "parentId"] { assert!(!packet.to_string().contains(internal), "internal field leaked: {internal}"); }
-        let payloads:Vec<Value>=packet["messages"].as_array().unwrap().iter().filter_map(|m| {let text=m["content"].as_str().map(str::to_owned).unwrap_or_else(||m["content"].as_array().into_iter().flatten().filter_map(|p|p["text"].as_str()).collect::<String>());serde_json::from_str(&text).ok()}).collect();
-        for patch in payloads.iter().flat_map(|p|p["frames"].as_array().into_iter().flatten()).filter_map(|f|f["unifiedDiff"].as_str()) {
-            let encoded=serde_json::to_string(patch).unwrap();
-            assert_eq!(serde_json::to_string(&payloads).unwrap().matches(&encoded).count(),1,"round {round}: complete patch must occur once in the entire request");
+        let texts: Vec<_> = packet["messages"].as_array().unwrap().iter().map(&message_text).collect();
+        let all = texts.join("\n");
+        for internal in ["createRequestDigest", "timestampSource", "createdAt", "updatedAt", "parentId", "materialRange", "materialFrames", "textHash", "bodyStartChar", "automatic_material_projection", "unifiedDiff"] {
+            assert!(!all.contains(internal), "round {round}: internal field leaked: {internal}");
         }
-        let turn=payloads.iter().find(|p|p["documentId"].is_string() && p["paragraphs"].is_array()).unwrap();
-        assert!(turn["paragraphs"].as_array().unwrap().iter().all(|p|p.get("text").is_none()));
-        assert!(packet.to_string().contains("materialRange"));
-        assert!(!packet.to_string().contains("contextBridgeManifest"));
-        if round>=3 {assert!(!turn.to_string().contains("A_FIXED_CHANGED_GIT_BODY"));}
+        let delivery = &deliveries.iter().rev().find(|(i,_)|*i==round).unwrap().1;
+        let focus = &focuses[round];
+        let location = texts.iter().rev().find(|t|t.starts_with("【Focus：用户当前阅读的位置】")).unwrap();
+        assert_eq!(location, &format!("【Focus：用户当前阅读的位置】\n文件：{}\n版本：{}\n可见范围：[0, 8)（Unicode 字符）；从 0 开始，左闭右开\n用户选区：[0, 4)（正文 Unicode 字符，从 0 开始，左闭右开）", delivery["focusPath"].as_str().unwrap(), focus.commit_hash));
+        assert!(!location.contains(delivery["focused"]["text"].as_str().unwrap()));
+        let reference = texts.iter().rev().find(|t|t.contains("引用范围：[0, 4)（正文 Unicode 字符")).unwrap();
+        assert!(reference.contains(&format!("文件：{}",delivery["focusPath"].as_str().unwrap())));
+        assert!(reference.contains(&format!("版本：{}",focus.commit_hash)));
+        assert!(reference.contains("原文见已提供的正文 [0, 4)"));
+        if let Some(stat) = delivery["stat"].as_str().filter(|s|!s.is_empty()) {
+            assert!(texts.iter().any(|t|t.starts_with("【Changes：课程材料相对已知版本的变化】")&&t.contains(stat)), "round {round}: native stat must survive byte for byte");
+        }
+        for patch in deliveries.iter().filter_map(|(_,v)|v["focused"]["gitChange"]["unifiedDiff"].as_str()).filter(|p|!p.is_empty()&&all.contains(p)) {
+            assert_eq!(all.matches(patch).count(),1,"round {round}: complete patch must occur once in the entire request");
+        }
+        assert!(!all.contains("contextBridgeManifest"));
     }
     for packet in &packets[..2] { let text=packet.to_string();assert!(!text.contains("B_NOT_YET_FOCUSED_BODY")&&!text.contains("B_FIXED_SECOND_BODY"));assert_eq!(text.matches("A_FIXED_FIRST_BODY").count(),1); }
-    assert!(packets[2].to_string().contains("B_FIXED_SECOND_BODY"));
-    assert!(packets[2].to_string().contains("automatic_material_projection"));
-    assert!(packets[3].to_string().contains("unifiedDiff"));
+    let texts = |packet: &Value| packet["messages"].as_array().unwrap().iter().map(&message_text).collect::<Vec<_>>();
+    assert!(texts(&packets[2]).iter().any(|t|t.starts_with("以下为文件全文（固定 Git 版本；首次正文基准）\n")&&t.ends_with("B_FIXED_SECOND_BODY\n+111")));
+    let patch = deliveries.iter().find(|(i,_)|*i==3).unwrap().1["focused"]["gitChange"]["unifiedDiff"].as_str().unwrap();
+    let model_path = format!("materials/{}",focuses[3].path);
+    assert!(patch.starts_with(&format!("diff --git a/{model_path} b/{model_path}\n")));
+    assert!(patch.contains(&format!("--- a/{model_path}\n+++ b/{model_path}\n")));
+    for packet in &packets[3..5] { assert_eq!(texts(packet).join("\n").matches(patch).count(),1); }
     let previous = packets[3]["messages"].as_array().unwrap();
     let unchanged = packets[4]["messages"].as_array().unwrap();
     assert_eq!(&unchanged[..previous.len()], previous.as_slice(), "unchanged Focus must preserve the exact earlier wire prefix, including historical time, references and locations");
-    let projections = |messages: &[Value]| messages.iter().filter(|m| m.to_string().contains("automatic_material_projection")).count();
+    let projections = |messages: &[Value]| messages.iter().map(&message_text).filter(|t|t.starts_with("以下为文件全文")||t.contains("当前聚焦文件的完整 Git diff（正文基准")).count();
     assert_eq!(projections(unchanged), projections(previous), "unchanged Focus must not append another body");
     let suffix = &unchanged[previous.len()..];
     assert_eq!(suffix.first().unwrap()["role"], "assistant", "previous answer remains after its original question");
     assert!(suffix.iter().any(|m|m.to_string().contains("referenceTime")), "new turn appends its own clock instead of replacing the earlier one");
-    assert!(suffix.iter().any(|m|m.to_string().contains("materialRange")), "new turn retains its own explicit citation");
+    assert!(suffix.iter().map(&message_text).any(|t|t.contains("引用范围：[0, 4)")&&t.contains("原文见已提供的正文 [0, 4)")), "new turn retains its own explicit citation");
     assert!(suffix.last().unwrap().to_string().contains("Fixed Changes 4"));
     assert!(!packets[5].to_string().contains("B_FIXED_SECOND_BODY"));
     assert!(packets[5].to_string().contains("A_FIXED_CHANGED_GIT_BODY"));
-    for packet in &packets[5..] {
-    let frames: Vec<Value> = packet["messages"].as_array().unwrap().iter().filter_map(|m| { let text=m["content"].as_str().map(str::to_owned).unwrap_or_else(||m["content"].as_array().into_iter().flatten().filter_map(|p|p["text"].as_str()).collect::<String>()); serde_json::from_str::<Value>(&text).ok() }).filter(|v| v["type"]=="automatic_material_projection").inspect(|v|assert!(v.get("bodyStartChar").is_none())).flat_map(|v|v["frames"].as_array().cloned().unwrap_or_default()).collect();
-    assert!(!frames.is_empty() && frames.iter().all(|f|f["kind"]=="full"));
+    for (round,packet) in packets.iter().enumerate().skip(5) {
+        let content = texts(packet);
+        let full: Vec<_> = content.iter().filter(|t|t.starts_with("以下为文件全文（固定 Git 版本；")).collect();
+        assert_eq!(full.len(),1,"new session or compaction must recover one complete body");
+        assert_eq!(full[0].split_once('\n').unwrap().1,"A_FIXED_CHANGED_GIT_BODY");
+        assert!(full[0].contains(if round==5 {"首次正文基准"} else {"正文基准已丢失，重新载入"}));
+        assert!(!content.iter().any(|t|t.contains("当前聚焦文件的完整 Git diff（正文基准")));
     }
     assert!(packets[3].to_string().contains("A_FIXED_CHANGED_GIT_BODY"));
     assert!(packets.iter().all(|packet|!packet.to_string().contains("UNFROZEN_WORKSPACE_BODY_MUST_NOT_LEAK")));

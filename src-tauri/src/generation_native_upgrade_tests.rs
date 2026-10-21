@@ -285,6 +285,7 @@ async fn native_exploration_context_reaches_first_and_reopened_provider_requests
     }
     let _ = stop.send(());
     let requests = provider.join().unwrap();
+    if let Some(folder)=std::env::var_os("LS_CHANGES_WIRE_EVIDENCE") { let folder=std::path::PathBuf::from(folder);fs::create_dir_all(&folder).unwrap();fs::write(folder.join("exploration-requests.json"),serde_json::to_vec_pretty(&requests).unwrap()).unwrap(); }
     assert_eq!(requests.len(), 3);
     let text = |message: &Value| message["content"].as_str().map(str::to_owned)
         .unwrap_or_else(|| message["content"].as_array().unwrap().iter()
@@ -292,8 +293,12 @@ async fn native_exploration_context_reaches_first_and_reopened_provider_requests
     for (round, packet) in requests.iter().enumerate() {
         let messages = packet["messages"].as_array().unwrap();
         let system = text(messages.iter().find(|message| message["role"] == "system").unwrap());
-        let payloads: Vec<Value> = messages.iter().map(&text).filter_map(|text|serde_json::from_str(&text).ok()).collect();
-        let exploration = payloads.iter().find(|value| value["scenario"] == "question-led-exploration");
+        let texts: Vec<_> = messages.iter().map(&text).collect();
+        let exploration: Vec<_> = texts.iter().filter(|t|t.starts_with("【Exploration：当前任务入口】")).collect();
+        assert!(!packet.to_string().contains("question-led-exploration"));
+        assert!(!packet.to_string().contains("storageDocumentId"));
+        assert!(!packet.to_string().contains("materialSourceIds"));
+        assert_eq!(messages.iter().filter(|m|m["role"]=="user"&&text(m)==goals[round]).count(),1,"current question is sent as one native user message");
         assert!(!packet.to_string().contains("learning_request"));
         assert!(!packet.to_string().contains("contextBridgeManifest"));
         if round < 2 {
@@ -303,13 +308,20 @@ async fn native_exploration_context_reaches_first_and_reopened_provider_requests
                 "userGoal":goals[round], "storageDocumentId":launch.document.id,
                 "materialSourceIds":[],
             });
-            assert_eq!(exploration.unwrap(), &json!({"scenario":"question-led-exploration", "storageDocumentId":launch.document.id, "materialSourceIds":[]}));
+            assert_eq!(exploration.len(), round+1);
+            assert!(exploration.iter().all(|t|t.as_str()=="【Exploration：当前任务入口】\n本会话来自独立探索入口，正文保存在探索笔记中。"));
+            let material_path = format!("文件：courses/{}.md",launch.document.id);
+            let identified: Vec<_> = texts.iter().filter(|t|t.contains(&launch.document.id)).collect();
+            assert_eq!(identified.len(),1,"the legitimate frozen material path remains once in history");
+            assert!(identified[0].starts_with("以下为笔记全文（未绑定 Git 版本）\n"));
+            assert!(identified[0].lines().any(|line|line==material_path));
+            assert_eq!(identified[0].matches(&launch.document.id).count(),1,"source identity is a real path, never bare exploration metadata");
             assert!(!system.contains(goals[0]));
             assert_eq!(serde_json::to_value(&runs[round].exploration_context).unwrap(), expected);
             assert!(!packet.to_string().contains("ORDINARY_NOTE_MUST_NOT_AUTO_LOAD"));
         } else {
             assert!(runs[round].exploration_context.is_none());
-            assert!(exploration.is_none());
+            assert!(exploration.is_empty());
             assert!(!system.contains("从用户问题发起的新探索"));
             for private in [goals[0], goals[1], "UPGRADE_HISTORY_MARKER", "ORDINARY_NOTE_MUST_NOT_AUTO_LOAD"] {
                 assert!(!packet.to_string().contains(private), "ordinary course inherited {private}");
