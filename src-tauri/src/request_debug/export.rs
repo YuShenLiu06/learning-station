@@ -93,6 +93,12 @@ pub(super) fn document(record: &Value) -> Result<Value> {
         let content = value.ok_or_else(|| CoreError::new("DEBUG_INCOMPLETE", "来源位置与请求体不一致，未导出；请重新采集。"))?;
         let decoded = if source["origin"] == "bridge" && source["registrationKey"] != "references" { decoded_content(&content) } else { content };
         let mut entry = json!({"sourceKey":source.get("registrationKey").unwrap_or(&source["name"]),"name":source["name"],"origin":source["origin"],"registered":source.get("registrationKey").is_some(),"finalPosition":location(source),"content":decoded});
+        if source["path"][0]=="messages" {
+            if let Some(index)=source["path"][1].as_u64() {
+                entry["messageIndex"]=json!(index);
+                if let Some(role)=record["body"]["messages"][index as usize]["role"].as_str(){entry["wireRole"]=json!(role);}
+            }
+        } else if source["path"][0]=="system" {entry["wireRole"]=json!("system");}
         for key in ["registrationKey", "description", "sourcePath", "runId", "userEntryId"] { if let Some(value) = source.get(key) { entry[key] = value.clone(); } }
         entries.push(entry);
     }
@@ -158,6 +164,7 @@ pub fn save(sequence: u64, state_dir: &Path) -> Result<Value> {
         r["body"]["messages"][3]["content"]=json!(literal);
         r["body"]["messages"][10]["content"]=json!(json!({"frames":[{"text":"COMPLETE_FOCUS_TAIL","code":literal}]}).to_string());
         r["body"]["messages"][11]["content"]=json!("CURRENT_QUESTION");
+        r["body"]["messages"][11]["role"]=json!("user");
         r["sources"]=json!([
             {"path":["messages",10,"content"],"origin":"bridge","registrationKey":"focus","description":"保留全文","runId":"old-run","userEntryId":"old-user","name":"material"},
             {"path":["messages",1,"content"],"origin":"user","registrationKey":"question","userEntryId":"old-user","name":"user"},
@@ -173,6 +180,7 @@ pub fn save(sequence: u64, state_dir: &Path) -> Result<Value> {
         assert_eq!(entries[0]["description"],"本轮位置");assert_eq!(entries[1]["content"],literal);
         assert_eq!(entries[2]["runId"],"old-run");assert_eq!(entries[2]["content"]["frames"][0]["code"],literal);
         assert_eq!(entries[3]["content"],"CURRENT_QUESTION");assert_eq!(doc["complete"],true);
+        assert_eq!(entries[3]["messageIndex"],11);assert_eq!(entries[3]["wireRole"],"user");
         assert!(!doc.to_string().contains("OLD_NATIVE_QUESTION"));
         assert_eq!(doc["projectionSnapshot"]["entries"][0]["finalLocations"][0]["path"][1],10);
         assert_eq!(doc["registrationSnapshot"]["entries"][0]["finalLocations"].as_array().unwrap().len(),1);
