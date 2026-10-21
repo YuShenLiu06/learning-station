@@ -198,3 +198,37 @@ test('legacy nativeMaterials Focus removes metadata body from actual full/diff/u
   n.close();
  }
 });
+
+test('pending read always revalidates with Rust even when a durable native reply exists', async () => {
+  for (const allowed of [false, true]) for (const cached of [false, true]) {
+    const s = spec();
+    let n = await openNativeSession(s, options());
+    const call = {id: 'pending_read', name: 'read', arguments: {sourceId: 'doc_1'}};
+    n.manager.appendMessage({role: 'assistant', content: [{type: 'toolCall', ...call}], api: model.api,
+      provider: model.provider, model: model.id, usage: {input: 0, output: 0}, stopReason: 'toolUse', timestamp: Date.now()});
+    n.manager.appendCustomEntry('learning-station-tool', {runId: 'original_read_run', callId: call.id});
+    n.close();
+    const result = {sourceId: 'doc_1', version: 'frozen-v1', content: 'PRIVATE_OLD_READ'};
+    if (cached) fs.writeFileSync(path.join(s.directory, 'tool-' + hash(JSON.stringify(['original_read_run', call.id])) + '.json'),
+      JSON.stringify({callId: call.id, name: call.name, argsHash: hash(JSON.stringify(call.arguments)), reply: {result}}));
+    let checks = 0;
+    const reopened = openNativeSession({...s, runId: 'current_read_run'}, {...options(), requestTool: async request => {
+      checks++;
+      assert.equal(request.type, 'tool_recover');
+      assert.equal(request.recoveryRunId, 'original_read_run');
+      return allowed ? {result: {...result, recovered: true}} : {error: {code: 'TOOL_SCOPE'}};
+    }});
+    if (allowed) {
+      n = await reopened;
+      assert(n.manager.buildSessionProjection().messages.some(m => m.role === 'toolResult' && text(m).includes('frozen-v1')));
+      n.close();
+    } else {
+      n = await reopened;
+      const messages = n.manager.buildSessionProjection().messages;
+      assert(messages.some(m => m.role === 'toolResult' && m.isError && text(m).includes('TOOL_SCOPE')));
+      assert(!messages.some(m => text(m).includes('PRIVATE_OLD_READ')));
+      n.close();
+    }
+    assert.equal(checks, 1, 'native cached read replies cannot bypass current Rust authorization');
+  }
+});

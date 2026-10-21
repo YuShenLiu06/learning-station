@@ -57,12 +57,10 @@ pub(crate) fn recover(
     {
         return Err(unknown());
     }
-    let state_dir = {
+    let (state_dir, session) = {
         let mut core = engine.lock().map_err(|_| unknown())?;
-        if crate::sessions::get(&mut core.content, session_id).is_err() {
-            return Err(unknown());
-        }
-        core.state_dir.clone()
+        let session = crate::sessions::get(&mut core.content, session_id).map_err(|_| unknown())?;
+        (core.state_dir.clone(), session)
     };
     let scope = ToolScope {
         session_id: session_id.into(),
@@ -84,6 +82,18 @@ pub(crate) fn recover(
             "CONFLICT",
             "原工具记录与本次参数不一致，未重复执行。",
         ));
+    }
+    if call.name == "read" {
+        let run = crate::generation::get(engine, run_id)?;
+        let read_scope = ToolScope {
+            session_id: session_id.into(),
+            section_id: run.source_document_id.clone().unwrap_or_else(|| {
+                if session.course_id.is_none() { session.section_id.clone() } else { String::new() }
+            }),
+            run_id: run_id.into(),
+            allowed_ids: run.read_scope_manifest().iter().map(|item| item.id.clone()).collect(),
+        };
+        validate_read_replay(engine, &read_scope, &call.args, &entry.result)?;
     }
     let mut result = entry.result;
     result["recovered"] = json!(true);
@@ -254,6 +264,9 @@ pub(crate) fn execute(
                 "原工具记录与本次参数不一致，未重复执行。",
             ));
         }
+        if name == "read" {
+            validate_read_replay(engine, scope, &args, &entry.result)?;
+        }
         let mut result = entry.result;
         result["replayed"] = json!(true);
         return Ok(result);
@@ -276,11 +289,32 @@ pub(crate) fn execute(
     Ok(result)
 }
 
-fn execute_read(
+/// Receipts prove an earlier read, not continuing permission to disclose it.
+/// Reuse the live read validator, then require the receipt's version to match
+/// this run's frozen version as well as the currently visible source.
+pub(crate) fn validate_read_replay(
     engine: &crate::app::Engine,
     scope: &ToolScope,
-    args: ReadArgs
-) -> Result<Value> {
+    args: &Value,
+    receipt: &Value,
+) -> Result<()> {
+    if tier_rank(&engine.ui_preferences()?.tool_authorization_tier) < 1 {
+        return Err(not_allowed());
+    }
+    let mut current = execute_read(engine, scope, decode::<ReadArgs>(args.clone())?)?;
+    fit_result_bytes(&mut current)?;
+    let unchanged = if args.get("sourceId").is_some() {
+        current["sourceId"] == receipt["sourceId"] && current["version"] == receipt["version"]
+    } else {
+        ["sessionId", "path", "bytes", "content", "truncated"].iter().all(|key| current[key] == receipt[key])
+    };
+    if !unchanged {
+        return Err(CoreError::new("CONFLICT", "原读取回执与本轮资料版本不一致，请保留原记录后重新提问。"));
+    }
+    Ok(())
+}
+
+fn execute_read(engine: &crate::app::Engine, scope: &ToolScope, args: ReadArgs) -> Result<Value> {
     let exclusive = args.source_id.is_some() as u8 + args.path.is_some() as u8;
     if exclusive != 1 {
         return Err(invalid());
@@ -1005,6 +1039,116 @@ mod tests {
             .code,
             "TOOL_NOT_ALLOWED"
         );
+    }
+
+    fn read_replay_fixture() -> (tempfile::TempDir, Arc<Engine>, ToolScope, String, String) {
+        let fixture = course_fixture("read");
+        let question = {
+            let mut core = fixture.1.lock().unwrap();
+            let session = crate::sessions::append(&mut core.content, &fixture.2.session_id,
+                crate::types::Entry { id: String::new(), kind: "user".into(), content: "Read source N".into(),
+                    created_at: crate::types::timestamp(), selection: None, related_ids: vec![], data: None },
+                None, "read-replay-saved-question").unwrap();
+            session.entries.last().unwrap().id.clone()
+        };
+        let mut runs = fixture.1.runs.lock().unwrap();
+        let run = &mut runs.get_mut(&fixture.2.run_id).unwrap().run;
+        run.user_entry_id = Some(question);
+        run.status = "failed".into();
+        drop(runs);
+        fixture
+    }
+
+    fn retry_read_run(engine: &Arc<Engine>, scope: &ToolScope, refresh: bool) -> ToolScope {
+        let mut next = scope.clone();
+        next.run_id = "run_read_retry".into();
+        let mut frozen = crate::generation::get(engine, &scope.run_id).unwrap();
+        frozen.id = next.run_id.clone();
+        if refresh {
+            let mut core = engine.lock().unwrap();
+            let session = crate::sessions::get(&mut core.content, &scope.session_id).unwrap();
+            frozen.course_read_manifest = Some(crate::context::course_read_manifest(
+                &core.content, session.course_id.as_deref().unwrap()).unwrap());
+            next.allowed_ids = frozen.read_scope_manifest().iter().map(|m| m.id.clone()).collect();
+        }
+        engine.runs.lock().unwrap().insert(next.run_id.clone(), crate::generation::ManagedRun {
+            run: frozen, cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        next
+    }
+
+    fn assert_read_replay_boundary(change: &str, cross_run: bool) {
+        let (_dir, engine, scope, source, sibling) = read_replay_fixture();
+        let args = json!({"sourceId":source});
+        let receipt = run(&engine, &scope, "read_before_failure", "read", args.clone()).unwrap();
+        let request = crate::learning_tools::operation_id(&engine, &scope, "read_before_failure", "read", &args).unwrap().0;
+        let ledger = super::workspace_root(&engine.lock().unwrap().state_dir, &scope.session_id)
+            .join("receipts").join(format!("{request}.json"));
+        let original = std::fs::read(&ledger).unwrap();
+        {
+            let mut core = engine.lock().unwrap();
+            let document = core.content.read(&source).unwrap();
+            match change {
+                "move" => {
+                    let owner = crate::course_sessions::course(&core.content, &sibling).unwrap().unwrap();
+                    crate::library_tree::move_node(&mut core.content, &source, Some(&owner), 0, &document.version).unwrap();
+                }
+                "trash" => {
+                    let preview = crate::trash::preview(&mut core.content, &source).unwrap();
+                    crate::trash::trash(&mut core.content, &source, &preview.version, "replay-trash").unwrap();
+                }
+                "update" => { core.content.save(&source, &document.content.replace("authorized source body", "new version"), &document.version).unwrap(); }
+                _ => {}
+            }
+        }
+        // Same persisted question and args after a failed model turn; new runs
+        // have a freshly captured directory, without changing the operation ID.
+        let retry = if cross_run { retry_read_run(&engine, &scope, true) } else { scope.clone() };
+        let replay = run(&engine, &retry, "read_after_failure", "read", args.clone());
+        let call = crate::model::ToolCall { id: "read_before_failure".into(), name: "read".into(), args };
+        let recovered = crate::native_session::recover(&engine, &scope.session_id, &scope.run_id, &call);
+        let retry_recovered = crate::native_session::recover(&engine, &retry.session_id, &retry.run_id, &call);
+        assert_eq!(std::fs::read(&ledger).unwrap(), original, "old receipt must remain immutable");
+        if change == "unchanged" {
+            assert_eq!(replay.unwrap()["version"], receipt["version"]);
+            assert_eq!(recovered.unwrap()["version"], receipt["version"]);
+            assert_eq!(retry_recovered.unwrap()["version"], receipt["version"]);
+        } else {
+            let expected = if change == "update" { "CONFLICT" } else { "TOOL_SCOPE" };
+            assert_eq!(replay.unwrap_err().code, expected, "{change} cross_run={cross_run}");
+            assert_eq!(recovered.unwrap_err().code, expected, "{change} original recovery");
+            assert_eq!(retry_recovered.unwrap_err().code, expected, "{change} retry recovery");
+        }
+    }
+
+    #[test]
+    fn read_replay_cross_run_move() { assert_read_replay_boundary("move", true); }
+    #[test]
+    fn read_replay_cross_run_trash() { assert_read_replay_boundary("trash", true); }
+    #[test]
+    fn read_replay_same_run_update() { assert_read_replay_boundary("update", false); }
+    #[test]
+    fn read_replay_cross_run_update() { assert_read_replay_boundary("update", true); }
+    #[test]
+    fn read_replay_unchanged_cross_run() { assert_read_replay_boundary("unchanged", true); }
+
+    #[test]
+    fn read_replay_rechecks_workspace_and_current_tier() {
+        for change in ["update", "delete", "tier"] {
+            let (_dir, engine, scope) = fixture("write");
+            let args = json!({"path":"draft.md"});
+            run(&engine, &scope, "workspace_seed", "write", json!({"path":"draft.md","content":"original"})).unwrap();
+            run(&engine, &scope, "workspace_read", "read", args.clone()).unwrap();
+            let files = super::workspace_root(&engine.lock().unwrap().state_dir, &scope.session_id).join("files");
+            match change {
+                "update" => std::fs::write(files.join("draft.md"), "changed").unwrap(),
+                "delete" => std::fs::remove_file(files.join("draft.md")).unwrap(),
+                _ => { engine.save_ui_preferences(UiPreferences { tool_authorization_tier: "off".into(), ..UiPreferences::default() }).unwrap(); }
+            }
+            assert!(run(&engine, &scope, "workspace_read", "read", args.clone()).is_err(), "{change}");
+            assert!(crate::native_session::recover(&engine, &scope.session_id, &scope.run_id,
+                &crate::model::ToolCall { id: "workspace_read".into(), name: "read".into(), args }).is_err(), "{change}");
+        }
     }
 
     #[test]

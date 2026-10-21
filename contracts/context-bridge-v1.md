@@ -35,6 +35,16 @@ type ContextBridgeManifest = {
 
 内部冻结包新增 `nativeMaterials`（经授权核验的当前完整范围、哈希及候选frames）和 `nativeReferences`。适配器核对实际Pi投影后选择沿用、diff或full重载；不把旧history拼成新userJSON。界面仍只显示sourceId/短指纹和部分范围，不新增路径打开，也不承诺总token下降。
 
+## 课程可读范围与实际正文
+
+`Run.courseReadManifest?: ManifestItem[]` 是独立的课程授权目录及精确版本快照，不含正文，不发送给模型。目录项 `includedChars=0` 不表示已接收；旧 Run 缺省时沿用原 `contextManifest` 授权。目录包含本课程可见笔记和附件，内部工具范围上限为4096份；单次显式引用仍遵守原有数量限制。
+
+普通课程对话不自动遍历当前笔记正文；显式选区、练习来源和 Citation 继续加入真实正文。`Context.manifest` / `Run.contextManifest` 仅列实际正文来源，`contextBridgeManifest` 仍以 Pi 实际投影为准，目录不能混入三者。
+
+受控 `read` 回包提供 `includedInInitialContext`、`authorizationScope`、`delivery=tool-result`、`range` 和 `truncated`。这些字段说明初始正文快照及本次返回范围，不证明远端已收到；Pi 的真实工具消息、投影与持久回执才是 session 正文事实。读取及旧回执重放/恢复均核实当前来源、课程归属、回收状态和冻结版本；回执版本还须等于本轮冻结版本，跨run同问题同参数不放宽检查。已有原生read回包也须经Rust重新核实；不改写旧回执。附件复用原有校验，仅返回纯文本，图片明确拒绝。
+
+Focus provider 后续仍接既有 `nativeMaterials` 投影接口：首次全文、有效完整基准才使用 Git 差量、未变不重复，新 session 或压缩丢失基准恢复全文。本切片保留该接口，不声称已完成 Focus 与 UI 的组合验收。
+
 ## 内嵌内容
 
 `learning-embed` 块是现有笔记正文的一部分，不增加 bridge 的授权、网络抓取或来源编号。网页/视频链接不自动变为知识来源；AI 回答引用的编号不能冒充 `manifest` 中的材料编号。
@@ -53,3 +63,5 @@ Focus由独立冻结接口传入，仍自动加载聚焦正文；本层空来源
 `GenerationRequest.focus`、`Run.focus` 与 assistant 自身 `entry.data.focus` 使用 [Focus v1](focus-v1.md) 的同一个冻结对象；审计快照保留完整Focus；目标完整正文已由材料投影供给时，Pi turn metadata仅保留身份、位置和范围，不重复段落text，字符数按实际投影统计。Focus 不从最新 Session 或页面回填。queued Focus 表示已冻结请求，不冒充 Pi 已接收材料基线。
 
 Focus 使用同 checkpoint 的 Git binary 判定移除自动材料正文，清单保留0字符元数据；`metadataOnlySourceIds` 同步排除 Pi 旧自动材料投影。用户明确选区/引用及经授权的主动文本 read 沿各自原协议，不能把元数据身份当作图片正文读取权限。
+
+历史授权与read目录独立：`nativeSession.authorizedSourceIds` 继续使用课程可见历史来源集合，兼容旧course/folder/exercise编号，不因此授予read权限或注入正文。仍授权的历史与摘要在升级时保留；真实撤权仍触发原生权限边界。

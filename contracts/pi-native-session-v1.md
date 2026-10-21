@@ -32,7 +32,7 @@ cwd 与 Node 目录读取参数都不是强隔离：真实锁版 read/Bash 可�
 | `session_sync {id}` | Rust同步当前已绑定目录中的普通文件和目录；同id `tool_result.result.synced=true`后继续；无路径参数 |
 | `context_manifest {manifest}` | 实际原生材料投影的清单；写入当前Run，随后该assistant自身快照 |
 | `session_lifecycle {event,reason,aborted}` | 压缩开始/结束的安全状态，无消息正文或凭据 |
-| `tool_recover {id,name,args,recoveryRunId}` | 核对同学习会话原run、原操作ID和已提交对象，只读，不执行原工具；无证据返回unknown，有台账但工具或参数不一致返回CONFLICT |
+| `tool_recover {id,name,args,recoveryRunId}` | 核对同学习会话原run、原操作ID和已提交对象，只读，不执行原工具；无证据返回unknown，有台账但工具或参数不一致返回CONFLICT；read同时核实当前权限及原轮/本轮冻结版本 |
 
 普通 `tool_request/tool_result/delta/done` 继续原协议。工具结果未回到 Pi 不代表业务未执行。Rust 在发送回包前持久化 `tool-sha256([runId,callId]).json`；恢复优先用原回包，必要时查询真实业务对象。新业务操作 ID 取 `sha256([saved-question-v1,sessionId,userEntryId,toolName,canonicalArgs])`，同一问题换 run/call 重试仍返回原对象；旧无 userEntryId 的记录沿原 run/call ID。原生已接受用户问题按 `userEntryId` 登记实际 native entry ID，失败重试不重复用户原话。
 
@@ -62,7 +62,9 @@ Rust 在 practice 模式显式开启 `outputValidation`，Node 每次完成最�
 
 首次承接旧课程时，先将原 preferences、业务会话目录和对应 Pi 目录备份到私有 `course-session-backups/<sha256(courseId)>/`，完整回执后才建立新课程对话。原对话及来源保持原样，`legacySessionIds` 供界面提示和历史查看；不选一段旧对话覆盖其他记录，不拼接 Pi 历史。备份遇到运行锁、符号链接或读写失败时不切换路由。旧练习仍按 originSessionId 作答/批改，聊天使用课程 session；引用校验同时核实原账本与课程。
 
-Focus 切换时，native 的历史授权集合保留仍属于该课程的已见来源，显式材料引用也核对同课程归属；回收历史保护仍生效。此集合不注入其他笔记正文，不扩大 Rust ToolScope/read 工具的本轮来源列表。
+Focus 切换时，native 的历史授权集合保留仍属于该课程的已见来源，兼容旧scope中的course/folder/exercise编号；它独立于仅含可读材料和附件的courseReadManifest，升级不得因目录类型减少而排除仍授权的历史/摘要。显式材料引用也核对同课程归属；移出课程、回收或真实撤权仍触发历史保护。此集合不注入其他笔记正文，不扩大 Rust ToolScope/read 工具的本轮来源列表。
+
+read的持久回执只证明原读取，重放或恢复前（包括Node已有原生回包）必须由Rust重新核实当前授权、来源归属、可见性、原轮及当前轮冻结版本和回执版本。版本变化不重写原回执，不静默换成新正文。明确的TOOL_SCOPE/CONFLICT/TOOL_NOT_ALLOWED/TRASHED/NOT_FOUND拒绝以无正文工具错误配对，允许进入权限边界并继续会话；原轮/本轮Run缺失或损坏、回执证据缺失仍为unknown，不配对为资源读取拒绝。write/bash沿原幂等与只读恢复协议执行，不因当前档位改变而重复操作。
 
 ### 来源、移动与回收边界
 

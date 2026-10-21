@@ -126,10 +126,11 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
       if(!owner)throw new NativeSessionError('NATIVE_TOOL_UNKNOWN');
       const receipt=path.join(spec.directory,'tool-'+sha(JSON.stringify([owner.runId,call.id]))+'.json');
       let reply=fs.existsSync(receipt)?JSON.parse(read(receipt,65536)):null;
-      if(!reply?.reply){
+      if(call.name==='read'||!reply?.reply){
         if(typeof requestTool!=='function')throw new NativeSessionError('NATIVE_TOOL_UNKNOWN');
         const recovered=await requestTool({type:'tool_recover',recoveryRunId:owner.runId,id:call.id,name:call.name,args:call.arguments});
-        if(!recovered?.result?.persisted)throw new NativeSessionError('NATIVE_TOOL_UNKNOWN');
+        const deniedRead=call.name==='read'&&['TOOL_SCOPE','CONFLICT','TOOL_NOT_ALLOWED','TRASHED','NOT_FOUND'].includes(recovered?.error?.code);
+        if(!(call.name==='read'?recovered?.result||deniedRead:recovered?.result?.persisted))throw new NativeSessionError('NATIVE_TOOL_UNKNOWN');
         reply={callId:call.id,name:call.name,argsHash:sha(JSON.stringify(stable(call.arguments))),reply:recovered};
       }
       if(reply.callId!==call.id||reply.name!==call.name||reply.argsHash!==sha(JSON.stringify(stable(call.arguments)))||!reply.reply)throw new NativeSessionError('NATIVE_TOOL_UNKNOWN');

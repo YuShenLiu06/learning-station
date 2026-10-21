@@ -206,6 +206,8 @@ pub struct ModelStore {
     config_path: PathBuf,
     keychain_namespace: String,
     settings: ModelSettings,
+    #[cfg(test)]
+    fixture_credentials: Option<(ModelSettings, String)>,
 }
 // Never Serialize credentials or derive Debug: no secrets cross IPC or logs.
 pub struct ModelCredentials {
@@ -414,7 +416,18 @@ impl ModelStore {
             config_path,
             keychain_namespace: crate::types::hash(&identity.to_string_lossy()),
             settings,
+            #[cfg(test)]
+            fixture_credentials: None,
         })
+    }
+    #[cfg(test)]
+    pub(crate) fn use_local_fixture(&mut self, endpoint: String) {
+        assert!(endpoint.starts_with("http://127.0.0.1:"));
+        self.fixture_credentials = Some((ModelSettings {
+            configured: true, provider: "custom".into(), protocol: PROTOCOL.into(),
+            model: "offline-fixture".into(), base_url: endpoint, active_profile: "custom".into(),
+            ..ModelSettings::default()
+        }, "synthetic-local-key".into()));
     }
     pub fn settings(&self) -> ModelSettings {
         let mut settings = self.settings.clone();
@@ -610,6 +623,10 @@ impl ModelStore {
         Ok(self.settings())
     }
     pub fn credentials(&self) -> Result<ModelCredentials> {
+        #[cfg(test)]
+        if let Some((settings, key)) = &self.fixture_credentials {
+            return ModelCredentials::new(settings.clone(), key.clone());
+        }
         if !self.settings.configured {
             return Err(CoreError::new(
                 "NOT_CONFIGURED",
@@ -1225,10 +1242,18 @@ async fn run_sidecar(
                         if !crate::types::valid_id(original){return Err(sidecar_error("TOOL_PROTOCOL"));}
                         let call=ToolCall{id:event["id"].as_str().unwrap_or_default().into(),name:event["name"].as_str().unwrap_or_default().into(),args:event["args"].clone()};
                         validate_tool_call(&call)?;
-                        let value=await_stage(recovery(original.into(),call.clone()),&cancel,deadline).await?;
-                        let reply=json!({"type":"tool_result","id":call.id,"result":value});
+                        let recovered=await_stage(recovery(original.into(),call.clone()),&cancel,deadline).await;
+                        let reply = match recovered {
+                            Ok(value) => json!({"type":"tool_result","id":call.id,"result":value}),
+                            Err(error) if call.name == "read" && matches!(error.code.as_str(),
+                                "TOOL_SCOPE" | "CONFLICT" | "TOOL_NOT_ALLOWED" | "TRASHED" | "NOT_FOUND") =>
+                                json!({"type":"tool_result","id":call.id,"error":{"code":error.code,"message":error.message}}),
+                            Err(error) => return Err(error),
+                        };
                         let path=native.directory.join(format!("tool-{}.json",crate::types::hash(&serde_json::to_string(&json!([original,call.id]))?)));
-                        crate::native_session::atomic(&path,&json!({"version":1,"runId":original,"callId":call.id,"name":call.name,"argsHash":crate::types::hash(&serde_json::to_string(&call.args)?),"reply":reply}))?;
+                        if call.name != "read" || !path.exists() {
+                            crate::native_session::atomic(&path,&json!({"version":1,"runId":original,"callId":call.id,"name":call.name,"argsHash":crate::types::hash(&serde_json::to_string(&call.args)?),"reply":reply}))?;
+                        }
                         let mut bytes=serde_json::to_vec(&reply)?;bytes.push(b'\n');
                         await_stage(async{stdin.write_all(&bytes).await.map_err(|_|runtime_error())},&cancel,deadline).await?;
                         had_response=true;

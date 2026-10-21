@@ -164,3 +164,52 @@ async fn course_start_without_focus_keeps_readable_versions_separate_from_explic
     assert!(!run.read_scope_manifest().iter().any(|m| m.id == b.id));
     assert!(run.context_bridge_manifest.is_none());
 }
+
+#[test]
+fn course_cwd_requires_fresh_trash_visibility_while_physical_files_survive() {
+    let temp = tempfile::tempdir().unwrap();
+    let engine = Engine::new(temp.path().join("library"), temp.path().join("state")).unwrap();
+    let mut core = engine.lock().unwrap();
+    let course =
+        crate::library_tree::create_project(&mut core.content, "Synthetic", "", "binding-trash-course")
+            .unwrap();
+    let session =
+        crate::course_sessions::create(&mut core, &course.id, "binding-trash-session").unwrap();
+    let root = crate::course_project::course_project_root(core.content.root(), &course.id).unwrap();
+    let mut stale =
+        crate::content::ContentStore::new(core.content.root().into(), core.state_dir.clone())
+            .unwrap();
+    stale.refresh().unwrap();
+    let preview = crate::trash::preview(&mut core.content, &course.id).unwrap();
+    let receipt = crate::trash::trash(
+        &mut core.content,
+        &course.id,
+        &preview.version,
+        "binding-trash-course-request",
+    )
+    .unwrap();
+    assert!(root.is_dir());
+    assert!(core.content.root().join(&course.path).is_file());
+    assert_eq!(
+        crate::native_session::project_root(&stale, &session)
+            .unwrap_err()
+            .code,
+        "TRASH_STATE_CHANGED"
+    );
+    assert_eq!(
+        crate::native_session::project_root(&core.content, &session)
+            .unwrap_err()
+            .code,
+        "TRASHED"
+    );
+    crate::trash::restore(
+        &mut core.content,
+        &receipt.trash_id,
+        "binding-restore-course-request",
+    )
+    .unwrap();
+    assert_eq!(
+        crate::native_session::project_root(&core.content, &session).unwrap(),
+        Some(root)
+    );
+}

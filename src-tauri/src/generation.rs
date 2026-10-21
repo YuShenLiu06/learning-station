@@ -570,12 +570,26 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
                 tool_recovery: Some({
                     let engine = engine.clone();
                     let sid = session.id.clone();
+                    let current_run_id = id.clone();
                     Arc::new(move |original: String, call: model::ToolCall| {
                         let engine = engine.clone();
                         let sid = sid.clone();
+                        let current_run_id = current_run_id.clone();
                         Box::pin(async move {
                             tokio::task::spawn_blocking(move || {
-                                crate::native_session::recover(&engine, &sid, &original, &call)
+                                let receipt = crate::native_session::recover(&engine, &sid, &original, &call)?;
+                                if call.name == "read" {
+                                    let current = get(&engine, &current_run_id).map_err(|_| {
+                                        CoreError::new("NATIVE_TOOL_UNKNOWN", "本轮工具授权快照尚不可核实；未恢复读取。")
+                                    })?;
+                                    let scope = crate::learning_tools::ToolScope {
+                                        session_id: sid, run_id: current_run_id,
+                                        section_id: current.source_document_id.clone().unwrap_or_default(),
+                                        allowed_ids: current.read_scope_manifest().iter().map(|item| item.id.clone()).collect(),
+                                    };
+                                    crate::authorized_tools::validate_read_replay(&engine, &scope, &call.args, &receipt)?;
+                                }
+                                Ok(receipt)
                             })
                             .await
                             .map_err(|_| {
@@ -3318,3 +3332,7 @@ mod rendered_exercise_snapshot_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "generation_native_upgrade_tests.rs"]
+mod native_upgrade_tests;

@@ -31,6 +31,8 @@ pub(crate) fn project_root(
     let Some(owner) = &session.course_id else {
         return Ok(None);
     };
+    // Recycle retains physical files; validate current visibility before handing Pi a cwd.
+    store.read(owner)?;
     match crate::course_project::course_project_root(store.root(), owner) {
         Ok(root) => {
             // Reuse the course Git service; Pi's native .agents discovery needs
@@ -186,12 +188,12 @@ pub fn recover(
     call: &crate::model::ToolCall,
 ) -> Result<Value> {
     let unknown = || CoreError::new("NATIVE_TOOL_UNKNOWN", "原工具结果尚不可核实；未重复写入。");
-    let run = crate::generation::get(engine, run_id)?;
+    let run = crate::generation::get(engine, run_id).map_err(|_| unknown())?;
     if run.session_id != session_id {
         return Err(unknown());
     }
-    // Workspace tools recover from their own durable receipt ledger; the ledger
-    // is the proof of the original execution, not the current tier.
+    // Workspace tools recover durable evidence without repeating effects.
+    // Reads additionally revalidate current permission and the frozen version.
     if crate::authorized_tools::required_rank(&call.name).is_some() {
         return crate::authorized_tools::recover(engine, session_id, run_id, call);
     }
