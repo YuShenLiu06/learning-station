@@ -607,6 +607,57 @@ impl MaterialGit {
         self.git(&["cat-file", "blob", &file.blob_oid], &[])
     }
 
+    /// Resolve an existing logical material path against this repository's root.
+    pub(crate) fn repository_path(&self, course_id: &str, path: &str) -> Result<String> {
+        check_id(course_id)?;
+        check_path(path)?;
+        if self.course.as_deref().is_some_and(|course| course != course_id) {
+            return Err(scope());
+        }
+        Ok(if self.course.is_some() {
+            format!("materials/{path}")
+        } else {
+            format!("materials/{course_id}/{path}")
+        })
+    }
+
+    /// Native model-facing Git text uses the complete fixed commit roots, never
+    /// the live worktree or the material subtree as a synthetic repository root.
+    fn root_diff(
+        &self,
+        course_id: &str,
+        old: Option<&str>,
+        new: &str,
+        flags: &[&str],
+        path: &str,
+    ) -> Result<Vec<u8>> {
+        self.checkpoint(course_id, new)?;
+        let old_tree = match old {
+            Some(oid) => self.checkpoint(course_id, oid)?.checkpoint_commit_oid,
+            None => self.text(&["hash-object", "-t", "tree", "--stdin"], &[])?,
+        };
+        let mut args = vec!["diff", "--no-ext-diff", "--no-textconv", "--no-color"];
+        args.extend_from_slice(flags);
+        args.extend([old_tree.as_str(), new, "--", path]);
+        self.git(&args, &[])
+    }
+
+    pub(crate) fn stat(&self, course_id: &str, old: Option<&str>, new: &str) -> Result<String> {
+        let path = if self.course.is_some() {
+            "materials".to_owned()
+        } else {
+            check_id(course_id)?;
+            format!("materials/{course_id}")
+        };
+        String::from_utf8(self.root_diff(course_id, old, new, &["--find-renames", "--stat"], &path)?)
+            .map_err(|_| git_error())
+    }
+
+    pub(crate) fn patch(&self, course_id: &str, old: &str, new: &str, path: &str) -> Result<Vec<u8>> {
+        let path = self.repository_path(course_id, path)?;
+        self.root_diff(course_id, Some(old), new, &["--no-renames", "--patch", "--full-index"], &path)
+    }
+
     pub fn compare(
         &self,
         course_id: &str,
@@ -788,11 +839,15 @@ impl MaterialGit {
 
     /// Git computes the exact diff of authorized model-visible bodies; fixed file OIDs
     /// still identify the original objects. No textconv, hooks, shell or network.
-    pub(crate) fn compare_bodies(&self, old: &str, new: &str) -> Result<String> {
+    pub(crate) fn compare_bodies(&self, old: &str, new: &str, model_path: &str) -> Result<String> {
+        check_path(model_path)?;
+        self.validate_layout()?;
         let old_oid = self.text(&["hash-object", "-w", "--stdin"], old.as_bytes())?;
         let new_oid = self.text(&["hash-object", "-w", "--stdin"], new.as_bytes())?;
         check_oid(&old_oid)?; check_oid(&new_oid)?;
-        String::from_utf8(self.git(&["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames", &old_oid, &new_oid], &[])?).map_err(|_| git_error())
+        let old_tree = self.tree(&[(model_path.into(), old_oid)])?;
+        let new_tree = self.tree(&[(model_path.into(), new_oid)])?;
+        String::from_utf8(self.git(&["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames", &old_tree, &new_tree, "--", model_path], &[])?).map_err(|_| git_error())
     }
 
     fn text(&self, args: &[&str], input: &[u8]) -> Result<String> {

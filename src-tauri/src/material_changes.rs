@@ -12,11 +12,14 @@ pub fn for_focus(
 ) -> Result<Value> {
     let frozen = crate::focus::load(core, session, focus)?;
     let focus = &frozen.focus;
+    let git = crate::focus::open_materials(core, focus)?;
+    let model_path = git.repository_path(&focus.course_id, &focus.path)?;
     let source = focus.asset.as_ref().and_then(|a| a["id"].as_str()).unwrap_or(&focus.document_id);
     let text = (!focus.binary && matches!(focus.r#type.as_str(), "markdown" | "text"))
         .then_some((source, focus.path.as_str()));
-    let mut value = prepare(&crate::focus::open_materials(core, focus)?, &focus.course_id,
+    let mut value = prepare(&git, &focus.course_id,
         &focus.commit_hash, previous, focus_previous, text, 512 * 1024)?;
+    value["focusPath"] = json!(model_path);
     if focus.r#type == "markdown" {
         if let Some(text) = value["focused"]["text"].as_str() {
             let (_, body) = crate::content::parse(text)?;
@@ -26,12 +29,15 @@ pub fn for_focus(
             value["focused"]["bodyStartChar"] = json!(0);
             value["focused"]["text"] = json!(body);
             if let Some(previous) = focus_previous {
-                let git = crate::focus::open_materials(core, focus)?;
                 if let Some(old) = git.files(&focus.course_id, previous)?.into_iter().find(|f|f.path==focus.path) {
                     let old_text = String::from_utf8(git.read(&focus.course_id, previous, &focus.path)?).map_err(|_| CoreError::new("CONTEXT_CONFLICT", "旧正文不是有效文本，不能生成差量。"))?;
                     let (_, old_body) = crate::content::parse(&old_text)?;
-                    let patch = git.compare_bodies(&old_body, &body)?;
-                    value["focused"]["gitChange"] = json!({"baseCommitOid":previous,"baseBlobOid":old.blob_oid,"unifiedDiff":patch});
+                    let patch = git.compare_bodies(&old_body, &body, &model_path)?;
+                    if patch.is_empty() {
+                        value["focused"].as_object_mut().unwrap().remove("gitChange");
+                    } else {
+                        value["focused"]["gitChange"] = json!({"baseCommitOid":previous,"baseBlobOid":old.blob_oid,"unifiedDiff":patch});
+                    }
                 }
             }
         }
@@ -98,7 +104,7 @@ pub fn prepare(
             .find(|f| f.path == path)
             .ok_or_else(|| CoreError::new("MATERIAL_SCOPE", "聚焦材料不在本次固定版本。"))?;
         let bytes = git.read(course, commit, path)?;
-        focused = json!({"id":id,"path":path,"gitCommitOid":commit,"gitBlobOid":file.blob_oid,"totalBytes":bytes.len()});
+        focused = json!({"id":id,"path":path,"modelPath":git.repository_path(course, path)?,"gitCommitOid":commit,"gitBlobOid":file.blob_oid,"totalBytes":bytes.len()});
         let binary = git.compare(course, None, commit, None)?.changes.into_iter()
             .find(|change| change.path == path)
             .ok_or_else(|| CoreError::new("MATERIAL_SCOPE", "固定版本缺少 Git 文件状态。"))?.binary;
@@ -112,10 +118,10 @@ pub fn prepare(
                 focused["textHash"] = json!(version);
                 focused["range"] = json!({"startChar":0,"endChar":text.chars().count(),"complete":true,"totalBytes":text.len()});
                 focused["text"] = json!(text);
-                if let Some(change) = diff
+                if diff
                     .changes
                     .iter()
-                    .find(|c| c.path == path && c.patch.is_some())
+                    .any(|c| c.path == path && c.patch.is_some())
                 {
                     if let Some(old_oid) = focus_previous {
                         if let Some(base) = git
@@ -123,7 +129,8 @@ pub fn prepare(
                             .into_iter()
                             .find(|f| f.path == path)
                         {
-                            focused["gitChange"] = json!({"baseCommitOid":old_oid,"baseBlobOid":base.blob_oid,"unifiedDiff":change.patch});
+                            let patch = String::from_utf8(git.patch(course, old_oid, commit, path)?).map_err(|_| CoreError::new("MATERIAL_GIT", "固定 Git 文本补丁无效。"))?;
+                            focused["gitChange"] = json!({"baseCommitOid":old_oid,"baseBlobOid":base.blob_oid,"unifiedDiff":patch});
                         }
                     }
                 }
@@ -137,7 +144,7 @@ pub fn prepare(
         .as_ref()
         .is_none_or(|c| c.excluded_files != checkpoint.excluded_files);
     let value = json!({"checkpoint":checkpoint,"baseCommitOid":previous,"initial":diff.initial,
-        "changes":changes,"exclusionsChanged":exclusions_changed,"focused":focused,"complete":true});
+        "changes":changes,"stat":git.stat(course, previous, commit)?,"exclusionsChanged":exclusions_changed,"focused":focused,"complete":true});
     if serde_json::to_vec(&value)?.len() > budget {
         return Err(CoreError::new(
             "LIMIT_EXCEEDED",
