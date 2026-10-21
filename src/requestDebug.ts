@@ -110,3 +110,36 @@ export function sourceReadingContent(record:DebugRecord,source:DebugSource):stri
   }catch{}
   return sourceContent(record,source);
 }
+export type DebugContentSection={title:string;text:string;format:'text'|'diff'};
+export type DebugPresentation={facts:[string,string][];sections:DebugContentSection[];notice?:string};
+export function sourcePresentation(record:DebugRecord,source:DebugSource):DebugPresentation|null {
+ if(source.origin!=='bridge')return null;
+ const raw=sourceValue(record,source);let value:Record<string,unknown>;
+ try{value=(typeof raw==='string'?JSON.parse(raw):raw) as Record<string,unknown>;}catch{
+  if(typeof raw==='string'&&['focus','material_changes'].includes(source.registrationKey??''))return {facts:[],sections:[{title:'实发正文',text:raw,format:source.registrationKey==='material_changes'?'diff':'text'}]};
+  return null;
+ }
+ if(!value||typeof value!=='object'||Array.isArray(value))return null;
+ const facts:[string,string][]=[];
+ const field=(label:string,key:string)=>{if(typeof value[key]==='string'&&value[key])facts.push([label,value[key] as string]);};
+ const range=(r:unknown)=>{if(!r||typeof r!=='object')return '';const v=r as Record<string,unknown>;return typeof v.startChar==='number'&&typeof v.endChar==='number'?`[${v.startChar}, ${v.endChar})${v.complete===true?' · 完整':v.complete===false?' · 部分':''}`:'';};
+ if(value.type==='automatic_material_projection'){
+  field('文件','path');field('冻结版本（旧协议）','version');
+  const covered=range(value.range);if(covered)facts.push(['正文范围',covered]);
+  const sections:DebugContentSection[]=[];
+  for(const frame of Array.isArray(value.frames)?value.frames:[]){
+   if(frame.kind==='full'&&typeof frame.text==='string')sections.push({title:'全文 · full',text:frame.text,format:'text'});
+   if(frame.kind==='diff'&&typeof frame.unifiedDiff==='string')sections.push({title:'增量 · diff',text:frame.unifiedDiff,format:'diff'});
+  }
+  facts.push(['所属轮次',sourceRound(record,source)+(sourceRound(record,source)==='历史轮次'?' · 该基准仍在本次实际请求中':'')]);
+  return {facts,sections,notice:sections.length?undefined:'此片段未记录全文或 diff，不能据此认定正文已发送或沿用。'};
+ }
+ if(source.name==='learning-station-focus'){
+  field('当前文件','path');field('冻结 Git commit','commitHash');field('视图','view');
+  const paragraphs=Array.isArray(value.paragraphs)?value.paragraphs:[];
+  const covered=paragraphs.map(range).filter(Boolean);if(covered.length)facts.push(['可见范围',covered.join('，')]);
+  const sections=paragraphs.filter(p=>typeof p.text==='string').map((p,index)=>({title:'可见正文'+(paragraphs.length>1?' '+(index+1):''),text:p.text as string,format:'text' as const}));
+  return {facts,sections,notice:'此处是实际记录的聚焦位置；真实引用和正文基准分别以对应实发片段为准。'};
+ }
+ return null;
+}

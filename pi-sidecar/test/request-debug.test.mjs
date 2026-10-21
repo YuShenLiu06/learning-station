@@ -151,3 +151,13 @@ test('debug capture keeps the same Request-boundary registrations while its body
  controller.enqueue(new TextEncoder().encode(JSON.stringify({messages:[{role:'user',content:'frozen question'}]})));controller.close();
  const capture=await pending;assert.equal(capture.complete,true);assert.equal(capture.registrations[0].value,'frozen question');assert.equal(capture.projectionRegistrations[0].value.referenceTime,'frozen-time');assert.equal(capture.sources[0].runId,'frozen-run');
 });
+test('unchanged Focus values keep their own native question identity across repeated text',async()=>{
+ const {bindSources}=await import('../request-debug.mjs');
+ const focus='【Focus：用户当前阅读的位置】\n文件：documents/focus.md\n版本：'+('a'.repeat(40));
+ const body={messages:[{role:'user',content:focus},{role:'user',content:'test'},{role:'assistant',content:'answer'},{role:'user',content:focus},{role:'user',content:'test'}]};
+ const native=[{value:focus,origin:'bridge',registrationKey:'focus',name:'learning-station-focus',userEntryId:'old-user'},{value:'test',origin:'user',registrationKey:'question',name:'user',userEntryId:'old-user'},{value:'answer',origin:'model',name:'assistant'},{value:focus,origin:'bridge',registrationKey:'focus',name:'learning-station-focus',userEntryId:'current-user'},{value:'test',origin:'user',registrationKey:'question',name:'user',userEntryId:'current-user'}];
+ const sources=bindSources(body,{native});
+ assert.deepEqual(sources.filter(s=>s.registrationKey==='focus').map(s=>[s.path[1],s.userEntryId]),[[0,'old-user'],[3,'current-user']]);
+ const missing=bindSources(body,{native:native.filter(s=>s.userEntryId!=='current-user'||s.registrationKey!=='question')});
+ assert.ok(missing.filter(s=>[0,3].includes(s.path[1])).every(s=>s.origin==='unknown'));
+});

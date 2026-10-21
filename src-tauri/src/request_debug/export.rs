@@ -51,14 +51,22 @@ fn location(source: &Value) -> Value {
     for key in ["start", "end"] { if let Some(item) = source.get(key) { value[key] = item.clone(); } }
     value
 }
-fn snapshot_entries(items: Option<&Vec<Value>>, entries: &[Value]) -> Vec<Value> {
+fn snapshot_entries(items: Option<&Vec<Value>>, entries: &[Value], frozen_owner: Option<&Value>) -> Vec<Value> {
     items.into_iter().flatten().map(|item| {
         let mut input = item.clone();
-        if let Some(object) = input.as_object_mut() { if let Some(value) = object.remove("value") { object.insert("content".into(), value); } }
+        if let Some(object) = input.as_object_mut() { if let Some(value) = object.remove("value") {
+            let protocol_value=frozen_owner.is_none() && ["current_time","focus","material_changes","exploration"].iter().any(|key|item["key"]==*key);
+            object.insert("content".into(),if protocol_value {decoded_content(&value)} else {value});
+        } }
         let positions: Vec<_> = entries.iter().filter(|entry| entry.get("registrationKey").is_some()
             && entry["registrationKey"] == item["key"]
             && item.get("userEntryId").is_none_or(|id| entry.get("userEntryId")==Some(id))
-            && item.get("runId").is_none_or(|id| entry.get("runId")==Some(id)))
+            && item.get("runId").is_none_or(|id| entry.get("runId")==Some(id))
+            && frozen_owner.is_none_or(|owner| {
+                if let (Some(expected),Some(actual))=(owner.get("userEntryId").filter(|v|!v.is_null()),entry.get("userEntryId")) { return expected==actual; }
+                if let (Some(expected),Some(actual))=(owner.get("runId").filter(|v|!v.is_null()),entry.get("runId")) { return expected==actual; }
+                true // Legacy capture has no round identity; do not invent one.
+            }))
             .map(|entry| entry["finalPosition"].clone()).collect();
         input["finalLocations"] = json!(positions);
         input["locationStatus"] = json!(if positions.is_empty() {"没有已记录的匹配位置；冻结值不是最终实发"} else {"按 key 与已有回合标识关联；同一 key 可有多个片段，不表示逐值一一对应"});
@@ -94,13 +102,14 @@ pub(super) fn document(record: &Value) -> Result<Value> {
     let complete = |items: Option<&Vec<Value>>| items.is_some_and(|items| !items.is_empty() && items.iter().all(|item| item.get("value").is_some() && item.get("omitted").is_none()));
     let registration_complete = complete(registrations);
     let projection_complete = complete(projections);
+    let question_located = entries.iter().any(|entry|entry["registrationKey"]=="question");
     Ok(json!({
         "schemaVersion":2,"scope":"ContextBridge（不含完整 Pi 历史、系统提示或工具定义）","redacted":true,
-        "complete":registration_complete && projection_complete && unknown.is_empty(),
+        "complete":registration_complete && projection_complete && unknown.is_empty() && question_located,
         "request":{"sequence":record["sequence"],"time":record["time"],"phase":record["phase"],"protocol":record["protocol"],"identity":record["identity"]},
-        "registrationSnapshot":{"complete":registration_complete,"status":if registration_complete {"完整冻结输入；数组顺序不是实发顺序"} else {"不完整：快照缺失或省略；缺失内容无法导出，未从最终请求反推补造"},"entries":snapshot_entries(registrations,&entries)},
-        "projectionSnapshot":{"complete":projection_complete,"status":"Pi 可见的注册值；不是最终 wire 顺序。同一 key 可多值、多位置；最终内容与位置见 finalProjection.entries","entries":snapshot_entries(projections,&entries)},
-        "finalProjection":{"captureComplete":true,"attributionComplete":unknown.is_empty(),"status":if unknown.is_empty() {"已定位的桥片段及本轮问题；保留各片段自身的 run/user 标识；按最终消息及片段顺序排列"} else {"来源绑定不完整：仅列出已定位的桥片段及本轮问题；未归属位置见 unattributedLocations，不补造其来源"},"entries":entries,"unattributedLocations":unknown},
+        "registrationSnapshot":{"complete":registration_complete,"status":if registration_complete {"完整冻结输入；数组顺序不是实发顺序"} else {"不完整：快照缺失或省略；缺失内容无法导出，未从最终请求反推补造"},"entries":snapshot_entries(registrations,&entries,Some(&record["identity"]))},
+        "projectionSnapshot":{"complete":projection_complete,"status":if projection_complete {"Pi 可见的注册值；不是最终 wire 顺序。同一 key 可多值、多位置；最终内容与位置见 finalProjection.entries"} else {"不完整：投影注册快照缺失或省略，未从最终请求反推补造"},"entries":snapshot_entries(projections,&entries,None)},
+        "finalProjection":{"captureComplete":true,"attributionComplete":unknown.is_empty(),"questionLocated":question_located,"status":if !unknown.is_empty() {"来源绑定不完整：仅列出已定位的桥片段及本轮问题；未归属位置见 unattributedLocations，不补造其来源"} else if !question_located {"不完整：未定位本轮问题；已定位的桥片段仍按实际位置保留，不能从问题文字反推绑定"} else {"已定位的桥片段及本轮问题；保留各片段自身的 run/user 标识；按最终消息及片段顺序排列"},"entries":entries,"unattributedLocations":unknown},
         "snapshotOmitted":record["snapshotOmitted"],
         "decoding":"只解析已知桥容器；引用原文、材料代码与问题中的字面反斜线 n 不二次解码。"
     }))
@@ -166,6 +175,8 @@ pub fn save(sequence: u64, state_dir: &Path) -> Result<Value> {
         assert_eq!(entries[3]["content"],"CURRENT_QUESTION");assert_eq!(doc["complete"],true);
         assert!(!doc.to_string().contains("OLD_NATIVE_QUESTION"));
         assert_eq!(doc["projectionSnapshot"]["entries"][0]["finalLocations"][0]["path"][1],10);
+        assert_eq!(doc["registrationSnapshot"]["entries"][0]["finalLocations"].as_array().unwrap().len(),1);
+        assert_eq!(doc["registrationSnapshot"]["entries"][0]["finalLocations"][0]["path"][1],2);
     }
     #[test] fn explicit_save_matches_decode_is_private_and_survives_capture_clear() {
         let dir = tempfile::tempdir().unwrap();
@@ -208,5 +219,19 @@ pub fn save(sequence: u64, state_dir: &Path) -> Result<Value> {
         assert_eq!(doc["finalProjection"]["entries"][0]["content"],json!({"a":1}));
         assert!(doc["finalProjection"]["entries"][1]["content"].is_string());
         assert_eq!(doc["registrationSnapshot"]["entries"][0]["finalLocations"][0]["path"][1],10);
+    }
+    #[test] fn known_projection_json_decodes_once_while_plaintext_focus_and_question_stay_literal() {
+        let mut r=record();let literal=r#"{"code":"\\n"}"#;
+        r["registrations"]=json!([{"key":"question","value":literal}]);
+        r["projectionRegistrations"]=json!([
+            {"key":"current_time","value":json!({"description":"本轮冻结时间","referenceTime":"FIXED_TIME"}).to_string()},
+            {"key":"focus","value":"【Focus：用户当前阅读的位置】\ncode: \\n"}
+        ]);
+        let doc=document(&r).unwrap();
+        assert_eq!(doc["projectionSnapshot"]["entries"][0]["content"]["referenceTime"],"FIXED_TIME");
+        assert_eq!(doc["projectionSnapshot"]["entries"][1]["content"],"【Focus：用户当前阅读的位置】\ncode: \\n");
+        assert_eq!(doc["registrationSnapshot"]["entries"][0]["content"],literal);
+        assert_eq!(doc["complete"],false);assert_eq!(doc["finalProjection"]["questionLocated"],false);
+        assert!(doc["finalProjection"]["status"].as_str().unwrap().contains("未定位本轮问题"));
     }
 }

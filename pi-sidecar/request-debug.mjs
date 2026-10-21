@@ -47,6 +47,19 @@ export function bindSources(body, trace={}) {
   if(body.system!==undefined)count(body.system,'system');
   for(const message of body.messages??[])count(message.content,message.role);
   const compatible=(source,role)=>role==='assistant'?source.origin==='model':['tool','function'].includes(role)?source.origin==='tool':!['model','tool'].includes(source.origin);
+  // Repeated unchanged Focus/time values are distinct registrations. Locate
+  // their owning native questions first, using the already preserved question order.
+  const anchors=[],questionSeen=new Map();
+  function anchor(value,index){
+    if(typeof value==='string'){
+      const id=key('user',value),candidates=(trace.native??[]).filter(item=>item.value===value&&value&&compatible(item,'user'));
+      if(!candidates.length||candidates.length!==counts.get(id)||!candidates.every(item=>item.origin==='user'&&item.registrationKey==='question'))return;
+      const occurrence=questionSeen.get(id)??0;questionSeen.set(id,occurrence+1);
+      if(candidates[occurrence]?.userEntryId)anchors.push({index,userEntryId:candidates[occurrence].userEntryId});
+    }else if(Array.isArray(value))value.forEach(item=>anchor(item,index));
+    else if(value&&typeof value==='object')for(const [name,item]of Object.entries(value))if(['content','text'].includes(name))anchor(item,index);
+  }
+  for(const [index,message]of (body.messages??[]).entries())if(message.role==='user')anchor(message.content,index);
   function visit(value,path,system=false,role=null) {
     if(typeof value==='string') {
       const id=key(role,value),occurrence=seen.get(id)??0;seen.set(id,occurrence+1);
@@ -54,6 +67,12 @@ export function bindSources(body, trace={}) {
       // Pi's trace is in projection order. Bind repeated text only with a complete
       // one-to-one occurrence match; a missing/extra occurrence stays unassigned.
       if(candidates.length&&candidates.length===counts.get(id)&&(candidates.length===1||candidates.every(item=>item.origin==='user'&&item.registrationKey==='question'))){const {value:ignored,...source}=candidates[occurrence];fragments.push({path,...source});return;}
+      if(candidates.length>1&&candidates.length===counts.get(id)&&path[0]==='messages'){
+        const next=anchors.find(a=>a.index>=path[1]);
+        const owners=anchors.filter(a=>a.index===next?.index).map(a=>a.userEntryId);
+        const owned=candidates.filter(item=>item.origin==='bridge'&&owners.includes(item.userEntryId));
+        if(owned.length===1){const {value:ignored,...source}=owned[0];fragments.push({path,...source});return;}
+      }
       if(system) {
         const matches=(trace.systems??[]).flatMap(source=>{const at=value.indexOf(source.value);return source.value&&at>=0&&value.indexOf(source.value,at+1)<0?[{path,start:at,end:at+source.value.length,origin:source.origin,name:source.name,sourcePath:source.sourcePath}]:[];});
         if(matches.length){let cursor=0;for(const item of matches.sort((a,b)=>a.start-b.start)){if(item.start<cursor)continue;if(item.start>cursor)fragments.push({path,start:cursor,end:item.start,origin:'unknown',name:'未注册 / 未映射片段'});fragments.push(item);cursor=item.end;}if(cursor<value.length)fragments.push({path,start:cursor,end:value.length,origin:'unknown',name:'未注册 / 未映射片段'});return;}

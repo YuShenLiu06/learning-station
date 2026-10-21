@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
-import {requestText,requestDiff,orderedSources,sourceContent,sourceReadingContent,sourceRole,sourceRound,isCurrentQuestion} from '../src/requestDebug.ts';
+import {requestText,requestDiff,orderedSources,sourceContent,sourceReadingContent,sourceRole,sourceRound,isCurrentQuestion,sourcePresentation} from '../src/requestDebug.ts';
 const record=(sequence,session,body,extra={})=>({sequence,identity:{sessionId:session},complete:true,body,...extra});
 test('actual captured JSON strings expose Focus, citations and Changes; diff never crosses sessions',()=>{
   const before=record(1,'s1',{messages:[{role:'user',content:JSON.stringify({focus:{body:'Focus A'},citationContext:'citation A',changes:'Changes A'})}]});
@@ -42,8 +42,8 @@ test('real settings component toggles capture and clears shown request after dis
   const file=new URL(`./.debug-ui-${process.pid}.mjs`,import.meta.url);
   await build({stdin:{contents:"export {RequestDebugSettings} from './src/RequestDebugSettings';",resolveDir:process.cwd(),loader:'tsx'},outfile:file.pathname,bundle:true,packages:'external',platform:'node',format:'esm',jsx:'automatic',plugins:[{name:'debug-api',setup(b){b.onResolve({filter:/^\.\/api$/},()=>({path:'api',namespace:'fixture'}));b.onLoad({filter:/.*/,namespace:'fixture'},()=>({contents:'export const call=(...args)=>globalThis.debugTestCall(...args);',loader:'js'}));}}]});
   const React=await import('react');const {createRoot}=await import('react-dom/client');const {RequestDebugSettings}=await import(file.href);
-  let enabled=false;const commands=[];const entries=[record(1,'s1',{messages:[{role:'user',content:'Focus A'}]}),record(2,'s1',{messages:[{role:'user',content:'Focus B'}]},{previousSequence:1})].map(r=>({...r,phase:'initial',status:'HTTP 200',time:'fixture',bodyBytes:100}));
-  entries[1].registrations=[{key:'actual_provider',lifetime:'OneShot',position:'References',value:'registered line one\nregistered line two'}];
+  let copiedJson='';Object.defineProperty(dom.window.navigator,'clipboard',{configurable:true,value:{writeText:async text=>{copiedJson=text;}}});let enabled=false;const commands=[];const entries=[record(1,'s1',{messages:[{role:'user',content:'Focus A'}]}),record(2,'s1',{messages:[{role:'user',content:'Focus B'}]},{previousSequence:1})].map(r=>({...r,phase:'initial',status:'HTTP 200',time:'fixture',bodyBytes:100}));
+  entries[1].registrations=[{key:'actual_provider',lifetime:'OneShot',position:'References',value:'registered line one\nregistered line two'+('\nSYNTHETIC_OFFSCREEN_TAIL'.repeat(1500))}];
   entries[1].sources=[{path:['messages',0,'content'],origin:'bridge',name:'learning-station-material',sourcePath:'native/fixture/material'}];
   globalThis.debugTestCall=async(command,args)=>{commands.push([command,args]);if(command==='request_debug_decode')return {complete:true,finalProjection:{entries:[{content:'Focus B'}]}};if(command==='request_debug_export')return {path:'/fixture/context-bridge.json',complete:true};if(command==='request_debug_set')enabled=args.enabled;return {enabled,records:enabled?entries:[],dropped:0};};
   const root=createRoot(document.getElementById('root'));
@@ -52,7 +52,7 @@ test('real settings component toggles capture and clears shown request after dis
     assert.equal(document.querySelector('input').checked,false);assert.match(document.body.textContent,/已关闭，不采集/);
     await React.act(async()=>document.querySelector('input').click());assert.equal(enabled,true);assert.match(document.body.textContent,/导出解码 JSON/);await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent==='导出解码 JSON').click());assert.match(document.body.textContent,/已导出.*context-bridge.json/);assert.deepEqual(commands.find(([command])=>command==='request_debug_export')[1],{sequence:2});await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent==='上下文').click());assert.match(document.querySelector('pre').textContent,/Focus B/);
     await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent==='与上次差异').click());assert.match(document.querySelector('pre').textContent,/- Focus A/);
-    await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent==='来源').click());assert.match(document.body.textContent,/actual_provider/);assert.match(document.body.textContent,/OneShot/);assert.match(document.body.textContent,/registered line one/);assert.match(document.body.textContent,/learning-station-material/);await React.act(async()=>document.querySelector('[aria-label="请求 #1"]').click());await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent==='导出解码 JSON').click());assert.deepEqual(commands.filter(([command])=>command==='request_debug_export').at(-1)[1],{sequence:1});
+    await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent==='来源').click());assert.doesNotMatch(document.body.textContent,/actual_provider/);await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent.startsWith('展开冻结详情')).click());assert.match(document.body.textContent,/actual_provider/);assert.match(document.body.textContent,/OneShot/);assert.match(document.body.textContent,/registered line one/);const snapshotToolbar=document.querySelector('[aria-label="内部注册快照操作"]');await React.act(async()=>[...snapshotToolbar.querySelectorAll('button')].find(b=>b.textContent==='全部折叠').click());await React.act(async()=>[...snapshotToolbar.querySelectorAll('button')].find(b=>b.textContent==='复制完整 JSON').click());assert.deepEqual(JSON.parse(copiedJson),entries[1].registrations);assert.match(copiedJson,/SYNTHETIC_OFFSCREEN_TAIL/);assert.match(document.body.textContent,/learning-station-material/);await React.act(async()=>document.querySelector('[aria-label="请求 #1"]').click());await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent==='导出解码 JSON').click());assert.deepEqual(commands.filter(([command])=>command==='request_debug_export').at(-1)[1],{sequence:1});
     await React.act(async()=>document.querySelector('input').click());assert.equal(enabled,false);assert.equal(document.querySelector('pre'),null);assert.doesNotMatch(document.body.textContent,/Focus [AB]/);assert.ok(commands.some(([command])=>command==='request_debug_set'));
   }finally{await React.act(async()=>root.unmount());delete globalThis.debugTestCall;await unlink(file);await unlink(new URL(file.href.replace(/\.mjs$/,'.css'))).catch(()=>{});dom.window.close();}
 });
@@ -87,4 +87,14 @@ test('timing annotations use actual wire role and original round without moving 
  assert.deepEqual(orderedSources(r).map(s=>s.path[1]),[0,1,2]);
  assert.equal(sourceRole(r,call),'assistant');assert.equal(sourceRound(r,old),'历史轮次');assert.equal(sourceRound(r,current),'本轮');assert.equal(sourceRound(r,call),'轮次未定位');
  assert.equal(isCurrentQuestion(r,old),false);assert.equal(isCurrentQuestion(r,current),true);assert.match(sourceContent(r,call),/tool_calls/);
+});
+
+test('Focus and Changes readers preserve actual readable wire and Git diff without decoding literals twice',()=>{
+ const focus='【Focus：用户当前阅读的位置】\n文件：documents/focus.md\n版本：'+('a'.repeat(40))+'\n可见范围：第 12–20 行\n\n以下为文件全文\nline one\ncode: \\n';
+ const changes='【Changes：课程材料相对已知版本的变化】\n documents/focus.md | 2 +-\n\n当前聚焦文件的完整 Git diff：\ndiff --git a/documents/focus.md b/documents/focus.md\n--- a/documents/focus.md\n+++ b/documents/focus.md\n@@ -1 +1 @@\n-old line\n+new line\n';
+ const r=record(5,'s',{messages:[{role:'user',content:focus},{role:'user',content:changes}]});const original=JSON.stringify(r);
+ const f=sourcePresentation(r,{path:['messages',0,'content'],origin:'bridge',name:'learning-station-focus',registrationKey:'focus'});
+ const c=sourcePresentation(r,{path:['messages',1,'content'],origin:'bridge',name:'learning-station-changes',registrationKey:'material_changes'});
+ assert.equal(f.sections[0].text,focus);assert.equal(f.sections[0].format,'text');assert.equal(c.sections[0].text,changes);assert.equal(c.sections[0].format,'diff');assert.equal(JSON.stringify(r),original);
+ assert.ok(f.sections[0].text.endsWith('code: \\n'));
 });
