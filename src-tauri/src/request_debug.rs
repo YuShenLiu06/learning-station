@@ -34,7 +34,7 @@ impl DebugState {
             return;
         }
         // The sidecar redacts before IPC; never accept arbitrary unbounded events.
-        if event.to_string().len()>768*1024 { self.dropped+=1; return; }
+        if event.to_string().len()>3*1024*1024 { self.dropped+=1; return; }
         let sid=meta["sessionId"].as_str().unwrap_or("");
         let previous=self.last_sequences.iter().find(|(id,_)|id==sid).map(|(_,seq)|*seq);
         self.sequence+=1;

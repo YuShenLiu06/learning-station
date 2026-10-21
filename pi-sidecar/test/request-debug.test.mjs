@@ -98,3 +98,22 @@ test('source binding never guesses custom roles from user text and resolves ambi
   assert.deepEqual(mixed.map(s=>s.origin),['unknown','pi','unknown']);
   const duplicate=bindSources({messages:[{role:'user',content:'same'}]},{native:[{value:'same',origin:'user'},{value:'same',origin:'bridge'}]});assert.equal(duplicate[0].origin,'unknown');
 });
+test('frozen input and live multi-fragment registrations remain separate, complete and redacted',async()=>{
+  const {snapshotRequest,DEBUG_RECORD_LIMIT}=await import('../request-debug.mjs');
+  const location=JSON.stringify({documentId:'fixture',paragraphs:[{start:0,end:4}]});
+  const material=JSON.stringify({type:'automatic_material_projection',frames:[{kind:'full',text:'line one\nline two\\n'}]});
+  const body={messages:[{role:'user',content:location},{role:'user',content:material}]};
+  const frozen=[{key:'focus',description:'冻结全文',value:{text:'A'.repeat(1500000),api_key:'private-frozen-secret'}}];
+  const live=[{key:'focus',description:'位置',value:JSON.parse(location),runId:'current'},{key:'focus',description:'完整基准',value:JSON.parse(material),runId:'previous'}];
+  const capture=await snapshotRequest(new Request('https://synthetic.invalid/v1/chat/completions',{method:'POST',body:JSON.stringify(body)}),'synthetic-key',{registrations:frozen,sources:()=>({registrations:live,native:[{value:material,origin:'bridge',registrationKey:'focus',description:'完整基准',runId:'previous',name:'learning-station-material'},{value:location,origin:'bridge',registrationKey:'focus',description:'位置',runId:'current',name:'learning-station-focus'}]})});
+  assert.equal(capture.complete,true);assert.equal(capture.registrations[0].value.text.length,1500000);
+  assert.equal(capture.projectionRegistrations.length,2);assert.equal(capture.sources.filter(s=>s.registrationKey==='focus').length,2);
+  assert.deepEqual(capture.sources.map(s=>s.path[1]),[0,1]);assert.deepEqual(capture.body,body);
+  assert.doesNotMatch(JSON.stringify(capture),/private-frozen-secret/);assert.ok(Buffer.byteLength(JSON.stringify(capture))<DEBUG_RECORD_LIMIT);
+});
+test('ambiguous identical assistant content keeps its actual wire role without invented entry identity',async()=>{
+  const {bindSources}=await import('../request-debug.mjs');
+  const sources=bindSources({messages:[{role:'assistant',content:'same'},{role:'user',content:'same'}]},{native:[{value:'same',origin:'model',name:'assistant',sourcePath:'one'},{value:'same',origin:'model',name:'assistant',sourcePath:'two'}]});
+  assert.equal(sources[0].origin,'model');assert.equal(sources[0].sourcePath,'unmapped');assert.equal(sources[0].runId,undefined);
+  assert.equal(sources[1].origin,'unknown');assert.equal(sources[1].registrationKey,undefined);
+});

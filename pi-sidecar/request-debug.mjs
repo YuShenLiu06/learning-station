@@ -1,5 +1,6 @@
 // Only sanitized data leaves the sending process. Never read credential files.
 export const DEBUG_BODY_LIMIT = 256 * 1024;
+export const DEBUG_RECORD_LIMIT = 3 * 1024 * 1024;
 const sensitive = key => /(?:authorization|cookie|api[-_]?key|token|password|passwd|secret|credential)$/i.test(key.replace(/([a-z])([A-Z])/g,'$1_$2'));
 const assignment=/(?:^|[^a-z0-9_])["']?(?:api[-_ ]?key|[a-z_-]{0,48}token|[a-z_-]{0,48}password|passwd|[a-z_-]{0,48}secret|cookie)["']?\s*[:=]\s*(?:"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|([^\s,;"'<>}]+))/gi;
 export function redactDebug(value, apiKey = '', extraSecrets = []) {
@@ -36,7 +37,7 @@ export function redactDebug(value, apiKey = '', extraSecrets = []) {
 }
 export function bindSources(body, trace={}) {
   const fragments=[];
-  function visit(value,path,system=false) {
+  function visit(value,path,system=false,role=null) {
     if(typeof value==='string') {
       const candidates=(trace.native??[]).filter(item=>item.value===value&&value);
       if(candidates.length===1){const {value:ignored,...source}=candidates[0];fragments.push({path,...source});return;}
@@ -44,13 +45,14 @@ export function bindSources(body, trace={}) {
         const matches=(trace.systems??[]).flatMap(source=>{const at=value.indexOf(source.value);return source.value&&at>=0&&value.indexOf(source.value,at+1)<0?[{path,start:at,end:at+source.value.length,origin:source.origin,name:source.name,sourcePath:source.sourcePath}]:[];});
         if(matches.length){let cursor=0;for(const item of matches.sort((a,b)=>a.start-b.start)){if(item.start<cursor)continue;if(item.start>cursor)fragments.push({path,start:cursor,end:item.start,origin:'unknown',name:'未注册 / 未映射片段'});fragments.push(item);cursor=item.end;}if(cursor<value.length)fragments.push({path,start:cursor,end:value.length,origin:'unknown',name:'未注册 / 未映射片段'});return;}
       }
-      fragments.push({path,origin:'unknown',name:'未知 / 未追踪',sourcePath:'unmapped'});return;
+      const origin=role==='assistant'?'model':['tool','function'].includes(role)?'tool':'unknown';
+      fragments.push({path,origin,name:origin==='model'?'模型回复（未定位唯一原生条目）':origin==='tool'?'工具返回（未定位唯一原生条目）':'未知 / 未追踪',sourcePath:'unmapped'});return;
     }
-    if(Array.isArray(value))value.forEach((item,index)=>visit(item,[...path,index],system));
-    else if(value&&typeof value==='object')for(const [key,item]of Object.entries(value))if(key==='content'||key==='text'||key==='system')visit(item,[...path,key],system);
+    if(Array.isArray(value))value.forEach((item,index)=>visit(item,[...path,index],system,role));
+    else if(value&&typeof value==='object')for(const [key,item]of Object.entries(value))if(key==='content'||key==='text'||key==='system')visit(item,[...path,key],system,role);
   }
   if(body.system!==undefined)visit(body.system,['system'],true);
-  for(const [index,message]of (body.messages??[]).entries())visit(message.content,['messages',index,'content'],['system','developer'].includes(message.role));
+  for(const [index,message]of (body.messages??[]).entries())visit(message.content,['messages',index,'content'],['system','developer'].includes(message.role),message.role);
   return fragments;
 }
 export async function snapshotRequest(request, apiKey, debug={}) {
@@ -74,10 +76,16 @@ export async function snapshotRequest(request, apiKey, debug={}) {
   // exact candidate strings present in this bounded, final wire payload.
   const texts=[];const collect=value=>{if(typeof value==='string')texts.push(value);else if(value&&typeof value==='object')Object.values(value).forEach(collect);};collect(parsed);
   const values=new Set(texts);
+  const projectionRegistrations=trace.registrations??null;
   trace={native:(trace.native??[]).filter(item=>values.has(item.value)),systems:(trace.systems??[]).filter(item=>typeof item.value==='string'&&item.value&&texts.some(text=>text.includes(item.value)))};
-  const safe=redactDebug({body:parsed,registrations:debug.registrations??null,trace},apiKey,headerSecrets);
+  const safe=redactDebug({body:parsed,registrations:debug.registrations??null,projectionRegistrations,trace},apiKey,headerSecrets);
   safe.sources=bindSources(safe.body,safe.trace);
   delete safe.trace;
-  if(Buffer.byteLength(JSON.stringify(safe))>2*DEBUG_BODY_LIMIT)return {headers,complete:false,bodyBytes:bytes,omitted:'整个请求体：脱敏后超过 512 KiB 展示上限',body:null};
-  return {headers,complete:true,bodyBytes:bytes,body:safe.body,registrations:safe.registrations,sources:safe.sources};
+  if(Buffer.byteLength(JSON.stringify(safe.body))>2*DEBUG_BODY_LIMIT)return {headers,complete:false,bodyBytes:bytes,omitted:'整个请求体：脱敏后超过 512 KiB 展示上限',body:null};
+  if(Buffer.byteLength(JSON.stringify(safe))>DEBUG_RECORD_LIMIT) {
+    safe.registrations=null;safe.projectionRegistrations=null;
+    safe.snapshotOmitted='注册快照超过单记录 3 MiB 预算；未截取前缀或反推补造';
+  }
+  if(Buffer.byteLength(JSON.stringify(safe))>DEBUG_RECORD_LIMIT)return {headers,complete:false,bodyBytes:bytes,omitted:'整个记录超过 3 MiB 捕获上限',body:null};
+  return {headers,complete:true,bodyBytes:bytes,...safe};
 }

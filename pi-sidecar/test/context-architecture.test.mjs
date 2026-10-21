@@ -78,6 +78,7 @@ test('final SDK wire allows only registered supplements in declared order and on
     }
     if(process.env.LS_CONTEXT_WIRE_EVIDENCE) {
       fs.mkdirSync(process.env.LS_CONTEXT_WIRE_EVIDENCE,{recursive:true});
+      fs.writeFileSync(path.join(process.env.LS_CONTEXT_WIRE_EVIDENCE,'captures.json'),JSON.stringify(captures,null,2));
       fs.writeFileSync(path.join(process.env.LS_CONTEXT_WIRE_EVIDENCE,'requests-after.json'),JSON.stringify(packets,null,2));
       fs.writeFileSync(path.join(process.env.LS_CONTEXT_WIRE_EVIDENCE,'source-map.json'),JSON.stringify(captures.map(c=>({sources:c.sources,registrations:c.registrations})),null,2));
     }

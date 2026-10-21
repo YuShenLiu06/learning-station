@@ -51,41 +51,58 @@ fn location(source: &Value) -> Value {
     for key in ["start", "end"] { if let Some(item) = source.get(key) { value[key] = item.clone(); } }
     value
 }
+fn snapshot_entries(items: Option<&Vec<Value>>, entries: &[Value]) -> Vec<Value> {
+    items.into_iter().flatten().map(|item| {
+        let mut input = item.clone();
+        if let Some(object) = input.as_object_mut() { if let Some(value) = object.remove("value") { object.insert("content".into(), value); } }
+        let positions: Vec<_> = entries.iter().filter(|entry| entry.get("registrationKey").is_some()
+            && entry["registrationKey"] == item["key"]
+            && item.get("userEntryId").is_none_or(|id| entry.get("userEntryId")==Some(id))
+            && item.get("runId").is_none_or(|id| entry.get("runId")==Some(id)))
+            .map(|entry| entry["finalPosition"].clone()).collect();
+        input["finalLocations"] = json!(positions);
+        input["locationStatus"] = json!(if positions.is_empty() {"没有已记录的匹配位置；冻结值不是最终实发"} else {"按 key 与已有回合标识关联；同一 key 可有多个片段，不表示逐值一一对应"});
+        input
+    }).collect()
+}
 pub(super) fn document(record: &Value) -> Result<Value> {
     if record["complete"] != true { return Err(CoreError::new("DEBUG_INCOMPLETE", "请求体不完整，无法导出完整桥内容；请开启调试后重新采集较小请求。")); }
     let sources = record["sources"].as_array().filter(|s| !s.is_empty())
         .ok_or_else(|| CoreError::new("DEBUG_INCOMPLETE", "未记录最终来源定位，无法导出桥内容；请开启调试后重新发送问题。"))?;
     let mut sources = sources.clone();
     sources.sort_by(position_cmp);
+    let questions = sources.iter().filter(|s|s["registrationKey"]=="question").count();
     let mut entries = Vec::new();
     let mut unknown = Vec::new();
     for source in &sources {
-        if source["origin"] == "unknown" { unknown.push(location(source)); }
-        if source["origin"] != "bridge" && source["registrationKey"] != "question" { continue; }
-        let content = at(&record["body"], source)
-            .ok_or_else(|| CoreError::new("DEBUG_INCOMPLETE", "来源位置与请求体不一致，未导出；请重新采集。"))?;
-        let mut entry = json!({"sourceKey":source["name"],"origin":source["origin"],"registered":source.get("registrationKey").is_some(),"finalPosition":location(source),"content":if source["origin"] == "bridge" {decoded_content(&content)} else {content}});
-        for key in ["registrationKey", "description", "sourcePath"] { if let Some(value) = source.get(key) { entry[key] = value.clone(); } }
+        let value = at(&record["body"], source);
+        if source["origin"] == "unknown" && value.as_ref().is_none_or(|v| v.as_str().is_none_or(|text| !text.trim().is_empty())) { unknown.push(location(source)); }
+        let current_question = source["registrationKey"] == "question" && match source.get("userEntryId") {
+            Some(id) => record["identity"].get("userEntryId")==Some(id),
+            None => match source.get("runId") { Some(id)=>record["identity"].get("runId")==Some(id),None=>questions==1 }
+        };
+        if source["origin"] != "bridge" && !current_question { continue; }
+        let content = value.ok_or_else(|| CoreError::new("DEBUG_INCOMPLETE", "来源位置与请求体不一致，未导出；请重新采集。"))?;
+        let decoded = if source["origin"] == "bridge" && source["registrationKey"] != "references" { decoded_content(&content) } else { content };
+        let mut entry = json!({"sourceKey":source.get("registrationKey").unwrap_or(&source["name"]),"name":source["name"],"origin":source["origin"],"registered":source.get("registrationKey").is_some(),"finalPosition":location(source),"content":decoded});
+        for key in ["registrationKey", "description", "sourcePath", "runId", "userEntryId"] { if let Some(value) = source.get(key) { entry[key] = value.clone(); } }
         entries.push(entry);
     }
     if entries.is_empty() { return Err(CoreError::new("DEBUG_INCOMPLETE", "本请求没有可定位的桥片段，无法导出桥内容。")); }
     let registrations = record["registrations"].as_array();
-    let registration_complete = registrations.is_some_and(|items| !items.is_empty() && items.iter().all(|item| item.get("value").is_some() && item.get("omitted").is_none()));
-    let inputs: Vec<_> = registrations.into_iter().flatten().map(|item| {
-        let mut input = item.clone();
-        if let Some(object) = input.as_object_mut() { if let Some(value) = object.remove("value") { object.insert("content".into(), value); } }
-        let positions: Vec<_> = entries.iter().filter(|entry| entry.get("registrationKey").is_some() && entry["registrationKey"] == item["key"]).map(|entry| entry["finalPosition"].clone()).collect();
-        input["finalLocations"] = json!(positions);
-        if positions.is_empty() { input["locationStatus"] = json!("未记录逐键最终位置；不能把冻结值当作最终实发"); }
-        input
-    }).collect();
+    let projections = record["projectionRegistrations"].as_array();
+    let complete = |items: Option<&Vec<Value>>| items.is_some_and(|items| !items.is_empty() && items.iter().all(|item| item.get("value").is_some() && item.get("omitted").is_none()));
+    let registration_complete = complete(registrations);
+    let projection_complete = complete(projections);
     Ok(json!({
-        "schemaVersion":1,"scope":"ContextBridge（不含完整 Pi 历史、系统提示或工具定义）","redacted":true,
-        "complete":registration_complete && unknown.is_empty(),
+        "schemaVersion":2,"scope":"ContextBridge（不含完整 Pi 历史、系统提示或工具定义）","redacted":true,
+        "complete":registration_complete && projection_complete && unknown.is_empty(),
         "request":{"sequence":record["sequence"],"time":record["time"],"phase":record["phase"],"protocol":record["protocol"],"identity":record["identity"]},
-        "registrationSnapshot":{"complete":registration_complete,"status":if registration_complete {"完整冻结输入；数组顺序不是实发顺序"} else {"不完整：快照缺失或存在 omitted；缺失内容无法导出，未从最终请求反推补造"},"entries":inputs},
-        "finalProjection":{"captureComplete":true,"attributionComplete":unknown.is_empty(),"status":"仅包含已绑定的桥片段与本轮已定位问题；后续拼装不冒充注册键，按最终消息路径及片段顺序排列","entries":entries,"unattributedLocations":unknown},
-        "decoding":"只解析桥协议容器及 context/nativeReferences 的对象或数组 JSON；材料、代码、问题和字面 \\n 不二次解码。"
+        "registrationSnapshot":{"complete":registration_complete,"status":if registration_complete {"完整冻结输入；数组顺序不是实发顺序"} else {"不完整：快照缺失或省略；缺失内容无法导出，未从最终请求反推补造"},"entries":snapshot_entries(registrations,&entries)},
+        "projectionSnapshot":{"complete":projection_complete,"status":"Pi 可见的注册值；不是最终 wire 顺序。同一 key 可多值、多位置；最终内容与位置见 finalProjection.entries","entries":snapshot_entries(projections,&entries)},
+        "finalProjection":{"captureComplete":true,"attributionComplete":unknown.is_empty(),"status":"全部已绑定桥片段及本轮问题；保留旧基准片段自身的 run/user 标识，不将原生历史用户消息混入桥导出；按最终消息及片段顺序排列","entries":entries,"unattributedLocations":unknown},
+        "snapshotOmitted":record["snapshotOmitted"],
+        "decoding":"只解析已知桥容器；引用原文、材料代码与问题中的字面反斜线 n 不二次解码。"
     }))
 }
 pub fn decode(sequence: u64) -> Result<Value> {
@@ -121,6 +138,34 @@ pub fn save(sequence: u64, state_dir: &Path) -> Result<Value> {
         assert_eq!(parsed["finalProjection"]["entries"][0]["content"]["context"]["quote"],"a\nb");
         assert!(!serialized.contains("NEVER_EXPORT")); assert!(serialized.contains("sessionId"));
         assert!(parsed["registrationSnapshot"]["entries"][0].get("description").is_none());
+    }
+    #[test] fn multiple_focus_fragments_keep_identity_and_exclude_native_history() {
+        let mut r=record();
+        r["identity"]["userEntryId"]=json!("current-user");
+        let literal=r#"{"code":"\\n"}"#;
+        r["body"]["messages"][0]["content"]=json!("\n  ");
+        r["body"]["messages"][1]["content"]=json!("OLD_NATIVE_QUESTION");
+        r["body"]["messages"][2]["content"]=json!(json!({"documentId":"fixture"}).to_string());
+        r["body"]["messages"][3]["content"]=json!(literal);
+        r["body"]["messages"][10]["content"]=json!(json!({"frames":[{"text":"COMPLETE_FOCUS_TAIL","code":literal}]}).to_string());
+        r["body"]["messages"][11]["content"]=json!("CURRENT_QUESTION");
+        r["sources"]=json!([
+            {"path":["messages",10,"content"],"origin":"bridge","registrationKey":"focus","description":"保留全文","runId":"old-run","userEntryId":"old-user","name":"material"},
+            {"path":["messages",1,"content"],"origin":"user","registrationKey":"question","userEntryId":"old-user","name":"user"},
+            {"path":["messages",2,"content"],"origin":"bridge","registrationKey":"focus","description":"本轮位置","runId":"r","userEntryId":"current-user","name":"focus"},
+            {"path":["messages",0,"content"],"origin":"unknown","name":"blank"},
+            {"path":["messages",3,"content"],"origin":"bridge","registrationKey":"references","name":"references"},
+            {"path":["messages",11,"content"],"origin":"user","registrationKey":"question","userEntryId":"current-user","name":"user"}
+        ]);
+        r["registrations"]=json!([{"key":"focus","description":"冻结聚焦材料","value":{"documentId":"fixture"}}]);
+        r["projectionRegistrations"]=json!([{"key":"focus","description":"保留全文","runId":"old-run","userEntryId":"old-user","value":{"frames":[]}},{"key":"focus","description":"本轮位置","runId":"r","userEntryId":"current-user","value":{"documentId":"fixture"}}]);
+        let doc=document(&r).unwrap();let entries=doc["finalProjection"]["entries"].as_array().unwrap();
+        assert_eq!(entries.len(),4);assert_eq!(entries.iter().filter(|e|e["registrationKey"]=="focus").count(),2);
+        assert_eq!(entries[0]["description"],"本轮位置");assert_eq!(entries[1]["content"],literal);
+        assert_eq!(entries[2]["runId"],"old-run");assert_eq!(entries[2]["content"]["frames"][0]["code"],literal);
+        assert_eq!(entries[3]["content"],"CURRENT_QUESTION");assert_eq!(doc["complete"],true);
+        assert!(!doc.to_string().contains("OLD_NATIVE_QUESTION"));
+        assert_eq!(doc["projectionSnapshot"]["entries"][0]["finalLocations"][0]["path"][1],10);
     }
     #[test] fn explicit_save_matches_decode_is_private_and_survives_capture_clear() {
         let dir = tempfile::tempdir().unwrap();

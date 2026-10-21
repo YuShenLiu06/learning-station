@@ -208,7 +208,6 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
         value:text(convertToLlm([message])[0]??message),origin:message.role==='custom'?(['learning-station-material','learning-station-turn','learning-station-changes','learning-station-focus'].includes(message.customType)?'bridge':'unknown'):({user:'user',assistant:'model',toolResult:'tool',compactionSummary:'pi',branchSummary:'pi'}[message.role]??'unknown'),
         ...(entry.sourceEntry.details?.bridgeKey?{registrationKey:entry.sourceEntry.details.bridgeKey,description:entry.sourceEntry.details.bridgeDescription,runId:entry.sourceEntry.details.runId,userEntryId:entry.sourceEntry.details.userEntryId}:message.role==='user'?{registrationKey:'question',description:'Pi 原生用户输入',...userIdentity(entry.sourceEntry.id)}:{}),
         name:message.customType??message.role,sourcePath:`native/${entry.sourceEntry.id}/${message.customType??message.role}`,
-        ...(message.role==='user'&&entry.sourceEntry.id===record.userNativeId?{registrationKey:'question'}:{}),
       }))),
       async requestTool(call,signal){manager.appendCustomEntry('learning-station-tool',{runId:spec.runId,callId:call.id,argsHash:sha(JSON.stringify(stable(call.args)))});sync(file);await checkpoint();return requestTool(call,signal);},
       async prompt(question){

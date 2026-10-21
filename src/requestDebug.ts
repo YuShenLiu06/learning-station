@@ -3,6 +3,7 @@ export type DebugRecord = {
   method: string; headers: Record<string,string>; body: unknown; complete: boolean; omitted?: string; bodyBytes: number;
   status: string; runOutcome?: string;
   registrations?: {key:string;description?:string;lifetime?:string;position:string|number;value?:unknown;omitted?:string}[] | null;
+  projectionRegistrations?: unknown[] | null; snapshotOmitted?:string;
   sources?: {path:(string|number)[];start?:number;end?:number;origin:string;name:string;registrationKey?:string;description?:string;runId?:string;userEntryId?:string;sourcePath?:string}[];
   identity: { retry?: boolean; courseId?: string; sessionId: string; runId: string; requestId?: string; userEntryId?: string; attempt: string; model: string; operation?: string };
 };
@@ -79,4 +80,11 @@ export function debugPhase(record: DebugRecord): string {
 }
 export function sourceLabel(source: DebugSource): string {
   return ({pi:'Pi 原生',bridge:source.registrationKey?'桥 · 注册来源':'桥 · 后续拼装',user:'用户消息',tool:'工具返回',model:'模型回复',unknown:'未知 / 未映射'} as Record<string,string>)[source.origin]??source.origin;
+}
+
+export function isCurrentQuestion(record:DebugRecord,source:DebugSource):boolean {
+  if(source.registrationKey!=='question')return false;
+  if(source.userEntryId)return source.userEntryId===record.identity.userEntryId;
+  if(source.runId)return source.runId===record.identity.runId;
+  return (record.sources??[]).filter(s=>s.registrationKey==='question').length===1;
 }
