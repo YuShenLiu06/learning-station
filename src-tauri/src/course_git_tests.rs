@@ -284,6 +284,7 @@ fn synthetic_transcript_only_commit_preserves_the_material_tree() {
     assert_ne!(first.checkpoint_commit_oid, next.checkpoint_commit_oid);
     assert_eq!(first.material_tree_oid, next.material_tree_oid);
     assert!(f.diff(&first, &next, None).changes.is_empty());
+    assert_eq!(f.git.stat("course_a", Some(&first.checkpoint_commit_oid), &oid).unwrap(), "");
     fs::write(
         f.root.join("unregistered-chat.jsonl"),
         b"not automatically included",
@@ -331,6 +332,72 @@ fn legacy_bare_repository_reopens_for_reads_but_cannot_commit() {
     // Initial comparison is read-only as well: Git computes the native empty
     // tree identity without mktree/-w on a legacy archive.
     assert!(reader.compare(&doc.id, None, oid, None).unwrap().initial);
+    let model_path = reader.repository_path(&doc.id, "documents/legacy.md").unwrap();
+    assert_eq!(model_path, "materials/legacy/documents/legacy.md");
+    let stat = reader.stat(&doc.id, None, oid).unwrap();
+    let empty = git_text(&path, &["hash-object", "-t", "tree", "--stdin"], &[]);
+    assert_eq!(stat.as_bytes(), git(&path, &["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--find-renames", "--stat", &empty, oid, "--", "materials/legacy"], &[]));
+    assert!(stat.contains(&model_path));
+    assert!(reader.repository_path(&doc.id, "../outside.md").is_err());
+}
+
+#[test]
+fn model_stat_is_native_root_diff_including_rename_binary_delete_and_focused_file() {
+    let f = Fixture::new();
+    fs::write(f.root.join("materials/rename-before.txt"), b"rename unchanged\n").unwrap();
+    fs::write(f.root.join("materials/delete.txt"), b"delete this\n").unwrap();
+    fs::write(f.root.join("materials/picture.png"), b"\x89PNG\r\n\x1a\n\0before").unwrap();
+    let first = f.commit(None);
+    fs::rename(f.root.join("materials/rename-before.txt"), f.root.join("materials/rename-after.txt")).unwrap();
+    fs::remove_file(f.root.join("materials/delete.txt")).unwrap();
+    fs::write(f.root.join("materials/picture.png"), b"\x89PNG\r\n\x1a\n\0after").unwrap();
+    fs::write(f.store.root().join(&f.child.path), content::serialize(&f.child.metadata, "focused change\n").unwrap()).unwrap();
+    let frozen = f.freeze();
+    // None of these later worktree edits may be sampled by stat or patch.
+    fs::write(f.root.join("materials/delete.txt"), b"late unrelated\n").unwrap();
+    fs::write(f.root.join("materials/late.txt"), b"late addition\n").unwrap();
+    fs::write(f.store.root().join(&f.child.path), content::serialize(&f.child.metadata, "late focus\n").unwrap()).unwrap();
+    let next = f.git.commit(&frozen, Some(&first.checkpoint_commit_oid)).unwrap();
+    let old = &first.checkpoint_commit_oid;
+    let new = &next.checkpoint_commit_oid;
+    let stat = f.git.stat("course_a", Some(old), new).unwrap();
+    assert_eq!(stat.as_bytes(), git(&f.root, &["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--find-renames", "--stat", old, new, "--", "materials"], &[]));
+    assert!(stat.contains("materials/documents/child_a.md"));
+    assert!(stat.contains("materials/{rename-before.txt => rename-after.txt}"));
+    assert!(stat.contains("materials/picture.png") && stat.contains("Bin"));
+    assert!(stat.contains("materials/delete.txt") && stat.contains("deletion"));
+    assert!(!stat.contains("late") && !stat.contains("material-exclusions"));
+    let patch = f.git.patch("course_a", old, new, CHILD).unwrap();
+    assert_eq!(patch, git(&f.root, &["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames", "--patch", "--full-index", old, new, "--", "materials/documents/child_a.md"], &[]));
+    let patch = String::from_utf8(patch).unwrap();
+    assert!(patch.contains("+++ b/materials/documents/child_a.md\n") && patch.contains("+focused change\n"));
+    assert!(!patch.contains("late focus"));
+    assert!(f.git.repository_path("course_b", CHILD).is_err());
+    assert!(f.git.stat("course_a", Some("HEAD"), new).is_err());
+    assert!(f.git.patch("course_a", old, new, "../outside.md").is_err());
+}
+
+#[test]
+fn body_patch_uses_real_trees_at_repository_path_without_document_metadata() {
+    let f = Fixture::new();
+    let path = f.git.repository_path("course_a", CHILD).unwrap();
+    let old = "old body\nunchanged\n";
+    let new = "new body 😀\nunchanged\n";
+    let patch = f.git.compare_bodies(old, new, &path).unwrap();
+    let tree = |text: &str| {
+        let blob = git_text(&f.root, &["hash-object", "-w", "--stdin"], text.as_bytes());
+        let documents = git_text(&f.root, &["mktree"], format!("100644 blob {blob}\tchild_a.md\n").as_bytes());
+        let materials = git_text(&f.root, &["mktree"], format!("040000 tree {documents}\tdocuments\n").as_bytes());
+        git_text(&f.root, &["mktree"], format!("040000 tree {materials}\tmaterials\n").as_bytes())
+    };
+    let old_tree = tree(old);
+    let new_tree = tree(new);
+    assert_eq!(patch.as_bytes(), git(&f.root, &["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames", &old_tree, &new_tree, "--", &path], &[]));
+    assert!(patch.starts_with("diff --git a/materials/documents/child_a.md b/materials/documents/child_a.md\n"));
+    assert!(patch.contains("--- a/materials/documents/child_a.md\n") && patch.contains("+++ b/materials/documents/child_a.md\n"));
+    assert!(patch.contains("-old body\n+new body 😀\n"));
+    assert!(!patch.contains("parentId") && !patch.contains("createRequestDigest"));
+    assert!(f.git.compare_bodies(old, new, "/outside.md").is_err());
 }
 
 #[test]

@@ -293,7 +293,9 @@ mod tests {
         assert!(old.matches(&request).unwrap());
         let prompt = crate::context_bridge::ContextBridge::freeze(&request, &old.context, &session, None, &projection, crate::time_context::for_operation(&c.state_dir, "focus-test").unwrap()).unwrap();
         let envelope: Value = serde_json::from_str(prompt.messages[0]["content"].as_str().unwrap()).unwrap();
-        assert_eq!(envelope["bridge"].as_array().unwrap().iter().find(|part|part["key"]=="focus").unwrap()["value"], json!(f)); assert!(envelope.get("activeDocumentId").is_none());
+        let mut expected_input = json!(f);
+        expected_input["selectionRanges"] = json!([]);
+        assert_eq!(envelope["bridge"].as_array().unwrap().iter().find(|part|part["key"]=="focus").unwrap()["value"], expected_input); assert!(envelope.get("activeDocumentId").is_none());
         drop(c); drop(e);
         let reopened = Engine::new(dir.path().join("library"), dir.path().join("state")).unwrap();
         let mut c = reopened.lock().unwrap(); c.content.refresh().unwrap();

@@ -140,19 +140,11 @@ fn native_patch_is_complete_and_budget_failure_does_not_silently_clip() {
     let id = f.a.id.clone();
     f.save(&id, &"changed 🧪\n".repeat(17000));
     let second = f.checkpoint(Some(&first.checkpoint_commit_oid));
-    let native = f
-        .git
-        .compare(
-            &f.course.id,
-            Some(&first.checkpoint_commit_oid),
-            &second.checkpoint_commit_oid,
-            Some(&path),
-        )
-        .unwrap();
+    let native = String::from_utf8(f.git.patch(&f.course.id, &first.checkpoint_commit_oid, &second.checkpoint_commit_oid, &path).unwrap()).unwrap();
     let value = f
         .project(&second, Some(&first), Some((&f.a.id, &path)), BUDGET)
         .unwrap();
-    assert_eq!(value["focused"]["gitChange"]["unifiedDiff"], json!(native.changes[0].patch));
+    assert_eq!(value["focused"]["gitChange"]["unifiedDiff"], json!(native));
     assert!(value["changes"][0].get("patch").is_none());
     assert!(value["focused"]["gitChange"]["unifiedDiff"]
         .as_str()
@@ -303,6 +295,8 @@ fn focused_text_assets_keep_real_identity_content_version_and_complete_fixed_byt
         let source = &value["focused"];
         assert_eq!(source["id"], asset.id);
         assert_eq!(source["path"], path);
+        assert_eq!(source["modelPath"], format!("materials/{path}"));
+        assert!(source["gitChange"].is_null());
         assert_eq!(source["version"], asset.sha256);
         assert_eq!(source["textHash"], source["version"]);
         assert_eq!(source["text"].as_str().unwrap().as_bytes(), bytes);
@@ -311,6 +305,27 @@ fn focused_text_assets_keep_real_identity_content_version_and_complete_fixed_byt
         assert_ne!(source["gitBlobOid"], source["version"]);
         assert_eq!(source["gitCommitOid"], cp.checkpoint_commit_oid);
     }
+}
+
+#[test]
+fn focused_text_asset_patch_keeps_repository_prefix_and_frozen_bytes() {
+    let f = Fixture::new();
+    let asset = assets::import(&f.store, &f.course.id, "notes:lesson.txt", b"before text\n", "asset-native-patch").unwrap();
+    let first = f.checkpoint(None);
+    let path = f.asset_path(&first, &asset.id);
+    let root = crate::course_project::course_project_root(f.store.root(), &f.course.id).unwrap();
+    std::fs::write(root.join("materials").join(&path), b"after text\n").unwrap();
+    let second = f.checkpoint(Some(&first.checkpoint_commit_oid));
+    std::fs::write(root.join("materials").join(&path), b"unfrozen text\n").unwrap();
+    let value = f.project(&second, Some(&first), Some((&asset.id, &path)), BUDGET).unwrap();
+    let model_path = format!("materials/{path}");
+    assert_eq!(value["focused"]["modelPath"], model_path);
+    assert_eq!(value["focused"]["text"], "after text\n");
+    let patch = value["focused"]["gitChange"]["unifiedDiff"].as_str().unwrap();
+    assert!(patch.starts_with(&format!("diff --git a/{model_path} b/{model_path}\n")));
+    assert!(patch.contains(&format!("+++ b/{model_path}\n")));
+    assert!(patch.contains("-before text\n+after text\n"));
+    assert!(!value.to_string().contains("unfrozen text"));
 }
 
 #[test]
@@ -324,16 +339,86 @@ fn course_notification_old_and_focus_body_old_compare_independently() {
     f.save(&id, "A final fixed version\n");
     let third = f.checkpoint(Some(&second.checkpoint_commit_oid));
     let value = prepare(&f.git, &f.course.id, &third.checkpoint_commit_oid, Some(&second.checkpoint_commit_oid), Some(&first.checkpoint_commit_oid), Some((&f.a.id, &path)), BUDGET).unwrap();
-    let native = f.git.compare(&f.course.id, Some(&first.checkpoint_commit_oid), &third.checkpoint_commit_oid, Some(&path)).unwrap();
+    let native = String::from_utf8(f.git.patch(&f.course.id, &first.checkpoint_commit_oid, &third.checkpoint_commit_oid, &path).unwrap()).unwrap();
     assert_eq!(value["baseCommitOid"], second.checkpoint_commit_oid);
+    assert_eq!(value["stat"], f.git.stat(&f.course.id, Some(&second.checkpoint_commit_oid), &third.checkpoint_commit_oid).unwrap());
     assert_eq!(value["focused"]["gitChange"]["baseCommitOid"], first.checkpoint_commit_oid);
     assert_eq!(value["changes"][0]["patchBaseCommitOid"], first.checkpoint_commit_oid);
-    assert_eq!(value["focused"]["gitChange"]["unifiedDiff"], json!(native.changes[0].patch));
+    assert_eq!(value["focused"]["gitChange"]["unifiedDiff"], json!(native));
     assert!(value["changes"][0].get("patch").is_none());
     let missing = prepare(&f.git, &f.course.id, &third.checkpoint_commit_oid, Some(&second.checkpoint_commit_oid), None, Some((&f.a.id, &path)), BUDGET).unwrap();
     assert!(missing["focused"]["gitChange"].is_null());
     assert!(missing["changes"][0]["patch"].is_null());
     assert!(missing["focused"]["text"].as_str().unwrap().contains("A final fixed version"));
+}
+
+#[test]
+fn focus_paths_and_body_patch_use_frozen_root_paths_for_text_and_metadata_only_views() {
+    use crate::{app::Engine, focus::{FreezeRequest, Input}};
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path().join("library"), dir.path().join("state")).unwrap();
+    let mut core = engine.lock().unwrap();
+    let course = library_tree::create_project(&mut core.content, "C", "", "path-course").unwrap();
+    let note = library_tree::create(&mut core.content, "section", "A", Some(&course.id), "old body\n", "path-note").unwrap();
+    let sid = core.start_session(&note.id, false).unwrap().0.id;
+    let request = |core: &crate::app::Core, id: &str, view: &str, asset: Option<String>| {
+        let doc = core.content.read(id).unwrap();
+        FreezeRequest {
+            session_id: sid.clone(),
+            input: Input { document_id: id.into(), expected_body: doc.body, expected_version: Some(doc.version), view: view.into(), ranges: vec![], question_id: None, asset_id: asset },
+            selection: String::new(), injections: vec![], assistant_references: vec![], exercise_references: vec![],
+        }
+    };
+    let r = request(&core, &note.id, "read", None);
+    let first = crate::focus::freeze(&mut core, r).unwrap();
+    let session = crate::sessions::get(&mut core.content, &sid).unwrap();
+    let initial = for_focus(&mut core, &session, &first, None, None).unwrap();
+    let path = format!("materials/documents/{}.md", note.id);
+    assert_eq!(initial["focusPath"], path);
+    assert_eq!(initial["focused"]["modelPath"], path);
+    assert_eq!(initial["focused"]["text"], "old body\n");
+    assert!(initial["focused"]["gitChange"].is_null());
+    // Git may abbreviate the generated long ID in its native default stat width.
+    assert!(!initial["stat"].as_str().unwrap().is_empty());
+    core.content.save(&note.id, &content::serialize(&note.metadata, "new body\n").unwrap(), &note.version).unwrap();
+    let r = request(&core, &note.id, "read", None);
+    let second = crate::focus::freeze(&mut core, r).unwrap();
+    let doc = core.content.read(&note.id).unwrap();
+    core.content.save(&note.id, &content::serialize(&doc.metadata, "late workspace\n").unwrap(), &doc.version).unwrap();
+    let value = for_focus(&mut core, &session, &second, Some(&first.commit_hash), Some(&first.commit_hash)).unwrap();
+    assert_eq!(value["focused"]["text"], "new body\n");
+    let patch = value["focused"]["gitChange"]["unifiedDiff"].as_str().unwrap();
+    assert!(patch.starts_with(&format!("diff --git a/{path} b/{path}\n")));
+    assert!(patch.contains("-old body\n+new body\n"));
+    assert!(!patch.contains("createRequestDigest") && !patch.contains("parentId") && !value.to_string().contains("late workspace"));
+    let unchanged = for_focus(&mut core, &session, &second, Some(&second.commit_hash), Some(&second.commit_hash)).unwrap();
+    assert_eq!(unchanged["stat"], "");
+    assert!(unchanged["focused"]["gitChange"].is_null());
+    assert_eq!(unchanged["focused"]["text"], "new body\n");
+    let exercise = crate::exercises::create_manual(&mut core.content, &sid, &note.id, crate::exercises::ManualExercise {
+        question: "Q?".into(), format: "exact".into(), answers: vec!["PRIVATE_KEY_BODY".into()], explanation: "PRIVATE_REASON_BODY".into(),
+    }, "path-exercise").unwrap();
+    let r = request(&core, &exercise.document.id, "exercise", None);
+    let focus = crate::focus::freeze(&mut core, r).unwrap();
+    let value = for_focus(&mut core, &session, &focus, Some(&second.commit_hash), None).unwrap();
+    assert_eq!(value["focusPath"], format!("materials/documents/{}.md", exercise.document.id));
+    assert!(value["focused"].is_null());
+    assert!(!value.to_string().contains("PRIVATE_KEY_BODY") && !value.to_string().contains("PRIVATE_REASON_BODY"));
+    let image = crate::material_git::retry_busy(|| assets::import(&core.content, &course.id, "picture.png", b"\x89PNG\r\n\x1a\n\0image", "path-image")).unwrap();
+    let r = request(&core, &note.id, "asset", Some(image.id));
+    let focus = crate::focus::freeze(&mut core, r).unwrap();
+    assert_eq!(focus.r#type, "image");
+    let value = for_focus(&mut core, &session, &focus, Some(&second.commit_hash), None).unwrap();
+    assert_eq!(value["focusPath"], format!("materials/{}", focus.path));
+    assert!(value["focused"].is_null());
+    let doc = core.content.read(&note.id).unwrap();
+    core.content.save(&note.id, &content::serialize(&doc.metadata, "binary\0body").unwrap(), &doc.version).unwrap();
+    let r = request(&core, &note.id, "read", None);
+    let binary = crate::focus::freeze(&mut core, r).unwrap();
+    assert!(binary.binary);
+    let value = for_focus(&mut core, &session, &binary, None, None).unwrap();
+    assert_eq!(value["focusPath"], path);
+    assert!(value["focused"].is_null());
 }
 
 #[test]

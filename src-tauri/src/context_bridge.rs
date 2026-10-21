@@ -67,13 +67,18 @@ impl ContextBridge {
         time.validate()?;
         let metadata_only_ids: Vec<_> = ctx.manifest.iter().filter(|m| m.included_chars == 0 && !ctx.automatic_materials.iter().any(|a|a.id==m.id)).map(|m|m.id.clone()).collect();
         let (_, references) = projection.provider_texts(ctx)?;
-        let references = crate::citation_context::bridge_references(&references, ctx)?;
+        let references = crate::citation_context::bridge_references(&references, ctx, request.focus.as_ref());
         let question = if request.prompt.trim().is_empty() { crate::generation::default_request(&request.mode) } else { &request.prompt };
         let mut store = Self::default();
         store.add(&crate::time_context::bridge_part(&time))?;
         store.add(&crate::context::bridge_part(&references))?;
         if let Some(focus) = &request.focus {
-            store.add(&crate::focus::bridge_part(focus))?;
+            let mut part = crate::focus::bridge_part(focus);
+            // Citation locators already use body Unicode-character coordinates.
+            // These are actual selected ranges, distinct from the viewport and
+            // from the complete material projection's range.
+            part.value["selectionRanges"] = json!(ctx.citation_context.as_ref().map(|c| c.references.iter().filter(|r|r.source.id==focus.document_id).filter_map(|r|r.locator.clone()).collect::<Vec<_>>()).unwrap_or_default());
+            store.add(&part)?;
         } else {
             store.add(&automatic_context::bridge_part(projection, ctx))?;
         }

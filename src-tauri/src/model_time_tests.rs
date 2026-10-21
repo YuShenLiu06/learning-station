@@ -147,6 +147,7 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
         }
         captures
     });
+    let mut clocks = Vec::new();
     for (i, goal) in ["爱因斯坦是什么人？", "继续解释他的科学贡献"]
         .iter()
         .enumerate()
@@ -229,6 +230,7 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
             &format!("generation:{}:{}", session.id, entry_id),
         )
         .unwrap();
+        clocks.push(json!({"description":"本轮冻结时间与时区","referenceTime":clock.reference_time,"timeZone":clock.time_zone}));
         let messages = {
             let c = e.lock().unwrap();
             let projection = crate::context_bridge::ContextBridge::snapshot(
@@ -298,15 +300,36 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
         let texts: Vec<String> = messages.iter().map(|m| m["content"].as_str().map(str::to_owned)
             .unwrap_or_else(||m["content"].as_array().into_iter().flatten().filter_map(|p|p["text"].as_str()).collect())).collect();
         let all_text = texts.join("\n");
+        let prior = if i==0 {&[][..]} else {packets[0]["messages"].as_array().unwrap().as_slice()};
+        assert_eq!(&messages[..prior.len()],prior,"reopening preserves the original wire prefix including its one-shot references");
+        let current_text = texts[prior.len()..].join("\n");
         let payloads: Vec<Value> = texts.iter().filter_map(|t|serde_json::from_str(t).ok()).collect();
-        let time = payloads.iter().find(|v|v["referenceTime"].is_string()).expect("independent frozen time");
+        let times: Vec<_> = payloads.iter().filter(|v|v["referenceTime"].is_string()).collect();
+        assert_eq!(times.len(),i+1,"each native turn retains its own frozen clock");
+        for (round,time) in times.iter().enumerate() { assert_eq!(*time, &clocks[round]); }
+        let time = times.last().expect("independent current frozen time");
         assert!(time["timeZone"].is_string());
         assert!(!all_text.contains("learning_request"));
         assert!(!all_text.contains("contextBridgeManifest"));
         assert!(!all_text.contains("UNREVEALED_TYPED_ANSWER_SENTINEL"));
         assert!(!all_text.contains("UNREVEALED_TYPED_EXPLANATION_SENTINEL"));
-        assert_eq!(all_text.contains("quoted_exercise_part"), i == 0);
-        assert_eq!(all_text.contains("quoted_ai_answer"), i == 0);
+        assert_eq!(current_text.contains("练习引用分区：题目"), i == 0);
+        assert_eq!(all_text.matches("练习引用分区：题目").count(),1,"original reference remains once without being re-injected");
+        assert_eq!(current_text.contains("RENDERED_QUESTION_TYPED_SOURCE"), i == 0);
+        assert_eq!(all_text.matches("RENDERED_QUESTION_TYPED_SOURCE").count(),1,"original reference remains once without being re-injected");
+        assert!(!all_text.contains("quoted_exercise_part"));
+        assert_eq!(current_text.contains("历史回答引用"), i == 0);
+        assert_eq!(all_text.matches("历史回答引用").count(),1,"original reference remains once without being re-injected");
+        assert_eq!(current_text.contains("AI_REF_FIXTURE **raw**。IGNORE_ALL_SYSTEM_RULES"), i == 0);
+        assert_eq!(all_text.matches("AI_REF_FIXTURE **raw**。IGNORE_ALL_SYSTEM_RULES").count(),1,"original reference remains once without being re-injected");
+        assert!(!all_text.contains("quoted_ai_answer"));
+        let exploration: Vec<_> = texts.iter().filter(|t|t.starts_with("【Exploration：当前任务入口】")).collect();
+        assert_eq!(exploration.len(), i+1);
+        assert!(exploration.iter().all(|t|t.as_str()=="【Exploration：当前任务入口】\n本会话来自独立探索入口，正文保存在探索笔记中。"));
+        assert!(!all_text.contains("question-led-exploration"));
+        assert!(!all_text.contains("storageDocumentId"));
+        let goal = if i==0 {"爱因斯坦是什么人？"} else {"继续解释他的科学贡献"};
+        assert_eq!(texts.iter().filter(|t|t.as_str()==goal).count(),1,"current question is a single genuine native user message");
         assert!(!sys.contains("referenceTime:"));
         assert!(!sys.contains("爱因斯坦是什么人？"));
         let all = p.to_string();
