@@ -972,6 +972,11 @@ async fn run_sidecar(
     let mut request_context = request_context.unwrap_or_else(RequestContext::capture);
     request_context.time.validate()?;
     ensure_usage_allowed(&credentials.settings)?;
+    let debug_attempt = uuid::Uuid::new_v4().to_string();
+    let debug_run = request_context.native_session.as_ref().map(|n|n.run_id.clone()).unwrap_or_else(||debug_attempt.clone());
+    let debug_fallback = json!({"sessionId":request_context.native_session.as_ref().map(|n|n.learning_session_id.clone()).unwrap_or_else(||format!("utility:{}",operation)),"runId":debug_run,"operation":operation,"attempt":debug_attempt});
+    let mut debug_epoch = None;
+    let mut debug_metadata = Value::Null;
     let diagnostic_path = credentials.diagnostic_path.take();
     validate_tool_policy(&policy, tool_handler.is_some())?;
     crate::learning_skills::validate(&policy.mode, &policy.allowed_tools, &skills)?;
@@ -1005,6 +1010,7 @@ async fn run_sidecar(
     #[serde(rename_all = "camelCase")]
     struct Input<'a> {
         protocol: u8,
+        debug_protocol: bool,
         operation: &'a str,
         settings: &'a ModelSettings,
         api_key: &'a str,
@@ -1020,6 +1026,7 @@ async fn run_sidecar(
     }
     let mut input = serde_json::to_vec(&Input {
         protocol: 1,
+        debug_protocol: true,
         operation,
         settings: &credentials.settings,
         api_key: &credentials.api_key,
@@ -1144,6 +1151,18 @@ async fn run_sidecar(
                     serde_json::from_slice(&line).map_err(|_| sidecar_error("MODEL_RESPONSE"))?;
                 line.clear();
                 match event.get("type").and_then(Value::as_str) {
+                    Some("debug_probe") if ready && !settled => {
+                        let (epoch,meta)=crate::request_debug::gate(&debug_run,&debug_fallback);
+                        debug_epoch=epoch; debug_metadata=meta;
+                        stdin.write_all(format!("{}\n",json!({"type":"tool_result","id":event["id"],"result":{"epoch":epoch}})).as_bytes()).await.map_err(|_|runtime_error())?;
+                    }
+                    Some("debug_request" | "debug_status") if ready && !settled => {
+                        if let Some(epoch)=debug_epoch.filter(|epoch|event["epoch"].as_u64()==Some(*epoch)) {
+                            if let Some(id)=event["id"].as_str().filter(|id|id.len()<=64) {
+                                crate::request_debug::capture(epoch,&format!("{}:{}",debug_attempt,id),&debug_metadata,&event);
+                            }
+                        }
+                    }
                     Some("ready") if !ready && !settled => {
                         if event
                             .get("timeContext")
@@ -1425,6 +1444,7 @@ async fn run_sidecar(
         final_content.ok_or_else(|| sidecar_error("MODEL_RESPONSE"))
     }
     .await;
+    crate::request_debug::finish_attempt(&debug_attempt, result.as_ref().err().map(|error|error.code.as_str()));
     if result.is_err() {
         stop_child(&mut child, &mut stdin).await;
     }
@@ -2201,6 +2221,28 @@ mod tests {
                 assert_eq!(result.unwrap_err().code, "MODEL_INCOMPLETE");
             }
             server.join().unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn request_debug_real_stdio_boundary_on_off_and_failed_response() {
+        use crate::request_debug;
+        for (enabled,complete) in [(false,true),(true,true),(true,false)] {
+            request_debug::set(enabled);
+            let (credentials,server)=fixture(complete,true);
+            let result=generate(credentials,vec![json!({"role":"user","content":"debug-wire-boundary-synthetic"})],Arc::new(AtomicBool::new(false)),|_|{}).await;
+            let snapshot=request_debug::snapshot();
+            request_debug::set(false);
+            server.join().unwrap();
+            let records:Vec<_>=snapshot["records"].as_array().unwrap().iter().filter(|r|r["body"].to_string().contains("debug-wire-boundary-synthetic")).collect();
+            if !enabled {assert!(records.is_empty());continue;}
+            assert_eq!(records.len(),1,"actual stdio record missing: {snapshot}");
+            assert_eq!(records[0]["body"]["model"],"user-selected/model-2026");
+            assert_eq!(records[0]["body"]["max_tokens"],6144);
+            assert_eq!(records[0]["headers"]["authorization"],"[REDACTED]");
+            assert_eq!(records[0]["status"],"HTTP 200");
+            assert!(!records[0].to_string().contains("fixture-secret"));
+            assert_eq!(records[0]["runOutcome"],if complete {"complete"} else {"MODEL_INCOMPLETE"});
+            assert_eq!(result.is_ok(),complete);
         }
     }
     fn fixture(finish: bool, custom: bool) -> (ModelCredentials, thread::JoinHandle<()>) {

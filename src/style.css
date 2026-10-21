@@ -141,3 +141,14 @@ label select{display:block;background:#fff;border:1px solid #dce5ce;border-radiu
 .tool-authorization-settings .tier-option .label-note { grid-column: 1 / -1; margin: 0; font-size: 11px; color: var(--muted); }
 /* The read-only receipt audit reuses task-list/task-item; a semantic ul needs the same flat look. */
 .tool-authorization-settings ul.task-list { list-style: none; padding: 0; margin: 10px 0 0; }
+
+.request-debug { max-width: 100%; }
+.debug-switch { display: flex; align-items: center; gap: 10px; font-weight: 600; margin: 16px 0; }
+.debug-switch input { width: auto; }
+.request-debug select { width: 100%; margin: 6px 0 12px; }
+.debug-identity { display: grid; gap: 4px; font-size: 12px; }
+.debug-identity div { display: grid; grid-template-columns: 100px minmax(0,1fr); gap: 10px; }
+.debug-identity dd { margin: 0; overflow-wrap: anywhere; }
+.debug-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 16px 0 8px; }
+.debug-tabs [aria-pressed="true"] { background: var(--paper-deep, #e8e0d2); }
+.request-debug pre { max-height: 65vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 14px; border: 1px solid var(--line, #ddd4c6); background: var(--paper, #f7f3ea); font-size: 12px; line-height: 1.65; user-select: text; }

@@ -1,3 +1,4 @@
+import { snapshotRequest, redactDebug } from './request-debug.mjs';
 import {resolveTimeContext,timeSystemContext} from './time-context.mjs';
 import { resolveLearningSkills } from './learning-skills.mjs';
 import {randomUUID} from 'node:crypto';
@@ -141,20 +142,43 @@ function statusCode(status) {
 }
 
 /** Explicit fetch, no ambient credentials, no retry, and no redirects to any host. */
-export function createControlledFetch({ endpoint, apiKey, fail, protocol = 'openai-completions', diagnostic, baseFetch = globalThis.fetch }) {
+export function createControlledFetch({ endpoint, apiKey, fail, protocol = 'openai-completions', diagnostic, debug, baseFetch = globalThis.fetch }) {
   const target = `${normalizeEndpoint(endpoint, 'custom')}${protocol === 'anthropic-messages' ? '/v1/messages?beta=true' : '/chat/completions'}`;
   return async (input, init) => {
     const request = new Request(input, init);
     if (request.url !== target || request.method !== 'POST' || (protocol === 'anthropic-messages' ? request.headers.get('x-api-key') !== apiKey || request.headers.has('authorization') : request.headers.get('authorization') !== `Bearer ${apiKey}`)) {
       fail('INVALID_URL'); throw new SafeError('INVALID_URL');
     }
+    // Ask the volatile Rust gate for every actual send, including tool/compaction turns.
+    // Disabled means no body clone, serialization, or debug content crosses IPC.
+    let capture;
+    if (debug) {
+      try {
+        const epoch=await debug.gate();
+        if (epoch !== null && epoch !== undefined) {
+          capture={epoch,id:randomUUID(),time:new Date().toISOString(),complete:false,body:null,omitted:'捕获失败，未显示请求体'};
+          try {Object.assign(capture,await snapshotRequest(request,apiKey));}catch{}
+        }
+      } catch {} // Observability must never change model/tool behavior.
+    }
+    const report = async event => { if(capture) await debug.emit({...event,epoch:capture.epoch,id:capture.id}).catch(()=>{}); };
     const headersController = new AbortController();
     // A bounded connect/headers phase, followed by the outer first-response and total deadlines.
     const timer = setTimeout(() => { fail('TIMEOUT'); headersController.abort(); }, 10_000);
     const signal = AbortSignal.any([request.signal, headersController.signal]);
     let response;
-    try { response = await baseFetch(request, { redirect: 'error', signal }); }
-    catch { if (!signal.aborted) fail('NETWORK'); throw new SafeError('NETWORK'); }
+    try {
+      const pending=baseFetch(request, { redirect: 'error', signal });
+      pending.catch(()=>{});
+      await report({type:'debug_request',...capture,phase:debug?.phase,protocol,url:redactDebug(target,apiKey),method:request.method});
+      capture = capture ? {epoch:capture.epoch,id:capture.id} : undefined;
+      response = await pending;
+      await report({type:'debug_status',status:`HTTP ${response.status}`});
+    }
+    catch {
+      await report({type:'debug_status',status:signal.aborted?'cancelled_or_timeout':'network_failure'});
+      if (!signal.aborted) fail('NETWORK'); throw new SafeError('NETWORK');
+    }
     finally { clearTimeout(timer); }
     diagnostic?.headers(response);
     if (!response.ok) {
@@ -282,9 +306,14 @@ export async function runLearningAgent(request, emit, { signal, streamFn: fixtur
       offset = end;
     }
   };
-  const controlledFetch = createControlledFetch({ endpoint: model.baseUrl, apiKey: request.apiKey, fail, protocol: model.api, diagnostic });
+  let debugOrdinal=0;
+  const debugFor = context => request.debugProtocol === true && requestTool ? {
+    phase:context.messages.at(-1)?.role==='toolResult'?'tool_continuation':debugOrdinal===0?'initial':'continuation',
+    gate:async()=>{debugOrdinal++; const reply=await requestTool({type:'debug_probe',id:'debug_'+randomUUID()});return reply?.result?.epoch;},
+    emit,
+  } : undefined;
   const productionStream = (selectedModel, context, options) => (model.api === 'anthropic-messages' ? streamAnthropic : streamSimple)(selectedModel, context, {
-    ...options, maxTokens: Math.min(model.maxTokens,options?.maxTokens??model.maxTokens), apiKey: request.apiKey, fetch: controlledFetch, ...(glm ? { reasoning: 'max' } : {}),
+    ...options, maxTokens: Math.min(model.maxTokens,options?.maxTokens??model.maxTokens), apiKey: request.apiKey, fetch: createControlledFetch({endpoint:model.baseUrl,apiKey:request.apiKey,fail,protocol:model.api,diagnostic,debug:debugFor(context)}), ...(glm ? { reasoning: 'max' } : {}),
     timeoutMs: request.operation === 'test' ? 30_000 : 120_000, maxRetries: 0, maxRetryDelayMs: 1,
     cacheRetention: 'none', env: {}, toolChoice: toolsEnabled && (!request.nativeSession || options?.sessionId===native?.manager.getSessionId()) ? 'auto' : 'none', temperature: 1,
     ...(glm ? { samplingParams: { top_p: 0.95, thinking: { type: 'enabled', clear_thinking: false }, reasoning_effort: 'max' } } : {}),

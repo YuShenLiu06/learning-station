@@ -537,6 +537,7 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
         let mut last_persist = std::time::Instant::now();
         let tool_handler = (!policy.allowed_tools.is_empty())
             .then(|| learning_tool_handler(engine.clone(), tool_scope, sink.clone()));
+        crate::request_debug::register(&id, json!({"courseId":session.course_id,"sessionId":session.id,"runId":id,"requestId":request.request_id,"userEntryId":native_session.user_entry_id,"retry":request.user_entry_id.is_some()}));
         let result = model::generate_scoped(
             credentials,
             messages,

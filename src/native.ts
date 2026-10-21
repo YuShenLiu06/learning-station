@@ -152,6 +152,7 @@ async function generation(payload: Record<string, unknown>, mode: string, prompt
 
 export async function nativeCall(command: string, payload: Record<string, unknown>): Promise<unknown> {
   switch (command) {
+    case 'request_debug_get': case 'request_debug_set': case 'request_debug_enter_session': case 'request_debug_clear_session': return ipc(command, payload);
     case 'get_exercise_reference': case 'get_feishu_bot_settings': case 'configure_feishu_bot': case 'start_feishu_bot': case 'stop_feishu_bot': case 'get_feishu_bot_snapshot': case 'get_grading_settings': case 'set_grading_model': case 'grade_attempt': case 'get_grade_run': case 'cancel_grade_run': case 'check_anki_connection': case 'get_anki_due': case 'reveal_anki_card': case 'answer_anki_card': case 'get_anki_operation': case 'add_review_items_to_anki': return ipc(command, payload);
     case 'course_sessions': return ipc(command, payload);
     case 'course_session_create': case 'course_session_select': case 'course_session_rename': return learning(await ipc<NativeSession>(command, payload));

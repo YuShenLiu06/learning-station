@@ -18,6 +18,7 @@ pub mod focus;
 pub mod learning_skills;
 pub mod learning_tools;
 pub mod model;
+pub mod request_debug;
 pub mod native_session;
 pub mod reminders;
 pub mod sessions;

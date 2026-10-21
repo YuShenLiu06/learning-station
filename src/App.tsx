@@ -259,6 +259,7 @@ export function App() {
   const chat = courseChats[courseId];
   const readingSession = sessions[activeId];
   const session = chat ? { ...chat, ...(current?.section.kind === 'exercise' && readingSession ? { exercises: readingSession.exercises, exerciseSessionId: readingSession.exerciseSessionId } : {}) } : readingSession ?? emptySession(activeId);
+  useEffect(() => { const id=session.id; if(id) void call('request_debug_enter_session',{sessionId:id}).catch(()=>undefined); return () => { if(id) void call('request_debug_clear_session',{sessionId:id}).catch(()=>undefined); }; },[session.id]);
   const chatDraft = useChatDraft(session.courseId ? session.id : '');
   const chatDraftRef = useRef(chatDraft); chatDraftRef.current = chatDraft;
   const conversation = mergeOutgoing(session.messages, outgoing, session.id);
