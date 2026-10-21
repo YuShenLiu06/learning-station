@@ -237,6 +237,7 @@ async fn context_bridge_real_pi_wire_replays_full_diff_once_per_tool_loop_and_fa
             crate::learning_skills::capture("question", &["query_related_knowledge".into()])
                 .unwrap(),
             Some(RequestContext {
+                debug_identity: None,
                 output_validator: None,
                 native_session: None,
                 context_observer: None,
@@ -339,7 +340,8 @@ async fn changes_capacity_and_binary_focus_rejections_survive_the_actual_sidecar
         let messages = vec![json!({"role":"user","content":json!({"focus":focus,"question":"Retain this original question","nativeMaterials":[],"nativeReferences":"","contextBridgeManifest":{"version":1,"entries":[]}}).to_string()})];
         let value = json!({"checkpoint":{"courseId":"capacity_course","checkpointCommitOid":cp,"materialTreeOid":tree,"excludedFiles":[]},"baseCommitOid":null,"focused":null,"complete":true,"changes":(0..257).map(|n|json!({"path":format!("documents/{n}.md"),"status":"M"})).collect::<Vec<_>>()});
         let value = if expected == "CONTEXT_CONFLICT" {json!({"checkpoint":{"courseId":"capacity_course","checkpointCommitOid":cp,"materialTreeOid":tree,"excludedFiles":[]},"baseCommitOid":null,"focused":{"textUnavailable":"binary"},"complete":true,"changes":[]})} else {value};
-        let result = generate_scoped(ModelCredentials::new(ModelSettings { provider:"custom".into(), protocol:PROTOCOL.into(), base_url:"http://127.0.0.1:1/v1".into(), model:"fixture".into(), ..ModelSettings::default() }, "synthetic-capacity-not-real".into()).unwrap(), messages, Arc::new(AtomicBool::new(false)), |_|panic!("Changes rejection must precede model output"), None, ToolPolicy::legacy(false), vec![], Some(RequestContext { material_changes:Some(Arc::new(move |_,_|Ok(value.clone()))), native_session:Some(native), ..RequestContext::capture() })).await;
+        let result = generate_scoped(ModelCredentials::new(ModelSettings { provider:"custom".into(), protocol:PROTOCOL.into(), base_url:"http://127.0.0.1:1/v1".into(), model:"fixture".into(), ..ModelSettings::default() }, "synthetic-capacity-not-real".into()).unwrap(), messages, Arc::new(AtomicBool::new(false)), |_|panic!("Changes rejection must precede model output"), None, ToolPolicy::legacy(false), vec![], Some(RequestContext {
+                debug_identity: None, material_changes:Some(Arc::new(move |_,_|Ok(value.clone()))), native_session:Some(native), ..RequestContext::capture() })).await;
         assert_eq!(result.unwrap_err().code, expected);
         let path = dir.path().join("state/pi-native").join(hash(&session.id)).join("transcript.jsonl");
         let transcript = std::fs::read_to_string(path).unwrap();
@@ -421,7 +423,8 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
             Ok(value)
         });
         let transcript = std::path::PathBuf::from(&native.directory).join("transcript.jsonl");
-        generate_scoped(ModelCredentials::new(ModelSettings { provider:"custom".into(), protocol:PROTOCOL.into(), base_url:endpoint.clone(), model:"fixture".into(), ..ModelSettings::default() }, "synthetic-fixed-git-only".into()).unwrap(), messages, Arc::new(AtomicBool::new(false)), |_|{}, None, ToolPolicy::legacy(false), vec![], Some(RequestContext { material_changes:Some(handler), native_session:Some(native), ..RequestContext::capture() })).await.unwrap();
+        generate_scoped(ModelCredentials::new(ModelSettings { provider:"custom".into(), protocol:PROTOCOL.into(), base_url:endpoint.clone(), model:"fixture".into(), ..ModelSettings::default() }, "synthetic-fixed-git-only".into()).unwrap(), messages, Arc::new(AtomicBool::new(false)), |_|{}, None, ToolPolicy::legacy(false), vec![], Some(RequestContext {
+                debug_identity: None, material_changes:Some(handler), native_session:Some(native), ..RequestContext::capture() })).await.unwrap();
         if round == 4 {
             // Invoke the real Pi API, rather than constructing Rust history or a cache.
             let root=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();

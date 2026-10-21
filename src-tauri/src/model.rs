@@ -813,6 +813,7 @@ pub type CompactionObserver = Arc<dyn Fn() + Send + Sync>;
 pub type MaterialChangesHandler = Arc<dyn Fn(Option<String>, Option<String>) -> Result<Value> + Send + Sync>;
 #[derive(Clone)]
 pub struct RequestContext {
+    pub debug_identity: Option<Value>,
     pub material_changes: Option<MaterialChangesHandler>,
     pub time: crate::time_context::TimeContext,
     pub exploration: Option<crate::exploration::ExplorationContext>,
@@ -825,6 +826,7 @@ pub struct RequestContext {
 impl RequestContext {
     fn capture() -> Self {
         Self {
+            debug_identity: None,
             material_changes: None,
             time: crate::time_context::TimeContext::capture(),
             exploration: None,
@@ -973,8 +975,11 @@ async fn run_sidecar(
     request_context.time.validate()?;
     ensure_usage_allowed(&credentials.settings)?;
     let debug_attempt = uuid::Uuid::new_v4().to_string();
+    let mut debug_fallback=request_context.debug_identity.clone().unwrap_or_else(||json!({}));
     let debug_run = request_context.native_session.as_ref().map(|n|n.run_id.clone()).unwrap_or_else(||debug_attempt.clone());
-    let debug_fallback = json!({"sessionId":request_context.native_session.as_ref().map(|n|n.learning_session_id.clone()).unwrap_or_else(||format!("utility:{}",operation)),"runId":debug_run,"operation":operation,"attempt":debug_attempt});
+    if debug_fallback["sessionId"].is_null(){debug_fallback["sessionId"]=json!(request_context.native_session.as_ref().map(|n|n.learning_session_id.clone()).unwrap_or_else(||format!("utility:{}",operation)));}
+    if debug_fallback["runId"].is_null(){debug_fallback["runId"]=json!(debug_run);}
+    debug_fallback["attempt"]=json!(debug_attempt); debug_fallback["operation"]=json!(operation);
     let mut debug_epoch = None;
     let mut debug_metadata = Value::Null;
     let diagnostic_path = credentials.diagnostic_path.take();
@@ -1152,7 +1157,7 @@ async fn run_sidecar(
                 line.clear();
                 match event.get("type").and_then(Value::as_str) {
                     Some("debug_probe") if ready && !settled => {
-                        let (epoch,meta)=crate::request_debug::gate(&debug_run,&debug_fallback);
+                        let (epoch,meta)=crate::request_debug::gate(&debug_fallback);
                         debug_epoch=epoch; debug_metadata=meta;
                         stdin.write_all(format!("{}\n",json!({"type":"tool_result","id":event["id"],"result":{"epoch":epoch}})).as_bytes()).await.map_err(|_|runtime_error())?;
                     }
@@ -2229,7 +2234,8 @@ mod tests {
         for (enabled,complete) in [(false,true),(true,true),(true,false)] {
             request_debug::set(enabled);
             let (credentials,server)=fixture(complete,true);
-            let result=generate(credentials,vec![json!({"role":"user","content":"debug-wire-boundary-synthetic"})],Arc::new(AtomicBool::new(false)),|_|{}).await;
+            let identity=json!({"courseId":"debug-course","sessionId":"debug-session","runId":"debug-run","requestId":"debug-request","retry":true});
+            let result=generate_scoped(credentials,vec![json!({"role":"user","content":"debug-wire-boundary-synthetic"})],Arc::new(AtomicBool::new(false)),|_|{},None,ToolPolicy::legacy(false),vec![],Some(RequestContext{debug_identity:Some(identity.clone()),..RequestContext::capture()})).await;
             let snapshot=request_debug::snapshot();
             request_debug::set(false);
             server.join().unwrap();
@@ -2240,6 +2246,7 @@ mod tests {
             assert_eq!(records[0]["body"]["max_tokens"],6144);
             assert_eq!(records[0]["headers"]["authorization"],"[REDACTED]");
             assert_eq!(records[0]["status"],"HTTP 200");
+            for key in ["courseId","sessionId","runId","requestId","retry"]{assert_eq!(records[0]["identity"][key],identity[key]);}
             assert!(!records[0].to_string().contains("fixture-secret"));
             assert_eq!(records[0]["runOutcome"],if complete {"complete"} else {"MODEL_INCOMPLETE"});
             assert_eq!(result.is_ok(),complete);

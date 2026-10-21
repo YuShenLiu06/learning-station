@@ -11,13 +11,17 @@ pub struct DebugState {
     epoch: u64,
     sequence: u64,
     records: Vec<Value>,
-    metadata: Vec<(String, Value)>,
     dropped: usize,
 }
 impl DebugState {
     fn set(&mut self, enabled: bool) {
         self.enabled=enabled; self.epoch+=1;
-        self.records.clear(); self.metadata.clear(); self.last_sequences.clear(); self.dropped=0;
+        self.records.clear(); self.last_sequences.clear(); self.dropped=0;
+    }
+    fn gate(&self,meta:&Value)->(Option<u64>,Value) {
+        let sid=meta["sessionId"].as_str().unwrap_or("");
+        let visible=self.active_session.as_deref().is_none_or(|active|active==sid)||sid=="utility:test";
+        ((self.enabled&&visible).then_some(self.epoch),meta.clone())
     }
     fn snapshot(&self) -> Value { json!({"enabled":self.enabled,"records":self.records,"dropped":self.dropped}) }
     fn capture(&mut self, epoch: u64, key: &str, meta: &Value, event: &Value) {
@@ -54,26 +58,13 @@ pub fn clear_session(session: &str) {
     let mut s=state().lock().unwrap_or_else(|e|e.into_inner());
     s.epoch+=1;
     s.records.retain(|r|r["identity"]["sessionId"]!=session);
-    s.metadata.retain(|(_,m)|m["sessionId"]!=session);
     s.last_sequences.retain(|(id,_)|id!=session);
     if s.active_session.as_deref()==Some(session) {s.active_session=Some(String::new());}
 }
 pub fn enter_session(session: &str) { state().lock().unwrap_or_else(|e|e.into_inner()).active_session=Some(session.into()); }
-pub fn register(run: &str, mut metadata: Value) {
-    let mut s=state().lock().unwrap_or_else(|e|e.into_inner());
-    if !s.enabled { return; }
-    metadata["retry"]=json!(s.metadata.iter().any(|(id,m)|id!=run && m["sessionId"]==metadata["sessionId"] && m["userEntryId"]==metadata["userEntryId"] && !metadata["userEntryId"].is_null()));
-    if s.metadata.len()>=80 { s.metadata.remove(0); }
-    s.metadata.push((run.into(),metadata));
-}
-pub fn gate(run: &str, fallback: &Value) -> (Option<u64>, Value) {
+pub fn gate(meta: &Value) -> (Option<u64>, Value) {
     let s=state().lock().unwrap_or_else(|e|e.into_inner());
-    let registered=s.metadata.iter().rev().find(|(id,_)|id==run).map(|(_,m)|m.clone()).unwrap_or(Value::Null);
-    let mut meta=fallback.clone();
-    if let Some(fields)=registered.as_object(){for (key,value) in fields {meta[key]=value.clone();}}
-    let sid=meta["sessionId"].as_str().unwrap_or("");
-    let visible=s.active_session.as_deref().is_none_or(|active|active==sid) || sid.starts_with("utility:");
-    ((s.enabled && visible).then_some(s.epoch),meta)
+    s.gate(meta)
 }
 pub fn capture(epoch:u64,key:&str,meta:&Value,event:&Value) { state().lock().unwrap_or_else(|e|e.into_inner()).capture(epoch,key,meta,event); }
 pub fn finish_attempt(attempt:&str,error:Option<&str>) {
@@ -82,13 +73,25 @@ pub fn finish_attempt(attempt:&str,error:Option<&str>) {
 }
 #[cfg(test)] mod tests {
     use super::*;
+    #[test] fn frozen_identity_survives_mid_run_toggle_and_sessions_stay_separate() {
+        let mut s=DebugState::default();
+        let a=json!({"courseId":"course-a","sessionId":"a","runId":"grade-a","requestId":"request-a","retry":true});
+        let b=json!({"courseId":"course-b","sessionId":"b","runId":"grade-b","requestId":"request-b"});
+        assert!(s.gate(&a).0.is_none());s.set(true);assert_eq!(s.gate(&a).1,a);
+        s.capture(s.epoch,"a1",&a,&json!({"type":"debug_request"}));
+        s.capture(s.epoch,"b1",&b,&json!({"type":"debug_request"}));
+        s.capture(s.epoch,"a2",&a,&json!({"type":"debug_request"}));
+        assert_eq!(s.records[2]["previousSequence"],1);assert!(s.records[1]["previousSequence"].is_null());
+        s.set(false);s.set(true);assert_eq!(s.gate(&a).1,a);assert!(s.records.is_empty());
+        s.active_session=Some("b".into());assert!(s.gate(&a).0.is_none());assert!(s.gate(&b).0.is_some());
+    }
     #[test] fn volatile_gate_limits_and_late_events() {
         let mut s=DebugState::default(); let e=json!({"type":"debug_request","body":{"messages":["fixture"]}});
         s.capture(0,"a",&json!({"sessionId":"a"}),&e); assert!(s.records.is_empty());
         s.set(true); let epoch=s.epoch;
         for i in 0..45 {s.capture(epoch,&i.to_string(),&json!({"sessionId":"a"}),&e);}
         assert_eq!(s.records.len(),40); assert_eq!(s.dropped,5);
-        s.set(false); s.capture(epoch,"late",&Value::Null,&e); assert!(s.records.is_empty()); assert!(s.metadata.is_empty());
+        s.set(false); s.capture(epoch,"late",&Value::Null,&e); assert!(s.records.is_empty());
         s.set(true); s.capture(epoch,"old",&Value::Null,&e); assert!(s.records.is_empty());
     }
 }

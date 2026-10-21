@@ -1,37 +1,36 @@
 // Only sanitized data leaves the sending process. Never read credential files.
 export const DEBUG_BODY_LIMIT = 256 * 1024;
-const sensitive = key => /^(?:.*[-_])?(?:authorization|cookie|set-cookie|api[-_]?key|access[-_]?token|refresh[-_]?token|token|password|passwd|secret|credential)$/i.test(key) || /^(apiKey|accessToken|refreshToken|clientSecret)$/i.test(key);
+const sensitive = key => /(?:authorization|cookie|api[-_]?key|token|password|passwd|secret|credential)$/i.test(key.replace(/([a-z])([A-Z])/g,'$1_$2'));
+const assignment=/(?:^|[^a-z0-9_])["']?(?:api[-_ ]?key|[a-z_-]{0,48}token|[a-z_-]{0,48}password|passwd|[a-z_-]{0,48}secret|cookie)["']?\s*[:=]\s*(?:"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|([^\s,;"'<>}]+))/gi;
 export function redactDebug(value, apiKey = '', extraSecrets = []) {
-  const secrets = new Set([...(apiKey ? [apiKey] : []),...extraSecrets].filter(Boolean));
+  const secrets=new Set([...(apiKey?[apiKey]:[]),...extraSecrets].filter(Boolean));
+  function scan(input) {
+    const normalized=input.replace(/\\"/g,'"');
+    for(const match of normalized.matchAll(assignment)) {const raw=match[1]??match[2]??match[3];if(raw) {secrets.add(raw);try{secrets.add(JSON.parse('"'+raw+'"'));}catch{}}}
+    for(const match of normalized.matchAll(/(?:authorization["']?\s*[:=]\s*["']?)([^\r\n"']+)/gi)) {
+      const raw=match[1].trim();secrets.add(raw);for(const part of raw.split(/\s+/).slice(1))if(part)secrets.add(part);
+    }
+    for(const match of normalized.matchAll(/cookie["']?\s*[:=]\s*["']?([^\r\n"']+)/gi)) {
+      for(const pair of match[1].split(';')){const at=pair.indexOf('=');if(at>=0){const token=pair.slice(at+1).trim();if(token)secrets.add(token);}}
+    }
+    for(const match of normalized.matchAll(/\b(?:Bearer|Basic)\s+([a-z0-9+/_=.:-]+)/gi))secrets.add(match[1]);
+  }
   function gather(item) {
-    if (!item || typeof item !== 'object') return;
-    for (const [key, entry] of Object.entries(item)) {
-      if (sensitive(key) && typeof entry === 'string' && entry) secrets.add(entry);
-      if (typeof entry === 'string') {
-        for(const match of entry.matchAll(/\b(?:Bearer|Basic)\s+([a-z0-9+/_=.:-]+)/gi))secrets.add(match[1]);
-        for(const match of entry.matchAll(/(?:api[-_ ]?key|access[-_]?token|refresh[-_]?token|password|passwd|secret|token|cookie)\s*[:=]\s*([^\s,;"'<>}]+)/gi))secrets.add(match[1]);
-        try { gather(JSON.parse(entry)); } catch {} }
-      else gather(entry);
+    if(typeof item==='string'){scan(item);try{const nested=JSON.parse(item);if(nested&&typeof nested==='object')gather(nested);}catch{}return;}
+    if(item&&typeof item==='object')for(const [key,entry]of Object.entries(item)){
+      if(sensitive(key)&&typeof entry==='string'&&entry){secrets.add(entry);if(/cookie/i.test(key))scan('Cookie: '+entry);if(/authorization/i.test(key))scan('Authorization: '+entry);}
+      gather(entry);
     }
   }
   gather(value);
-  function text(input) {
-    let out = input;
-    for (const secret of [...secrets].sort((a,b) => b.length-a.length)) {
-      for (const form of new Set([secret, JSON.stringify(secret).slice(1,-1), encodeURIComponent(secret)])) out = out.split(form).join('[REDACTED]');
-    }
-    out = out.replace(/\b(Bearer|Basic)\s+[a-z0-9+/_=.:-]+/gi, '$1 [REDACTED]');
-    out = out.replace(/((?:api[-_]?key|access[-_]?token|refresh[-_]?token|password|passwd|secret|token|cookie)\s*[:=]\s*)([^\s,;"'<>}]+)/gi, '$1[REDACTED]');
-    out = out.replace(/\b(?:sk-[a-z0-9_-]{8,}|ghp_[a-z0-9]+|eyJ[a-z0-9_-]+\.[a-z0-9_-]+\.[a-z0-9_-]+)\b/gi, '[REDACTED]');
-    return out;
-  }
+  const forms=[...new Set([...secrets].flatMap(secret=>[secret,JSON.stringify(secret).slice(1,-1),encodeURIComponent(secret)]))].filter(Boolean).sort((a,b)=>b.length-a.length);
+  // One pass: inserted markers are never scanned for shorter secrets.
+  const pattern=forms.length?new RegExp(forms.map(secret=>secret.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')).join('|'),'g'):null;
+  const text=input=>(pattern?input.replace(pattern,'[REDACTED]'):input).replace(/\b(?:sk-[a-z0-9_-]{8,}|ghp_[a-z0-9]+|eyJ[a-z0-9_-]+\.[a-z0-9_-]+\.[a-z0-9_-]+)\b/gi,'[REDACTED]');
   function visit(item) {
-    if (typeof item === 'string') {
-      try { const parsed=JSON.parse(item); if (parsed && typeof parsed==='object') return JSON.stringify(visit(parsed)); } catch {}
-      return text(item);
-    }
-    if (Array.isArray(item)) return item.map(visit);
-    if (item && typeof item === 'object') return Object.fromEntries(Object.entries(item).map(([key,entry]) => [text(key), sensitive(key) ? '[REDACTED]' : visit(entry)]));
+    if(typeof item==='string'){try{const nested=JSON.parse(item);if(nested&&typeof nested==='object')return JSON.stringify(visit(nested));}catch{}return text(item);}
+    if(Array.isArray(item))return item.map(visit);
+    if(item&&typeof item==='object')return Object.fromEntries(Object.entries(item).map(([key,entry])=>[text(key),sensitive(key)?'[REDACTED]':visit(entry)]));
     return item;
   }
   return visit(value);
@@ -53,5 +52,6 @@ export async function snapshotRequest(request, apiKey) {
   const body=Buffer.concat(chunks).toString('utf8');
   let parsed; try { parsed=JSON.parse(body); } catch { return {headers,complete:false,bodyBytes:bytes,omitted:'非 JSON 请求体，未显示',body:null}; }
   const safe=redactDebug(parsed,apiKey,headerSecrets);
+  if(Buffer.byteLength(JSON.stringify(safe))>2*DEBUG_BODY_LIMIT)return {headers,complete:false,bodyBytes:bytes,omitted:'整个请求体：脱敏后超过 512 KiB 展示上限',body:null};
   return {headers,complete:true,bodyBytes:bytes,body:safe};
 }

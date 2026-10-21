@@ -537,7 +537,7 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
         let mut last_persist = std::time::Instant::now();
         let tool_handler = (!policy.allowed_tools.is_empty())
             .then(|| learning_tool_handler(engine.clone(), tool_scope, sink.clone()));
-        crate::request_debug::register(&id, json!({"courseId":session.course_id,"sessionId":session.id,"runId":id,"requestId":request.request_id,"userEntryId":native_session.user_entry_id}));
+        let debug_retry=engine.runs.lock().unwrap_or_else(|e|e.into_inner()).values().any(|r|r.run.id!=id && r.run.session_id==session.id && r.run.user_entry_id.as_deref()==Some(native_session.user_entry_id.as_str()));
         let result = model::generate_scoped(
             credentials,
             messages,
@@ -559,6 +559,7 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
             policy,
             skills,
             Some(model::RequestContext {
+                debug_identity: Some(json!({"courseId":session.course_id,"sessionId":session.id,"runId":id,"requestId":request.request_id,"userEntryId":native_session.user_entry_id,"retry":debug_retry})),
                 output_validator: (request.mode == "practice").then(|| {
                     let manifest = ctx.manifest.clone();
                     let id = id.clone();

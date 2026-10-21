@@ -63,3 +63,9 @@ test('Anthropic actual system/tools/parameters captured, auth redacted',async()=
     assert.deepEqual(events[0].body,server.packets[0].body);assert.equal(events[0].headers['x-api-key'],'[REDACTED]');
   }finally{await server.close();}
 });
+test('embedded JSON, quoted assignments, auth schemes, cookies and camel credential fields stay redacted before IPC',async()=>{
+  const body={messages:[{content:'```json\n{"password":"private-fenced-pass","api_key":"private-fenced-key","token":"private-fenced-token"}\n```'},{content:'password="private-quoted-pass" token=\'private-quoted-token\''},{content:'Authorization: ApiKey private-auth-value\nCookie: session=private-cookie-one; auth=private-cookie-two'}],metadata:{sessionToken:'private-session-token',idToken:'private-id-token',userPassword:'private-user-pass'}};
+  const before=JSON.stringify(body);const safe=redactDebug(body,secret);assert.equal(JSON.stringify(body),before);assert.doesNotMatch(JSON.stringify(safe),/private-[a-z-]+/);
+  const req=new Request('http://localhost/',{method:'POST',body:JSON.stringify({password:'D',token:'E',secret:'R',accessToken:'A',refreshToken:'C',api_key:'T',text:'D'.repeat(210000)})});
+  const snapshot=await snapshotRequest(req,secret);assert.equal(snapshot.complete,false);assert.match(snapshot.omitted,/脱敏后超过/);assert.ok(JSON.stringify(snapshot).length<1000);
+});

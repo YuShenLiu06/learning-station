@@ -254,6 +254,7 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
             },
             skills.clone(),
             Some(RequestContext {
+                debug_identity: None,
                 output_validator: None,
                 native_session: None,
                 context_observer: None,

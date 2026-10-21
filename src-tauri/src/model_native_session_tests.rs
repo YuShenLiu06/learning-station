@@ -228,6 +228,7 @@ async fn native_restart_case(same_course: bool) {
             )
             .unwrap(),
             Some(RequestContext {
+                debug_identity: None,
                 output_validator: None,
                 time: frozen.time,
                 exploration: None,
@@ -365,6 +366,7 @@ async fn native_restart_case(same_course: bool) {
         )
         .unwrap(),
         Some(RequestContext {
+                debug_identity: None,
             output_validator: None,
             time: frozen.time,
             exploration: None,
@@ -752,6 +754,7 @@ async fn rust_node_pi_exercise_tool_receipt_corrects_invalid_output_in_same_nati
         },
         crate::learning_skills::capture("question", &["generate_exercises".into()]).unwrap(),
         Some(RequestContext {
+                debug_identity: None,
             output_validator: None,
             time: frozen.time,
             exploration: None,
