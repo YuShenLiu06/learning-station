@@ -217,3 +217,119 @@ async fn native_pending_read_missing_run_with_cache_stays_unknown() { pending_re
 async fn native_pending_read_corrupt_run_without_cache_stays_unknown() { pending_read(false, Some("corrupt")).await; }
 #[tokio::test]
 async fn native_pending_read_corrupt_run_with_cache_stays_unknown() { pending_read(true, Some("corrupt")).await; }
+
+#[tokio::test]
+async fn native_exploration_context_reaches_first_and_reopened_provider_requests_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path().join("library");
+    let state = dir.path().join("state");
+    let mut engine = Engine::new(library.clone(), state.clone()).unwrap();
+    let (launch, ordinary) = {
+        let mut core = engine.lock().unwrap();
+        let launch = crate::exploration::begin(
+            &mut core.content, "EXPLORATION_ORIGINAL_QUESTION", "native-exploration-launch",
+        ).unwrap();
+        // A supported legacy course avoids external project resource discovery;
+        // this regression tests scenario routing, not the resource loader.
+        let owner = crate::library_tree::create(
+            &mut core.content, "course", "Ordinary course", None, "", "native-ordinary-course",
+        ).unwrap();
+        crate::library_tree::create(
+            &mut core.content, "section", "Unread note", Some(&owner.id),
+            "ORDINARY_NOTE_MUST_NOT_AUTO_LOAD", "native-ordinary-note",
+        ).unwrap();
+        let ordinary = crate::course_sessions::create(
+            &mut core, &owner.id, "native-ordinary-conversation",
+        ).unwrap();
+        (launch, ordinary)
+    };
+    let native = state.join("pi-native").join(hash(&launch.session.id)).join("transcript.jsonl");
+    let (endpoint, stop, provider) = server(3);
+    let mut first_transcript = vec![];
+    let goals = ["EXPLORATION_ORIGINAL_QUESTION", "EXPLORATION_FOLLOWUP_GOAL", "ORDINARY_NEW_QUESTION"];
+    let mut runs = vec![];
+    for (round, goal) in goals.iter().enumerate() {
+        if round > 0 {
+            // Drop all in-memory runs/model state. Reopen the same business and
+            // exact Pi session through production routing, not a test-built spec.
+            drop(engine);
+            engine = Engine::new(library.clone(), state.clone()).unwrap();
+            engine.lock().unwrap().content.refresh().unwrap();
+        }
+        engine.model.lock().await.use_local_fixture(endpoint.clone());
+        let session = if round == 2 { &ordinary.id } else { &launch.session.id };
+        let queued = start(engine.clone(), GenerationRequest {
+            focus: None, session_id: session.clone(), document_id: None,
+            // Even a question request must not turn an ordinary course into exploration.
+            mode: "question".into(), prompt: (*goal).into(), selection: String::new(),
+            request_id: format!("native-exploration-turn-{round}"),
+            user_entry_id: (round == 0).then(|| launch.user_entry_id.clone()),
+            injections: vec![], exercise_references: vec![], assistant_references: vec![],
+        }, Arc::new(|_| {})).await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(45);
+        let finished = loop {
+            let run = get(&engine, &queued.id).unwrap();
+            if !matches!(run.status.as_str(), "queued" | "running") { break run; }
+            assert!(Instant::now() < deadline, "native exploration turn deadline");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(finished.status, "succeeded", "{:?}", finished.error);
+        assert!(finished.context_bridge_manifest.is_some(), "real Pi projection must return its inventory");
+        if round == 0 {
+            first_transcript = fs::read(&native).unwrap();
+        } else if round == 1 {
+            assert!(fs::read(&native).unwrap().starts_with(&first_transcript),
+                "reopening must retain the exact native transcript");
+        }
+        runs.push(finished);
+    }
+    let _ = stop.send(());
+    let requests = provider.join().unwrap();
+    assert_eq!(requests.len(), 3);
+    let text = |message: &Value| message["content"].as_str().map(str::to_owned)
+        .unwrap_or_else(|| message["content"].as_array().unwrap().iter()
+            .filter_map(|part| part["text"].as_str()).collect::<Vec<_>>().join(""));
+    for (round, packet) in requests.iter().enumerate() {
+        let messages = packet["messages"].as_array().unwrap();
+        let system = text(messages.iter().find(|message| message["role"] == "system").unwrap());
+        let turn = messages.iter().map(&text)
+            .filter_map(|text| serde_json::from_str::<Value>(&text).ok())
+            .filter(|value| value["type"] == "learning_request").last()
+            .expect("provider must receive the actual native learning turn");
+        if round < 2 {
+            let expected = json!({
+                "origin":"exploration-entry", "originalUserEntryId":launch.user_entry_id,
+                "scenario":"question-led-exploration", "originalQuestion":goals[0],
+                "userGoal":goals[round], "storageDocumentId":launch.document.id,
+                "materialSourceIds":[],
+            });
+            assert_eq!(turn["explorationContext"], expected, "ContextBridge/native turn lost exploration context");
+            let system_context = system.lines().rev().find_map(|line| serde_json::from_str::<Value>(line).ok())
+                .expect("provider system prompt must carry the exploration object, not only turn metadata");
+            assert_eq!(system_context, expected, "Rust/model/native system wiring lost the frozen exploration context");
+            assert!(system.contains("从用户问题发起的新探索"));
+            assert!(system.contains("不是教材缺失"));
+            assert_eq!(serde_json::to_value(&runs[round].exploration_context).unwrap(), expected);
+            assert!(!packet.to_string().contains("ORDINARY_NOTE_MUST_NOT_AUTO_LOAD"));
+        } else {
+            assert!(runs[round].exploration_context.is_none());
+            assert!(turn["explorationContext"].is_null());
+            assert!(!system.contains("从用户问题发起的新探索"));
+            for private in [goals[0], goals[1], "UPGRADE_HISTORY_MARKER", "ORDINARY_NOTE_MUST_NOT_AUTO_LOAD"] {
+                assert!(!packet.to_string().contains(private), "ordinary course inherited {private}");
+            }
+            assert!(runs[round].context_manifest.is_empty());
+        }
+    }
+    assert!(requests[1]["messages"].as_array().unwrap().iter()
+        .any(|message| message["role"] == "user" && text(message) == goals[0]),
+        "restored request must retain the original real native user");
+    assert!(requests[1]["messages"].to_string().contains("UPGRADE_HISTORY_MARKER"));
+    let entries: Vec<Value> = String::from_utf8(fs::read(&native).unwrap()).unwrap()
+        .lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    assert_eq!(entries[0]["id"], hash(&launch.session.id));
+    assert_eq!(entries.iter().filter(|entry| entry["type"] == "message" && entry["message"]["role"] == "user").count(), 2);
+    assert!(entries.iter().any(|entry| entry["type"] == "custom_message"
+        && entry["customType"] == "learning-station-turn"
+        && entry["content"].as_str().unwrap_or("").contains(goals[1])));
+}
