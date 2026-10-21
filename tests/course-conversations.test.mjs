@@ -75,7 +75,7 @@ test('actual React course conversations create, select, rename and restore indep
   const reading=()=>document.querySelector('.document-title-row h1')?.textContent;
   try{
     await React.act(async()=>root.render(React.createElement(App)));await wait(()=>heading()==='原有对话'&&row('原有对话'));
-    assert.equal(reading(),'材料甲');await wait(()=>button('恢复到当前对话')&&!button('恢复到当前对话').disabled);assert.match(document.querySelector('.model-prompt').textContent,/升级前的旧问题/);await click(button('恢复到当前对话'));assert.equal(composer().value,'升级前的旧问题');assert.equal(drafts.get('section:note_a').data.question,'');assert.match(document.querySelector('.messages').textContent,/旧会话的独立历史/);
+    assert.equal(reading(),'材料甲');await wait(()=>button('恢复到当前对话')&&!button('恢复到当前对话').disabled);assert.match(document.querySelector('.model-prompt').textContent,/升级前的旧问题/);await click(button('恢复到当前对话'));assert.equal(composer().value,'升级前的旧问题');await wait(()=>drafts.get('section:note_a').data.question==='');assert.match(document.querySelector('.messages').textContent,/旧会话的独立历史/);
     await input(composer(),'原会话未发送的问题');await click(row('材料乙'));await wait(()=>reading()==='材料乙');assert.equal(heading(),'原有对话');assert.equal(composer().value,'原会话未发送的问题');
     const beforeOpen=commands.filter(value=>value.command==='open_document').length;
     await React.act(async()=>{newChat('course_a').dispatchEvent(new MouseEvent('click',{bubbles:true}));newChat('course_a').dispatchEvent(new MouseEvent('click',{bubbles:true}));});

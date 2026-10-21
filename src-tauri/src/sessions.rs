@@ -1238,7 +1238,8 @@ pub fn review_items_all(store: &mut ContentStore) -> Result<Vec<Value>> {
             .get("createdAt")
             .cloned()
             .unwrap_or_else(|| json!(doc.modified_at));
-        let item = json!({"id":doc.id,"front":front,"back":back,"sectionId":section_id,"source":if kind=="error"{"错题"}else if data.get("origin").and_then(Value::as_str)==Some("pi-tool"){"AI复习（待确认）"}else{"手动复习"},"sessionId":session_id,"tags":data.get("tags").cloned().unwrap_or_else(||json!([])),"createdAt":stamp});
+        let course_id = session_cache.get(&session_id).and_then(|session| session.course_id.as_deref());
+        let item = json!({"id":doc.id,"front":front,"back":back,"sectionId":section_id,"courseId":course_id,"source":if kind=="error"{"错题"}else if data.get("origin").and_then(Value::as_str)==Some("pi-tool"){"AI复习（待确认）"}else{"手动复习"},"sessionId":session_id,"tags":data.get("tags").cloned().unwrap_or_else(||json!([])),"createdAt":stamp});
         if grouped.get(&key).is_none_or(|old| {
             old["createdAt"].as_str().unwrap_or("") <= item["createdAt"].as_str().unwrap_or("")
         }) {

@@ -534,6 +534,11 @@ mod tests {
         };
         let receipt = crate::learning_tools::execute(&engine, &scope, "record_empty", "record_question", json!({"question":"A course question"})).unwrap();
         assert_eq!(receipt["persisted"], true);
+        let card = crate::learning_tools::execute(&engine, &scope, "card_empty", "create_review_card", json!({"front":"No materials yet","back":"Synthetic only"})).unwrap();
+        assert_eq!(card["persisted"], true);
+        let items = crate::review::list_for_course(&mut engine.lock().unwrap().content, "No materials yet", chat.course_id.as_deref()).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["sourceDocumentId"], serde_json::Value::Null);
         let saved = sessions::get(&mut engine.lock().unwrap().content, &chat.id).unwrap();
         assert!(saved.entries[0].related_ids.is_empty());
         assert!(saved.section_id.is_empty());
