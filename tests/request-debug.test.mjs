@@ -22,6 +22,20 @@ test('only Settings contains the debug switch; lifecycle clears departed session
   const config=JSON.parse(readFileSync(new URL('../src-tauri/tauri.conf.json',import.meta.url)));
   assert.equal(config.bundle.resources['../pi-sidecar/request-debug.mjs'],'pi-sidecar/request-debug.mjs');
 });
+test('debug commands pass through the real native adapter to Tauri invoke',async()=>{
+  const {build}=await import('esbuild');const {unlink}=await import('node:fs/promises');
+  const file=new URL(`./.debug-native-${process.pid}.mjs`,import.meta.url);
+  await build({entryPoints:['src/native.ts'],outfile:file.pathname,bundle:true,packages:'external',platform:'node',format:'esm',plugins:[{name:'tauri-invoke',setup(b){b.onResolve({filter:/^@tauri-apps\/api\/core$/},()=>({path:'core',namespace:'fixture'}));b.onLoad({filter:/.*/,namespace:'fixture'},()=>({contents:'export const invoke=(...args)=>globalThis.debugNativeInvoke(...args);',loader:'js'}));}}]});
+  const calls=[];globalThis.debugNativeInvoke=async(command,args)=>{calls.push([command,args]);return {enabled:args.enabled??false,records:[],dropped:0};};
+  try{
+    const {nativeCall}=await import(file.href);
+    for(const [command,args] of [['request_debug_get',{}],['request_debug_set',{enabled:true}],['request_debug_enter_session',{sessionId:'synthetic-session'}],['request_debug_clear_session',{sessionId:'synthetic-session'}]]) {
+      await nativeCall(command,args);assert.deepEqual(calls.at(-1),[command,args]);
+    }
+    assert.equal(calls.length,4);
+    await assert.rejects(nativeCall('request_debug_not_registered',{}));assert.equal(calls.length,4);
+  }finally{delete globalThis.debugNativeInvoke;await unlink(file);}
+});
 test('real settings component toggles capture and clears shown request after disabling',async()=>{
   const {build}=await import('esbuild');const {JSDOM}=await import('jsdom');const {unlink}=await import('node:fs/promises');
   const dom=new JSDOM('<div id="root"></div>',{url:'http://127.0.0.1/',pretendToBeVisual:true});Object.assign(globalThis,{window:dom.window,document:dom.window.document,IS_REACT_ACT_ENVIRONMENT:true});Object.defineProperty(globalThis,'navigator',{configurable:true,value:dom.window.navigator});
