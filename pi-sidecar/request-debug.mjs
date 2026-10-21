@@ -7,11 +7,10 @@ export function redactDebug(value, apiKey = '', extraSecrets = []) {
   function scan(input) {
     const normalized=input.replace(/\\"/g,'"');
     for(const match of normalized.matchAll(assignment)) {const raw=match[1]??match[2]??match[3];if(raw) {secrets.add(raw);try{secrets.add(JSON.parse('"'+raw+'"'));}catch{}}}
-    for(const match of normalized.matchAll(/(?:authorization["']?\s*[:=]\s*["']?)([^\r\n"']+)/gi)) {
-      const raw=match[1].trim();secrets.add(raw);for(const part of raw.split(/\s+/).slice(1))if(part)secrets.add(part);
-    }
-    for(const match of normalized.matchAll(/cookie["']?\s*[:=]\s*["']?([^\r\n"']+)/gi)) {
-      for(const pair of match[1].split(';')){const at=pair.indexOf('=');if(at>=0){const token=pair.slice(at+1).trim();if(token)secrets.add(token);}}
+    for(const match of normalized.matchAll(/(?:authorization|proxy-authorization|cookie|set-cookie)["']?\s*[:=]\s*([^\r\n]+)/gi)) {
+      const raw=match[1].trim();if(raw)secrets.add(raw);
+      for(const quoted of raw.matchAll(/["']([^"']+)["']/g))secrets.add(quoted[1]);
+      for(const part of raw.split(/[;,]/)){const at=part.indexOf('=');const value=(at>=0?part.slice(at+1):part.replace(/^\S+\s+/, '')).trim().replace(/^["']|["']$/g,'');if(value)secrets.add(value);}
     }
     for(const match of normalized.matchAll(/\b(?:Bearer|Basic)\s+([a-z0-9+/_=.:-]+)/gi))secrets.add(match[1]);
   }
@@ -26,7 +25,7 @@ export function redactDebug(value, apiKey = '', extraSecrets = []) {
   const forms=[...new Set([...secrets].flatMap(secret=>[secret,JSON.stringify(secret).slice(1,-1),encodeURIComponent(secret)]))].filter(Boolean).sort((a,b)=>b.length-a.length);
   // One pass: inserted markers are never scanned for shorter secrets.
   const pattern=forms.length?new RegExp(forms.map(secret=>secret.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')).join('|'),'g'):null;
-  const text=input=>(pattern?input.replace(pattern,'[REDACTED]'):input).replace(/\b(?:sk-[a-z0-9_-]{8,}|ghp_[a-z0-9]+|eyJ[a-z0-9_-]+\.[a-z0-9_-]+\.[a-z0-9_-]+)\b/gi,'[REDACTED]');
+  const text=input=>{const headersHidden=input.replace(/\b(?:authorization|proxy-authorization|cookie|set-cookie)\s*[:=]\s*[^\r\n]*/gi,'认证信息: [REDACTED]');return (pattern?headersHidden.replace(pattern,'[REDACTED]'):headersHidden).replace(/\b(?:sk-[a-z0-9_-]{8,}|ghp_[a-z0-9]+|eyJ[a-z0-9_-]+\.[a-z0-9_-]+\.[a-z0-9_-]+)\b/gi,'[REDACTED]');};
   function visit(item) {
     if(typeof item==='string'){try{const nested=JSON.parse(item);if(nested&&typeof nested==='object')return JSON.stringify(visit(nested));}catch{}return text(item);}
     if(Array.isArray(item))return item.map(visit);

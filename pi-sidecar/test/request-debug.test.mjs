@@ -69,3 +69,7 @@ test('embedded JSON, quoted assignments, auth schemes, cookies and camel credent
   const req=new Request('http://localhost/',{method:'POST',body:JSON.stringify({password:'D',token:'E',secret:'R',accessToken:'A',refreshToken:'C',api_key:'T',text:'D'.repeat(210000)})});
   const snapshot=await snapshotRequest(req,secret);assert.equal(snapshot.complete,false);assert.match(snapshot.omitted,/脱敏后超过/);assert.ok(JSON.stringify(snapshot).length<1000);
 });
+test('quoted Cookie and Digest authentication lines are entirely hidden, including repeated values',()=>{
+  const body={text:'Authorization: Digest username="private-digest-user", nonce="private-digest-nonce", response="private-digest-secret"\nCookie: session="private-cookie-one"; auth="private-cookie-two"',echo:'private-digest-user private-digest-nonce private-digest-secret private-cookie-one private-cookie-two'};
+  assert.doesNotMatch(JSON.stringify(redactDebug(body,secret)),/private-[a-z-]+/);
+});
