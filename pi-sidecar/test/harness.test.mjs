@@ -8,7 +8,7 @@ import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Agent } from '@earendil-works/pi-agent-core';
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai/utils/event-stream';
-import { runLearningAgent, MODEL_ID, FIXED_SYSTEM, normalizeEndpoint, createModel, safeErrorEvent } from '../harness.mjs';
+import { runLearningAgent, MODEL_ID, normalizeEndpoint, createModel, safeErrorEvent } from '../harness.mjs';
 
 const SECRET = 'fixture-secret-not-a-real-key';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -89,15 +89,15 @@ test('only Coding Plan official endpoints or localhost fixtures are accepted', (
   for (const endpoint of ['https://api.z.ai/api/paas/v4', 'https://open.bigmodel.cn/api/paas/v4', 'https://example.com/v1', 'http://api.z.ai/api/coding/paas/v4', 'https://@api.z.ai/api/coding/paas/v4', 'https://api.z.ai/api/coding/paas/v4?key=bad']) assert.throws(() => normalizeEndpoint(endpoint));
   assert.throws(() => createModel({ ...request().settings, model: 'another-model' }));
 });
-test('real Pi Agent has empty tools, fixed system, explicit Rust history, and streams', async () => {
+test('real Pi Agent has empty tools, only a short clock system, explicit Rust history, and streams', async () => {
   const events = [];
   let actualAgent;
-  const result = await runLearningAgent(request(), (event) => events.push(event), {
+  const input = {...request(),timeContext:{referenceTime:'2026-10-21T09:00:00Z',timeZone:'Etc/UTC'}};
+  const result = await runLearningAgent(input, (event) => events.push(event), {
     onAgent: (agent) => { actualAgent = agent; assert(agent instanceof Agent); assert.deepEqual(agent.state.tools, []); },
     streamFn: fakeStream('fixture 文本', { inspect: (model, context) => {
       assert.equal(model.id, MODEL_ID); assert.equal(model.compat.thinkingFormat, 'zai');
-      assert(context.messages[0].content.startsWith(`${FIXED_SYSTEM}\n\n当前时间：`));
-      assert(context.messages[0].content.includes('当前时间：'));
+      assert.equal(context.messages[0].content,'\n\n当前时间：2026-10-21T09:00:00+00:00（Etc/UTC）');
 
       assert(!JSON.stringify(context).includes('UNTRUSTED SYSTEM'));
       assert(context.messages.some((message) => message.role === 'assistant'));
