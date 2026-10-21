@@ -59,9 +59,10 @@ pub fn clear_session(session: &str) {
     if s.active_session.as_deref()==Some(session) {s.active_session=Some(String::new());}
 }
 pub fn enter_session(session: &str) { state().lock().unwrap_or_else(|e|e.into_inner()).active_session=Some(session.into()); }
-pub fn register(run: &str, metadata: Value) {
+pub fn register(run: &str, mut metadata: Value) {
     let mut s=state().lock().unwrap_or_else(|e|e.into_inner());
     if !s.enabled { return; }
+    metadata["retry"]=json!(s.metadata.iter().any(|(id,m)|id!=run && m["sessionId"]==metadata["sessionId"] && m["userEntryId"]==metadata["userEntryId"] && !metadata["userEntryId"].is_null()));
     if s.metadata.len()>=80 { s.metadata.remove(0); }
     s.metadata.push((run.into(),metadata));
 }

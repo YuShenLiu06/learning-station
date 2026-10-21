@@ -37,7 +37,7 @@ export function redactDebug(value, apiKey = '', extraSecrets = []) {
   return visit(value);
 }
 export async function snapshotRequest(request, apiKey) {
-  const headerSecrets=[...request.headers].filter(([key])=>!/^(content-type|accept|anthropic-version)$/i.test(key)).flatMap(([,value])=>[value,...value.split(/[;= ]/u).filter(part=>part.length>3)]);
+  const headerSecrets=[...request.headers].filter(([key])=>/auth|api[-_]?key|credential|cookie|secret|token|password/i.test(key)).flatMap(([,value])=>[value,...value.split(/[;= ]/u).filter(part=>part.length>3)]);
   const headers = redactDebug(Object.fromEntries([...request.headers].map(([key,value]) => [key, /^(content-type|accept|anthropic-version)$/i.test(key) ? value : '[REDACTED]'])),apiKey,headerSecrets);
   const size = Number(request.headers.get('content-length'));
   if (size > DEBUG_BODY_LIMIT) return { headers, complete:false, bodyBytes:size, omitted:'整个请求体：超过 256 KiB 捕获上限', body:null };
