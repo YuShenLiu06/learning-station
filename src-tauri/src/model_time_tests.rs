@@ -224,13 +224,26 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
             )
             .unwrap();
         }
-        let messages =
-            crate::generation::messages_with_intent(&request, &ctx, &session, Some(&intent));
         let clock = crate::time_context::for_operation(
             &state,
             &format!("generation:{}:{}", session.id, entry_id),
         )
         .unwrap();
+        let messages = {
+            let c = e.lock().unwrap();
+            let projection = crate::context_bridge::ContextBridge::snapshot(
+                &c.state_dir, &c.content, &session, &ctx,
+            ).unwrap();
+            crate::context_bridge::ContextBridge::freeze(
+                &request, &ctx, &session, Some(&intent), &projection, clock.clone(),
+            ).unwrap().messages
+        };
+        let native = {
+            let c = e.lock().unwrap();
+            let markdown = c.content.read(&session.id).unwrap().content;
+            crate::native_session::prepare(&state, &session, &format!("time_run_{i}"), &entry_id,
+                ctx.manifest.iter().map(|m|m.id.clone()).collect(), false, vec![], &markdown).unwrap()
+        };
         let settings = ModelSettings {
             configured: true,
             provider: "custom".into(),
@@ -256,7 +269,7 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
             Some(RequestContext {
                 debug_identity: None, debug_registrations: None,
                 output_validator: None,
-                native_session: None,
+                native_session: Some(native),
                 context_observer: None,
                 tool_recovery: None,
                 material_changes: None,
@@ -279,61 +292,23 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
             .unwrap()["content"]
             .as_str()
             .unwrap();
-        assert!(sys.contains("AI回答引用是用户明确选择的历史AI文本"));
         assert!(!sys.contains("IGNORE_ALL_SYSTEM_RULES"));
-        let request_payload = p["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|m| m["content"].as_str())
-            .find_map(|text| {
-                serde_json::from_str::<Value>(text)
-                    .ok()
-                    .filter(|v| v["type"] == "learning_request")
-            })
-            .expect("real Pi request contains the Rust learning request");
-        assert_eq!(
-            request_payload["assistantReferenceManifest"]
-                .as_array()
-                .unwrap()
-                .len(),
-            if i == 0 { 1 } else { 0 }
-        );
-        assert_eq!(
-            request_payload["exerciseReferenceManifest"]
-                .as_array()
-                .unwrap()
-                .len(),
-            if i == 0 { 1 } else { 0 }
-        );
-        assert!(!p.to_string().contains("UNREVEALED_TYPED_ANSWER_SENTINEL"));
-        assert!(!p
-            .to_string()
-            .contains("UNREVEALED_TYPED_EXPLANATION_SENTINEL"));
-        if i == 0 {
-            assert!(request_payload["context"]
-                .as_str()
-                .unwrap()
-                .contains("quoted_exercise_part"));
-        }
-        if i == 0 {
-            assert!(request_payload["context"]
-                .as_str()
-                .unwrap()
-                .contains("quoted_ai_answer"));
-        }
-        assert!(!request_payload["manifest"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|v| v["path"].as_str().unwrap_or("").starts_with("ai-answer/")));
-        assert!(sys.contains("从用户问题发起的新探索"));
-        assert!(sys.contains("不是教材缺失"));
-        assert!(sys.contains("不额外逐条询问保存许可"));
-        assert!(sys.contains("爱因斯坦是什么人？"));
-        assert!(sys.contains("referenceTime:"));
-        assert!(sys.contains("timeZone:"));
-        assert!(sys.contains("name: learning-explore"));
+        assert!(!sys.contains("name: learning-explore"));
+        let messages = p["messages"].as_array().unwrap();
+        let texts: Vec<String> = messages.iter().map(|m| m["content"].as_str().map(str::to_owned)
+            .unwrap_or_else(||m["content"].as_array().into_iter().flatten().filter_map(|p|p["text"].as_str()).collect())).collect();
+        let all_text = texts.join("\n");
+        let payloads: Vec<Value> = texts.iter().filter_map(|t|serde_json::from_str(t).ok()).collect();
+        let time = payloads.iter().find(|v|v["referenceTime"].is_string()).expect("independent frozen time");
+        assert!(time["timeZone"].is_string());
+        assert!(!all_text.contains("learning_request"));
+        assert!(!all_text.contains("contextBridgeManifest"));
+        assert!(!all_text.contains("UNREVEALED_TYPED_ANSWER_SENTINEL"));
+        assert!(!all_text.contains("UNREVEALED_TYPED_EXPLANATION_SENTINEL"));
+        assert_eq!(all_text.contains("quoted_exercise_part"), i == 0);
+        assert_eq!(all_text.contains("quoted_ai_answer"), i == 0);
+        assert!(!sys.contains("referenceTime:"));
+        assert!(!sys.contains("爱因斯坦是什么人？"));
         let all = p.to_string();
         assert!(all.contains("LINKED_MATERIAL_MUST_SURVIVE"));
         assert!(all.contains(if i == 0 {

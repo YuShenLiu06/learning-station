@@ -292,10 +292,10 @@ async fn native_exploration_context_reaches_first_and_reopened_provider_requests
     for (round, packet) in requests.iter().enumerate() {
         let messages = packet["messages"].as_array().unwrap();
         let system = text(messages.iter().find(|message| message["role"] == "system").unwrap());
-        let turn = messages.iter().map(&text)
-            .filter_map(|text| serde_json::from_str::<Value>(&text).ok())
-            .filter(|value| value["type"] == "learning_request").last()
-            .expect("provider must receive the actual native learning turn");
+        let payloads: Vec<Value> = messages.iter().map(&text).filter_map(|text|serde_json::from_str(&text).ok()).collect();
+        let exploration = payloads.iter().find(|value| value["scenario"] == "question-led-exploration");
+        assert!(!packet.to_string().contains("learning_request"));
+        assert!(!packet.to_string().contains("contextBridgeManifest"));
         if round < 2 {
             let expected = json!({
                 "origin":"exploration-entry", "originalUserEntryId":launch.user_entry_id,
@@ -303,17 +303,13 @@ async fn native_exploration_context_reaches_first_and_reopened_provider_requests
                 "userGoal":goals[round], "storageDocumentId":launch.document.id,
                 "materialSourceIds":[],
             });
-            assert_eq!(turn["explorationContext"], expected, "ContextBridge/native turn lost exploration context");
-            let system_context = system.lines().rev().find_map(|line| serde_json::from_str::<Value>(line).ok())
-                .expect("provider system prompt must carry the exploration object, not only turn metadata");
-            assert_eq!(system_context, expected, "Rust/model/native system wiring lost the frozen exploration context");
-            assert!(system.contains("从用户问题发起的新探索"));
-            assert!(system.contains("不是教材缺失"));
+            assert_eq!(exploration.unwrap(), &json!({"scenario":"question-led-exploration", "storageDocumentId":launch.document.id, "materialSourceIds":[]}));
+            assert!(!system.contains(goals[0]));
             assert_eq!(serde_json::to_value(&runs[round].exploration_context).unwrap(), expected);
             assert!(!packet.to_string().contains("ORDINARY_NOTE_MUST_NOT_AUTO_LOAD"));
         } else {
             assert!(runs[round].exploration_context.is_none());
-            assert!(turn["explorationContext"].is_null());
+            assert!(exploration.is_none());
             assert!(!system.contains("从用户问题发起的新探索"));
             for private in [goals[0], goals[1], "UPGRADE_HISTORY_MARKER", "ORDINARY_NOTE_MUST_NOT_AUTO_LOAD"] {
                 assert!(!packet.to_string().contains(private), "ordinary course inherited {private}");
@@ -329,7 +325,9 @@ async fn native_exploration_context_reaches_first_and_reopened_provider_requests
         .lines().map(|line| serde_json::from_str(line).unwrap()).collect();
     assert_eq!(entries[0]["id"], hash(&launch.session.id));
     assert_eq!(entries.iter().filter(|entry| entry["type"] == "message" && entry["message"]["role"] == "user").count(), 2);
-    assert!(entries.iter().any(|entry| entry["type"] == "custom_message"
-        && entry["customType"] == "learning-station-turn"
+    assert_eq!(entries.iter().filter(|entry| entry["type"] == "message"
+        && entry["message"]["role"] == "user"
+        && text(&entry["message"]) == goals[1]).count(), 1);
+    assert!(!entries.iter().any(|entry| entry["type"] == "custom_message"
         && entry["content"].as_str().unwrap_or("").contains(goals[1])));
 }

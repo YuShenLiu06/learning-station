@@ -400,7 +400,7 @@ test('read returns results without persisted receipts; write and bash require th
   assert.equal(failed.isError, true);
 });
 
-test('authorized workspace tools register on top of question mode with an explicit boundary notice', { timeout: 4000 }, async () => {
+test('authorized workspace tools register without exposing internal authorization tiers', { timeout: 4000 }, async () => {
   let system = '';
   await withServer((body, res) => { system = body.messages[0].content; sse(res, { text: 'fixture answer', final: true }); }, async (endpoint) => {
     const input = request(endpoint);
@@ -408,9 +408,9 @@ test('authorized workspace tools register on top of question mode with an explic
     const result = await runLearningAgent(input, () => {}, { requestTool: async () => { throw new Error('unexpected tool'); } });
     assert.equal(result.output, 'fixture answer');
   });
-  assert(system.includes('工具授权档位'));
-  assert(system.includes('会话工作区'));
-  assert(system.includes('read'));
+  assert(!system.includes('工具授权档位'));
+  assert(!system.includes('本机设置'));
+  assert(!system.includes('本轮已注册工具'));
 });
 
 test('create_todo reminderEnabled is an opt-in boolean that requires a time', () => {
@@ -444,3 +444,9 @@ test('card execution needs no loaded skill and cancellation/retry never invents 
     assert.equal(result.structuredContent.ok, false);
   }
 });
+
+ test('exercise tool never expands supplied skill guidance into descriptions',()=>{
+ const plugin=createLearningPlugin({allowedTools:['generate_exercises'],exerciseGuidance:'FULL_SKILL_BODY_SENTINEL',requestTool:async()=>({})});
+ assert(!plugin.tools[0].description.includes('FULL_SKILL_BODY_SENTINEL'));
+ assert(plugin.tools[0].parameters.properties.exercises);
+ });

@@ -463,6 +463,31 @@ fn prepare_mode(state: &Path, session: &Session, ctx: &Context, native: bool) ->
         chains,
     }
 }
+// Keep the durable raw chain intact; only the native model projection uses body coordinates.
+fn native_body_chain(chain: &Chain, source: &MaterialSnapshot) -> Option<Chain> {
+    let mut projected = full(source);
+    projected.frames.clear();
+    let mut previous: Option<String> = None;
+    for (index, frame) in chain.frames.iter().enumerate() {
+        let mut prefix = chain.clone();
+        prefix.frames.truncate(index + 1);
+        let raw = replay(&prefix)?;
+        let (_, body) = crate::content::parse(&raw).ok()?;
+        let version = match frame { Frame::Full { version, .. } | Frame::Diff { version, .. } => version };
+        if previous.as_ref() == Some(&body) {
+            // A metadata-only edit still keeps the actual document version.
+            match projected.frames.last_mut()? {
+                Frame::Full { version: v, .. } | Frame::Diff { version: v, .. } => *v = version.clone(),
+            }
+        } else if let Some(diff) = previous.as_ref().and_then(|old| patch(old, &body, version)) {
+            projected.frames.push(diff);
+        } else {
+            projected.frames = vec![Frame::Full { version: version.clone(), hash: hash(&body), text: body.clone() }];
+        }
+        previous = Some(body);
+    }
+    (previous.as_deref() == Some(source.text.as_str())).then_some(projected)
+}
 impl Prepared {
     /// Separate versioned automatic documents from the existing one-shot material text.
     pub fn native_materials(&self, ctx: &Context) -> Vec<Value> {
@@ -470,17 +495,35 @@ impl Prepared {
             .iter()
             .enumerate()
             .map(|(index, s)| {
-                let mut value: Value = self
-                    .chains
-                    .get(index)
+                let mut source = s.clone();
+                let mut projection_error = false;
+                let body_chain = if s.body_start_char > 0 {
+                    match crate::content::parse(&s.text) {
+                        Ok((_, body)) if s.text.chars().count() - body.chars().count() == s.body_start_char => {
+                            source.total_bytes = s.total_bytes.saturating_sub(s.text.len() - body.len());
+                            source.text = body;
+                        }
+                        _ => {
+                            // A malformed prefix must never fall back to sending raw metadata.
+                            source.text.clear();
+                            source.complete = false;
+                            source.total_bytes = 0;
+                            projection_error = true;
+                        }
+                    }
+                    source.body_start_char = 0;
+                    Some(self.chains.get(index).and_then(|c| native_body_chain(c, &source)).unwrap_or_else(||full(&source)))
+                } else { None };
+                let mut value: Value = body_chain.as_ref().or_else(||self.chains.get(index))
                     .and_then(|c| serde_json::from_str(&rendered(c)).ok())
                     .unwrap_or(json!({"frames":[]}));
-                value["id"] = json!(s.id);
-                value["version"] = json!(s.version);
-                value["range"] = json!(s.range());
-                value["text"] = json!(s.text);
-                value["textHash"] = json!(hash(&s.text));
-                value["bodyStartChar"] = json!(s.body_start_char);
+                value["id"] = json!(source.id);
+                value["version"] = json!(source.version);
+                value["range"] = json!(source.range());
+                value["text"] = json!(source.text);
+                value["textHash"] = json!(hash(&source.text));
+                value["bodyStartChar"] = json!(source.body_start_char);
+                if projection_error { value["projectionError"] = json!("CONTEXT_CONFLICT"); }
                 value
             })
             .collect()
@@ -869,6 +912,74 @@ mod tests {
         }
     }
     #[test]
+    fn native_projection_strips_metadata_from_full_diff_and_body_coordinates() {
+        let (_d, e, id, sid) = setup();
+        let (_, ctx, first) = capture(&e, &sid);
+        let source = &ctx.automatic_materials[0];
+        assert!(source.body_start_char > 0);
+        let original_raw = source.text.clone();
+        let (_, original_body) = content::parse(&source.text).unwrap();
+        let initial = first.native_materials(&ctx).remove(0);
+        assert_eq!(initial["text"], original_body);
+        assert_eq!(initial["textHash"], hash(&original_body));
+        assert_eq!(initial["version"], source.version);
+        assert_eq!(initial["range"]["startChar"], 0);
+        assert_eq!(initial["range"]["endChar"], original_body.chars().count());
+        assert_eq!(initial["bodyStartChar"], 0);
+        assert_eq!(initial["frames"][0]["text"], original_body);
+        assert_eq!(initial["frames"][0]["textHash"], hash(&original_body));
+        answer(&e, &sid, &first, "native_body_answer");
+        edit(&e, &id, &body().replace("Line 080: Original", "Line 080: Body changed"));
+        let (_, next_ctx, next) = capture(&e, &sid);
+        let raw_frames = serde_json::to_string(&next.chains).unwrap();
+        let projected = next.native_materials(&next_ctx).remove(0);
+        assert_eq!(projected["version"], next_ctx.automatic_materials[0].version);
+        let (_, next_body) = content::parse(&next_ctx.automatic_materials[0].text).unwrap();
+        assert_eq!(projected["text"], next_body);
+        assert_eq!(projected["textHash"], hash(&next_body));
+        assert_eq!(projected["range"]["endChar"], next_body.chars().count());
+        assert!(projected["frames"].as_array().unwrap().iter().any(|f|f["kind"] == "diff"));
+        for output in [&initial, &projected] {
+            for internal in ["timestampSource", "createdAt", "updatedAt", "createRequestDigest"] {
+                assert!(!output.to_string().contains(internal), "leaked {internal}");
+            }
+        }
+        assert_eq!(serde_json::to_string(&next.chains).unwrap(), raw_frames);
+        assert_eq!(ctx.automatic_materials[0].text, original_raw);
+        let normalized = native_body_chain(&next.chains[0], &MaterialSnapshot {
+            text: next_body.clone(), body_start_char: 0,
+            total_bytes: next_body.len(), ..next_ctx.automatic_materials[0].clone()
+        }).unwrap();
+        assert_eq!(replay(&normalized).unwrap(), next_body);
+        let (mut metadata, _) = content::parse(&next_ctx.automatic_materials[0].text).unwrap();
+        metadata.extra.insert("createRequestDigest".into(), json!("PRIVATE_METADATA_ONLY_CHANGE"));
+        let metadata_raw = content::serialize(&metadata, &next_body).unwrap();
+        let mut metadata_chain = next.chains[0].clone();
+        metadata_chain.frames.push(patch(&next_ctx.automatic_materials[0].text, &metadata_raw, "metadata-v3").unwrap());
+        metadata_chain.version = "metadata-v3".into();
+        let mut metadata_ctx = next_ctx.clone();
+        let material = &mut metadata_ctx.automatic_materials[0];
+        material.body_start_char = metadata_raw.chars().count() - next_body.chars().count();
+        material.total_bytes = metadata_raw.len();
+        material.text = metadata_raw;
+        material.version = "metadata-v3".into();
+        let metadata_only = Prepared { text: String::new(), stats: json!({}), chains: vec![metadata_chain] }
+            .native_materials(&metadata_ctx).remove(0);
+        assert_eq!(metadata_only["textHash"], projected["textHash"]);
+        assert_eq!(metadata_only["version"], "metadata-v3");
+        assert!(!metadata_only.to_string().contains("PRIVATE_METADATA_ONLY_CHANGE"));
+        let mut prefix_ctx = next_ctx.clone();
+        prefix_ctx.automatic_materials[0].complete = false;
+        assert_eq!(next.native_materials(&prefix_ctx)[0]["range"]["complete"], false);
+        let mut broken = next_ctx;
+        broken.automatic_materials[0].text = "```json\nPRIVATE_UNCLOSED_METADATA".into();
+        let safe = next.native_materials(&broken).remove(0);
+        assert_eq!(safe["text"], "");
+        assert_eq!(safe["projectionError"], "CONTEXT_CONFLICT");
+        assert_eq!(safe["range"]["complete"], false);
+        assert!(!safe.to_string().contains("PRIVATE_UNCLOSED_METADATA"));
+    }
+    #[test]
     fn diff_roundtrips_unicode_blank_lines_newline_and_insertion_removal() {
         for (old, new) in [
             ("原文\n\n尾行", "原文\n改动\n尾行\n"),
@@ -901,4 +1012,8 @@ mod tests {
             assert_eq!(replay(&c).unwrap(), new);
         }
     }
+}
+
+pub(crate) fn bridge_part(prepared: &Prepared, ctx: &Context) -> crate::context_bridge::PromptPart {
+    crate::context_bridge::PromptPart { key: "materials", description: "已授权的本轮材料", value: json!(prepared.native_materials(ctx)) }
 }

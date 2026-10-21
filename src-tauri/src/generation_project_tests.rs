@@ -146,8 +146,8 @@ async fn course_start_without_focus_keeps_readable_versions_separate_from_explic
     .unwrap();
     let wire: Value =
         serde_json::from_str(frozen.messages[0]["content"].as_str().unwrap()).unwrap();
-    assert!(wire["nativeMaterials"].as_array().unwrap().is_empty());
-    assert!(wire["nativeReferences"]
+    assert!(wire["bridge"].as_array().unwrap().iter().find(|p| p["key"] == "materials").unwrap()["value"].as_array().unwrap().is_empty());
+    assert!(wire["bridge"].as_array().unwrap().iter().find(|p| p["key"] == "references").unwrap()["value"]
         .as_str()
         .unwrap()
         .contains("COURSE_A_BODY_NOT_OPENING_CONTEXT"));

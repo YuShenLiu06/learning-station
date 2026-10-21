@@ -891,7 +891,7 @@ fn record_user_and_resume(
     Ok(())
 }
 
-fn default_request(mode: &str) -> &'static str {
+pub(crate) fn default_request(mode: &str) -> &'static str {
     match mode {
         "practice" => "请根据当前材料和学习疑点生成3道针对练习。",
         "feedback" => "请根据本次作答给出有材料依据的反馈，错因仅作为待确认建议。",
@@ -1110,18 +1110,6 @@ pub(crate) fn messages_with_intent(
     vec![
         json!({"role":"system","content":format!("{rules}\n{task}")}),
         json!({"role":"user","content":serde_json::to_string(&json!({"type":"learning_request","explorationContext":intent,"userGoal":request.prompt,"context":ctx.text,"manifest":ctx.manifest,"historyManifest":history_manifest,"assistantReferenceManifest":ctx.assistant_reference_manifest,"exerciseReferenceManifest":ctx.exercise_reference_manifest,"warnings":warnings,"learningHistory":history,"selectedText":request.selection,"question":if request.prompt.trim().is_empty(){default_request(&request.mode)}else{&request.prompt},"mode":request.mode})).unwrap_or_default()}),
-    ]
-}
-
-pub(crate) fn messages_current(
-    request: &GenerationRequest,
-    ctx: &Context,
-    session: &Session,
-    intent: Option<&crate::exploration::ExplorationContext>,
-) -> Vec<Value> {
-    let _ = session;
-    vec![
-        json!({"role":"user","content":serde_json::to_string(&json!({"type":"learning_request","explorationContext":intent,"context":ctx.text,"manifest":ctx.manifest,"assistantReferenceManifest":ctx.assistant_reference_manifest,"exerciseReferenceManifest":ctx.exercise_reference_manifest,"warnings":ctx.warnings.iter().filter(|w|!w.starts_with("TRUNCATED_HISTORY")).collect::<Vec<_>>(),"selectedText":request.selection,"question":if request.prompt.trim().is_empty(){default_request(&request.mode)}else{&request.prompt},"mode":request.mode})).unwrap_or_default()}),
     ]
 }
 

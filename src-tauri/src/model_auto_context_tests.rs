@@ -159,7 +159,7 @@ async fn context_bridge_real_pi_wire_replays_full_diff_once_per_tool_loop_and_fa
             selection: String::new(),
             prompt,
             request_id: format!("bridge_op_{round}"),
-            user_entry_id: Some(user),
+            user_entry_id: Some(user.clone()),
             injections: vec![],
             assistant_references: vec![],
             exercise_references: vec![],
@@ -176,17 +176,17 @@ async fn context_bridge_real_pi_wire_replays_full_diff_once_per_tool_loop_and_fa
         let sent = frozen.messages[0]["content"].as_str().unwrap();
         let json: Value = serde_json::from_str(sent).unwrap();
         assert!(json.get("learningHistory").is_none());
-        assert!(sent.find("\"context\"").unwrap() < sent.rfind("\"question\"").unwrap());
+        let parts = json["bridge"].as_array().unwrap();
+        assert_eq!(parts.iter().map(|p|p["key"].as_str().unwrap()).collect::<Vec<_>>(), vec!["current_time", "references", "materials", "question"]);
         assert_eq!(json["contextBridgeManifest"], frozen.manifest);
-        assert_eq!(json["manifest"], json!(ctx.manifest));
-        assert!(json["turnState"]["turn"]["referenceTime"]
-            .as_str()
-            .is_some());
+        assert!(json.get("manifest").is_none());
+        assert!(json.get("turnState").is_none());
+        assert!(parts[0]["value"]["referenceTime"].as_str().is_some());
         if round == 3 {
-            failed_projection = json["context"].as_str().unwrap().into();
+            failed_projection = parts[2]["value"].to_string();
         }
         if round == 4 {
-            assert_eq!(json["context"], failed_projection);
+            assert_eq!(parts[2]["value"].to_string(), failed_projection);
         }
         projections.push(json.clone());
         let legacy = crate::generation::messages_with_intent(&request, &ctx, &s, None);
@@ -211,6 +211,12 @@ async fn context_bridge_real_pi_wire_replays_full_diff_once_per_tool_loop_and_fa
             .join("state/automatic-context")
             .join(format!("{sid}.json"));
         let prior = std::fs::read(&key_path).ok();
+        let native = {
+            let c = e.lock().unwrap();
+            let markdown = c.content.read(&sid).unwrap().content;
+            crate::native_session::prepare(&c.state_dir, &s, &format!("bridge_run_{round}"),
+                &user, ctx.manifest.iter().map(|m|m.id.clone()).collect(), false, vec![], &markdown).unwrap()
+        };
         let result = generate_scoped(
             ModelCredentials::new(
                 ModelSettings {
@@ -239,7 +245,7 @@ async fn context_bridge_real_pi_wire_replays_full_diff_once_per_tool_loop_and_fa
             Some(RequestContext {
                 debug_identity: None, debug_registrations: None,
                 output_validator: None,
-                native_session: None,
+                native_session: Some(native),
                 context_observer: None,
                 tool_recovery: None,
                 material_changes: None,
@@ -282,14 +288,16 @@ async fn context_bridge_real_pi_wire_replays_full_diff_once_per_tool_loop_and_fa
         sizes[round]["actualApiPayloadBytes"] =
             json!(serde_json::to_vec(&packets[packet_index]).unwrap().len());
     }
-    // Within a live tool loop the original bridge user envelope is present exactly once.
-    let first_user = &packets[0]["messages"][1];
+    // Within a live tool loop Pi receives the original question through its user entry once.
+    let message_text = |m: &Value| m["content"].as_str().map(str::to_owned).unwrap_or_else(||
+        m["content"].as_array().into_iter().flatten().filter_map(|p|p["text"].as_str()).collect::<String>());
+    let first_user = packets[0]["messages"].as_array().unwrap().iter().find(|m| m["role"] == "user" && message_text(m) == "Fixture question 0").expect("normal user question");
     for packet in &packets[..3] {
         let matching = packet["messages"]
             .as_array()
             .unwrap()
             .iter()
-            .filter(|m| m["role"] == "user" && m["content"] == first_user["content"])
+            .filter(|m| m["role"] == "user" && message_text(m) == message_text(first_user))
             .count();
         assert_eq!(matching, 1);
         assert_eq!(packet["max_tokens"], 8192);
@@ -302,7 +310,7 @@ async fn context_bridge_real_pi_wire_replays_full_diff_once_per_tool_loop_and_fa
         .collect::<Vec<_>>();
     assert_eq!(tools.len(), 2);
     for tool in tools {
-        let t = tool["content"].as_str().unwrap();
+        let t = message_text(tool);
         assert!(t.contains("Original public course statement"));
         assert!(!t.contains("unifiedDiff"));
         assert!(!t.contains("readcache"));
@@ -337,7 +345,7 @@ async fn changes_capacity_and_binary_focus_rejections_survive_the_actual_sidecar
         };
         let cp = "a".repeat(40); let tree = "b".repeat(40);
         let focus = json!({"courseId":"capacity_course","commitHash":cp,"materialTreeOid":tree,"paragraphs":if expected == "CONTEXT_CONFLICT" {json!([{ "text":"SYNTHETIC_BINARY_BODY_MUST_NOT_SEND" }])} else {json!([])}});
-        let messages = vec![json!({"role":"user","content":json!({"focus":focus,"question":"Retain this original question","nativeMaterials":[],"nativeReferences":"","contextBridgeManifest":{"version":1,"entries":[]}}).to_string()})];
+        let messages = vec![json!({"role":"user","content":json!({"bridge":[{"key":"focus","description":"本轮聚焦快照","value":focus},{"key":"references","description":"本轮明确引用","value":""},{"key":"question","description":"本轮用户问题","value":"Retain this original question"}],"contextBridgeManifest":{"version":1,"entries":[]}}).to_string()})];
         let value = json!({"checkpoint":{"courseId":"capacity_course","checkpointCommitOid":cp,"materialTreeOid":tree,"excludedFiles":[]},"baseCommitOid":null,"focused":null,"complete":true,"changes":(0..257).map(|n|json!({"path":format!("documents/{n}.md"),"status":"M"})).collect::<Vec<_>>()});
         let value = if expected == "CONTEXT_CONFLICT" {json!({"checkpoint":{"courseId":"capacity_course","checkpointCommitOid":cp,"materialTreeOid":tree,"excludedFiles":[]},"baseCommitOid":null,"focused":{"textUnavailable":"binary"},"complete":true,"changes":[]})} else {value};
         let result = generate_scoped(ModelCredentials::new(ModelSettings { provider:"custom".into(), protocol:PROTOCOL.into(), base_url:"http://127.0.0.1:1/v1".into(), model:"fixture".into(), ..ModelSettings::default() }, "synthetic-capacity-not-real".into()).unwrap(), messages, Arc::new(AtomicBool::new(false)), |_|panic!("Changes rejection must precede model output"), None, ToolPolicy::legacy(false), vec![], Some(RequestContext {
@@ -418,8 +426,9 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
             let session=sessions::get(&mut core.content,&session_id)?;
             let value=crate::material_changes::for_focus(&mut core,&session,&focus,previous.as_deref(),body_previous.as_deref())?;
             let text=value["focused"]["text"].as_str().unwrap();
-            let (_,body)=crate::content::parse(text)?;
-            assert_eq!(value["focused"]["bodyStartChar"].as_u64().unwrap() as usize,text[..text.len()-body.len()].chars().count());
+            assert_eq!(value["focused"]["bodyStartChar"],0);
+            assert_eq!(value["focused"]["textHash"],hash(text));
+            assert!(!text.contains("createRequestDigest"));
             Ok(value)
         });
         let transcript = std::path::PathBuf::from(&native.directory).join("transcript.jsonl");
@@ -437,15 +446,16 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
     if let Some(folder)=std::env::var_os("LS_CHANGES_WIRE_EVIDENCE") { let folder=std::path::PathBuf::from(folder);std::fs::create_dir_all(&folder).unwrap();std::fs::write(folder.join("requests.json"),serde_json::to_vec_pretty(&packets).unwrap()).unwrap(); }
 
     for (round,packet) in packets.iter().enumerate() {
+        for internal in ["createRequestDigest", "timestampSource", "createdAt", "updatedAt", "parentId"] { assert!(!packet.to_string().contains(internal), "internal field leaked: {internal}"); }
         let payloads:Vec<Value>=packet["messages"].as_array().unwrap().iter().filter_map(|m| {let text=m["content"].as_str().map(str::to_owned).unwrap_or_else(||m["content"].as_array().into_iter().flatten().filter_map(|p|p["text"].as_str()).collect::<String>());serde_json::from_str(&text).ok()}).collect();
         for patch in payloads.iter().flat_map(|p|p["frames"].as_array().into_iter().flatten()).filter_map(|f|f["unifiedDiff"].as_str()) {
             let encoded=serde_json::to_string(patch).unwrap();
             assert_eq!(serde_json::to_string(&payloads).unwrap().matches(&encoded).count(),1,"round {round}: complete patch must occur once in the entire request");
         }
-        let turn=payloads.iter().find(|p|p["focus"].is_object()).unwrap();
-        assert!(turn["focus"]["paragraphs"].as_array().unwrap().iter().all(|p|p.get("text").is_none()));
-        assert!(turn["context"].as_str().unwrap().contains("materialRange"));
-        assert!(turn["contextBridgeManifest"]["entries"].as_array().unwrap().iter().any(|e|e["sourceMarkers"]==json!(["citation","material","focus"])));
+        let turn=payloads.iter().find(|p|p["documentId"].is_string() && p["paragraphs"].is_array()).unwrap();
+        assert!(turn["paragraphs"].as_array().unwrap().iter().all(|p|p.get("text").is_none()));
+        assert!(packet.to_string().contains("materialRange"));
+        assert!(!packet.to_string().contains("contextBridgeManifest"));
         if round>=3 {assert!(!turn.to_string().contains("A_FIXED_CHANGED_GIT_BODY"));}
     }
     for packet in &packets[..2] { let text=packet.to_string();assert!(!text.contains("B_NOT_YET_FOCUSED_BODY")&&!text.contains("B_FIXED_SECOND_BODY"));assert_eq!(text.matches("A_FIXED_FIRST_BODY").count(),1); }
@@ -456,7 +466,7 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
     assert!(!packets[5].to_string().contains("B_FIXED_SECOND_BODY"));
     assert!(packets[5].to_string().contains("A_FIXED_CHANGED_GIT_BODY"));
     for packet in &packets[5..] {
-    let frames: Vec<Value> = packet["messages"].as_array().unwrap().iter().filter_map(|m| { let text=m["content"].as_str().map(str::to_owned).unwrap_or_else(||m["content"].as_array().into_iter().flatten().filter_map(|p|p["text"].as_str()).collect::<String>()); serde_json::from_str::<Value>(&text).ok() }).filter(|v| v["type"]=="automatic_material_projection").inspect(|v|assert!(v["bodyStartChar"].as_u64().unwrap()>0)).flat_map(|v|v["frames"].as_array().cloned().unwrap_or_default()).collect();
+    let frames: Vec<Value> = packet["messages"].as_array().unwrap().iter().filter_map(|m| { let text=m["content"].as_str().map(str::to_owned).unwrap_or_else(||m["content"].as_array().into_iter().flatten().filter_map(|p|p["text"].as_str()).collect::<String>()); serde_json::from_str::<Value>(&text).ok() }).filter(|v| v["type"]=="automatic_material_projection").inspect(|v|assert!(v.get("bodyStartChar").is_none())).flat_map(|v|v["frames"].as_array().cloned().unwrap_or_default()).collect();
     assert!(!frames.is_empty() && frames.iter().all(|f|f["kind"]=="full"));
     }
     assert!(packets[3].to_string().contains("A_FIXED_CHANGED_GIT_BODY"));

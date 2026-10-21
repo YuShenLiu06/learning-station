@@ -293,7 +293,7 @@ mod tests {
         assert!(old.matches(&request).unwrap());
         let prompt = crate::context_bridge::ContextBridge::freeze(&request, &old.context, &session, None, &projection, crate::time_context::for_operation(&c.state_dir, "focus-test").unwrap()).unwrap();
         let envelope: Value = serde_json::from_str(prompt.messages[0]["content"].as_str().unwrap()).unwrap();
-        assert_eq!(envelope["focus"], json!(f)); assert_eq!(envelope["activeDocumentId"], a);
+        assert_eq!(envelope["bridge"].as_array().unwrap().iter().find(|part|part["key"]=="focus").unwrap()["value"], json!(f)); assert!(envelope.get("activeDocumentId").is_none());
         drop(c); drop(e);
         let reopened = Engine::new(dir.path().join("library"), dir.path().join("state")).unwrap();
         let mut c = reopened.lock().unwrap(); c.content.refresh().unwrap();
@@ -498,7 +498,7 @@ mod tests {
         let packet = crate::context_bridge::ContextBridge::freeze(&req,ctx,&session,None,&projection,crate::time_context::for_operation(&c.state_dir,"binary-focus").unwrap()).unwrap();
         let envelope:Value = serde_json::from_str(packet.messages[0]["content"].as_str().unwrap()).unwrap();
         assert!(!serde_json::to_string(&envelope).unwrap().contains("SYNTHETIC_BINARY_FOCUS_MARKER"));
-        assert_eq!(envelope["metadataOnlySourceIds"],json!([a])); assert!(envelope["nativeMaterials"].as_array().unwrap().is_empty());
+        assert_eq!(envelope["metadataOnlySourceIds"],json!([a])); assert!(envelope["bridge"].as_array().unwrap().iter().all(|p|p["key"]!="materials"));
         let run:Run = serde_json::from_value(json!({"id":"run_binary_focus","focus":f,"sessionId":sid,"mode":"explain","status":"cancelled","content":"","createdAt":"fixture","updatedAt":"fixture","requestDigest":"fixture","contextSnapshotVersion":1,"contextManifest":ctx.manifest,"courseReadManifest":load(&mut c,&session,&f).unwrap().course_read_manifest})).unwrap();
         let scope = ToolScope { session_id:sid,section_id:a.clone(),run_id:run.id.clone(),allowed_ids:ctx.manifest.iter().map(|m|m.id.clone()).collect() };
         e.runs.lock().unwrap().insert(run.id.clone(),ManagedRun { run,cancel:std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)) });
@@ -628,4 +628,8 @@ mod tests {
             c=e.lock().unwrap();
         }
     }
+}
+
+pub(crate) fn bridge_part(focus: &Focus) -> crate::context_bridge::PromptPart {
+    crate::context_bridge::PromptPart { key: "focus", description: "当前聚焦材料与固定版本", value: serde_json::json!(focus) }
 }
