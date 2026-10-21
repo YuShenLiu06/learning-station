@@ -1,0 +1,16 @@
+{
+  "productName": "学习站 M2 验收",
+  "identifier": "cn.yushen.learning-station.m2qa",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "学习站 · M2本地验收",
+        "width": 1440,
+        "height": 920,
+        "minWidth": 1040,
+        "minHeight": 680
+      }
+    ]
+  }
+}

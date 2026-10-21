@@ -65,3 +65,5 @@ Focus由独立冻结接口传入，仍自动加载聚焦正文；本层空来源
 Focus 使用同 checkpoint 的 Git binary 判定移除自动材料正文，清单保留0字符元数据；`metadataOnlySourceIds` 同步排除 Pi 旧自动材料投影。用户明确选区/引用及经授权的主动文本 read 沿各自原协议，不能把元数据身份当作图片正文读取权限。
 
 历史授权与read目录独立：`nativeSession.authorizedSourceIds` 继续使用课程可见历史来源集合，兼容旧course/folder/exercise编号，不因此授予read权限或注入正文。仍授权的历史与摘要在升级时保留；真实撤权仍触发原生权限边界。
+
+具有Focus的请求按原固定OID读取，后续工作区编辑不会混入该请求；新请求冻结为新版本后，不得重放旧版本回执。回收和课程归属仍核对当前可见性，旧Git对象存在不授予读取权限。交出课程cwd前也复用同一ContentStore回收门禁。

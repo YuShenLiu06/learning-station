@@ -390,6 +390,28 @@ mod tests {
         assert!(query["results"][0]["excerpt"].as_str().unwrap().contains("原文😀"));
         let attachment = crate::authorized_tools::execute(&e, &scope, "read-asset", "read", json!({"sourceId":asset.id})).unwrap();
         assert_eq!(attachment["content"], "Frozen attachment"); assert_eq!(attachment["version"], asset.sha256);
+        // Same accepted Focus still reads its fixed OID. A new frozen request
+        // must not reuse that receipt when its source version has changed.
+        let args = json!({"sourceId":scope.section_id});
+        let refreshed = {
+            let mut c = e.lock().unwrap();
+            let input = request(&c, &scope.session_id, &scope.section_id);
+            let focus = freeze(&mut c, input).unwrap();
+            let session = crate::sessions::get(&mut c.content, &scope.session_id).unwrap();
+            let frozen = load(&mut c, &session, &focus).unwrap();
+            let allowed_ids = frozen.course_read_manifest.as_ref().unwrap().iter().map(|m|m.id.clone()).collect();
+            let run: Run = serde_json::from_value(json!({"focus":focus,"id":"run_focus_refreshed","sessionId":scope.session_id,"mode":"explain","status":"cancelled","content":"","createdAt":"fixture","updatedAt":"fixture","requestDigest":"fixture","contextSnapshotVersion":1,"contextManifest":frozen.context.manifest,"courseReadManifest":frozen.course_read_manifest})).unwrap();
+            let refreshed = ToolScope { session_id:scope.session_id.clone(),section_id:scope.section_id.clone(),run_id:run.id.clone(),allowed_ids };
+            e.runs.lock().unwrap().insert(run.id.clone(),ManagedRun { run,cancel:std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)) });
+            refreshed
+        };
+        assert_eq!(crate::authorized_tools::validate_read_replay(&e,&refreshed,&args,&read).unwrap_err().code,"CONFLICT");
+        {
+            let mut c=e.lock().unwrap();
+            let preview=crate::trash::preview(&mut c.content,&scope.section_id).unwrap();
+            crate::trash::trash(&mut c.content,&scope.section_id,&preview.version,"focus-replay-revoke").unwrap();
+        }
+        assert!(crate::authorized_tools::validate_read_replay(&e,&scope,&args,&read).is_err(),"an old fixed OID never grants current visibility after recycle");
     }
     #[test]
     fn exercise_focus_contains_question_state_without_reference_answers() {
