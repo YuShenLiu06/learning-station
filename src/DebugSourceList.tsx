@@ -1,14 +1,14 @@
 import { useState } from 'react';
 import { ChevronRight, Copy } from 'lucide-react';
 import { DebugJsonView } from './DebugJsonView';
-import { isCurrentQuestion, orderedSources, sourceContent, sourceLabel, sourceValue, sourceReadingContent } from './requestDebug';
+import { isCurrentQuestion, orderedSources, sourceContent, sourceLabel, sourceValue, sourceReadingContent, sourceRole, sourceRound } from './requestDebug';
 import type { DebugRecord, DebugSource } from './requestDebug';
 function SourceRow({record,source,index,reading}: {record:DebugRecord;source:DebugSource;index:number;reading?:boolean}) {
   const [copied,setCopied]=useState('');
   const path=source.path.join(' / ')+(source.start!==undefined?' ['+source.start+','+source.end+')':'');
   async function copy() {try{await navigator.clipboard.writeText(path+(source.sourcePath?'\n'+source.sourcePath:''));setCopied('路径已复制');}catch{setCopied('复制失败，可选中路径复制。');}}
   return <details className={reading?'debug-context-card':'debug-source-row'} open={reading&&(source.name==='learning-station-material'||source.registrationKey==='question')?true:undefined} data-source-key={source.registrationKey}>
-    <summary><span className="debug-item-number">{String(index+1).padStart(2,'0')}</span><span className="debug-card-title"><span className={'debug-source-badge '+source.origin}>{sourceLabel(source)}</span><strong>{source.registrationKey??source.name}</strong>{source.origin==='bridge'&&!source.registrationKey&&<span className="debug-source-badge unregistered">未注册</span>}<span className="debug-source-path">{path}</span></span><ChevronRight className="debug-chevron" size={14}/></summary>
+    <summary><span className="debug-item-number">{String(index+1).padStart(2,'0')}</span><span className="debug-card-title"><span className={'debug-source-badge '+source.origin}>{sourceLabel(source)}</span><strong>{source.registrationKey??source.name}</strong><span className="debug-source-badge">{sourceRole(record,source)} · {sourceRound(record,source)}</span>{source.origin==='bridge'&&!source.registrationKey&&<span className="debug-source-badge unregistered">未注册</span>}<span className="debug-source-path">{path}</span></span><ChevronRight className="debug-chevron" size={14}/></summary>
     <div className="debug-context-body">{source.description&&<p className="debug-source-description">{source.description}</p>}<pre>{reading?sourceReadingContent(record,source):sourceContent(record,source)}</pre><div className="debug-source-location">{source.sourcePath&&<code>{source.sourcePath}</code>}{source.runId&&<span>run · {source.runId}</span>}{source.userEntryId&&<span>userEntry · {source.userEntryId}</span>}<button className="quiet-button" onClick={()=>{void copy();}} aria-label={'复制来源路径 '+String(index+1)}><Copy size={12}/>复制路径</button>{copied&&<span role="status">{copied}</span>}</div></div>
   </details>;
 }

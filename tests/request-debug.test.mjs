@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
-import {requestText,requestDiff,orderedSources,sourceContent,sourceReadingContent} from '../src/requestDebug.ts';
+import {requestText,requestDiff,orderedSources,sourceContent,sourceReadingContent,sourceRole,sourceRound,isCurrentQuestion} from '../src/requestDebug.ts';
 const record=(sequence,session,body,extra={})=>({sequence,identity:{sessionId:session},complete:true,body,...extra});
 test('actual captured JSON strings expose Focus, citations and Changes; diff never crosses sessions',()=>{
   const before=record(1,'s1',{messages:[{role:'user',content:JSON.stringify({focus:{body:'Focus A'},citationContext:'citation A',changes:'Changes A'})}]});
@@ -79,4 +79,12 @@ test('reading shows actual full or diff text without protocol hash fields or sec
  const source={path:['messages',0,'content'],origin:'bridge',name:'learning-station-material'};
  assert.equal(sourceReadingContent(r,source),body);
  assert.doesNotMatch(sourceReadingContent(r,source),/HASH_ONLY_FOR_JSON/);
+});
+test('timing annotations use actual wire role and original round without moving messages',()=>{
+ const r=record(4,'s',{messages:[{role:'user',content:'test'},{role:'assistant',content:null,tool_calls:[{id:'c'}]},{role:'user',content:'test'}]},{identity:{sessionId:'s',runId:'new-run',userEntryId:'new-user'}});
+ const old={path:['messages',0,'content'],origin:'user',registrationKey:'question',userEntryId:'old-user'},current={...old,path:['messages',2,'content'],userEntryId:'new-user'},call={path:['messages',1],origin:'model',name:'assistant · tool_calls'};
+ r.sources=[current,call,old];
+ assert.deepEqual(orderedSources(r).map(s=>s.path[1]),[0,1,2]);
+ assert.equal(sourceRole(r,call),'assistant');assert.equal(sourceRound(r,old),'历史轮次');assert.equal(sourceRound(r,current),'本轮');assert.equal(sourceRound(r,call),'轮次未定位');
+ assert.equal(isCurrentQuestion(r,old),false);assert.equal(isCurrentQuestion(r,current),true);assert.match(sourceContent(r,call),/tool_calls/);
 });

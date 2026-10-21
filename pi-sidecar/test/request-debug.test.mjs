@@ -52,6 +52,8 @@ test('real Pi provider sends every tool turn and labels continuation; no extra m
     for(let i=0;i<2;i++)assert.deepEqual(records[i].body,server.packets[i].body);
     assert.equal(records[0].phase,'initial');assert.equal(records[1].phase,'tool_continuation');
     assert.equal(records[1].body.messages.at(-1).role,'tool');assert.ok(records[0].body.tools.length);
+    const toolCalls=records[1].body.messages.findIndex(m=>m.role==='assistant'&&m.tool_calls?.length);
+    assert.ok(toolCalls>=0);assert.ok(records[1].sources.some(s=>s.path[0]==='messages'&&s.path[1]===toolCalls&&s.origin==='model'&&s.name.includes('tool_calls')));
   }finally{await server.close();}
 });
 test('Anthropic actual system/tools/parameters captured, auth redacted',async()=>{
@@ -88,6 +90,11 @@ test('actual native projection binds named custom sources to final Request and r
     assert.ok(capture.sources.some(s=>s.origin==='user'&&s.registrationKey==='question'));assert.ok(capture.sources.some(s=>s.origin==='pi'&&s.name==='cwd'));
     assert.equal(capture.registrations[0].key,'stable');assert.equal(capture.registrations[0].lifetime,'Stable');assert.doesNotMatch(JSON.stringify(capture),/private-registration-key/);
     for(const source of capture.sources){let value=capture.body;for(const key of source.path)value=value[key];assert.equal(typeof value,'string');}
+    const nextEvents=[];
+    await runLearningAgent({...request,apiKey:secret,nativeSession:{...request.nativeSession,runId:'sources_run_2',userEntryId:'sources_user_2'}},async e=>nextEvents.push(e),{requestTool:async call=>call.type==='debug_probe'?{result:{epoch:1}}:{result:{synced:true}}});
+    const repeated=nextEvents.find(e=>e.type==='debug_request');assert.deepEqual(repeated.body,server.packets[1].body);assert.equal(server.packets.length,2);
+    assert.deepEqual(repeated.sources.filter(s=>s.registrationKey==='question').map(s=>s.userEntryId),['sources_user','sources_user_2']);
+    assert.ok(repeated.sources.filter(s=>s.registrationKey==='question').every(s=>s.origin==='user'));
   }finally{await server.close();await fs.rm(directory,{recursive:true,force:true});}
 });
 test('source binding never guesses custom roles from user text and resolves ambiguous/mixed fragments honestly',async()=>{
@@ -116,4 +123,31 @@ test('ambiguous identical assistant content keeps its actual wire role without i
   const sources=bindSources({messages:[{role:'assistant',content:'same'},{role:'user',content:'same'}]},{native:[{value:'same',origin:'model',name:'assistant',sourcePath:'one'},{value:'same',origin:'model',name:'assistant',sourcePath:'two'}]});
   assert.equal(sources[0].origin,'model');assert.equal(sources[0].sourcePath,'unmapped');assert.equal(sources[0].runId,undefined);
   assert.equal(sources[1].origin,'unknown');assert.equal(sources[1].registrationKey,undefined);
+});
+test('repeated questions bind only through complete ordered native user occurrences',async()=>{
+  const {bindSources}=await import('../request-debug.mjs');
+  const body={messages:[{role:'user',content:[{type:'text',text:'test'}]},{role:'assistant',content:'answer'},{role:'user',content:[{type:'text',text:'test'}]}]};
+  const native=[{value:'test',origin:'user',registrationKey:'question',name:'user',runId:'old-run',userEntryId:'old-user'},{value:'answer',origin:'model',name:'assistant'},{value:'test',origin:'user',registrationKey:'question',name:'user',runId:'current-run',userEntryId:'current-user'}];
+  const sources=bindSources(body,{native});
+  assert.deepEqual(sources.filter(s=>s.registrationKey==='question').map(s=>[s.path[1],s.userEntryId]),[[0,'old-user'],[2,'current-user']]);
+  const ambiguous=bindSources({messages:[body.messages[0]]},{native});assert.equal(ambiguous[0].origin,'unknown');assert.equal(ambiguous[0].userEntryId,undefined);
+  const mixed=bindSources(body,{native:[native[0],{...native[2],origin:'bridge',registrationKey:'references'}]});assert.ok(mixed.every(s=>s.registrationKey===undefined));
+});
+test('null and empty assistant bodies retain tool-call timing nodes without changing wire',async()=>{
+ const {bindSources}=await import('../request-debug.mjs');
+ for(const content of [null,'',[],undefined]){
+  const body={messages:[{role:'user',content:'question'},{role:'assistant',content,tool_calls:[{id:'call-1',type:'function',function:{name:'read',arguments:'{}'}}]},{role:'tool',content:'result',tool_call_id:'call-1'}]};
+  const original=JSON.stringify(body),sources=bindSources(body);
+  assert.deepEqual(sources.map(s=>s.path[1]),[0,1,2]);assert.equal(sources[1].origin,'model');assert.match(sources[1].name,/tool_calls/);assert.deepEqual(sources[1].path,['messages',1]);assert.equal(JSON.stringify(body),original);
+ }
+});
+test('debug capture keeps the same Request-boundary registrations while its body is read asynchronously',async()=>{
+ let controller;const body=new ReadableStream({start(c){controller=c;}});
+ const registrations=[{key:'question',value:'frozen question'}];
+ const trace={native:[{value:'frozen question',origin:'user',registrationKey:'question',name:'user',runId:'frozen-run',userEntryId:'frozen-user'}],registrations:[{key:'current_time',value:{referenceTime:'frozen-time'},runId:'frozen-run'}]};
+ const request=new Request('https://synthetic.invalid/',{method:'POST',body,duplex:'half'});
+ const pending=snapshotRequest(request,'synthetic-only',{registrations,sources:()=>trace});
+ registrations[0].value='later edit';trace.native[0].runId='later-run';trace.registrations[0].value.referenceTime='later-time';
+ controller.enqueue(new TextEncoder().encode(JSON.stringify({messages:[{role:'user',content:'frozen question'}]})));controller.close();
+ const capture=await pending;assert.equal(capture.complete,true);assert.equal(capture.registrations[0].value,'frozen question');assert.equal(capture.projectionRegistrations[0].value.referenceTime,'frozen-time');assert.equal(capture.sources[0].runId,'frozen-run');
 });

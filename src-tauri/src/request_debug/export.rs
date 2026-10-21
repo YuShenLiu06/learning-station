@@ -100,7 +100,7 @@ pub(super) fn document(record: &Value) -> Result<Value> {
         "request":{"sequence":record["sequence"],"time":record["time"],"phase":record["phase"],"protocol":record["protocol"],"identity":record["identity"]},
         "registrationSnapshot":{"complete":registration_complete,"status":if registration_complete {"完整冻结输入；数组顺序不是实发顺序"} else {"不完整：快照缺失或省略；缺失内容无法导出，未从最终请求反推补造"},"entries":snapshot_entries(registrations,&entries)},
         "projectionSnapshot":{"complete":projection_complete,"status":"Pi 可见的注册值；不是最终 wire 顺序。同一 key 可多值、多位置；最终内容与位置见 finalProjection.entries","entries":snapshot_entries(projections,&entries)},
-        "finalProjection":{"captureComplete":true,"attributionComplete":unknown.is_empty(),"status":"全部已绑定桥片段及本轮问题；保留旧基准片段自身的 run/user 标识，不将原生历史用户消息混入桥导出；按最终消息及片段顺序排列","entries":entries,"unattributedLocations":unknown},
+        "finalProjection":{"captureComplete":true,"attributionComplete":unknown.is_empty(),"status":if unknown.is_empty() {"已定位的桥片段及本轮问题；保留各片段自身的 run/user 标识；按最终消息及片段顺序排列"} else {"来源绑定不完整：仅列出已定位的桥片段及本轮问题；未归属位置见 unattributedLocations，不补造其来源"},"entries":entries,"unattributedLocations":unknown},
         "snapshotOmitted":record["snapshotOmitted"],
         "decoding":"只解析已知桥容器；引用原文、材料代码与问题中的字面反斜线 n 不二次解码。"
     }))
@@ -194,6 +194,9 @@ pub fn save(sequence: u64, state_dir: &Path) -> Result<Value> {
         assert_eq!(document(&r).unwrap()["registrationSnapshot"]["complete"],false);
         r["sources"][0]["origin"] = json!("unknown");
         assert_eq!(document(&r).unwrap()["finalProjection"]["attributionComplete"],false);
+        let doc=document(&r).unwrap();
+        assert!(doc["finalProjection"]["status"].as_str().unwrap().contains("来源绑定不完整"));
+        assert!(!doc["finalProjection"]["status"].as_str().unwrap().contains("全部已绑定"));
         r["complete"] = json!(false); assert!(document(&r).is_err());
     }
     #[test] fn utf16_fragments_and_registered_question_preserve_original_text() {

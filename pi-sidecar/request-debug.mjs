@@ -37,10 +37,23 @@ export function redactDebug(value, apiKey = '', extraSecrets = []) {
 }
 export function bindSources(body, trace={}) {
   const fragments=[];
+  const counts=new Map(),seen=new Map();
+  const key=(role,value)=>JSON.stringify([role,value]);
+  function count(value,role) {
+    if(typeof value==='string'){const id=key(role,value);counts.set(id,(counts.get(id)??0)+1);}
+    else if(Array.isArray(value))value.forEach(item=>count(item,role));
+    else if(value&&typeof value==='object')for(const [name,item]of Object.entries(value))if(['content','text','system'].includes(name))count(item,role);
+  }
+  if(body.system!==undefined)count(body.system,'system');
+  for(const message of body.messages??[])count(message.content,message.role);
+  const compatible=(source,role)=>role==='assistant'?source.origin==='model':['tool','function'].includes(role)?source.origin==='tool':!['model','tool'].includes(source.origin);
   function visit(value,path,system=false,role=null) {
     if(typeof value==='string') {
-      const candidates=(trace.native??[]).filter(item=>item.value===value&&value);
-      if(candidates.length===1){const {value:ignored,...source}=candidates[0];fragments.push({path,...source});return;}
+      const id=key(role,value),occurrence=seen.get(id)??0;seen.set(id,occurrence+1);
+      const candidates=(trace.native??[]).filter(item=>item.value===value&&value&&compatible(item,role));
+      // Pi's trace is in projection order. Bind repeated text only with a complete
+      // one-to-one occurrence match; a missing/extra occurrence stays unassigned.
+      if(candidates.length&&candidates.length===counts.get(id)&&(candidates.length===1||candidates.every(item=>item.origin==='user'&&item.registrationKey==='question'))){const {value:ignored,...source}=candidates[occurrence];fragments.push({path,...source});return;}
       if(system) {
         const matches=(trace.systems??[]).flatMap(source=>{const at=value.indexOf(source.value);return source.value&&at>=0&&value.indexOf(source.value,at+1)<0?[{path,start:at,end:at+source.value.length,origin:source.origin,name:source.name,sourcePath:source.sourcePath}]:[];});
         if(matches.length){let cursor=0;for(const item of matches.sort((a,b)=>a.start-b.start)){if(item.start<cursor)continue;if(item.start>cursor)fragments.push({path,start:cursor,end:item.start,origin:'unknown',name:'未注册 / 未映射片段'});fragments.push(item);cursor=item.end;}if(cursor<value.length)fragments.push({path,start:cursor,end:value.length,origin:'unknown',name:'未注册 / 未映射片段'});return;}
@@ -51,8 +64,16 @@ export function bindSources(body, trace={}) {
     if(Array.isArray(value))value.forEach((item,index)=>visit(item,[...path,index],system,role));
     else if(value&&typeof value==='object')for(const [key,item]of Object.entries(value))if(key==='content'||key==='text'||key==='system')visit(item,[...path,key],system,role);
   }
-  if(body.system!==undefined)visit(body.system,['system'],true);
-  for(const [index,message]of (body.messages??[]).entries())visit(message.content,['messages',index,'content'],['system','developer'].includes(message.role),message.role);
+  if(body.system!==undefined)visit(body.system,['system'],true,'system');
+  for(const [index,message]of (body.messages??[]).entries()){
+    const before=fragments.length;
+    // Null/empty assistant content can still carry the tool calls which establish
+    // the following tool-result order. Capture the actual message, not invented text.
+    if(message.content!==null&&message.content!==''&&message.content!==undefined)visit(message.content,['messages',index,'content'],['system','developer'].includes(message.role),message.role);
+    const origin=message.role==='assistant'?'model':['tool','function'].includes(message.role)?'tool':'unknown';
+    if(fragments.length===before)fragments.push({path:['messages',index],origin,name:message.role+(message.tool_calls?.length?' · tool_calls':'（无文本正文）'),sourcePath:'wire/messages/'+index});
+    else if(message.tool_calls?.length)fragments.push({path:['messages',index,'tool_calls'],origin:'model',name:'assistant · tool_calls',sourcePath:'wire/messages/'+index+'/tool_calls'});
+  }
   return fragments;
 }
 export async function snapshotRequest(request, apiKey, debug={}) {
@@ -60,6 +81,13 @@ export async function snapshotRequest(request, apiKey, debug={}) {
   const headers = redactDebug(Object.fromEntries([...request.headers].map(([key,value]) => [key, /^(content-type|accept|anthropic-version)$/i.test(key) ? value : '[REDACTED]'])),apiKey,headerSecrets);
   const size = Number(request.headers.get('content-length'));
   if (size > DEBUG_BODY_LIMIT) return { headers, complete:false, bodyBytes:size, omitted:'整个请求体：超过 256 KiB 捕获上限', body:null };
+  // Take trace metadata at this Request boundary, before awaiting its body clone.
+  // Later user edits/projection updates must not be backfilled into this record.
+  const frozenRegistrations=structuredClone(debug.registrations??null);
+  let trace={};try{
+    const current=debug.sources?.()??{};
+    trace={native:(current.native??[]).map(item=>({...item})),systems:(current.systems??[]).map(item=>({...item})),registrations:structuredClone(current.registrations??null)};
+  }catch{}
   // Read a bounded clone; the original Request is passed unchanged to fetch.
   const reader = request.clone().body?.getReader();
   const chunks=[]; let bytes=0;
@@ -71,14 +99,13 @@ export async function snapshotRequest(request, apiKey, debug={}) {
   }
   const body=Buffer.concat(chunks).toString('utf8');
   let parsed; try { parsed=JSON.parse(body); } catch { return {headers,complete:false,bodyBytes:bytes,omitted:'非 JSON 请求体，未显示',body:null}; }
-  let trace={};try{trace=debug.sources?.()??{};}catch{}
   // Do not copy/redact the whole session history into debug metadata: retain only
   // exact candidate strings present in this bounded, final wire payload.
   const texts=[];const collect=value=>{if(typeof value==='string')texts.push(value);else if(value&&typeof value==='object')Object.values(value).forEach(collect);};collect(parsed);
   const values=new Set(texts);
   const projectionRegistrations=trace.registrations??null;
   trace={native:(trace.native??[]).filter(item=>values.has(item.value)),systems:(trace.systems??[]).filter(item=>typeof item.value==='string'&&item.value&&texts.some(text=>text.includes(item.value)))};
-  const safe=redactDebug({body:parsed,registrations:debug.registrations??null,projectionRegistrations,trace},apiKey,headerSecrets);
+  const safe=redactDebug({body:parsed,registrations:frozenRegistrations,projectionRegistrations,trace},apiKey,headerSecrets);
   safe.sources=bindSources(safe.body,safe.trace);
   delete safe.trace;
   if(Buffer.byteLength(JSON.stringify(safe.body))>2*DEBUG_BODY_LIMIT)return {headers,complete:false,bodyBytes:bytes,omitted:'整个请求体：脱敏后超过 512 KiB 展示上限',body:null};
