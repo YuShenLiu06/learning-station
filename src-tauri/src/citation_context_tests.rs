@@ -732,7 +732,7 @@ mod cases {
         .unwrap();
         let envelope: Value =
             serde_json::from_str(frozen.messages[0]["content"].as_str().unwrap()).unwrap();
-        let payload = envelope["nativeReferences"]
+        let payload = envelope["bridge"].as_array().unwrap().iter().find(|p| p["key"] == "references").unwrap()["value"]
             .as_str()
             .unwrap()
             .lines()

@@ -176,17 +176,17 @@ async fn context_bridge_real_pi_wire_replays_full_diff_once_per_tool_loop_and_fa
         let sent = frozen.messages[0]["content"].as_str().unwrap();
         let json: Value = serde_json::from_str(sent).unwrap();
         assert!(json.get("learningHistory").is_none());
-        assert!(sent.find("\"context\"").unwrap() < sent.rfind("\"question\"").unwrap());
+        let parts = json["bridge"].as_array().unwrap();
+        assert_eq!(parts.iter().map(|p|p["key"].as_str().unwrap()).collect::<Vec<_>>(), vec!["current_time", "references", "materials", "question"]);
         assert_eq!(json["contextBridgeManifest"], frozen.manifest);
-        assert_eq!(json["manifest"], json!(ctx.manifest));
-        assert!(json["turnState"]["turn"]["referenceTime"]
-            .as_str()
-            .is_some());
+        assert!(json.get("manifest").is_none());
+        assert!(json.get("turnState").is_none());
+        assert!(parts[0]["value"]["referenceTime"].as_str().is_some());
         if round == 3 {
-            failed_projection = json["context"].as_str().unwrap().into();
+            failed_projection = parts[2]["value"].to_string();
         }
         if round == 4 {
-            assert_eq!(json["context"], failed_projection);
+            assert_eq!(parts[2]["value"].to_string(), failed_projection);
         }
         projections.push(json.clone());
         let legacy = crate::generation::messages_with_intent(&request, &ctx, &s, None);
@@ -282,8 +282,8 @@ async fn context_bridge_real_pi_wire_replays_full_diff_once_per_tool_loop_and_fa
         sizes[round]["actualApiPayloadBytes"] =
             json!(serde_json::to_vec(&packets[packet_index]).unwrap().len());
     }
-    // Within a live tool loop the original bridge user envelope is present exactly once.
-    let first_user = &packets[0]["messages"][1];
+    // Within a live tool loop Pi receives the original question through its user entry once.
+    let first_user = packets[0]["messages"].as_array().unwrap().iter().find(|m| m["role"] == "user" && m["content"] == "Fixture question 0").expect("normal user question");
     for packet in &packets[..3] {
         let matching = packet["messages"]
             .as_array()
@@ -337,7 +337,7 @@ async fn changes_capacity_and_binary_focus_rejections_survive_the_actual_sidecar
         };
         let cp = "a".repeat(40); let tree = "b".repeat(40);
         let focus = json!({"courseId":"capacity_course","commitHash":cp,"materialTreeOid":tree,"paragraphs":if expected == "CONTEXT_CONFLICT" {json!([{ "text":"SYNTHETIC_BINARY_BODY_MUST_NOT_SEND" }])} else {json!([])}});
-        let messages = vec![json!({"role":"user","content":json!({"focus":focus,"question":"Retain this original question","nativeMaterials":[],"nativeReferences":"","contextBridgeManifest":{"version":1,"entries":[]}}).to_string()})];
+        let messages = vec![json!({"role":"user","content":json!({"bridge":[{"key":"focus","value":focus},{"key":"references","value":""},{"key":"question","value":"Retain this original question"}],"contextBridgeManifest":{"version":1,"entries":[]}}).to_string()})];
         let value = json!({"checkpoint":{"courseId":"capacity_course","checkpointCommitOid":cp,"materialTreeOid":tree,"excludedFiles":[]},"baseCommitOid":null,"focused":null,"complete":true,"changes":(0..257).map(|n|json!({"path":format!("documents/{n}.md"),"status":"M"})).collect::<Vec<_>>()});
         let value = if expected == "CONTEXT_CONFLICT" {json!({"checkpoint":{"courseId":"capacity_course","checkpointCommitOid":cp,"materialTreeOid":tree,"excludedFiles":[]},"baseCommitOid":null,"focused":{"textUnavailable":"binary"},"complete":true,"changes":[]})} else {value};
         let result = generate_scoped(ModelCredentials::new(ModelSettings { provider:"custom".into(), protocol:PROTOCOL.into(), base_url:"http://127.0.0.1:1/v1".into(), model:"fixture".into(), ..ModelSettings::default() }, "synthetic-capacity-not-real".into()).unwrap(), messages, Arc::new(AtomicBool::new(false)), |_|panic!("Changes rejection must precede model output"), None, ToolPolicy::legacy(false), vec![], Some(RequestContext {
@@ -442,10 +442,10 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
             let encoded=serde_json::to_string(patch).unwrap();
             assert_eq!(serde_json::to_string(&payloads).unwrap().matches(&encoded).count(),1,"round {round}: complete patch must occur once in the entire request");
         }
-        let turn=payloads.iter().find(|p|p["focus"].is_object()).unwrap();
-        assert!(turn["focus"]["paragraphs"].as_array().unwrap().iter().all(|p|p.get("text").is_none()));
-        assert!(turn["context"].as_str().unwrap().contains("materialRange"));
-        assert!(turn["contextBridgeManifest"]["entries"].as_array().unwrap().iter().any(|e|e["sourceMarkers"]==json!(["citation","material","focus"])));
+        let turn=payloads.iter().find(|p|p["documentId"].is_string() && p["paragraphs"].is_array()).unwrap();
+        assert!(turn["paragraphs"].as_array().unwrap().iter().all(|p|p.get("text").is_none()));
+        assert!(packet.to_string().contains("materialRange"));
+        assert!(!packet.to_string().contains("contextBridgeManifest"));
         if round>=3 {assert!(!turn.to_string().contains("A_FIXED_CHANGED_GIT_BODY"));}
     }
     for packet in &packets[..2] { let text=packet.to_string();assert!(!text.contains("B_NOT_YET_FOCUSED_BODY")&&!text.contains("B_FIXED_SECOND_BODY"));assert_eq!(text.matches("A_FIXED_FIRST_BODY").count(),1); }
