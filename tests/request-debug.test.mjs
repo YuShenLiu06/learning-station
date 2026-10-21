@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
-import {requestText,requestDiff,orderedSources,sourceContent} from '../src/requestDebug.ts';
+import {requestText,requestDiff,orderedSources,sourceContent,sourceReadingContent} from '../src/requestDebug.ts';
 const record=(sequence,session,body,extra={})=>({sequence,identity:{sessionId:session},complete:true,body,...extra});
 test('actual captured JSON strings expose Focus, citations and Changes; diff never crosses sessions',()=>{
   const before=record(1,'s1',{messages:[{role:'user',content:JSON.stringify({focus:{body:'Focus A'},citationContext:'citation A',changes:'Changes A'})}]});
@@ -71,4 +71,12 @@ test('wire fragments retain numeric order and multiple occurrences of a registra
   const content=JSON.stringify({frames:[{text:literal}]});
   assert.match(sourceContent(record(2,'s1',{messages:[{content}]}),{path:['messages',0,'content'],origin:'bridge',name:'material'}),/code/);
   assert.ok(sourceContent(record(2,'s1',{messages:[{content}]}),{path:['messages',0,'content'],origin:'bridge',name:'material'}).includes(literal));
+});
+
+test('reading shows actual full or diff text without protocol hash fields or second decoding',()=>{
+ const body='line one\\nline two\\ncode: \\\\n';
+ const r=record(1,'s',{messages:[{content:JSON.stringify({type:'automatic_material_projection',version:'HASH_ONLY_FOR_JSON',frames:[{kind:'full',text:body}]})}]});
+ const source={path:['messages',0,'content'],origin:'bridge',name:'learning-station-material'};
+ assert.equal(sourceReadingContent(r,source),body);
+ assert.doesNotMatch(sourceReadingContent(r,source),/HASH_ONLY_FOR_JSON/);
 });

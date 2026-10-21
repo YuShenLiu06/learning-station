@@ -88,3 +88,14 @@ export function isCurrentQuestion(record:DebugRecord,source:DebugSource):boolean
   if(source.runId)return source.runId===record.identity.runId;
   return (record.sources??[]).filter(s=>s.registrationKey==='question').length===1;
 }
+export function sourceReadingContent(record:DebugRecord,source:DebugSource):string {
+  const raw=sourceValue(record,source);
+  if(source.origin==='bridge'&&typeof raw==='string')try{
+    const value=JSON.parse(raw) as {type?:string;frames?:{kind?:string;text?:unknown;unifiedDiff?:unknown}[]};
+    if(value.type==='automatic_material_projection'&&Array.isArray(value.frames)&&value.frames.length) {
+      const parts=value.frames.map(frame=>frame.kind==='full'?frame.text:frame.kind==='diff'?frame.unifiedDiff:undefined);
+      if(parts.every((part):part is string=>typeof part==='string'))return parts.join('\n\n');
+    }
+  }catch{}
+  return sourceContent(record,source);
+}
