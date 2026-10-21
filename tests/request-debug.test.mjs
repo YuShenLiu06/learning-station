@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
-import {requestText,requestDiff} from '../src/requestDebug.ts';
+import {requestText,requestDiff,orderedSources,sourceContent} from '../src/requestDebug.ts';
 const record=(sequence,session,body,extra={})=>({sequence,identity:{sessionId:session},complete:true,body,...extra});
 test('actual captured JSON strings expose Focus, citations and Changes; diff never crosses sessions',()=>{
   const before=record(1,'s1',{messages:[{role:'user',content:JSON.stringify({focus:{body:'Focus A'},citationContext:'citation A',changes:'Changes A'})}]});
@@ -45,19 +45,30 @@ test('real settings component toggles capture and clears shown request after dis
   let enabled=false;const commands=[];const entries=[record(1,'s1',{messages:[{role:'user',content:'Focus A'}]}),record(2,'s1',{messages:[{role:'user',content:'Focus B'}]},{previousSequence:1})].map(r=>({...r,phase:'initial',status:'HTTP 200',time:'fixture',bodyBytes:100}));
   entries[1].registrations=[{key:'actual_provider',lifetime:'OneShot',position:'References',value:'registered line one\nregistered line two'}];
   entries[1].sources=[{path:['messages',0,'content'],origin:'bridge',name:'learning-station-material',sourcePath:'native/fixture/material'}];
-  globalThis.debugTestCall=async(command,args)=>{commands.push(command);if(command==='request_debug_decode')return {complete:true,finalProjection:{entries:[{content:'Focus B'}]}};if(command==='request_debug_export')return {path:'/fixture/context-bridge.json',complete:true};if(command==='request_debug_set')enabled=args.enabled;return {enabled,records:enabled?entries:[],dropped:0};};
+  globalThis.debugTestCall=async(command,args)=>{commands.push([command,args]);if(command==='request_debug_decode')return {complete:true,finalProjection:{entries:[{content:'Focus B'}]}};if(command==='request_debug_export')return {path:'/fixture/context-bridge.json',complete:true};if(command==='request_debug_set')enabled=args.enabled;return {enabled,records:enabled?entries:[],dropped:0};};
   const root=createRoot(document.getElementById('root'));
   try{
     await React.act(async()=>root.render(React.createElement(RequestDebugSettings)));
     assert.equal(document.querySelector('input').checked,false);assert.match(document.body.textContent,/已关闭，不采集/);
-    await React.act(async()=>document.querySelector('input').click());assert.equal(enabled,true);assert.match(document.body.textContent,/导出ContextBridge解码JSON/);await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent==='导出ContextBridge解码JSON').click());assert.match(document.body.textContent,/已导出.*context-bridge.json/);await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent==='上下文正文').click());assert.match(document.querySelector('pre').textContent,/Focus B/);
-    await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent.startsWith('diff')).click());assert.match(document.querySelector('pre').textContent,/- Focus A/);
-    await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent==='按来源 / 注册键').click());assert.match(document.body.textContent,/actual_provider/);assert.match(document.body.textContent,/OneShot/);assert.match(document.body.textContent,/registered line one/);assert.match(document.body.textContent,/learning-station-material/);
-    await React.act(async()=>document.querySelector('input').click());assert.equal(enabled,false);assert.equal(document.querySelector('pre'),null);assert.doesNotMatch(document.body.textContent,/Focus [AB]/);assert.ok(commands.includes('request_debug_set'));
-  }finally{await React.act(async()=>root.unmount());delete globalThis.debugTestCall;await unlink(file);dom.window.close();}
+    await React.act(async()=>document.querySelector('input').click());assert.equal(enabled,true);assert.match(document.body.textContent,/导出解码 JSON/);await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent==='导出解码 JSON').click());assert.match(document.body.textContent,/已导出.*context-bridge.json/);assert.deepEqual(commands.find(([command])=>command==='request_debug_export')[1],{sequence:2});await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent==='上下文').click());assert.match(document.querySelector('pre').textContent,/Focus B/);
+    await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent==='与上次差异').click());assert.match(document.querySelector('pre').textContent,/- Focus A/);
+    await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent==='来源').click());assert.match(document.body.textContent,/actual_provider/);assert.match(document.body.textContent,/OneShot/);assert.match(document.body.textContent,/registered line one/);assert.match(document.body.textContent,/learning-station-material/);await React.act(async()=>document.querySelector('[aria-label="请求 #1"]').click());await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent==='导出解码 JSON').click());assert.deepEqual(commands.filter(([command])=>command==='request_debug_export').at(-1)[1],{sequence:1});
+    await React.act(async()=>document.querySelector('input').click());assert.equal(enabled,false);assert.equal(document.querySelector('pre'),null);assert.doesNotMatch(document.body.textContent,/Focus [AB]/);assert.ok(commands.some(([command])=>command==='request_debug_set'));
+  }finally{await React.act(async()=>root.unmount());delete globalThis.debugTestCall;await unlink(file);await unlink(new URL(file.href.replace(/\.mjs$/,'.css'))).catch(()=>{});dom.window.close();}
 });
 test('readable message view excludes tool schemas and decodes JSON once without altering code literals',()=>{
   const body={model:'fixture-model',max_tokens:99,messages:[{role:'user',content:JSON.stringify({frames:[{kind:'full',text:'line one\nline two\ncode: \\n'}]})}],tools:[{function:{description:'TOOL_SCHEMA_MUST_STAY_COLLAPSED'}}]};
   const text=requestText(record(1,'s1',body));assert.match(text,/line one\nline two/);assert.match(text,/code: \\n/);assert.doesNotMatch(text,/TOOL_SCHEMA_MUST_STAY_COLLAPSED|fixture-model|max_tokens/);
   const first=requestDiff(undefined,record(1,'s1',body));assert.match(first,/无前次记录，展示完整请求/);assert.match(first,/TOOL_SCHEMA_MUST_STAY_COLLAPSED/);
+});
+
+test('wire fragments retain numeric order and multiple occurrences of a registration key',()=>{
+  const source=(index,start)=>({path:['messages',index,'content'],start,end:start+1,origin:'bridge',name:'material',registrationKey:'focus'});
+  const r=record(1,'s1',{messages:[]},{sources:[source(10,0),source(2,4),source(2,0)]});
+  assert.deepEqual(orderedSources(r).map(s=>[s.path[1],s.start]),[[2,0],[2,4],[10,0]]);
+  assert.equal(orderedSources(r).filter(s=>s.registrationKey==='focus').length,3);
+  const literal='{"code":"\\\\n"}';
+  const content=JSON.stringify({frames:[{text:literal}]});
+  assert.match(sourceContent(record(2,'s1',{messages:[{content}]}),{path:['messages',0,'content'],origin:'bridge',name:'material'}),/code/);
+  assert.ok(sourceContent(record(2,'s1',{messages:[{content}]}),{path:['messages',0,'content'],origin:'bridge',name:'material'}).includes(literal));
 });
