@@ -70,11 +70,21 @@ test('actual React course conversations create, select, rename and restore indep
   const row=title=>[...document.querySelectorAll('.tree-row')].find(value=>value.title===title);
   const newChat=owner=>[...document.querySelectorAll('.tree-row')].find(value=>value.title==='新建对话'&&value.dataset.courseId===owner);
   const button=text=>[...document.querySelectorAll('button')].find(value=>value.textContent.trim()===text);
+  const key=async(element,key,extra={})=>React.act(async()=>element.dispatchEvent(new KeyboardEvent('keydown',{key,bubbles:true,cancelable:true,...extra})));
+  const renameCount=()=>commands.filter(value=>value.command==='course_session_rename').length;
+  const openRename=async(title,keyboard=false)=>{
+    const target=row(title);assert.ok(target,'left conversation exists');
+    if(keyboard)await key(target,'F10',{shiftKey:true});else await React.act(async()=>target.dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true,clientX:40,clientY:100})));
+    await wait(()=>document.querySelector('.tree-context-menu [role="menuitem"]'));
+    const action=document.querySelector('.tree-context-menu [role="menuitem"]');assert.equal(action.textContent,'重命名对话');assert.ok(document.activeElement===action);
+    await click(action);await wait(()=>document.querySelector('[aria-label="对话名称"]'));
+  };
   const composer=()=>document.querySelector('[aria-label="向学习助手提问"]');
   const heading=()=>document.querySelector('.assistant-heading h2')?.textContent;
   const reading=()=>document.querySelector('.document-title-row h1')?.textContent;
   try{
     await React.act(async()=>root.render(React.createElement(App)));await wait(()=>heading()==='原有对话'&&row('原有对话'));
+    assert.equal(Boolean(button('重命名对话')),false,'no duplicate rename button above the conversation');
     assert.equal(reading(),'材料甲');await wait(()=>button('恢复到当前对话')&&!button('恢复到当前对话').disabled);assert.match(document.querySelector('.model-prompt').textContent,/升级前的旧问题/);await click(button('恢复到当前对话'));assert.equal(composer().value,'升级前的旧问题');await wait(()=>drafts.get('section:note_a').data.question==='');assert.match(document.querySelector('.messages').textContent,/旧会话的独立历史/);
     await input(composer(),'原会话未发送的问题');await click(row('材料乙'));await wait(()=>reading()==='材料乙');assert.equal(heading(),'原有对话');assert.equal(composer().value,'原会话未发送的问题');
     const beforeOpen=commands.filter(value=>value.command==='open_document').length;
@@ -83,7 +93,9 @@ test('actual React course conversations create, select, rename and restore indep
     assert.equal(commands.filter(value=>value.command==='course_session_create').length,1);assert.equal(commands.filter(value=>value.command==='open_document').length,beforeOpen);assert.equal(reading(),'材料乙');assert.equal(composer().value,'');assert.doesNotMatch(document.querySelector('.messages').textContent,/旧会话/);
     await input(composer(),'新会话的草稿');await click(row('原有对话'));await wait(()=>heading()==='原有对话');assert.equal(composer().value,'原会话未发送的问题');
     await click(row('新对话 1'));await wait(()=>heading()==='新对话 1');assert.equal(composer().value,'新会话的草稿');assert.equal(reading(),'材料乙');
-    await click(button('重命名对话'));await input(document.querySelector('[aria-label="对话名称"]'),'语法讨论');await click(button('保存名称'));await wait(()=>heading()==='语法讨论'&&row('语法讨论'));assert.equal(selected.get('course_a'),first);
+    await key(row('新对话 1'),'ContextMenu');await wait(()=>document.querySelector('.tree-context-menu'));await key(document.activeElement,'Escape');assert.equal(document.querySelector('.tree-context-menu'),null);assert.ok(document.activeElement===row('新对话 1'));assert.equal(renameCount(),0);
+    await openRename('新对话 1');await input(document.querySelector('[aria-label="对话名称"]'),'不应保存的名称');await click(document.querySelector('[aria-label="关闭弹窗"]'));assert.equal(renameCount(),0);assert.equal(heading(),'新对话 1');
+    await openRename('新对话 1');await input(document.querySelector('[aria-label="对话名称"]'),'语法讨论');await click(button('保存名称'));await wait(()=>heading()==='语法讨论'&&row('语法讨论'));assert.equal(selected.get('course_a'),first);assert.equal(renameCount(),1);assert.equal(Boolean(button('重命名对话')),false);
     let releaseRead;blockedNoteRead={promise:new Promise(resolve=>{releaseRead=resolve;})};
     await click(button('带我梳理这一页'));await tick();assert.equal(document.querySelector('[aria-label="发送问题"]').disabled,true);assert.equal(commands.filter(value=>value.command==='start_generation').length,0);
     blockedNoteRead=null;releaseRead();await wait(()=>composer().value.includes('请带我梳理本页')&&document.querySelector('.composer-reference'));
@@ -92,7 +104,7 @@ test('actual React course conversations create, select, rename and restore indep
     await React.act(async()=>{window.getSelection().removeAllRanges();window.getSelection().addRange(range);document.querySelector('.document-scroll').dispatchEvent(new MouseEvent('mouseup',{bubbles:true}));});
     await wait(()=>document.querySelector('.selection-tray'));await click([...document.querySelectorAll('.selection-tray button')].find(value=>value.textContent==='留作复习'));await click(button('保存到复习'));
     assert.equal(commands.filter(value=>value.command==='append_entry'&&value.args.entry.data?.reviewCard).at(-1).args.entry.data.sourceDocumentId,'note_b');assert.equal(commands.filter(value=>value.command==='append_entry'&&value.args.entry.data?.reviewCard).at(-1).args.sessionId,first);
-    await click(document.querySelector('[aria-label="取消选句"]'));window.getSelection().removeAllRanges();await click(button('重命名对话'));await wait(()=>document.querySelector('[aria-label="对话名称"]'));await click(button('保存名称'));await wait(()=>!document.querySelector('[aria-label="对话名称"]'));
+    await click(document.querySelector('[aria-label="取消选句"]'));window.getSelection().removeAllRanges();await openRename('语法讨论',true);const saveName=button('保存名称'),closeRename=document.querySelector('[aria-label="关闭弹窗"]');saveName.focus();await key(saveName,'Tab');assert.ok(document.activeElement===closeRename);await key(closeRename,'Tab',{shiftKey:true});assert.ok(document.activeElement===saveName);await React.act(async()=>document.querySelector('[aria-label="对话名称"]').closest('form').requestSubmit());await wait(()=>!document.querySelector('[aria-label="对话名称"]'));assert.equal(renameCount(),2);
     const scroll=document.querySelector('.document-scroll'),blocks=[...scroll.querySelectorAll('[data-focus-start]')];let visibleBlock=0;
     scroll.getBoundingClientRect=()=>({top:0,bottom:100,height:100});blocks.forEach((block,index)=>{block.getBoundingClientRect=()=>index===visibleBlock?({top:10,bottom:50,height:40}):({top:200,bottom:240,height:40});});
     const submittedRanges=[{start:Number(blocks[0].dataset.focusStart),end:Number(blocks[0].dataset.focusEnd)}];let releaseContext;blockedContext={promise:new Promise(resolve=>{releaseContext=resolve;})};

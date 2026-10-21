@@ -933,7 +933,6 @@ export function App() {
       {materialQuestionBusy && <p className="context-loading" role="status">正在准备本页引用…</p>}
       {conversationBusy && <p className="context-loading" role="status">正在切换课程对话…</p>}
       {session.courseId && question && <div className="model-prompt"><p>此材料保留了一份旧提问草稿：{question}</p><button disabled={!chatDraft.loaded || conversationBusy} onClick={()=>{void restoreLegacyQuestion();}}>恢复到当前对话</button></div>}
-      {session.courseId && <button className="quiet-button" disabled={!!busyId} onClick={()=>{void beginRename(session.courseId!,session.id);}}>重命名对话</button>}
       {chatDraft.error && <div className="inline-error" role="alert">聊天草稿尚未保存：{chatDraft.error}{chatDraft.conflict !== undefined && <><p>找回的输入：{chatDraft.conflict}</p><button onClick={()=>chatDraft.resolve(true)}>使用找回的聊天草稿</button><button onClick={()=>chatDraft.resolve(false)}>保留当前聊天输入</button></>}<button onClick={()=>{void chatDraft.retry();}}>重试读取草稿</button></div>}
       {conversationErrors[courseId] && <div className="inline-error" role="alert">课程对话尚未读取：{conversationErrors[courseId]}<button onClick={()=>{void reloadConversations(courseId);}}>重试读取对话</button></div>}
       {!session.id && containingCourse(nodes,activeId) && <p className="model-prompt">从课程目录选择一个对话，或点击“新建对话”开始。</p>}
