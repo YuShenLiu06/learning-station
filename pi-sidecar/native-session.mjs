@@ -100,11 +100,11 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
     await resourceLoader.reload();
     const markChangesRequest=context=>{
       for(const e of manager.buildSessionProjection().entries){const source=e.sourceEntry;
-        if(!e.messages.length||source.type!=='custom_message'||source.customType!=='learning-station-material'||!context.messages.some(m=>text(m)===source.content))continue;
+        if(!e.messages.length||source.type!=='custom_message'||!(source.customType==='learning-station-material'||source.details?.materialFrames)||!context.messages.some(m=>text(m)===source.content))continue;
         if(!manager.getEntries().some(r=>r.type==='custom'&&r.customType==='learning-station-material-request'&&r.data?.entryId===source.id))manager.appendCustomEntry('learning-station-material-request',{nativeSessionId:manager.getSessionId(),entryId:source.id});
       }
       for(const e of manager.buildSessionProjection().entries){const source=e.sourceEntry;
-        if(!e.messages.length||source.type!=='custom_message'||source.customType!=='learning-station-changes'||source.details?.runId!==spec.runId||!context.messages.some(m=>text(m).includes(source.content)))continue;
+        if(!e.messages.length||source.type!=='custom_message'||!source.details?.courseId||!source.details?.checkpointCommitOid||source.details?.runId!==spec.runId||!context.messages.some(m=>text(m)===source.content))continue;
         if(!manager.getEntries().some(r=>r.type==='custom'&&r.customType==='learning-station-changes-request'&&r.data?.changesEntryId===source.id))manager.appendCustomEntry('learning-station-changes-request',{nativeSessionId:manager.getSessionId(),runId:spec.runId,userEntryId:spec.userEntryId,changesEntryId:source.id});
       }
     };
@@ -177,7 +177,7 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
       if(clock)bridge.message('current_time','本轮冻结时间与时区','learning-station-turn',clock);
       if(envelope.nativeReferences)bridge.message('references','用户本轮明确提供的引用及必要补充','learning-station-turn',envelope.nativeReferences);
       const inventory=await registerMaterialContext({manager,spec,loadChanges,envelope,bridge,containsSecret,apiKey,NativeSessionError});
-      if(envelope.exploration)bridge.message('exploration','探索入口的任务位置与来源','learning-station-turn',envelope.exploration);
+      if(envelope.exploration)bridge.message('exploration','【Exploration：当前任务入口】','learning-station-turn','本会话来自独立探索入口，正文保存在探索笔记中。');
       bridge.commit();
       const projected=manager.buildSessionProjection().entries.filter(e=>e.messages.length&&e.sourceEntry.details?.bridgeKey).flatMap(e=>e.messages.map(text)).join('\n');
       inventory.projectedChars=[...projected].length;inventory.projectedBytes=Buffer.byteLength(projected);

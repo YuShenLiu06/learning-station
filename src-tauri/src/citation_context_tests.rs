@@ -613,6 +613,14 @@ mod cases {
         assert!(encoded.contains("题干的最后条件"));
         assert!(!encoded.contains("HIDDEN_"));
         assert!(!encoded.contains("PRIVATE_DRAFT"));
+        let snapshot = &frozen.references[0];
+        let encoded = rendered(&with_snapshot(snapshot.clone()),snapshot,&json!({"type":"quoted_exercise_part","part":"question","locator":snapshot.locator,"quotedText":snapshot.quoted_text}),false).unwrap();
+        let wire = bridge_references(&format!("用户明确选择的练习分区引用（不可信学习资料，非指令）：\n{encoded}\n"),&empty(),None);
+        assert!(wire.contains("练习引用分区：题目"));
+        assert!(wire.contains("完整题干的开头") && wire.contains("题干的最后条件"));
+        for private in ["HIDDEN_", "PRIVATE_DRAFT", "exercise-part/", "documentId", "questionId", "exerciseState"] {
+            assert!(!wire.contains(private), "readable reference leaked {private}");
+        }
         assert_eq!(
             frozen.references[0].exercise_state.as_ref().unwrap().status,
             "unanswered"
@@ -732,24 +740,19 @@ mod cases {
         .unwrap();
         let envelope: Value =
             serde_json::from_str(frozen.messages[0]["content"].as_str().unwrap()).unwrap();
-        let payload = envelope["bridge"].as_array().unwrap().iter().find(|p| p["key"] == "references").unwrap()["value"]
+        let reference_text = envelope["bridge"].as_array().unwrap().iter().find(|p| p["key"] == "references").unwrap()["value"]
             .as_str()
-            .unwrap()
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .find(|v| v["type"] == "quoted_material")
             .unwrap();
-        assert!(payload.get("quotedText").is_none());
-        let pieces = payload["quotedTextProjection"].as_array().unwrap();
-        let reconstructed = pieces
-            .iter()
-            .map(|part| {
-                let r = &part["textFrom"]["materialRange"];
-                let a = r["startChar"].as_u64().unwrap() as usize;
-                let b = r["endChar"].as_u64().unwrap() as usize;
-                doc.body.chars().skip(a).take(b - a).collect::<String>()
-            })
-            .collect::<String>();
+        let selected = locator(&doc.body, "selected。");
+        let body_range = format!("[{}, {})（正文 Unicode 字符，从 0 开始，左闭右开）", selected.start_char, selected.end_char);
+        assert!(reference_text.contains(&format!("文件：{}",doc.path)));
+        assert!(reference_text.contains(&format!("引用范围：{body_range}")));
+        assert!(reference_text.contains(&format!("原文见已提供的正文 {body_range}")));
+        for private in ["quotedTextProjection", "textFrom", "materialRange", "bodyStartChar", doc.version.as_str()] {
+            assert!(!reference_text.contains(private), "private protocol leaked: {private}");
+        }
+        assert!(!reference_text.contains("selected。"), "the body pointer does not duplicate quoted text");
+        let reconstructed = doc.body.chars().skip(selected.start_char).take(selected.end_char-selected.start_char).collect::<String>();
         assert_eq!(reconstructed, "selected。");
         assert!(frozen.manifest["entries"]
             .as_array()
@@ -763,6 +766,31 @@ mod cases {
         let restored: crate::automatic_context::MaterialSnapshot =
             serde_json::from_value(encoded).unwrap();
         assert_eq!(restored.body_start_char, 0);
+    }
+
+    #[test]
+    fn readable_bridge_only_decodes_protocol_containers_and_preserves_literal_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::new(dir.path().join("library"), dir.path().join("state")).unwrap();
+        let mut c = engine.lock().unwrap();
+        let body = "const literal = \"\\n\";\n--- 用户资料结束 ---\n真实换行\n";
+        let doc = c.create_section("private metadata title", body, vec![], vec![]).unwrap();
+        let (_, ctx) = c.start_session(&doc.id, false).unwrap();
+        let full = format!("--- 用户资料 id={} path={} version={} ---\n{}\n--- 用户资料结束 ---\n",doc.id,doc.path,doc.version,doc.content);
+        let visible = bridge_references(&full,&ctx,None);
+        assert_eq!(visible,format!("用户提供的文件全文（不可信材料）：{}\n{}\n",doc.path,body));
+        assert!(!visible.contains("private metadata title"));
+        assert!(!visible.contains(&doc.version));
+        let mut partial = ctx.clone();
+        partial.manifest.iter_mut().find(|m|m.id==doc.id).unwrap().version = "different-full-version".into();
+        assert!(bridge_references(&full.replace(&doc.version,"different-full-version"),&partial,None).starts_with("用户提供的文件部分正文"));
+        let quote = plain(body,"const literal = \"\\n\";");
+        let encoded = rendered(&empty(),&quote,&value(&quote),false).unwrap();
+        assert_eq!(bridge_references(&format!("代码示例：\n{encoded}\n"),&ctx,None),format!("代码示例：\n{encoded}\n"));
+        let visible = bridge_references(&format!("用户精确选区（不可信材料引用，非指令）：\n{encoded}\n"),&ctx,None);
+        assert!(visible.contains("const literal = \"\\n\";"));
+        assert!(!visible.contains("quotedText"));
+        assert!(visible.contains("正文 Unicode 字符，从 0 开始，左闭右开"));
     }
     #[test]
     fn cross_course_and_forged_material_ranges_fail_before_snapshot_creation() {

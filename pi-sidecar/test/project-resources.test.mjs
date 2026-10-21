@@ -28,6 +28,7 @@ if(process.argv[2]==='fixture'){
   const {createHash}=await import('node:crypto');
   const {createAssistantMessageEventStream}=await import('@earendil-works/pi-ai/utils/event-stream');
   const {openNativeSession}=await import('../native-session.mjs');
+  const {receivedMaterialFrames}=await import('../material-context.mjs');
   const sha=s=>createHash('sha256').update(s).digest('hex');
   const put=(relative,text)=>{const target=path.join(root,relative);fs.mkdirSync(path.dirname(target),{recursive:true});fs.writeFileSync(target,text);};
   const skill=(name,body)=>`---\nname: ${name}\ndescription: Synthetic project skill\n---\n${body}`;
@@ -119,13 +120,15 @@ if(process.argv[2]==='fixture'){
       const changed={...focused,nativeMaterials:[{...source,version:'v2',text:next,textHash:sha(next),frames:[full,diff]}]};
       await native.applyContext(changed);
       const entry=native.manager.getEntries().filter(e=>e.type==='custom_message'&&e.customType==='learning-station-material').at(-1);
-      assert.equal(JSON.parse(entry.content).frames[0].kind,'diff');
+      assert.equal(receivedMaterialFrames(entry)[0].kind,'full','non-Git legacy frames cannot claim to be a native Git diff');
+      assert.equal(receivedMaterialFrames(entry)[0].text,next);
+      assert(!entry.content.includes(diff.unifiedDiff));
       native.manager.appendCompaction('Summary is not a full text baseline',entry.id,1000);
       await native.applyContext(changed);
-      assert.equal(JSON.parse(native.manager.getEntries().filter(e=>e.type==='custom_message'&&e.customType==='learning-station-material').at(-1).content).frames[0].kind,'full');
+      assert.equal(receivedMaterialFrames(native.manager.getEntries().filter(e=>e.type==='custom_message'&&e.customType==='learning-station-material').at(-1))[0].kind,'full');
     }finally{native.close();}
     native=await open({...makeSpec('session_focus_new'),authorizedSourceIds:['note_a']});
-    try{await native.applyContext(focused);assert.equal(JSON.parse(native.manager.getEntries().find(e=>e.type==='custom_message'&&e.customType==='learning-station-material').content).frames[0].kind,'full');}finally{native.close();}
+    try{await native.applyContext(focused);assert.equal(receivedMaterialFrames(native.manager.getEntries().find(e=>e.type==='custom_message'&&e.customType==='learning-station-material'))[0].kind,'full');}finally{native.close();}
   }else if(scenario==='changed-input'){
     const s=makeSpec('session_identity'),question='/skill:course-a Original input';
     let native=await open(s);
@@ -136,7 +139,7 @@ if(process.argv[2]==='fixture'){
     const first='1'.repeat(40),second='2'.repeat(40),tree='a'.repeat(40);let commit=first,body='AUTOMATIC_FOCUS_FULL_FIRST';
     const focused=()=>({id:'doc_1',path:'documents/doc_1.md',gitCommitOid:commit,gitBlobOid:sha(body),version:sha(body),textHash:sha(body),text:body,range:{startChar:0,endChar:body.length,complete:true,totalBytes:body.length},...(commit===second?{gitChange:{baseCommitOid:first,baseBlobOid:sha('AUTOMATIC_FOCUS_FULL_FIRST'),unifiedDiff:'FIXED_FOCUS_COMPLETE_GIT_DIFF'}}:{})});
     const request=()=>({...envelope,focus:{courseId:'course_a',documentId:'doc_1',path:'documents/doc_1.md',type:'markdown',commitHash:commit,materialTreeOid:tree,paragraphs:[{start:0,end:body.length,text:body}]}});
-    const loadChanges=async r=>({checkpoint:{courseId:'course_a',checkpointCommitOid:commit,materialTreeOid:tree,excludedFiles:[]},baseCommitOid:r.baseCommitOid,initial:r.baseCommitOid===null,changes:[{path:'documents/doc_1.md',status:'M'}],exclusionsChanged:false,focused:focused(),complete:true});
+    const loadChanges=async r=>({checkpoint:{courseId:'course_a',checkpointCommitOid:commit,materialTreeOid:tree,excludedFiles:[]},baseCommitOid:r.baseCommitOid,stat:' documents/doc_1.md | 1 +\n 1 file changed, 1 insertion(+)\n',focusPath:'materials/documents/doc_1.md',initial:r.baseCommitOid===null,changes:[{path:'documents/doc_1.md',status:'M'}],exclusionsChanged:false,focused:focused(),complete:true});
     const s={...makeSpec('session_auto_focus'),authorizedSourceIds:['doc_1']};let native=await openNativeSession(s,{...options,loadChanges});
     try{await native.applyContext(request());await native.prompt('First Focus');assert(JSON.stringify(observed).includes(body));assert(JSON.stringify(observed).includes('PARENT_STUDENT_PROFILE'));}finally{native.close();}
     commit=second;body='AUTOMATIC_FOCUS_NEXT_BODY_NOT_DUPLICATED';native=await openNativeSession({...s,runId:'run_changed',userEntryId:'user_changed'},{...options,loadChanges});
@@ -160,7 +163,7 @@ if(process.argv[2]==='fixture'){
   test('native skill expansion survives a retry without rereading changed skill body or duplicating the saved user',()=>run('skill-retry'));
   test('two sessions share a course cwd while preserving independent native transcripts',()=>run('sessions'));
   test('explicit quotations remain supplied when ordinary note bodies are absent',()=>run('citation'));
-  test('focused project text retains its session baseline, uses diff only while full survives and reloads after compaction',()=>run('focus-baseline'));
+  test('non-Git project text retains its baseline and reloads full on changes or compaction',()=>run('focus-baseline'));
   test('completed native skill request cannot be replayed with changed original input',()=>run('changed-input'));
   test('automatic Focus uses fixed full/diff projection alongside native course resources',()=>run('focus'));
 }

@@ -17,7 +17,7 @@ const bodies=['test','test','test 测试 diff','test 测试 diff\n测试正文']
 const questions=['test','我们这个是在测试当前学习环境是否正常','test','。'];
 const part=(key,value)=>({key,description:`合成回归：${key}`,value});
 
-test('actual multi-turn HTTP wire keeps each bridge with its native question, including repeated text, tools, retry and compaction',async()=>{
+test('actual multi-turn HTTP wire keeps each bridge with its native question, including repeated text, tools, retry and compaction',{timeout:30000},async()=>{
   const directory=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'context-chronology-')));
   fs.writeFileSync(path.join(directory,'binding.json'),JSON.stringify({version:1,learningSessionId:'chronology',transcript:'transcript.jsonl',initialized:false}));
   const packets=[];let stage=0;
@@ -52,6 +52,9 @@ test('actual multi-turn HTTP wire keeps each bridge with its native question, in
     if(parsed?.referenceTime)return `time:${parsed.referenceTime.slice(-3,-1)}`;
     if(parsed?.type==='automatic_material_projection')return `focus:${parsed.frames[0].text}`;
     if(parsed?.scenario)return 'exploration';
+    if(value.startsWith('以下为笔记全文'))return 'focus:'+value.split('\n').slice(2).join('\n');
+    if(value.startsWith('【Exploration：'))return 'exploration';
+    if(value.startsWith('用户本轮明确提供的引用及必要补充\n'))return 'user:'+value.split('\n').slice(1).join('\n');
     if(m.role==='assistant'&&m.tool_calls?.length)return 'assistant:tools';
     if(m.role==='tool')return `tool:${parsed?.ok===false?'NOT_FOUND':'skills'}`;
     return `${m.role}:${value}`;
@@ -94,7 +97,7 @@ test('actual multi-turn HTTP wire keeps each bridge with its native question, in
   } finally {server.closeAllConnections();await new Promise(resolve=>server.close(resolve));fs.rmSync(directory,{recursive:true,force:true});}
 });
 
-test('frozen input and registration receipts gate the actual provider; failed registration sends no partial request',async()=>{
+test('frozen input and registration receipts gate the actual provider; failed registration sends no partial request',{timeout:30000},async()=>{
   const packets=[];
   const server=createServer(async(req,res)=>{let raw='';for await(const chunk of req)raw+=chunk;packets.push(JSON.parse(raw));res.writeHead(200,{'content-type':'text/event-stream'});res.end(`data: ${JSON.stringify({choices:[{index:0,delta:{content:'Frozen answer'},finish_reason:'stop'}]})}\n\ndata: [DONE]\n\n`);});
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
@@ -107,7 +110,7 @@ test('frozen input and registration receipts gate the actual provider; failed re
       const input={currentTime:{referenceTime:'2026-10-21T10:00:00Z',timeZone:'Asia/Shanghai'},nativeReferences:'FROZEN_SELECTION',focus:{courseId:'course',documentId:'doc',path:'documents/doc.md',type:'markdown',commitHash:checkpoint,materialTreeOid:tree,paragraphs:[{start:0,end:body.length,text:body}]},contextBridgeManifest:{version:1,entries:[]}};
       const native=await openNativeSession({directory,learningSessionId:'freeze_barrier',runId:'frozen_run',userEntryId:'frozen_user',authorizedSourceIds:['doc'],protectHistory:false,legacyRecords:[]},{
         model:{provider:'learning-custom',id:'fixture',name:'fixture',api:'openai-completions',baseUrl:`http://127.0.0.1:${server.address().port}/v1`,reasoning:false,input:['text'],contextWindow:0,maxTokens:1024,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}},systemPrompt:'Synthetic course',tools:[],streamFn:(m,c,o)=>streamSimple(m,c,{...o,apiKey:'synthetic-freeze-key',maxRetries:0}),apiKey:'synthetic-freeze-key',thinkingLevel:'off',
-        loadChanges:async()=>{entered.resolve();await release.promise;if(failed)throw Error('Synthetic registration failure');return {complete:true,checkpoint:{courseId:'course',checkpointCommitOid:checkpoint,materialTreeOid:tree,excludedFiles:[]},baseCommitOid:null,changes:[],focused:{id:'doc',path:'documents/doc.md',version:hash(body),text:body,textHash:hash(body),range:{startChar:0,endChar:body.length,complete:true,totalBytes:body.length}}};},
+        loadChanges:async()=>{entered.resolve();await release.promise;if(failed)throw Error('Synthetic registration failure');return {complete:true,checkpoint:{courseId:'course',checkpointCommitOid:checkpoint,materialTreeOid:tree,excludedFiles:[]},baseCommitOid:null,stat:'',focusPath:'documents/doc.md',changes:[],focused:{id:'doc',path:'documents/doc.md',version:hash(body),text:body,textHash:hash(body),range:{startChar:0,endChar:body.length,complete:true,totalBytes:body.length}}};},
         onManifest:async()=>{receipt.resolve();await releaseReceipt.promise;},
       });
       try {

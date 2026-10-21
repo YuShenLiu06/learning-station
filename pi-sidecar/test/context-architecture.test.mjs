@@ -44,7 +44,7 @@ test('final SDK wire allows only registered supplements in declared order and on
       // This source-attribution contract uses unique frozen values. Repeated
       // questions/context are checked directly on HTTP in context-chronology.
       const frozenClock={...clock,referenceTime:`2026-10-21T09:00:0${round}Z`};
-      const focus={courseId:'course_1',documentId:'doc_1',sourceDocumentId:'doc_1',path:'documents/doc_1.md',type:'markdown',documentVersion:hash(body),commitHash:commit,materialTreeOid:tree,view:round===2?'edit':'read',paragraphs:[{startChar:0,endChar:body.length,text:body}],uiState:'DO_NOT_SEND_UI_STATE',metadata:{permission:'DO_NOT_SEND_PERMISSION',stats:'DO_NOT_SEND_STATS'}};
+      const focus={courseId:'course_1',documentId:'doc_1',sourceDocumentId:'doc_1',path:'documents/doc_1.md',type:'markdown',documentVersion:hash(body),commitHash:commit,materialTreeOid:tree,view:round===2?'edit':'read',paragraphs:[{startChar:round===2?1:0,endChar:body.length,text:body.slice(round===2?1:0)}],uiState:'DO_NOT_SEND_UI_STATE',metadata:{permission:'DO_NOT_SEND_PERMISSION',stats:'DO_NOT_SEND_STATS'}};
       const frozen=[entry('current_time','本轮时间',frozenClock),entry('references','本轮引用',round===0?quote:''),entry('focus','聚焦材料',focus),entry('question','仅作为原生用户消息发送',question)];
       const request={protocol:1,operation:'generate',apiKey:'synthetic-architecture-key',settings:{provider:'custom',protocol:'openai-completions',baseUrl:`http://127.0.0.1:${server.address().port}/v1`,model:'fixture'},timeContext:clock,learningTools:true,learningSkills:[],toolPolicy:{mode:'question',authorization:'off',allowedTools:LEARNING_PLUGIN.tools,maxCalls:6},debugProtocol:true,debugRegistrations:frozen,nativeSession:{directory,learningSessionId:'architecture_session',runId:`round_${round}`,userEntryId:`user_${round}`,authorizedSourceIds:['doc_1'],protectHistory:false,legacyRecords:[]},materialChanges:true,messages:[{role:'user',content:JSON.stringify({bridge:frozen,contextBridgeManifest:{version:1,entries:[]}})}]};
       await runLearningAgent(request,async event=>{if(event.type==='debug_request')captures.push(event);if(event.type==='context_manifest')inventories.push(event.manifest);},{requestTool:async call=>{
@@ -52,7 +52,7 @@ test('final SDK wire allows only registered supplements in declared order and on
         if(call.type==='session_sync')return {result:{synced:true}};
         assert.equal(call.type,'material_changes');
         assert.equal(call.focusBaseCommitOid,round===0||round===3?null:round===1?cp1:cp2);
-        return {result:{complete:true,checkpoint:{courseId:'course_1',checkpointCommitOid:commit,materialTreeOid:tree,excludedFiles:[]},baseCommitOid:call.baseCommitOid,exclusionsChanged:round===0,focused:source(body,commit,round>0),changes:round===2?[]:[{path:focus.path,status:'M',patch:'MUST_NOT_DUPLICATE_FOCUS_PATCH'},{path:'documents/other.md',status:'M',added:1,deleted:1,patch:'MUST_NOT_SEND_NONFOCUS_PATCH'}]}};
+        return {result:{complete:true,checkpoint:{courseId:'course_1',checkpointCommitOid:commit,materialTreeOid:tree,excludedFiles:[]},baseCommitOid:call.baseCommitOid,stat:round===2?'':' documents/doc_1.md | 1 +\n documents/other.md | 2 +-\n 2 files changed, 2 insertions(+), 1 deletion(-)\n',focusPath:'documents/doc_1.md',exclusionsChanged:round===0,focused:source(body,commit,round>0),changes:round===2?[]:[{path:focus.path,status:'M',patch:'MUST_NOT_DUPLICATE_FOCUS_PATCH'},{path:'documents/other.md',status:'M',added:1,deleted:1,patch:'MUST_NOT_SEND_NONFOCUS_PATCH'}]}};
       }});
       const packet=packets[round],texts=packet.messages.map(content),serialized=JSON.stringify(packet);
       assert.equal(texts.filter(text=>text===question).length,1);
@@ -72,15 +72,15 @@ test('final SDK wire allows only registered supplements in declared order and on
       }
       assert.equal(application.filter(s=>s.registrationKey==='current_time'&&s.userEntryId===`user_${round}`).length,1);
       assert.equal(texts.filter(text=>text.includes('EXACT_QUOTE')).length,round===3?0:1,'the original quotation remains in its historical turn until Pi compacts it');
-      if(round===0)assert(texts.includes(quote),'reference preserves real newlines and literal backslash-n');
-      const values=application.map(s=>{let value=packet;for(const at of s.path)value=value[at];return s.registrationKey==='references'?value:JSON.parse(value);});
-      const material=values.filter(v=>v.type==='automatic_material_projection');
-      if(round===0||round===3)assert.equal(material[0].frames[0].kind,'full');
-      if(round===1)assert.equal(material.at(-1).frames[0].kind,'diff');
-      if(round===2)assert.equal(material.length,2);
+      if(round===0)assert(texts.some(v=>v.endsWith(quote)),'reference preserves real newlines and literal backslash-n');
+      const values=application.map(s=>{let value=packet;for(const at of s.path)value=value[at];return value;});
+      const material=values.filter(v=>v.startsWith('以下为文件全文'));
+      if(round===0||round===3)assert.equal(material.length,1);
+      if(round===1)assert(values.some(v=>v.includes(`-${first}\n+${second}\n`)),'native focus diff is in Changes');
+      if(round===2)assert.equal(material.length,1,'unchanged preserves the initial body without appending a full');
       assert.equal(serialized.split(first).length-1,round===0?1:round===3?0:2); // full baseline plus diff removal line
-      const location=values.find(v=>v.documentId==='doc_1');assert(location);assert(location.paragraphs.every(p=>p.text===undefined));
-      const notifications=values.filter(v=>Array.isArray(v.changes));assert(notifications.every(v=>v.changes.every(c=>c.path!=='documents/doc_1.md'&&c.patch===undefined)));
+      const locations=values.filter(v=>v.startsWith('【Focus：'));assert(locations.length);assert(locations.every(v=>!v.includes(first)&&!v.includes(second)&&!v.includes('documentId')));
+      const notifications=values.filter(v=>v.startsWith('【Changes：'));assert(notifications.every(v=>v.includes('documents/doc_1.md')&&v.includes('documents/other.md')),'full course stat deliberately includes the focused file');
       assert.deepEqual(packet.tools.map(t=>t.function.name).sort(),[...LEARNING_PLUGIN.tools].sort());
       assert(packet.tools.every(t=>t.function.description.length<180));
     }

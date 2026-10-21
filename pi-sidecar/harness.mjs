@@ -252,7 +252,7 @@ class SecretFilter {
 function explorationPart(value,mode){
   if(value==null)return undefined;
   if(mode!=='question'||value.scenario!=='question-led-exploration'||typeof value.originalQuestion!=='string'||typeof value.userGoal!=='string'||value.originalQuestion.length>30000||value.userGoal.length>30000||typeof value.storageDocumentId!=='string'||!Array.isArray(value.materialSourceIds)||value.materialSourceIds.length>32)throw new SafeError('INVALID_INPUT');
-  return {key:'exploration',description:'探索入口的任务位置与来源',value:{scenario:value.scenario,storageDocumentId:value.storageDocumentId,materialSourceIds:value.materialSourceIds}};
+  return {key:'exploration',description:'【Exploration：当前任务入口】',value:'本会话来自独立探索入口，正文保存在探索笔记中。'};
 }
 /** Test dependencies accept functions only; JSON input cannot replace the real Agent or provider. */
 export async function runLearningAgent(request, emit, { signal, streamFn: fixtureStream, onAgent, settleBarrier, requestTool } = {}) {
