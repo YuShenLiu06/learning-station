@@ -528,3 +528,7 @@ mod intent_boundary_tests {
             .is_none());
     }
 }
+
+pub(crate) fn bridge_part(intent: &ExplorationContext) -> crate::context_bridge::PromptPart {
+    crate::context_bridge::PromptPart { key: "exploration", description: "探索入口的任务位置与来源", value: serde_json::json!({"scenario":intent.scenario,"storageDocumentId":intent.storage_document_id,"materialSourceIds":intent.material_source_ids}) }
+}

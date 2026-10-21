@@ -8,42 +8,16 @@ use crate::{
     types::*,
 };
 use serde_json::{json, Value};
-use std::{collections::BTreeMap, path::Path};
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Lifetime {
-    Stable,
-    Turn,
-    Versioned,
-    OneShot,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Position {
-    Stable,
-    History,
-    Materials,
-    References,
-    State,
-    Question,
-}
+use std::path::Path;
 #[derive(Clone)]
 pub struct PromptPart {
     pub key: &'static str,
-    pub lifetime: Lifetime,
-    pub position: Position,
+    pub description: &'static str,
     pub value: Value,
-}
-/// Providers supply already-authorized, already-frozen values and declare their lifetime/position.
-pub trait ContextProvider {
-    fn provide(&self) -> Result<PromptPart>;
-}
-impl ContextProvider for PromptPart {
-    fn provide(&self) -> Result<PromptPart> {
-        Ok(self.clone())
-    }
 }
 #[derive(Default)]
 pub struct ContextBridge {
-    parts: BTreeMap<&'static str, PromptPart>,
+    parts: Vec<PromptPart>,
 }
 pub struct FrozenPrompt {
     pub messages: Vec<Value>,
@@ -52,46 +26,25 @@ pub struct FrozenPrompt {
     pub debug_registrations: Option<Value>,
 }
 impl ContextBridge {
-    pub fn add(&mut self, provider: &dyn ContextProvider) -> Result<()> {
-        let part = provider.provide()?;
-        let valid = match part.position {
-            Position::Stable | Position::State => part.value.is_object(),
-            Position::History => part.value.is_array(),
-            Position::Materials | Position::References | Position::Question => {
-                part.value.is_string()
-            }
-        };
-        if !valid {
-            return Err(CoreError::new(
-                "INVALID_CONTEXT_REQUEST",
-                "上下文提供器的结构无效。",
-            ));
+    pub fn add(&mut self, part: &PromptPart) -> Result<()> {
+        if part.key.is_empty() || part.description.trim().is_empty() {
+            return Err(CoreError::new("INVALID_CONTEXT_REQUEST", "上下文登记缺少来源或说明。"));
         }
-
-        if let Some(old) = self.parts.get(part.key) {
-            if old.position != part.position
-                || old.lifetime != part.lifetime
-                || old.value != part.value
-            {
-                return Err(CoreError::new(
-                    "CONTEXT_CONFLICT",
-                    "同一上下文来源有冲突，未发送模型请求。",
-                ));
+        if let Some(old) = self.parts.iter().find(|p| p.key == part.key) {
+            if old.description != part.description || old.value != part.value {
+                return Err(CoreError::new("CONTEXT_CONFLICT", "同一上下文来源有冲突，未发送模型请求。"));
             }
             return Ok(());
         }
         if self.parts.len() >= 16 {
             return Err(CoreError::new("LIMIT_EXCEEDED", "上下文片段超过预算。"));
         }
-        self.parts.insert(part.key, part);
+        self.parts.push(part.clone());
         Ok(())
     }
     pub fn debug_registrations(&self) -> Value {
-        Value::Array(self.parts.values().map(|part| {
-            let mut item=json!({"key":part.key,"lifetime":format!("{:?}",part.lifetime),"position":format!("{:?}",part.position)});
-            if part.value.to_string().len()<=8192 {item["value"]=part.value.clone();}
-            else {item["omitted"]=json!("注册值超过8 KiB；最终投影请看原始请求");}
-            item
+        Value::Array(self.parts.iter().enumerate().map(|(position, part)| {
+            json!({"key":part.key,"description":part.description,"position":position,"value":part.value})
         }).collect())
     }
     pub fn snapshot(
@@ -112,58 +65,22 @@ impl ContextBridge {
         time: TimeContext,
     ) -> Result<FrozenPrompt> {
         time.validate()?;
-        let legacy = crate::generation::messages_current(request, ctx, session, intent);
-        let raw = legacy
-            .last()
-            .and_then(|m| m["content"].as_str())
-            .unwrap_or_default();
-        let mut metadata: serde_json::Map<String, Value> = serde_json::from_str(raw)?;
-        metadata.remove("learningHistory");
-        metadata.remove("historyManifest");
-        metadata.remove("context");
-        metadata.remove("userGoal");
-        if let Some(document) = &request.document_id { metadata.insert("activeDocumentId".into(), json!(document)); }
-        if let Some(focus) = &request.focus { metadata.insert("focus".into(), json!(focus)); }
         let metadata_only_ids: Vec<_> = ctx.manifest.iter().filter(|m| m.included_chars == 0 && !ctx.automatic_materials.iter().any(|a|a.id==m.id)).map(|m|m.id.clone()).collect();
-        if !metadata_only_ids.is_empty() { metadata.insert("metadataOnlySourceIds".into(), json!(metadata_only_ids)); }
-        let question = metadata.remove("question").unwrap_or(json!(""));
-        let (mut materials, references) = projection.provider_texts(ctx)?;
-        if request.focus.is_some() { materials.clear(); }
+        let (_, references) = projection.provider_texts(ctx)?;
+        let question = if request.prompt.trim().is_empty() { crate::generation::default_request(&request.mode) } else { &request.prompt };
         let mut store = Self::default();
-        for part in [
-            PromptPart {
-                key: "stable",
-                lifetime: Lifetime::Stable,
-                position: Position::Stable,
-                value: json!({"type":"learning_request","materialRole":"user-reference","projectionVersion":1}),
-            },
-            PromptPart {
-                key: "materials",
-                lifetime: Lifetime::Versioned,
-                position: Position::Materials,
-                value: json!(materials),
-            },
-            PromptPart {
-                key: "references",
-                lifetime: Lifetime::OneShot,
-                position: Position::References,
-                value: json!(references.clone()),
-            },
-            PromptPart {
-                key: "turn",
-                lifetime: Lifetime::Turn,
-                position: Position::State,
-                value: json!({"referenceTime":time.reference_time,"timeZone":time.time_zone,"metadata":metadata,"automaticProjection":projection.stats}),
-            },
-            PromptPart {
-                key: "question",
-                lifetime: Lifetime::Turn,
-                position: Position::Question,
-                value: question,
-            },
-        ] {
-            store.add(&part)?;
+        store.add(&crate::time_context::bridge_part(&time))?;
+        store.add(&crate::context::bridge_part(&references))?;
+        if let Some(focus) = &request.focus {
+            store.add(&crate::focus::bridge_part(focus))?;
+        } else {
+            store.add(&automatic_context::bridge_part(projection, ctx))?;
         }
+        if let Some(intent) = intent {
+            store.add(&crate::exploration::bridge_part(intent))?;
+        }
+        // Input snapshot only: Pi accepts this once via its normal user entry.
+        store.add(&PromptPart { key: "question", description: "本轮用户输入（由 Pi 用户消息入口发送）", value: json!(question) })?;
         let mut entries = if request.focus.is_some() { vec![] } else { projection.manifest_entries(ctx) };
         let auto_ids = ctx
             .automatic_materials
@@ -235,29 +152,15 @@ impl ContextBridge {
             }
         }
         entries.push(json!({"id":"request-time","kind":"turn","status":"added","version":hash(&serde_json::to_string(&time)?),"includedChars":serde_json::to_string(&time)?.chars().count(),"reason":"frozen_current_turn"}));
-        entries.push(json!({"id":"context-protocol","kind":"stable","status":"retained","version":"1","includedChars":serde_json::to_string(&store.parts["stable"].value)?.chars().count(),"reason":"projection_protocol"}));
         let manifest = json!({"version":1,"entries":entries,"projectedChars":projection.text.chars().count()+focus_text.chars().count(),"projectedBytes":projection.text.len()+focus_text.len()});
-        let mut messages = store.assemble()?;
-        let content = messages[0]["content"].as_str().unwrap_or_default();
-        // The exact same immutable inventory is transmitted, stored on Run, and shown by the UI.
-        let at = content
-            .rfind(",\"question\":")
-            .ok_or_else(|| CoreError::new("INVALID_STATE", "本轮问题位置无效。"))?;
-        let actual = format!(
-            "{},\"contextBridgeManifest\":{},\"nativeMaterials\":{},\"nativeReferences\":{}{}",
-            &content[..at],
-            serde_json::to_string(&manifest)?,
-            serde_json::to_string(&if request.focus.is_some() { vec![] } else { projection.native_materials(ctx) })?,
-            serde_json::to_string(&references)?,
-            &content[at..]
-        );
-        if actual.len() > 2 * 1024 * 1024 {
-            return Err(CoreError::new(
-                "LIMIT_EXCEEDED",
-                "模型上下文及来源清单超过传输预算。",
-            ));
+        let mut envelope = store.assemble()?;
+        envelope["contextBridgeManifest"] = manifest.clone();
+        envelope["metadataOnlySourceIds"] = json!(metadata_only_ids);
+        let content = serde_json::to_string(&envelope)?;
+        if content.len() > 2 * 1024 * 1024 {
+            return Err(CoreError::new("LIMIT_EXCEEDED", "模型上下文及来源清单超过传输预算。"));
         }
-        messages[0]["content"] = json!(actual);
+        let messages = vec![json!({"role":"user","content":content})];
         let debug_registrations=crate::request_debug::enabled().then(||store.debug_registrations());
         Ok(FrozenPrompt {
             debug_registrations,
@@ -266,87 +169,15 @@ impl ContextBridge {
             manifest,
         })
     }
-    pub fn assemble(&self) -> Result<Vec<Value>> {
-        let mut history = Vec::new();
-        let mut material = String::new();
-        let mut references = String::new();
-        let mut metadata = serde_json::Map::new();
-        let mut states = serde_json::Map::new();
-        let mut question = Value::Null;
-        let mut sorted = self.parts.values().collect::<Vec<_>>();
-        sorted.sort_by_key(|p| (p.position, p.key));
-        for p in sorted {
-            match p.position {
-                Position::Stable => {
-                    if let Some(values) = p.value.as_object() {
-                        for (k, v) in values {
-                            metadata.insert(k.clone(), v.clone());
-                        }
-                    }
-                }
-                Position::History => {
-                    if let Some(items) = p.value.as_array() {
-                        history.extend(items.clone());
-                    }
-                }
-                Position::Materials => material.push_str(p.value.as_str().unwrap_or_default()),
-                Position::References => references.push_str(p.value.as_str().unwrap_or_default()),
-                Position::State => {
-                    if let Some(values) = p.value["metadata"].as_object() {
-                        for (k, v) in values {
-                            metadata.insert(k.clone(), v.clone());
-                        }
-                    }
-                    let mut state = p.value.as_object().cloned().unwrap_or_default();
-                    state.remove("metadata");
-                    state.remove("automaticProjection");
-                    states.insert(p.key.to_string(), Value::Object(state));
-                }
-                Position::Question => {
-                    if !question.is_null() && question != p.value {
-                        return Err(CoreError::new("CONTEXT_CONFLICT", "本次问题来源冲突。"));
-                    }
-                    question = p.value.clone();
-                }
-            }
+    pub fn assemble(&self) -> Result<Value> {
+        let registrations = self.debug_registrations();
+        if serde_json::to_vec(&registrations)?.len() > 2 * 1024 * 1024 {
+            return Err(CoreError::new("LIMIT_EXCEEDED", "模型上下文超过传输预算，未截断。"));
         }
-        let context = format!("{material}{references}");
-        if context.chars().count() > crate::context::MAX_CONTEXT_CHARS
-            || serde_json::to_string(&history)?.chars().count() > 20_000
-        {
-            return Err(CoreError::new(
-                "LIMIT_EXCEEDED",
-                "本次模型上下文超过已有预算，未静默丢弃正文基准。",
-            ));
-        }
-        let metadata = serde_json::to_string(&metadata)?;
-        let inside = &metadata[1..metadata.len() - 1];
-        let history_field = if history.is_empty() {
-            String::new()
-        } else {
-            format!("\"learningHistory\":{},", serde_json::to_string(&history)?)
-        };
-        let text = format!(
-            "{{{}\"context\":{},{},\"automaticProjection\":{},\"turnState\":{},\"question\":{}}}",
-            history_field,
-            serde_json::to_string(&context)?,
-            inside,
-            serde_json::to_string(
-                &self
-                    .parts
-                    .get("turn")
-                    .map(|p| p.value["automaticProjection"].clone())
-                    .unwrap_or(Value::Null)
-            )?,
-            serde_json::to_string(&states)?,
-            serde_json::to_string(&question)?
-        );
-        if text.len() > 2 * 1024 * 1024 {
-            return Err(CoreError::new("LIMIT_EXCEEDED", "模型上下文超过传输预算。"));
-        }
-        Ok(vec![json!({"role":"user","content":text})])
+        Ok(json!({"bridge":registrations}))
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,90 +220,16 @@ mod tests {
         }
     }
     #[test]
-    fn debug_snapshot_uses_actual_registration_keys_and_original_attributes() {
-        let mut bridge=ContextBridge::default();
-        bridge.add(&PromptPart{key:"actual_provider",lifetime:Lifetime::OneShot,position:Position::References,value:json!("line one\nline two")}).unwrap();
-        let snapshot=bridge.debug_registrations();
-        assert_eq!(snapshot[0]["key"],"actual_provider");assert_eq!(snapshot[0]["lifetime"],"OneShot");assert_eq!(snapshot[0]["position"],"References");assert_eq!(snapshot[0]["value"],"line one\nline two");
-    }
-    #[test]
-    fn stable_turn_versioned_and_one_shot_parts_deduplicate_or_fail_before_assembly() {
-        let mut store = ContextBridge::default();
-        for (key, lifetime, position) in [
-            ("stable", Lifetime::Stable, Position::Stable),
-            ("turn", Lifetime::Turn, Position::State),
-            ("materials", Lifetime::Versioned, Position::Materials),
-            ("references", Lifetime::OneShot, Position::References),
-        ] {
-            let part = PromptPart {
-                key,
-                lifetime,
-                position,
-                value: if matches!(position, Position::Stable | Position::State) {
-                    json!({"value":"frozen"})
-                } else {
-                    json!("frozen")
-                },
-            };
-            store.add(&part).unwrap();
-            store.add(&part).unwrap();
-        }
-        assert_eq!(store.parts.len(), 4);
-        assert_eq!(
-            store
-                .add(&PromptPart {
-                    key: "materials",
-                    lifetime: Lifetime::Versioned,
-                    position: Position::Materials,
-                    value: json!("changed late")
-                })
-                .unwrap_err()
-                .code,
-            "CONTEXT_CONFLICT"
-        );
-    }
-    #[test]
-    fn new_turn_provider_keeps_its_frozen_value_and_budget_failure_never_clips_a_baseline() {
+    fn registration_preserves_order_description_full_content_and_conflict() {
         let mut bridge = ContextBridge::default();
-        for p in [
-            PromptPart {
-                key: "stable",
-                lifetime: Lifetime::Stable,
-                position: Position::Stable,
-                value: json!({"type":"learning_request"}),
-            },
-            PromptPart {
-                key: "learningHistory",
-                lifetime: Lifetime::Turn,
-                position: Position::History,
-                value: json!([]),
-            },
-            PromptPart {
-                key: "exam-state",
-                lifetime: Lifetime::Turn,
-                position: Position::State,
-                value: json!({"goal":"frozen local goal"}),
-            },
-            PromptPart {
-                key: "question",
-                lifetime: Lifetime::Turn,
-                position: Position::Question,
-                value: json!("actual question"),
-            },
-        ] {
-            bridge.add(&p).unwrap();
-        }
-        let sent = bridge.assemble().unwrap();
-        let v: Value = serde_json::from_str(sent[0]["content"].as_str().unwrap()).unwrap();
-        assert_eq!(v["turnState"]["exam-state"]["goal"], "frozen local goal");
-        bridge
-            .add(&PromptPart {
-                key: "materials",
-                lifetime: Lifetime::Versioned,
-                position: Position::Materials,
-                value: json!("x".repeat(60001)),
-            })
-            .unwrap();
-        assert_eq!(bridge.assemble().unwrap_err().code, "LIMIT_EXCEEDED");
+        let time = PromptPart { key: "current_time", description: "本轮时间", value: json!({"referenceTime":"2026-10-21T00:00:00Z"}) };
+        let reference = PromptPart { key: "references", description: "明确引用", value: json!("正文".repeat(10000)) };
+        bridge.add(&time).unwrap(); bridge.add(&reference).unwrap(); bridge.add(&time).unwrap();
+        let snapshot = bridge.debug_registrations();
+        assert_eq!(snapshot[0]["key"], "current_time");
+        assert_eq!(snapshot[1]["description"], "明确引用");
+        assert_eq!(snapshot[1]["value"], reference.value);
+        assert_eq!(bridge.add(&PromptPart { value: json!("changed"), ..reference }).unwrap_err().code, "CONTEXT_CONFLICT");
+        assert!(bridge.assemble().unwrap().get("question").is_none());
     }
 }

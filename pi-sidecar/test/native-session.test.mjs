@@ -1,6 +1,7 @@
 import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import os from 'node:os';import path from 'node:path';import {createHash} from 'node:crypto';
 import {createAssistantMessageEventStream} from '@earendil-works/pi-ai/utils/event-stream';
 import {openNativeSession} from '../native-session.mjs';
+import {getCurrentSystemPrompt} from '@earendil-works/pi-ai';
 const hash=s=>createHash('sha256').update(s).digest('hex');
 const model={provider:'learning-custom',id:'fixture',name:'fixture',api:'openai-completions',baseUrl:'http://127.0.0.1:1/v1',reasoning:false,input:['text'],contextWindow:0,maxTokens:1024,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}};
 function fixture(inspect){return (m,c,o)=>{inspect?.(c,o);const stream=createAssistantMessageEventStream();queueMicrotask(()=>{const msg={role:'assistant',content:[{type:'text',text:'Fixture answer'}],api:m.api,provider:m.provider,model:m.id,usage:{input:20,output:5,cacheRead:0,cacheWrite:0,totalTokens:25,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}},stopReason:'stop',timestamp:Date.now()};stream.push({type:'start',partial:msg});stream.push({type:'done',reason:'stop',message:msg});stream.end();});return stream;};}
@@ -20,8 +21,8 @@ test('frozen Focus remains on the native turn across cancelled-run retry without
  const focusEntry={id:'focus:0',kind:'turn',status:'added',sourceId:'doc_1',version:'v1',includedChars:8,range:{startChar:0,endChar:8,complete:true,totalBytes:8},reason:'focus_visible_body'};const inventory={...envelope.contextBridgeManifest,entries:[...envelope.contextBridgeManifest.entries,focusEntry]};let actual;
  let n=await openNativeSession(s,{...options(),onManifest:m=>{actual=m;}});await n.applyContext({...envelope,contextBridgeManifest:inventory,focus:structuredClone(focus)});assert.deepEqual(actual.entries.find(e=>e.id==='focus:0'),{...focusEntry,includedChars:0,reason:'focus_location'});await n.prompt('First question');n.close();
  let observed;n=await openNativeSession({...s,runId:'run_retry_focus'},options(fixture(c=>observed=c)));await n.applyContext({...envelope,contextBridgeManifest:inventory,focus:structuredClone(focus)});await n.prompt('First question');
- const turns=n.manager.buildSessionProjection().entries.filter(e=>e.messages.length&&e.sourceEntry.type==='custom_message'&&e.sourceEntry.customType==='learning-station-turn');
- assert.equal(turns.length,1);assert.deepEqual(JSON.parse(turns[0].sourceEntry.content).focus,{...focus,paragraphs:[{start:0,end:8}]});assert.deepEqual(JSON.parse(turns[0].sourceEntry.content).contextBridgeManifest.entries.find(e=>e.id==='focus:0'),{...focusEntry,includedChars:0,reason:'focus_location'});assert(JSON.stringify(observed.messages).includes('documents/doc_1.md'));assert.equal(n.manager.getEntries().filter(e=>e.type==='message'&&e.message.role==='user').length,1);n.close();
+ const turns=n.manager.buildSessionProjection().entries.filter(e=>e.messages.length&&e.sourceEntry.type==='custom_message'&&e.sourceEntry.customType==='learning-station-focus');
+ assert.equal(turns.length,1);assert.deepEqual(JSON.parse(turns[0].sourceEntry.content),{documentId:focus.documentId,sourceDocumentId:focus.sourceDocumentId,path:focus.path,type:focus.type,commitHash:focus.commitHash,view:focus.view,paragraphs:[{start:0,end:8}]});assert(!turns[0].sourceEntry.content.includes('contextBridgeManifest'));assert(JSON.stringify(observed.messages).includes('documents/doc_1.md'));assert.equal(n.manager.getEntries().filter(e=>e.type==='message'&&e.message.role==='user').length,1);n.close();
 });
 test('metadata-only material removes its old automatic body while keeping ordinary native conversation and explicit references',async()=>{
  const s=spec(),old='R2_OLD_AUTOMATIC_BODY_MARKER',source={...envelope.nativeMaterials[0],text:old,textHash:hash(old),frames:[{kind:'full',version:'v1',textHash:hash(old),text:old}]};let n=await openNativeSession(s,options());await n.applyContext({...envelope,nativeMaterials:[source]});await n.prompt('First question');await n.complete('Fixture answer');n.close();
@@ -92,10 +93,10 @@ test('compaction retaining only a Git diff reloads full and never trusts a summa
  n.manager.appendCompaction('Summary is not a full baseline',summary,100);n.close();
  n=await openNativeSession({...s,runId:'run_compact_git',userEntryId:'user_compact_git'},{...options(),loadChanges:async r=>changeReply(r.baseCommitOid,focused('doc_1','Material changed',cp2,{commit:cp1,body:'Material',patch:'delta only'}))});await n.applyContext(changesEnvelope('doc_1',cp2));assert.equal(JSON.parse(materialEntries(n).at(-1).content).frames[0].kind,'full');n.close();
 });
-test('unaccepted original request has no checkpoint receipt; a failed accepted request reconciles same user identity',async()=>{
+test('unstarted and failed transport never establish a body baseline; accepted user is still deduplicated',async()=>{
  const s=spec();let n=await openNativeSession(s,{...options(),loadChanges:async r=>{assert.equal(r.baseCommitOid,null);return changeReply(null,focused('doc_1','first'),[{path:'documents/doc_1.md',status:'A'}]);}});await n.applyContext(changesEnvelope());n.close();
  n=await openNativeSession(s,{...options(()=>{throw Error('synthetic cancelled/failed transport');}),loadChanges:async r=>{assert.equal(r.baseCommitOid,null);return changeReply(null,focused('doc_1','first'),[{path:'documents/doc_1.md',status:'A'}]);}});await n.applyContext(changesEnvelope());await n.prompt('First question').catch(()=>{});assert(n.record.userNativeId);assert.equal(n.record.status,'pending');n.close();
- n=await openNativeSession(s,{...options(),loadChanges:async r=>{assert.equal(r.baseCommitOid,cp1);return changeReply(cp1,focused('doc_1','first'),[],{exclusionsChanged:false});}});await n.applyContext(changesEnvelope());await n.prompt('First question');assert.equal(n.manager.getEntries().filter(e=>e.type==='message'&&e.message.role==='user').length,1);n.close();
+ n=await openNativeSession(s,{...options(),loadChanges:async r=>{assert.equal(r.baseCommitOid,null);assert.equal(r.focusBaseCommitOid,null);return changeReply(null,focused('doc_1','first'),[],{exclusionsChanged:false});}});await n.applyContext(changesEnvelope());await n.prompt('First question');assert.equal(n.manager.getEntries().filter(e=>e.type==='message'&&e.message.role==='user').length,1);n.close();
 });
 test('partial full frame is not a complete baseline even when its hash matches',async()=>{
  const s=spec();let n=await openNativeSession(s,options());const partial=structuredClone(envelope);partial.nativeMaterials[0].range.complete=false;await n.applyContext(partial);await n.prompt('First question');n.close();
@@ -109,14 +110,14 @@ test('over capacity or mismatched course fails before recording a Changes receip
  for(const bad of ['budget','course']){const s=spec();const n=await openNativeSession(s,{...options(),loadChanges:async r=>changeReply(r.baseCommitOid,focused('doc_1','first'),[{path:'file',patch:'x'.repeat(bad==='budget'?513*1024:1)}],bad==='course'?{checkpoint:{courseId:'other',checkpointCommitOid:cp1,materialTreeOid:tree}}:{})});await assert.rejects(n.applyContext(changesEnvelope()),e=>e.code===(bad==='budget'?'LIMIT_EXCEEDED':'NATIVE_SESSION_INVALID'));assert.equal(changeEntries(n).length,0);n.close();}
 });
 
-test('actual native cancellation reconciles its original request; an unstarted retry cannot advance it',async()=>{
+test('cancellation before model evidence and an unstarted retry cannot advance body or Changes baselines',async()=>{
  const s=spec();let started;const requestStarted=new Promise(resolve=>started=resolve);
  const abortedStream=(m,c,o)=>{const stream=createAssistantMessageEventStream();const stop=()=>{const error={role:'assistant',content:[],api:m.api,provider:m.provider,model:m.id,usage:{input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}},stopReason:'aborted',errorMessage:'Synthetic cancellation',timestamp:Date.now()};stream.push({type:'error',reason:'aborted',error});stream.end();};o.signal.addEventListener('abort',stop,{once:true});started();return stream;};
  let n=await openNativeSession(s,{...options(abortedStream),loadChanges:async r=>changeReply(r.baseCommitOid,focused('doc_1','first'),[{path:'documents/doc_1.md',status:'A'}])});
  await n.applyContext(changesEnvelope());const pending=n.prompt('First question');await requestStarted;await n.session.abort();await pending.catch(()=>{});assert(n.record.userNativeId);assert.equal(n.record.status,'pending');n.close();
  // This retry reuses the accepted user but is cancelled before a prepared request.
- n=await openNativeSession({...s,runId:'run_unstarted_retry'},{...options(),loadChanges:async r=>{assert.equal(r.baseCommitOid,cp1);return changeReply(cp1,focused('doc_1','unstarted version',cp2),[{path:'documents/doc_1.md',status:'M'}]);}});await n.applyContext(changesEnvelope('doc_1',cp2));n.close();
- n=await openNativeSession({...s,runId:'run_after_unstarted'},{...options(),loadChanges:async r=>{assert.equal(r.baseCommitOid,cp1);return changeReply(cp1,focused('doc_1','first'),[],{exclusionsChanged:false});}});await n.applyContext(changesEnvelope());await n.prompt('First question');assert.equal(n.manager.getEntries().filter(e=>e.type==='message'&&e.message.role==='user').length,1);n.close();
+ n=await openNativeSession({...s,runId:'run_unstarted_retry'},{...options(),loadChanges:async r=>{assert.equal(r.baseCommitOid,null);assert.equal(r.focusBaseCommitOid,null);return changeReply(null,focused('doc_1','unstarted version',cp2),[{path:'documents/doc_1.md',status:'M'}]);}});await n.applyContext(changesEnvelope('doc_1',cp2));n.close();
+ n=await openNativeSession({...s,runId:'run_after_unstarted'},{...options(),loadChanges:async r=>{assert.equal(r.baseCommitOid,null);assert.equal(r.focusBaseCommitOid,null);return changeReply(null,focused('doc_1','first'),[],{exclusionsChanged:false});}});await n.applyContext(changesEnvelope());await n.prompt('First question');assert.equal(n.manager.getEntries().filter(e=>e.type==='message'&&e.message.role==='user').length,1);n.close();
 });
 test('automatic native compaction awaits the fixed Changes reload before the next model request',async()=>{
  const s=spec(),lifecycle=[];let reloads=0,after=0;
@@ -159,7 +160,7 @@ test('automatic Focus body uses one native full-to-Git-diff projection without r
  const s=spec(),body='FOCUS_FIRST_FULL_BODY',nextBody='FOCUS_NEXT_COMPLETE_BODY';let source=focused('doc_1',body),seen;
  const opts=()=>({...options(fixture(c=>seen=c)),loadChanges:async r=>changeReply(r.baseCommitOid,source,r.baseCommitOid===source.gitCommitOid?[]:[{path:source.path,status:r.baseCommitOid?'M':'A',...(source.gitChange?{patch:source.gitChange.unifiedDiff}:{})}],{exclusionsChanged:r.baseCommitOid===null})});
  const turn=()=>({...changesEnvelope('doc_1',source.gitCommitOid),focus:{...changesEnvelope('doc_1',source.gitCommitOid).focus,paragraphs:[{start:0,end:[...source.text].length,text:source.text}]}});
- const assertMetadata=n=>{const e=n.manager.buildSessionProjection().entries.find(e=>e.messages.length&&e.sourceEntry.customType==='learning-station-turn');const f=JSON.parse(e.sourceEntry.content).focus;assert.equal(f.commitHash,source.gitCommitOid);assert.deepEqual(f.paragraphs,[{start:0,end:[...source.text].length}]);};
+ const assertMetadata=n=>{const e=n.manager.buildSessionProjection().entries.find(e=>e.messages.length&&e.sourceEntry.customType==='learning-station-focus');const f=JSON.parse(e.sourceEntry.content);assert.equal(f.commitHash,source.gitCommitOid);assert.deepEqual(f.paragraphs,[{start:0,end:[...source.text].length}]);};
  let n=await openNativeSession(s,opts());const frozen=turn();await n.applyContext(frozen);assert.equal(frozen.focus.paragraphs[0].text,body);assertMetadata(n);await n.prompt('First Focus');assert(JSON.stringify(seen.messages).includes(body));assert.equal(JSON.parse(materialEntries(n).at(-1).content).frames[0].kind,'full');n.close();
  source=focused('doc_1',nextBody,cp2,{commit:cp1,body,patch:'FIXED_OLD_NEW_COMPLETE_GIT_DIFF'});
  n=await openNativeSession({...s,runId:'run_focus_second',userEntryId:'user_focus_second'},opts());await n.applyContext(turn());assertMetadata(n);await n.prompt('Changed Focus');const frame=JSON.parse(materialEntries(n).at(-1).content).frames[0];assert.equal(frame.kind,'diff');assert.equal(frame.unifiedDiff,'FIXED_OLD_NEW_COMPLETE_GIT_DIFF');assert.equal(JSON.stringify(seen.messages).split(frame.unifiedDiff).length-1,1);assert(!JSON.stringify(seen.messages).includes(nextBody));n.close();
@@ -192,7 +193,7 @@ test('legacy nativeMaterials Focus removes metadata body from actual full/diff/u
   const body=i<1?'Material':changed;const n=await openNativeSession({...s,runId:'legacy_focus_'+i,userEntryId:'legacy_user_'+i},options(fixture(c=>seen=c)));
   const current={...envelope,nativeMaterials:i===0?envelope.nativeMaterials:[source],focus:{documentId:'doc_1',paragraphs:[{start:0,end:body.length,text:body}]}};
   await n.applyContext(current);await n.prompt('Legacy Focus '+i);assert.equal(current.focus.paragraphs[0].text,body);
-  const turn=seen.messages.map(m=>{try{return JSON.parse(text(m));}catch{return {};}}).find(v=>v.focus);assert.deepEqual(turn.focus.paragraphs,[{start:0,end:body.length}]);assert(!JSON.stringify(turn).includes(body));
+  const turn=seen.messages.map(m=>{try{return JSON.parse(text(m));}catch{return {};}}).find(v=>v.documentId==='doc_1');assert.deepEqual(turn.paragraphs,[{start:0,end:body.length}]);assert(!JSON.stringify(turn).includes(body));
   const frame=JSON.parse(materialEntries(n).at(-1).content).frames[0];assert.equal(frame.kind,i===1||i===2?'diff':'full');
   if(i===2)n.manager.appendCompaction('Synthetic summary is not a body',n.manager.getEntries().filter(e=>e.type==='message').at(-1).id,100);
   n.close();
@@ -231,4 +232,12 @@ test('pending read always revalidates with Rust even when a durable native reply
     }
     assert.equal(checks, 1, 'native cached read replies cannot bypass current Rust authorization');
   }
+});
+
+test('reopening a native session removes superseded application system rules while retaining user history',async()=>{
+ const s=spec();let n=await openNativeSession(s,{...options(),systemPrompt:'SUPERSEDED_APPLICATION_RULES'});await n.applyContext(envelope);await n.prompt('Existing genuine user question');await n.complete('Fixture answer');n.close();
+ let seen;n=await openNativeSession({...s,runId:'new_architecture_run',userEntryId:'new_architecture_user'},{...options(fixture(c=>seen=c)),systemPrompt:''});await n.applyContext(envelope);await n.prompt('New architecture question');n.close();
+ assert(seen.messages.some(m=>m.role==='user'&&text(m)==='Existing genuine user question'));
+ assert(!getCurrentSystemPrompt(seen.messages).includes('SUPERSEDED_APPLICATION_RULES'));
+ assert(!getCurrentSystemPrompt(seen.messages).includes('expert coding assistant'));
 });

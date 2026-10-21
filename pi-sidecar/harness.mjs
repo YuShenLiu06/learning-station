@@ -1,8 +1,9 @@
 import { snapshotRequest, redactDebug } from './request-debug.mjs';
-import {resolveTimeContext,timeSystemContext} from './time-context.mjs';
+import {resolveTimeContext} from './time-context.mjs';
 import { resolveLearningSkills } from './learning-skills.mjs';
 import {randomUUID} from 'node:crypto';
 import { openNativeSession } from './native-session.mjs';
+import {decodeBridgeInput,projectStandalone} from './context-bridge.mjs';
 import { Agent } from '@earendil-works/pi-agent-core';
 import { streamSimple } from '@earendil-works/pi-ai/api/openai-completions';
 import { streamSimple as streamAnthropic } from '@earendil-works/pi-ai/api/anthropic-messages';
@@ -248,10 +249,10 @@ class SecretFilter {
   }
 }
 
-export function explorationSystem(value,mode){
-  if(value==null)return '';
+function explorationPart(value,mode){
+  if(value==null)return undefined;
   if(mode!=='question'||value.scenario!=='question-led-exploration'||typeof value.originalQuestion!=='string'||typeof value.userGoal!=='string'||value.originalQuestion.length>30000||value.userGoal.length>30000||typeof value.storageDocumentId!=='string'||!Array.isArray(value.materialSourceIds)||value.materialSourceIds.length>32)throw new SafeError('INVALID_INPUT');
-  return `\n\n探索状态：主文档是自动保存的探索笔记容器；正常探索结论可沿既定流程追加保存，以回执为准。${JSON.stringify({scenario:value.scenario,storageDocumentId:value.storageDocumentId,materialSourceIds:value.materialSourceIds})}`;
+  return {key:'exploration',description:'探索入口的任务位置与来源',value:{scenario:value.scenario,storageDocumentId:value.storageDocumentId,materialSourceIds:value.materialSourceIds}};
 }
 /** Test dependencies accept functions only; JSON input cannot replace the real Agent or provider. */
 export async function runLearningAgent(request, emit, { signal, streamFn: fixtureStream, onAgent, settleBarrier, requestTool } = {}) {
@@ -266,6 +267,7 @@ export async function runLearningAgent(request, emit, { signal, streamFn: fixtur
   const codingTarget = ['open.bigmodel.cn', 'api.z.ai'].includes(targetUrl.hostname) && targetUrl.pathname.startsWith('/api/coding/');
   if (!fixture && (request.settings.provider !== 'custom' || codingTarget)) throw new SafeError('PLAN_USAGE_UNCONFIRMED');
   const history = prepareHistory(request.messages, request.operation, model);
+  if(!request.nativeSession&&history.some(m=>{try{return Array.isArray(JSON.parse(m.content)?.bridge);}catch{return false;}}))throw new SafeError('NATIVE_SESSION_INVALID');
   const glm = request.settings.provider !== 'custom';
   let agent;
   let native;
@@ -274,7 +276,8 @@ export async function runLearningAgent(request, emit, { signal, streamFn: fixtur
   const fail = (code) => { failure ??= code; agent?.abort();native?.session.abortCompaction();void native?.session.abort().catch(()=>{}); };
   const policy = validateToolPolicy(request.toolPolicy, request.learningTools === true, request.operation);
   const skills = resolveLearningSkills(request.learningSkills, policy);
-  const intentSystem=explorationSystem(request.explorationContext,policy.mode);
+  const intent=explorationPart(request.explorationContext,policy.mode);
+  const standalone=projectStandalone(request.nativeSession?[]:[{key:'current_time',description:'本轮冻结时间与时区',value:{referenceTime:timeContext.referenceTime,timeZone:timeContext.timeZone}},...(intent?[intent]:[])]);
   const toolsEnabled = policy.allowedTools.length > 0 && request.learningTools === true && request.operation === 'generate' && typeof requestTool === 'function';
   if (policy.allowedTools.length > 0 && !toolsEnabled) throw new SafeError('TOOLS_DISABLED');
   const permitted = new Set(policy.allowedTools);
@@ -304,7 +307,7 @@ export async function runLearningAgent(request, emit, { signal, streamFn: fixtur
     phase:context.messages.at(-1)?.role==='toolResult'?'tool_continuation':debugOrdinal===0?'initial':'continuation',
     gate:async()=>{debugOrdinal++; const reply=await requestTool({type:'debug_probe',id:'debug_'+randomUUID()});return reply?.result?.epoch;},
     registrations:request.debugRegistrations,
-    sources:()=>({native:native?.debugSources?.()??[],systems:context.messages.filter(m=>m.role==='system'&&m.sections).flatMap(m=>Object.entries(m.sections).filter(([,value])=>typeof value==='string').map(([name,value])=>({value,name,origin:name==='preamble'?'unknown':'pi',sourcePath:`Pi/system.sections/${name}`})))}),
+    sources:()=>({native:native?.debugSources?.()??standalone.sources,registrations:native?.debugRegistrations?.()??standalone.registrations,systems:context.messages.filter(m=>m.role==='system'&&m.sections).flatMap(m=>Object.entries(m.sections).filter(([,value])=>typeof value==='string').map(([name,value])=>({value,name,origin:name==='preamble'?'unknown':'pi',sourcePath:`Pi/system.sections/${name}`})))}),
     emit,
   } : undefined;
   const productionStream = (selectedModel, context, options) => (model.api === 'anthropic-messages' ? streamAnthropic : streamSimple)(selectedModel, context, {
@@ -326,8 +329,8 @@ export async function runLearningAgent(request, emit, { signal, streamFn: fixtur
     onProviderStreamEvent: chunk => { diagnostic.chunk(chunk); if (diagnostic.snapshot().invalidDelta) { fail('MODEL_FORMAT'); throw new SafeError('MODEL_FORMAT'); } },
   });
   const agentOptions = {
-    initialState: { systemPrompt: (request.operation === 'test' ? 'You are a connection test. Reply only with OK. Tools are disabled.' : policy.mode === 'grading' ? GRADING_SYSTEM : policy.mode === 'feedback' ? FEEDBACK_SYSTEM : policy.mode === 'practice' ? PRACTICE : '') + (request.nativeSession ? '' : `\n\n${timeSystemContext(timeContext)}`) + (request.nativeSession ? '' : intentSystem),
-      model, thinkingLevel: glm ? 'max' : 'off', tools: plugin?.tools ?? [], messages: history.slice(0, -1) },
+    initialState: { systemPrompt: (request.operation === 'test' ? 'You are a connection test. Reply only with OK. Tools are disabled.' : policy.mode === 'grading' ? GRADING_SYSTEM : policy.mode === 'feedback' ? FEEDBACK_SYSTEM : policy.mode === 'practice' ? PRACTICE : ''),
+      model, thinkingLevel: glm ? 'max' : 'off', tools: plugin?.tools ?? [], messages: [...history.slice(0, -1),...standalone.messages] },
     streamFn: fixtureStream ?? productionStream,
     getApiKey: () => request.apiKey,
     toolExecution: 'sequential',
@@ -343,7 +346,7 @@ export async function runLearningAgent(request, emit, { signal, streamFn: fixtur
   };
   if(request.nativeSession && request.operation==='generate'){
     const systemPrompt=agentOptions.initialState.systemPrompt;
-    native=await openNativeSession(request.nativeSession,{model,systemPrompt,tools:plugin?.tools??[],streamFn:agentOptions.streamFn,apiKey:request.apiKey,thinkingLevel:glm?'max':'off',beforeToolCall:agentOptions.beforeToolCall,finishTurn:agentOptions.finishTurn,requestTool,loadChanges:request.materialChanges===true?async ({baseCommitOid,focusBaseCommitOid})=>{const reply=await requestTool({type:'material_changes',id:'changes_'+randomUUID(),baseCommitOid,focusBaseCommitOid});if(!reply?.result)throw new SafeError(reply?.error?.code??'TOOL_PROTOCOL');return reply.result;}:undefined,checkpoint:async()=>{const reply=await requestTool({type:'session_sync',id:'sync_'+randomUUID()});if(reply?.result?.synced!==true)throw new SafeError('NATIVE_SESSION_INVALID');},onManifest:manifest=>{const write=emit({type:'context_manifest',manifest});manifestWrites.push(write);return write;},onLifecycle:event=>{const write=emit({type:'session_lifecycle',event:event.type,reason:event.reason,aborted:event.aborted});manifestWrites.push(write);return write;}});
+    native=await openNativeSession(request.nativeSession,{model,systemPrompt,timeContext,tools:plugin?.tools??[],streamFn:agentOptions.streamFn,apiKey:request.apiKey,thinkingLevel:glm?'max':'off',beforeToolCall:agentOptions.beforeToolCall,finishTurn:agentOptions.finishTurn,requestTool,loadChanges:request.materialChanges===true?async ({baseCommitOid,focusBaseCommitOid})=>{const reply=await requestTool({type:'material_changes',id:'changes_'+randomUUID(),baseCommitOid,focusBaseCommitOid});if(!reply?.result)throw new SafeError(reply?.error?.code??'TOOL_PROTOCOL');return reply.result;}:undefined,checkpoint:async()=>{const reply=await requestTool({type:'session_sync',id:'sync_'+randomUUID()});if(reply?.result?.synced!==true)throw new SafeError('NATIVE_SESSION_INVALID');},onManifest:manifest=>{const write=emit({type:'context_manifest',manifest});manifestWrites.push(write);return write;},onLifecycle:event=>{const write=emit({type:'session_lifecycle',event:event.type,reason:event.reason,aborted:event.aborted});manifestWrites.push(write);return write;}});
     agent=native.agent;
   }else agent=new Agent(agentOptions);
   const unsubscribe = agent.subscribe(async (event) => {
@@ -393,7 +396,7 @@ export async function runLearningAgent(request, emit, { signal, streamFn: fixtur
     await onAgent?.(agent);
     await emit({ type: 'ready', ...(native?{nativeSession:{version:PI_VERSION,engine:'pi-coding-agent',persistent:true,learningSessionId:request.nativeSession.learningSessionId}}:{}), harness: HARNESS, version: PI_VERSION, plugins: plugin ? [{ id: plugin.id, version: plugin.version, tools: policy.allowedTools }] : [], learningSkills: skills.versions, timeContext });
     if(native){
-      let envelope;try{envelope=JSON.parse(history.at(-1).content);}catch{throw new SafeError('INVALID_INPUT');}
+      let envelope;try{envelope=decodeBridgeInput(JSON.parse(history.at(-1).content));}catch{throw new SafeError('INVALID_INPUT');}
       if(typeof envelope.question!=='string')throw new SafeError('INVALID_INPUT');
       await native.applyContext(envelope);
       const outcome=await native.prompt(envelope.question);

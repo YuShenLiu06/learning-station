@@ -1,5 +1,7 @@
 // Application binding around the pinned public Pi SDK. Credentials and tools remain explicit.
 import fs from 'node:fs';
+import {ContextBridge,decodeBridgeInput} from './context-bridge.mjs';
+import {registerMaterialContext} from './material-context.mjs';
 import path from 'node:path';
 import {createHash, randomUUID} from 'node:crypto';
 import {createAssistantMessageEventStream} from '@earendil-works/pi-ai/utils/event-stream';
@@ -25,7 +27,7 @@ function sync(file){const fd=fs.openSync(file,'r');try{if(!process.permission)fs
 function text(message){return typeof message.content==='string'?message.content:(message.content??[]).filter(p=>p.type==='text').map(p=>p.text).join('');}
 function safeStream(original,secret,checkpoint,beforeRequest){return (model,context,options)=>{
   const stream=createAssistantMessageEventStream();
-  (async()=>{try{beforeRequest?.(context);await checkpoint();const cleanContext={...context,messages:context.messages.map(m=>m.role==='system'?{...m,...(m.sections?{sections:{...m.sections,cwd:'学习站受控学习空间（没有通用文件或命令权限）'}}:{}),...(typeof m.content==='string'?{content:m.content.replace(/<cwd>[\s\S]*?<\/cwd>/gu,'<cwd>学习站受控学习空间（没有通用文件或命令权限）</cwd>')}:{})}:m)};for await(const event of await original(model,cleanContext,options))stream.push(redact(event,secret));stream.end();}
+  (async()=>{try{await checkpoint();const cleanContext={...context,messages:context.messages.map(m=>m.role==='system'?{...m,...(m.sections?{sections:{...m.sections,cwd:'当前课程'}}:{}),...(typeof m.content==='string'?{content:m.content.replace(/<cwd>[\s\S]*?<\/cwd>/gu,'<cwd>当前课程</cwd>')}:{})}:m)};let received=false;for await(const event of await original(model,cleanContext,options)){if(!received&&(event.type==='text_delta'||event.type==='toolcall_start'||event.type==='done')){beforeRequest?.(context);await checkpoint();received=true;}stream.push(redact(event,secret));}stream.end();}
   catch{const error={role:'assistant',content:[],api:model.api,provider:model.provider,model:model.id,usage:{input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}},stopReason:'error',errorMessage:'Controlled stream failed',timestamp:Date.now()};stream.push({type:'error',reason:'error',error});stream.end();}})();
   return stream;
 };}
@@ -53,7 +55,7 @@ function validateInner(spec){
 }
 function validate(spec){try{return validateInner(spec);}catch(error){throw error instanceof NativeSessionError?error:new NativeSessionError('NATIVE_SESSION_INVALID',error);}}
 // Pi native messages are the only model transcript. Business Markdown remains independently intact.
-export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn,apiKey,thinkingLevel,finishTurn,beforeToolCall,requestTool,onManifest,onLifecycle,loadChanges,checkpoint:providedCheckpoint}){
+export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn,apiKey,thinkingLevel,finishTurn,beforeToolCall,requestTool,onManifest,onLifecycle,loadChanges,timeContext,checkpoint:providedCheckpoint}){
   const {file,binding}=validate(spec);
   const cwd=spec.projectRoot??spec.directory;
   const lock=path.join(spec.directory,'active.lock');let lockFd;
@@ -91,9 +93,16 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
     const settings=SettingsManager.inMemory({defaultTools:[],retry:{enabled:false,maxRetries:0},providerRetry:{maxRetries:0,maxRetryDelayMs:1},compaction:{enabled:model.contextWindow>0,reserveTokens:Math.min(model.maxTokens,Math.max(128,Math.floor(model.contextWindow/4))),keepRecentTokens:Math.max(128,Math.floor(model.contextWindow/4))},cacheWarming:'off'});
     // Pi owns project discovery, ancestor context files and skill parsing. Keep the
     // existing explicit extension/tool policy; text resources do not grant tools.
-    const resourceLoader=spec.projectRoot?new DefaultResourceLoader({cwd,agentDir:spec.agentDir??getAgentDir(),settingsManager:settings,systemPromptOverride:()=>systemPrompt,noExtensions:true}):sealedResources(systemPrompt);
+    // Pi treats an empty custom prompt as its default coding tutorial. Whitespace
+    // explicitly opts out while preserving its project AGENTS/skill discovery.
+    const piSystemPrompt=systemPrompt||' ';
+    const resourceLoader=spec.projectRoot?new DefaultResourceLoader({cwd,agentDir:spec.agentDir??getAgentDir(),settingsManager:settings,systemPromptOverride:()=>piSystemPrompt,noExtensions:true}):sealedResources(piSystemPrompt);
     await resourceLoader.reload();
     const markChangesRequest=context=>{
+      for(const e of manager.buildSessionProjection().entries){const source=e.sourceEntry;
+        if(!e.messages.length||source.type!=='custom_message'||source.customType!=='learning-station-material'||!context.messages.some(m=>text(m)===source.content))continue;
+        if(!manager.getEntries().some(r=>r.type==='custom'&&r.customType==='learning-station-material-request'&&r.data?.entryId===source.id))manager.appendCustomEntry('learning-station-material-request',{nativeSessionId:manager.getSessionId(),entryId:source.id});
+      }
       for(const e of manager.buildSessionProjection().entries){const source=e.sourceEntry;
         if(!e.messages.length||source.type!=='custom_message'||source.customType!=='learning-station-changes'||source.details?.runId!==spec.runId||!context.messages.some(m=>text(m).includes(source.content)))continue;
         if(!manager.getEntries().some(r=>r.type==='custom'&&r.customType==='learning-station-changes-request'&&r.data?.changesEntryId===source.id))manager.appendCustomEntry('learning-station-changes-request',{nativeSessionId:manager.getSessionId(),runId:spec.runId,userEntryId:spec.userEntryId,changesEntryId:source.id});
@@ -147,79 +156,23 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
     // Old per-turn references are not silently injected into later requests.
     for(const entry of manager.buildSessionProjection().entries){if(entry.sourceEntry.type==='custom_message'&&entry.sourceEntry.customType==='learning-station-turn'&&entry.messages.length)manager.appendContextEdit(entry.sourceEntry.id,null);}
     agent.state.messages=manager.buildSessionContext().messages;
-    const materialBaseline=id=>{
-      const active=manager.buildSessionProjection().entries.filter(e=>e.messages.length&&e.sourceEntry.type==='custom_message'&&e.sourceEntry.customType==='learning-station-material'&&e.sourceEntry.details?.sourceId===id);
-      let activeHash;let chainReady=false;
-      for(const entry of active){
-        let value;try{value=JSON.parse(text(entry.messages[0]));}catch{chainReady=false;break;}
-        for(const frame of value.frames??[]){if(frame.kind==='full'){chainReady=sha(frame.text)===frame.textHash;activeHash=frame.textHash;}
-        else if(frame.kind==='diff'){chainReady=chainReady&&frame.baseHash===activeHash;activeHash=frame.textHash;}else chainReady=false;}
-      }
-      return {active,last:chainReady?active.at(-1)?.sourceEntry.details:undefined};
-    };
-    let currentSources=[];let currentTurn;
-    const applyContext=async envelope=>{
+    const bridge=new ContextBridge(manager,{runId:spec.runId,userEntryId:spec.userEntryId});
+    const nativeTransform=agent.transformContext;
+    agent.transformContext=async(messages,signal)=>bridge.ordered(await nativeTransform?.(messages,signal)??messages);
+    let currentTurn;
+    const applyContext=async input=>{
+      const envelope=decodeBridgeInput(input);
       if(containsSecret(envelope,apiKey))throw new NativeSessionError('AUTH');
-      currentSources=envelope.nativeMaterials??[];currentTurn=envelope;
-      const inventory=structuredClone(envelope.contextBridgeManifest??{version:1,entries:[]});
-      const metadataOnly=envelope.metadataOnlySourceIds??[];
-      if(!Array.isArray(metadataOnly)||metadataOnly.some(id=>!spec.authorizedSourceIds.includes(id)))throw new NativeSessionError();
-      for(const entry of manager.buildSessionProjection().entries)if(entry.messages.length&&entry.sourceEntry.type==='custom_message'&&entry.sourceEntry.customType==='learning-station-material'&&metadataOnly.includes(entry.sourceEntry.details?.sourceId))manager.appendContextEdit(entry.sourceEntry.id,null);
-      inventory.entries=inventory.entries.filter(e=>e.kind!=='history');
-      if(loadChanges&&envelope.focus){
-        const focus=envelope.focus;
-        if(focus.asset&&!spec.authorizedSourceIds.includes(focus.asset.id))throw new NativeSessionError();
-        // A Git commit alone is never an accepted checkpoint. Reconcile the
-        // original saved question against its actual native user entry, even
-        // after cancellation, a lost reply, or a new run for the same question.
-        const received=manager.buildSessionProjection().entries.filter(e=>e.messages.length&&e.sourceEntry.type==='custom_message'&&e.sourceEntry.customType==='learning-station-changes'&&e.sourceEntry.details?.courseId===focus.courseId).map(e=>e.sourceEntry).filter(e=>manager.getEntries().some(r=>r.type==='custom'&&r.customType==='learning-station-changes-request'&&r.data?.changesEntryId===e.id&&r.data.runId===e.details.runId&&r.data.userEntryId===e.details.userEntryId&&r.data.nativeSessionId===manager.getSessionId())&&manager.getEntries().some(u=>u.type==='custom'&&u.customType==='learning-station-user'&&u.data?.userEntryId===e.details.userEntryId&&manager.getEntry(u.data.nativeId)?.message?.role==='user')).at(-1);
-        const body=materialBaseline(focus.asset?.id??focus.documentId).last;
-        const focusBaseCommitOid=body?.range?.complete&&body.path===focus.path?body.gitCommitOid??null:null;
-        const changes=await loadChanges({baseCommitOid:received?.details.checkpointCommitOid??null,focusBaseCommitOid});
-        if(changes?.complete!==true||changes.checkpoint?.courseId!==focus.courseId||changes.checkpoint.checkpointCommitOid!==focus.commitHash||changes.checkpoint.materialTreeOid!==focus.materialTreeOid||changes.baseCommitOid!==(received?.details.checkpointCommitOid??null)||!Array.isArray(changes.changes))throw new NativeSessionError();
-        if(Buffer.byteLength(JSON.stringify(changes))>512*1024)throw new NativeSessionError('LIMIT_EXCEEDED');
-        if(containsSecret(changes,apiKey))throw new NativeSessionError('AUTH');
-        const notificationChanges=changes.changes.map(({patch,patchBytes,...summary})=>summary);
-        if((changes.focused?.textUnavailable||focus.binary||['image','pdf','exercise'].includes(focus.type))&&(typeof changes.focused?.text==='string'||focus.paragraphs?.some(p=>p.text?.length)))throw new NativeSessionError('CONTEXT_CONFLICT');
-        currentSources=typeof changes.focused?.text==='string'?[changes.focused]:[];
-        for(const source of currentSources)if(sha(source.text)!==source.textHash||!spec.authorizedSourceIds.includes(source.id))throw new NativeSessionError();
-        if(currentSources.length+changes.changes.length+(changes.checkpoint.excludedFiles?.length??0)+inventory.entries.filter(e=>e.kind!=='material').length>256)throw new NativeSessionError('LIMIT_EXCEEDED');
-        inventory.entries=inventory.entries.filter(e=>e.kind!=='material');
-        for(const source of currentSources)inventory.entries.push({id:source.id,kind:'material',sourceId:source.id,path:source.path,version:source.version,includedChars:[...source.text].length,range:source.range,bodyStartChar:source.bodyStartChar??0,coordinateSpace:source.bodyStartChar?'serialized-document':'body'});
-        if(!currentSources.length&&!changes.focused?.textUnavailable)inventory.entries.push({id:`focus:${focus.asset?.id??focus.documentId}`,kind:'material',status:'added',sourceId:focus.asset?.id??focus.documentId,path:focus.path,version:focus.documentVersion,includedChars:0,reason:'focus_metadata_only'});
-        if(changes.focused?.textUnavailable)inventory.entries.push({id:changes.focused.id,kind:'material',status:'retained',sourceId:changes.focused.id,version:focus.documentVersion??focus.commitHash,includedChars:0,reason:`text_unavailable:${changes.focused.textUnavailable}`,fixedVersion:{courseId:focus.courseId,checkpointCommitOid:focus.commitHash,path:changes.focused.path,blobOid:changes.focused.gitBlobOid}});
-        for(const change of notificationChanges)inventory.entries.push({id:`change:${change.path}`,kind:'material',status:change.status==='A'?'added':'updated',version:focus.materialTreeOid,includedChars:JSON.stringify(change).length,path:change.path,fileStatus:change.status,added:change.added,deleted:change.deleted,binary:change.binary,fixedVersion:change.fixedVersion,reason:change.patchUnavailable?'git_patch_non_utf8':change.binary?'git_binary_status':'git_name_status_numstat'});
-        for(const [index,excluded] of (changes.checkpoint.excludedFiles??[]).entries())inventory.entries.push({id:`excluded:${index}:${excluded.assetId}`,kind:'material',status:'retained',...(excluded.assetId?{sourceId:excluded.assetId}:{}),version:focus.commitHash,includedChars:0,reason:`excluded:${excluded.reason}`,fileName:excluded.fileName});
-        if(changes.changes.length||changes.exclusionsChanged){
-          const notification={type:'material_changes',checkpoint:changes.checkpoint,baseCommitOid:changes.baseCommitOid,initial:changes.initial,changes:notificationChanges,complete:true};
-          manager.appendCustomMessageEntry('learning-station-changes',JSON.stringify(notification),false,{courseId:focus.courseId,checkpointCommitOid:focus.commitHash,materialTreeOid:focus.materialTreeOid,runId:spec.runId,userEntryId:spec.userEntryId});
-        }
-      }
-      for(const source of currentSources){
-        if(typeof source.text!=='string'||sha(source.text)!==source.textHash||!spec.authorizedSourceIds.includes(source.id))throw new NativeSessionError();
-        const {active,last}=materialBaseline(source.id);
-        let status=manager.getEntries().some(e=>e.type==='custom_message'&&e.customType==='learning-station-material'&&e.details?.sourceId===source.id)?'reloaded':'added',frames=[{kind:'full',version:source.version,textHash:source.textHash,text:source.text}];
-        if(last&&source.range?.complete&&last?.range?.complete&&(!source.path||last.path===source.path)&&last.textHash===source.textHash){status='retained';frames=[];}
-        else if(source.range?.complete&&last?.range?.complete&&(!source.path||last.path===source.path)&&active.length<8){
-          if(source.gitChange&&last.gitCommitOid===source.gitChange.baseCommitOid&&last.gitBlobOid===source.gitChange.baseBlobOid){frames=[{kind:'diff',version:source.version,baseHash:last.textHash,textHash:source.textHash,unifiedDiff:source.gitChange.unifiedDiff}];status='updated';}
-          else {const at=source.frames?.findIndex(f=>f.textHash===last.textHash)??-1;if(at>=0&&source.frames.length>at+1){frames=source.frames.slice(at+1);status='updated';}}
-        }
-        if(frames.length){
-          if(frames[0].kind==='full')for(const entry of active)manager.appendContextEdit(entry.sourceEntry.id,null);
-          manager.appendCustomMessageEntry('learning-station-material',JSON.stringify({type:'automatic_material_projection',id:source.id,...(source.path?{path:source.path}:{}),version:source.version,range:source.range,...(source.bodyStartChar?{bodyStartChar:source.bodyStartChar}:{}),frames}),false,{sourceId:source.id,...(source.path?{path:source.path}:{}),textHash:source.textHash,version:source.version,range:source.range,...(source.gitCommitOid?{gitCommitOid:source.gitCommitOid,gitBlobOid:source.gitBlobOid}:{})});
-        }
-        const item=inventory.entries.find(e=>e.sourceId===source.id&&e.kind==='material');if(item){item.status=status;item.reason=status==='retained'?'native_projection_contains_baseline':status==='updated'?'native_projection_verified_diff':'native_baseline_reload';}
-      }
-      for(const entry of manager.buildSessionProjection().entries){if(entry.sourceEntry.type==='custom_message'&&entry.sourceEntry.customType==='learning-station-turn'&&entry.messages.length)manager.appendContextEdit(entry.sourceEntry.id,null);}
-      const focusBodyProjected=currentSources.some(s=>s.id===(envelope.focus?.asset?.id??envelope.focus?.documentId)&&s.range?.complete&&(!envelope.focus?.documentVersion||s.version===envelope.focus.documentVersion));
-      const projectedMaterial=manager.buildSessionProjection().entries.filter(e=>e.messages.length&&e.sourceEntry.type==='custom_message'&&['learning-station-material','learning-station-changes'].includes(e.sourceEntry.customType)).flatMap(e=>e.messages.map(text)).join('\n')+(envelope.nativeReferences??'')+(focusBodyProjected?'':(envelope.focus?.paragraphs??[]).map(p=>p.text??'').join(''));
-      inventory.projectedChars=[...projectedMaterial].length;inventory.projectedBytes=Buffer.byteLength(projectedMaterial);
-      const turn={...envelope};delete turn.nativeMaterials;delete turn.learningHistory;delete turn.historyManifest;delete turn.context;delete turn.question;
-      // The verified full/diff frames above own the automatic Focus body. Keep the
-      // frozen source untouched; repeating visible text here bypasses that chain.
-      if(focusBodyProjected&&turn.focus?.paragraphs){turn.focus={...turn.focus,paragraphs:turn.focus.paragraphs.map(({text,...location})=>location)};for(const item of inventory.entries)if(item.kind==='turn'&&(item.id==='focus'||item.id.startsWith('focus:'))){item.includedChars=0;item.reason='focus_location';}}
-      turn.context=envelope.nativeReferences??'';delete turn.nativeReferences;turn.contextBridgeManifest=inventory;
-      manager.appendCustomMessageEntry('learning-station-turn',JSON.stringify(turn),false,{runId:spec.runId});
+      currentTurn=input;
+      for(const entry of manager.buildSessionProjection().entries)if(entry.messages.length&&entry.sourceEntry.type==='custom_message'&&['learning-station-turn','learning-station-focus'].includes(entry.sourceEntry.customType))bridge.exclude(entry.sourceEntry.id);
+      const clock=envelope.currentTime??(timeContext?{referenceTime:timeContext.referenceTime,timeZone:timeContext.timeZone}:undefined);
+      if(clock)bridge.message('current_time','本轮冻结时间与时区','learning-station-turn',clock);
+      if(envelope.nativeReferences)bridge.message('references','用户本轮明确提供的引用及必要补充','learning-station-turn',envelope.nativeReferences);
+      const inventory=await registerMaterialContext({manager,spec,loadChanges,envelope,bridge,containsSecret,apiKey,NativeSessionError});
+      if(envelope.exploration)bridge.message('exploration','探索入口的任务位置与来源','learning-station-turn',envelope.exploration);
+      bridge.commit();
+      const projected=manager.buildSessionProjection().entries.filter(e=>e.messages.length&&e.sourceEntry.details?.bridgeKey).flatMap(e=>e.messages.map(text)).join('\n');
+      inventory.projectedChars=[...projected].length;inventory.projectedBytes=Buffer.byteLength(projected);
       agent.state.messages=manager.buildSessionContext().messages;
       await onManifest?.(inventory);
     };
@@ -242,13 +195,15 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
       if(event.type==='message_end'&&event.message.role==='user'&&!record.userNativeId){
         const entry=manager.getEntries().filter(e=>e.type==='message'&&e.message.role==='user').at(-1);
         if(!entry)throw new NativeSessionError();
-        record.userNativeId=entry.id;manager.appendCustomEntry('learning-station-user',{userEntryId:spec.userEntryId,nativeId:entry.id,inputHash:record.inputHash});persist(record);
+        record.userNativeId=entry.id;manager.appendCustomEntry('learning-station-user',{userEntryId:spec.userEntryId,runId:spec.runId,nativeId:entry.id,inputHash:record.inputHash});persist(record);
       }
       if(event.type==='message_end')await checkpoint();
     });
-    return {session,agent,manager,applyContext,record,
+    const userIdentity=nativeId=>{const owner=manager.getEntries().find(e=>e.type==='custom'&&e.customType==='learning-station-user'&&e.data?.nativeId===nativeId)?.data;return owner?{userEntryId:owner.userEntryId,...(owner.runId?{runId:owner.runId}:{})}:{};};
+    return {session,agent,manager,applyContext,record,debugRegistrations:()=>bridge.registrations(),
       debugSources:()=>manager.buildSessionProjection().entries.flatMap(entry=>entry.messages.map(message=>({
-        value:text(message),origin:message.role==='custom'?(['learning-station-material','learning-station-turn','learning-station-changes'].includes(message.customType)?'bridge':'unknown'):({user:'user',assistant:'model',toolResult:'tool',compactionSummary:'pi',branchSummary:'pi'}[message.role]??'unknown'),
+        value:text(message),origin:message.role==='custom'?(['learning-station-material','learning-station-turn','learning-station-changes','learning-station-focus'].includes(message.customType)?'bridge':'unknown'):({user:'user',assistant:'model',toolResult:'tool',compactionSummary:'pi',branchSummary:'pi'}[message.role]??'unknown'),
+        ...(entry.sourceEntry.details?.bridgeKey?{registrationKey:entry.sourceEntry.details.bridgeKey,description:entry.sourceEntry.details.bridgeDescription,runId:entry.sourceEntry.details.runId,userEntryId:entry.sourceEntry.details.userEntryId}:message.role==='user'?{registrationKey:'question',description:'Pi 原生用户输入',...userIdentity(entry.sourceEntry.id)}:{}),
         name:message.customType??message.role,sourcePath:`native/${entry.sourceEntry.id}/${message.customType??message.role}`,
       }))),
       async requestTool(call,signal){manager.appendCustomEntry('learning-station-tool',{runId:spec.runId,callId:call.id,argsHash:sha(JSON.stringify(stable(call.args)))});sync(file);await checkpoint();return requestTool(call,signal);},

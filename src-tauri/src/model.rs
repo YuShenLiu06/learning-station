@@ -2375,7 +2375,7 @@ mod tests {
         assert_eq!(error.code, "MODEL_INCOMPLETE");
     }
     #[tokio::test]
-    async fn authorized_write_tool_round_trips_through_the_real_sidecar_with_tier_notice() {
+    async fn authorized_write_tool_round_trips_through_the_real_sidecar_without_internal_tier_notice() {
         use crate::{
             app::{Engine, UiPreferences},
             authorized_tools,
@@ -2478,10 +2478,7 @@ mod tests {
                         "write"
                     ]
                 );
-                assert!(payload["messages"][0]["content"]
-                    .as_str()
-                    .unwrap()
-                    .contains("工具授权档位"));
+                assert!(!payload.to_string().contains("工具授权档位"));
                 let body = if turn == 0 {
                     let first = json!({"choices":[{"index":0,"delta":{"role":"assistant","content":"我把结论写入工作区。"},"finish_reason":null}]});
                     let call = json!({"choices":[{"index":0,"delta":{"tool_calls":[

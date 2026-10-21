@@ -186,3 +186,7 @@ mod tests {
         assert!(a.reference_time.ends_with('Z'));
     }
 }
+
+pub(crate) fn bridge_part(time: &TimeContext) -> crate::context_bridge::PromptPart {
+    crate::context_bridge::PromptPart { key: "current_time", description: "本轮冻结时间与时区", value: serde_json::json!({"referenceTime":time.reference_time,"timeZone":time.time_zone}) }
+}

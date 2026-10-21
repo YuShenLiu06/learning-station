@@ -1498,3 +1498,8 @@ mod injection_tests {
         assert!(ctx.truncated);
     }
 }
+
+/// The bridge sends selected sources, without repeating the UI preview's reference preamble.
+pub(crate) fn bridge_part(text: &str) -> crate::context_bridge::PromptPart {
+    crate::context_bridge::PromptPart { key: "references", description: "用户本轮明确提供的引用及必要补充", value: serde_json::json!(text.strip_prefix(USER_MATERIAL_NOTICE).unwrap_or(text)) }
+}

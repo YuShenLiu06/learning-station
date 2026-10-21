@@ -902,3 +902,7 @@ mod tests {
         }
     }
 }
+
+pub(crate) fn bridge_part(prepared: &Prepared, ctx: &Context) -> crate::context_bridge::PromptPart {
+    crate::context_bridge::PromptPart { key: "materials", description: "已授权的本轮材料", value: json!(prepared.native_materials(ctx)) }
+}

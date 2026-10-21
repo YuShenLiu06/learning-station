@@ -16,9 +16,6 @@ export function resolveTimeContext(input) {
   const local = formatInstant(source.referenceTime, source.timeZone);
   return Object.freeze({ referenceTime: source.referenceTime, timeZone: source.timeZone, ...local });
 }
-export function timeSystemContext(context) {
-  return `当前时间：${context.localDateTime ?? context.referenceTime}${context.timeZone ? `（${context.timeZone}）` : ''}`;
-}
 export function freezeTodoTime(args, context) {
   if (args.relativeMinutes === undefined) return args;
   if (!Number.isInteger(args.relativeMinutes) || args.relativeMinutes < 1 || args.relativeMinutes > 525600 || !context) throw new Error('TOOL_PROTOCOL');

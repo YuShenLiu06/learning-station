@@ -97,7 +97,7 @@ test('real Pi Agent has empty tools, only a short clock system, explicit Rust hi
     onAgent: (agent) => { actualAgent = agent; assert(agent instanceof Agent); assert.deepEqual(agent.state.tools, []); },
     streamFn: fakeStream('fixture 文本', { inspect: (model, context) => {
       assert.equal(model.id, MODEL_ID); assert.equal(model.compat.thinkingFormat, 'zai');
-      assert.equal(context.messages[0].content,'\n\n当前时间：2026-10-21T09:00:00+00:00（Etc/UTC）');
+      assert(context.messages.some(m=>{try{return JSON.parse(m.content).referenceTime===input.timeContext.referenceTime;}catch{return false;}}));
 
       assert(!JSON.stringify(context).includes('UNTRUSTED SYSTEM'));
       assert(context.messages.some((message) => message.role === 'assistant'));
