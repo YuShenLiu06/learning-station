@@ -174,7 +174,7 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
           ||source.customType==='learning-station-changes'&&!manager.getEntries().some(r=>r.type==='custom'&&r.customType==='learning-station-changes-request'&&r.data?.changesEntryId===source.id))bridge.exclude(source.id);
       }
       const clock=envelope.currentTime??(timeContext?{referenceTime:timeContext.referenceTime,timeZone:timeContext.timeZone}:undefined);
-      if(clock)bridge.message('current_time','本轮冻结时间与时区','learning-station-turn','referenceTime: '+clock.referenceTime+'\ntimeZone: '+clock.timeZone);
+      if(clock)bridge.message('current_time','本轮冻结时间与时区','learning-station-turn','referenceTime: '+clock.referenceTime+(clock.timeZone?'\ntimeZone: '+clock.timeZone:''));
       if(envelope.nativeReferences)bridge.message('references','用户本轮明确提供的引用及必要补充','learning-station-turn',envelope.nativeReferences);
       const inventory=await registerMaterialContext({manager,spec,loadChanges,envelope,bridge,containsSecret,apiKey,NativeSessionError});
       // The exploration entry marks the session origin: register on the opening

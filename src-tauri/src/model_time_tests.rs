@@ -230,7 +230,8 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
             &format!("generation:{}:{}", session.id, entry_id),
         )
         .unwrap();
-        clocks.push(format!("本轮冻结时间与时区\nreferenceTime: {}\ntimeZone: {}", clock.reference_time, clock.time_zone.as_deref().unwrap_or("")));
+        let zone = clock.time_zone.as_deref().map(|tz| format!("\ntimeZone: {tz}")).unwrap_or_default();
+        clocks.push(format!("本轮冻结时间与时区\nreferenceTime: {}{}", clock.reference_time, zone));
         let messages = {
             let c = e.lock().unwrap();
             let projection = crate::context_bridge::ContextBridge::snapshot(
@@ -306,7 +307,7 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
         let times: Vec<_> = texts.iter().filter(|t|t.starts_with("本轮冻结时间与时区")).collect();
         assert_eq!(times.len(),i+1,"each native turn retains its own frozen clock");
         for (round,time) in times.iter().enumerate() { assert_eq!(*time, &clocks[round]); }
-        assert!(times.last().unwrap().contains("timeZone: "));
+        assert!(times.last().unwrap().starts_with("本轮冻结时间与时区\nreferenceTime: "));
         assert!(!all_text.contains("learning_request"));
         assert!(!all_text.contains("contextBridgeManifest"));
         assert!(!all_text.contains("UNREVEALED_TYPED_ANSWER_SENTINEL"));

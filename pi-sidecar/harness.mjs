@@ -277,7 +277,7 @@ export async function runLearningAgent(request, emit, { signal, streamFn: fixtur
   const policy = validateToolPolicy(request.toolPolicy, request.learningTools === true, request.operation);
   const skills = resolveLearningSkills(request.learningSkills, policy);
   const intent=explorationPart(request.explorationContext,policy.mode);
-  const standalone=projectStandalone(request.nativeSession?[]:[{key:'current_time',description:'本轮冻结时间与时区',value:'referenceTime: '+timeContext.referenceTime+'\ntimeZone: '+timeContext.timeZone},...(intent?[intent]:[])]);
+  const standalone=projectStandalone(request.nativeSession?[]:[{key:'current_time',description:'本轮冻结时间与时区',value:'referenceTime: '+timeContext.referenceTime+(timeContext.timeZone?'\ntimeZone: '+timeContext.timeZone:'')},...(intent?[intent]:[])]);
   const toolsEnabled = policy.allowedTools.length > 0 && request.learningTools === true && request.operation === 'generate' && typeof requestTool === 'function';
   if (policy.allowedTools.length > 0 && !toolsEnabled) throw new SafeError('TOOLS_DISABLED');
   const permitted = new Set(policy.allowedTools);
