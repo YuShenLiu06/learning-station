@@ -1,10 +1,10 @@
 # Focus v1（M2 #12）
 
-Focus 是本次提交的视图状态，不是学习模式，也不改变课程会话归属。前端传 `documentId`、预期正文/版本、`view`、UTF-16 可见原文范围、可选 `questionId/assetId`；身份、正文与状态由 Rust 校验。阅读按 Markdown 原文块、编辑按 CodeMirror 可见范围冻结；最多16段/8000字符。练习只提供当前题号及已作答/已批改状态，不自动注入参考答案；图片/PDF 只提供元数据。现有导入器不支持 PDF，本层不新增 PDF 正文读取。
+Focus 是本次提交的视图状态，不是学习模式，也不改变课程会话归属。定位为上层组装部件：唯一消费 file_metadata/versioning 两个底层接口拼接聚焦上下文（[接口契约](../docs/file-metadata-and-versioning.md)），原 Focus/Changes 的底层版本与 Git 职责并入 versioning，不再以旧名扩展底层。前端传 `documentId`、预期正文/版本、`view`、UTF-16 可见原文范围、可选 `questionId/assetId`；身份、正文与状态由 Rust 校验。阅读按 Markdown 原文块、编辑按 CodeMirror 可见范围冻结；最多16段/8000字符。练习只提供当前题号及已作答/已批改状态，不自动注入参考答案；图片/PDF 只提供元数据。现有导入器不支持 PDF，本层不新增 PDF 正文读取。Layer 2 将移除 paragraphs 正文与可见范围/坐标投影，部件只保留元数据、版本 hash 与 diff/全文；Layer 1 现状：FocusSnapshot envelope 结构暂不变，paragraphs 与坐标仍随冻结返回。
 
 ## 唯一冻结入口与 Changes 消费
 
-`freeze_focus { request: FreezeRequest }` → Rust `focus::freeze(core, request)`，在同一 Core 锁内刷新索引、核实 session/document/引用、形成 Context，执行一次 `FrozenMaterials::capture_project` 和 `MaterialGit::commit`，再核对清单所有材料与固定 Git 对象一致，并用该 checkpoint 的真实 compare 判定二进制；不另行 capture 或猜测编码。冻结失败不保存问题、不发送模型。返回：
+`freeze_focus { request: FreezeRequest }` → Rust `focus::freeze(core, request)`，在同一 Core 锁内刷新索引、核实 session/document/引用、形成 Context，执行一次 `FrozenMaterials::capture_project` 和 `MaterialGit::commit`（Layer 1 起版本冻结出口统一经 versioning.snapshot：仓库不存在先 init 再 commit，含平铺课程首次冻结的 ensure_project 迁移），再核对清单所有材料与固定 Git 对象一致，并用该 checkpoint 的真实 compare 判定二进制；不另行 capture 或猜测编码。冻结失败不保存问题、不发送模型。返回：
 
 ```ts
 type FocusSnapshot = {

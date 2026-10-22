@@ -2,7 +2,7 @@
 
 新课程使用 `library/courses/<courseId>/`；A/B 互为兄弟目录。
 `course_project_root(libraryRoot, courseId)` 返回现存且无符号链接的 canonical 根，供 Pi cwd 与 Git 共用。
-缺失/旧平铺课程返回 `COURSE_PROJECT_REQUIRED`，不隐式复制、迁移或初始化真实旧库。
+缺失根返回 `COURSE_PROJECT_REQUIRED`。旧平铺课程改为首次版本冻结时经 `ensure_project` 幂等迁移建仓（Layer 1，见 [文件元数据与版本接口](../docs/file-metadata-and-versioning.md)）：保留稳定 ID、内容版本与原文件，不删除原文件、不复制第二份材料，重复触发幂等；迁移后按物理课程服务。原「不隐式迁移旧库」约束已废除。
 
 - `library_tree::create_project(store, title, body, requestId)`：幂等新建物理课程；旧 `create` 保持旧课程行为。
 - `course_project::create_material(store, Metadata, body)`：显式创建物理课程/其子文档。
@@ -15,7 +15,7 @@
 - 原生编辑文档后，已有 read 立即读当前文件，陈旧 save 返回 CONFLICT。
 - create/save/tree move 共用物理归属校验：课程内改正文/重新排序保留路径；旧节点不能只改 parentId 挂入项目，项目节点也不能据此跨课程或移出项目。
 - 原生编辑 parentId 后，严格归属解析拒绝跨物理课程；树视图发出 PHYSICAL_PARENT 警告并按物理课程显示，不替用户重写正文。
-- 仅完整项目路径及实际根文档确认物理归属；索引限制须先安全、有界读取根文档并确认 ID 匹配目录、kind=course、parentId 为空，不能凭同名普通文件存在判断项目。旧嵌套 courses 路径和偶含 materials 的旧路径保持索引/创建行为。旧请求对应平铺课程时，create_project 明确报错，不伪报新项目或自动迁移。
+- 仅完整项目路径及实际根文档确认物理归属；索引限制须先安全、有界读取根文档并确认 ID 匹配目录、kind=course、parentId 为空，不能凭同名普通文件存在判断项目。旧嵌套 courses 路径和偶含 materials 的旧路径保持索引/创建行为。旧请求对应平铺课程时，create_project 明确报错，不伪报新项目；隐式迁移只发生在首次版本冻结（ensure_project），显式创建路径不迁移。
 - 旧文档、旧附件布局及其完整性校验原样保留。旧检查点读取与新课程独立 Git 由下一层提供。
 
 本层不改 UI、Pi session/entry 身份、资源发现、工具权限、Git 历史或聊天摄入。
@@ -25,7 +25,7 @@
 
 `MaterialGit::init_course(libraryRoot, courseId)` 只初始化新物理课程的普通 `.git/`；
 `open_course` 校验课程绑定、独立 objects/refs，拒绝共享 worktree、alternates、symlink/hardlink 或其他课程仓库。
-不重置既有仓库，不自动初始化/迁移旧库。`MaterialGit::open` 仅只读兼容旧 bare 快照；旧创建器仅在合成测试编译。
+不重置既有仓库；旧平铺课程仅在首次版本冻结时经 `ensure_project` 幂等迁移建仓，其余路径不隐式初始化或迁移。`MaterialGit::open` 仅只读兼容旧 bare 快照；旧创建器仅在合成测试编译。
 
 `FrozenMaterials::capture_project(store, courseId)` 冻结该课程当前 `materials/` 文件；两次捕获相同才返回。
 无文件系统事务承诺；返回后 owned bytes 不受后续编辑影响。附件采用物理路径，不再生成第二套可编辑投影。

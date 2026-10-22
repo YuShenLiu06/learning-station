@@ -2,6 +2,8 @@
 
 本层基于 Focus 9440b51 的课程路由接入 generation：`for_focus` 只消费 `focus::load` 的同一 Frozen，经 `focus::open_materials(core, focus)` 读取固定 OID，不再次 capture 或刷新目录。完整产品验收仍以组合测试和对应 SHA 的 CI 为准。
 
+底层职责已并入 versioning 接口（[接口契约](../docs/file-metadata-and-versioning.md)）：单文件与课程级统计、diff 与固定版本读分别由 `file_stat`/`all_stat`/`file_diff`/`all_diff` 提供，本层不再另开 Git 或哈希路径。独立 Changes 桥部件将并入 Focus 部件（Layer 2 待实现）：课程级变化作为 Focus 部件的课程变化块消费 `all_stat`，私有管道与接收语义随 Layer 2 重组；Layer 1 现状：material_changes 消费链与私有管道保持不变。
+
 ## 固定比较与正文
 
 `material_changes::prepare` 只复用 MaterialGit.checkpoint/files/read/compare，不 capture、commit、读取最新工作区或记录模型接受。调用者冻结课程、NEW OID、目标来源身份与安全相对路径。
