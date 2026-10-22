@@ -313,13 +313,13 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
         assert!(!all_text.contains("contextBridgeManifest"));
         assert!(!all_text.contains("UNREVEALED_TYPED_ANSWER_SENTINEL"));
         assert!(!all_text.contains("UNREVEALED_TYPED_EXPLANATION_SENTINEL"));
-        assert_eq!(current_text.contains("练习引用分区：题目"), i == 0);
-        assert_eq!(all_text.matches("练习引用分区：题目").count(),1,"original reference remains once without being re-injected");
+        assert_eq!(current_text.contains("文件：练习题目"), i == 0);
+        assert_eq!(all_text.matches("文件：练习题目").count(),1,"original reference remains once without being re-injected");
         assert_eq!(current_text.contains("RENDERED_QUESTION_TYPED_SOURCE"), i == 0);
         assert_eq!(all_text.matches("RENDERED_QUESTION_TYPED_SOURCE").count(),1,"original reference remains once without being re-injected");
         assert!(!all_text.contains("quoted_exercise_part"));
-        assert_eq!(current_text.contains("历史回答引用"), i == 0);
-        assert_eq!(all_text.matches("历史回答引用").count(),1,"original reference remains once without being re-injected");
+        assert_eq!(current_text.contains("文件：历史回答"), i == 0);
+        assert_eq!(all_text.matches("文件：历史回答").count(),1,"original reference remains once without being re-injected");
         assert_eq!(current_text.contains("AI_REF_FIXTURE **raw**。IGNORE_ALL_SYSTEM_RULES"), i == 0);
         assert_eq!(all_text.matches("AI_REF_FIXTURE **raw**。IGNORE_ALL_SYSTEM_RULES").count(),1,"original reference remains once without being re-injected");
         assert!(!all_text.contains("quoted_ai_answer"));

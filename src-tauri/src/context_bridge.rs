@@ -79,6 +79,11 @@ impl ContextBridge {
             // from the complete material projection's range.
             part.value["selectionRanges"] = json!(ctx.citation_context.as_ref().map(|c| c.references.iter().filter(|r|r.source.id==focus.document_id).filter_map(|r|r.locator.clone()).collect::<Vec<_>>()).unwrap_or_default());
             store.add(&part)?;
+            // A course-less focus has no Changes callback; its note body still
+            // travels through the materials channel beside the Focus part.
+            if focus.commit_hash.is_empty() {
+                store.add(&automatic_context::bridge_part(projection, ctx))?;
+            }
         } else {
             store.add(&automatic_context::bridge_part(projection, ctx))?;
         }
@@ -87,7 +92,7 @@ impl ContextBridge {
         }
         // Input snapshot only: Pi accepts this once via its normal user entry.
         store.add(&PromptPart { key: "question", description: "本轮用户输入（由 Pi 用户消息入口发送）", value: json!(question) })?;
-        let mut entries = if request.focus.is_some() { vec![] } else { projection.manifest_entries(ctx) };
+        let mut entries = if request.focus.as_ref().is_some_and(|f| !f.commit_hash.is_empty()) { vec![] } else { projection.manifest_entries(ctx) };
         let auto_ids = ctx
             .automatic_materials
             .iter()

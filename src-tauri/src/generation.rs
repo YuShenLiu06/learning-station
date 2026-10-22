@@ -616,7 +616,7 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
                         persist(&engine, &managed.run)
                     })
                 }),
-                material_changes: request.focus.clone().map(|focus| {
+                material_changes: changes_focus(&request.focus).map(|focus| {
                     let engine = engine.clone();
                     let sid = session.id.clone();
                     Arc::new(move |previous: Option<String>, body_previous: Option<String>| {
@@ -700,6 +700,12 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
 }
 
 pub(crate) use crate::model::task_tool_policy;
+
+/// A Changes callback needs a fixed course checkpoint. Course-less
+/// content-hash focuses carry no commit and never establish one.
+pub(crate) fn changes_focus(focus: &Option<crate::focus::Focus>) -> Option<crate::focus::Focus> {
+    focus.clone().filter(|f| !f.commit_hash.is_empty())
+}
 
 fn learning_tool_handler(
     engine: Arc<Engine>,

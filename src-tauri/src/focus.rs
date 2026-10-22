@@ -82,19 +82,6 @@ pub fn open_materials(core: &Core, focus: &Focus) -> Result<MaterialGit> {
         _ => Err(conflict()),
     }
 }
-fn paragraphs(body: &str, ranges: &[Range]) -> Result<Vec<Value>> {
-    if ranges.len() > 16 { return Err(conflict()); }
-    let offset = |wanted| { let mut n = 0; for (i, c) in body.char_indices() { if n == wanted { return Some(i); } n += c.len_utf16(); } (n == wanted).then_some(body.len()) };
-    let mut chars = 0;
-    let mut previous = 0;
-    ranges.iter().map(|r| {
-        if r.start < previous || r.end < r.start { return Err(conflict()); }
-        let text = body.get(offset(r.start).ok_or_else(conflict)?..offset(r.end).ok_or_else(conflict)?).ok_or_else(conflict)?;
-        chars += text.chars().count(); previous = r.end;
-        if chars > 8000 { return Err(conflict()); }
-        Ok(json!({"start":r.start,"end":r.end,"startChar":body[..offset(r.start).unwrap()].chars().count(),"endChar":body[..offset(r.end).unwrap()].chars().count(),"totalChars":body.chars().count(),"totalBytes":body.len(),"text":text}))
-    }).collect()
-}
 // One complete current source, using the existing Context/Pi projection. No link traversal.
 fn append_current(ctx: &mut Context, id: &str, path: &str, version: &str, text: &str, asset_course: Option<String>, body_start_char: usize) {
     let start = ctx.text.len();
@@ -106,68 +93,84 @@ pub fn freeze(core: &mut Core, request: FreezeRequest) -> Result<Focus> {
     let i = &request.input;
     if !["read", "edit", "exercise", "asset"].contains(&i.view.as_str()) || core.content.is_trashed(&request.session_id) { return Err(conflict()); }
     core.content.refresh()?;
-    let (session, mut ctx) = core.session_context_for(&request.session_id, Some(""), None)?;
+    let course = crate::course_sessions::course(&core.content, &i.document_id)?;
+    // A course freeze starts from an empty context and projects its own focus
+    // material; a course-less exploration freeze keeps the session material as
+    // the body channel and records content-hash identity only.
+    let (session, mut ctx) = core.session_context_for(&request.session_id, if course.is_some() { Some("") } else { Some(&i.document_id) }, None)?;
     let source_document_id = crate::course_sessions::source(&core.content, &session, &i.document_id)?;
     let document = core.content.read(&i.document_id)?;
     if document.body != i.expected_body || i.expected_version.as_ref().is_some_and(|v| v != &document.version) { return Err(conflict()); }
-    let course = crate::course_sessions::course(&core.content, &i.document_id)?.ok_or_else(conflict)?;
-    // One freeze equals one snapshot: a flat course gets its physical project
-    // here first, then capture → init → commit records the fixed checkpoint.
-    let snap = crate::versioning::snapshot(core, &course)?;
-    let git = MaterialGit::open_course(core.content.root(), &course)?;
-    let binary_paths: BTreeSet<_> = git.compare(&course, None, &snap.commit_hash, None)?.changes.into_iter().filter(|f| f.binary).map(|f| f.path).collect();
-    let available: BTreeSet<_> = git.files(&course, &snap.commit_hash)?.into_iter().map(|f| f.path).collect();
-    let inventory = crate::assets::list(&core.content, &course)?;
-    let assets: BTreeMap<_, _> = inventory.iter().map(|a| (a.id.clone(), format!("assets/{}/{}/{}", course, a.id, crate::assets::editable_name(&a.file_name)))).collect();
-    let path_for = |id: &str| assets.get(id).cloned().unwrap_or_else(|| format!("documents/{id}.md"));
-    // Metadata is checked against exactly these OIDs. Excluded files grant no read authority.
-    let mut catalog = context::course_read_manifest(&core.content, &course)?;
-    catalog.retain(|m| available.contains(&path_for(&m.id)));
-    for m in &catalog {
-        if format!("{:x}", Sha256::digest(git.read(&course, &snap.commit_hash, &path_for(&m.id))?)) != m.version { return Err(conflict()); }
-    }
-    let raw = git.read(&course, &snap.commit_hash, &format!("documents/{}.md", i.document_id))?;
-    let raw_text = std::str::from_utf8(&raw).map_err(|_| conflict())?;
-    if content::hash(raw_text) != document.version { return Err(conflict()); }
-    let mut focus = Focus { id: String::new(), course_id: course.clone(), session_id: session.id.clone(), document_id: i.document_id.clone(), source_document_id, path: format!("documents/{}.md", i.document_id), r#type: "markdown".into(), commit_hash: snap.commit_hash, material_tree_oid: snap.material_tree_oid, repository_version: Some(2), excluded_files: snap.excluded_files, document_version: document.version, view: i.view.clone(), binary: binary_paths.contains(&format!("documents/{}.md", i.document_id)), paragraphs: vec![], exercise: None, asset: None };
     let mut metadata_source: Option<String> = None;
-    if document.metadata.kind == "exercise" && i.asset_id.is_none() {
-        if i.view != "exercise" && i.view != "edit" { return Err(conflict()); }
-        focus.r#type = "exercise".into();
-        if i.view == "exercise" || i.question_id.is_some() {
-            let origin = crate::exercises::get(&mut core.content, &i.document_id)?;
-            let questions = origin.exercises["exercises"].as_array().ok_or_else(conflict)?;
-            let (number, question) = questions.iter().enumerate().find(|(_, q)| i.question_id.as_deref().is_none_or(|id| q["id"].as_str() == Some(id))).ok_or_else(conflict)?;
-            let id = question["id"].as_str().ok_or_else(conflict)?;
-            let attempt = origin.session.entries.iter().rev().find(|e| e.kind == "attempt" && e.data.as_ref().is_some_and(|d| d["exerciseId"] == id));
-            let graded = attempt.is_some_and(|a| origin.session.entries.iter().any(|e| e.kind == "feedback" && e.data.as_ref().is_some_and(|d| d["attemptId"] == a.id)));
-            focus.exercise = Some(json!({"questionId":id,"number":number+1,"answered":attempt.is_some(),"graded":graded}));
+    let mut catalog = Vec::new();
+    let mut assets: BTreeMap<String, String> = BTreeMap::new();
+    let focus = match &course {
+        Some(course) => {
+            // One freeze equals one snapshot: a flat course gets its physical project
+            // here first, then capture → init → commit records the fixed checkpoint.
+            let snap = crate::versioning::snapshot(core, course)?;
+            let git = MaterialGit::open_course(core.content.root(), course)?;
+            let binary_paths: BTreeSet<_> = git.compare(course, None, &snap.commit_hash, None)?.changes.into_iter().filter(|f| f.binary).map(|f| f.path).collect();
+            let available: BTreeSet<_> = git.files(course, &snap.commit_hash)?.into_iter().map(|f| f.path).collect();
+            let inventory = crate::assets::list(&core.content, course)?;
+            assets = inventory.iter().map(|a| (a.id.clone(), format!("assets/{}/{}/{}", course, a.id, crate::assets::editable_name(&a.file_name)))).collect();
+            let path_for = |id: &str| assets.get(id).cloned().unwrap_or_else(|| format!("documents/{id}.md"));
+            // Metadata is checked against exactly these OIDs. Excluded files grant no read authority.
+            catalog = context::course_read_manifest(&core.content, course)?;
+            catalog.retain(|m| available.contains(&path_for(&m.id)));
+            for m in &catalog {
+                if format!("{:x}", Sha256::digest(git.read(course, &snap.commit_hash, &path_for(&m.id))?)) != m.version { return Err(conflict()); }
+            }
+            let raw = git.read(course, &snap.commit_hash, &format!("documents/{}.md", i.document_id))?;
+            let raw_text = std::str::from_utf8(&raw).map_err(|_| conflict())?;
+            if content::hash(raw_text) != document.version { return Err(conflict()); }
+            let mut focus = Focus { id: String::new(), course_id: course.clone(), session_id: session.id.clone(), document_id: i.document_id.clone(), source_document_id, path: format!("documents/{}.md", i.document_id), r#type: "markdown".into(), commit_hash: snap.commit_hash, material_tree_oid: snap.material_tree_oid, repository_version: Some(2), excluded_files: snap.excluded_files, document_version: document.version.clone(), view: i.view.clone(), binary: binary_paths.contains(&format!("documents/{}.md", i.document_id)), paragraphs: vec![], exercise: None, asset: None };
+            if document.metadata.kind == "exercise" && i.asset_id.is_none() {
+                if i.view != "exercise" && i.view != "edit" { return Err(conflict()); }
+                focus.r#type = "exercise".into();
+                if i.view == "exercise" || i.question_id.is_some() {
+                    let origin = crate::exercises::get(&mut core.content, &i.document_id)?;
+                    let questions = origin.exercises["exercises"].as_array().ok_or_else(conflict)?;
+                    let (number, question) = questions.iter().enumerate().find(|(_, q)| i.question_id.as_deref().is_none_or(|id| q["id"].as_str() == Some(id))).ok_or_else(conflict)?;
+                    let id = question["id"].as_str().ok_or_else(conflict)?;
+                    let attempt = origin.session.entries.iter().rev().find(|e| e.kind == "attempt" && e.data.as_ref().is_some_and(|d| d["exerciseId"] == id));
+                    let graded = attempt.is_some_and(|a| origin.session.entries.iter().any(|e| e.kind == "feedback" && e.data.as_ref().is_some_and(|d| d["attemptId"] == a.id)));
+                    focus.exercise = Some(json!({"questionId":id,"number":number+1,"answered":attempt.is_some(),"graded":graded}));
+                }
+                // The editable exercise contains reference answers; never automatic body or read authority.
+            } else if let Some(asset_id) = &i.asset_id {
+                if i.view != "asset" { return Err(conflict()); }
+                let asset = inventory.iter().find(|a| &a.id == asset_id).ok_or_else(conflict)?;
+                focus.path = path_for(asset_id); focus.binary = binary_paths.contains(&focus.path);
+                let bytes = git.read(course, &focus.commit_hash, &focus.path)?;
+                if format!("{:x}", Sha256::digest(&bytes)) != asset.sha256 { return Err(conflict()); }
+                focus.r#type = if asset.mime.starts_with("image/") { "image" } else if asset.mime == "application/pdf" { "pdf" } else { "text" }.into();
+                focus.document_version = asset.sha256.clone();
+                focus.asset = Some(json!({"id":asset.id,"mime":asset.mime,"size":asset.size}));
+                if focus.r#type == "text" && !focus.binary {
+                    let text = std::str::from_utf8(&bytes).map_err(|_| conflict())?;
+                    append_current(&mut ctx, asset_id, &focus.path, &focus.document_version, text, Some(course.clone()), 0);
+                } else { metadata_source = Some(asset_id.clone()); }
+            } else {
+                if i.view != "read" && i.view != "edit" { return Err(conflict()); }
+                if !focus.binary {
+                    append_current(&mut ctx, &document.id, &document.path, &focus.document_version, raw_text, None, raw_text[..raw_text.len() - document.body.len()].chars().count());
+                } else { metadata_source = Some(document.id.clone()); }
+            }
+            focus
         }
-        // The editable exercise contains reference answers; never automatic body or read authority.
-    } else if let Some(asset_id) = &i.asset_id {
-        if i.view != "asset" { return Err(conflict()); }
-        let asset = inventory.iter().find(|a| &a.id == asset_id).ok_or_else(conflict)?;
-        focus.path = path_for(asset_id); focus.binary = binary_paths.contains(&focus.path);
-        let bytes = git.read(&course, &focus.commit_hash, &focus.path)?;
-        if format!("{:x}", Sha256::digest(&bytes)) != asset.sha256 { return Err(conflict()); }
-        focus.r#type = if asset.mime.starts_with("image/") { "image" } else if asset.mime == "application/pdf" { "pdf" } else { "text" }.into();
-        focus.document_version = asset.sha256.clone();
-        focus.asset = Some(json!({"id":asset.id,"mime":asset.mime,"size":asset.size}));
-        if focus.r#type == "text" && !focus.binary {
-            let text = std::str::from_utf8(&bytes).map_err(|_| conflict())?;
-            focus.paragraphs = paragraphs(text, &i.ranges)?;
-            append_current(&mut ctx, asset_id, &focus.path, &focus.document_version, text, Some(course.clone()), 0);
-        } else { metadata_source = Some(asset_id.clone()); }
-    } else {
-        if i.view != "read" && i.view != "edit" { return Err(conflict()); }
-        if !focus.binary {
-            focus.paragraphs = paragraphs(&document.body, &i.ranges)?;
-            append_current(&mut ctx, &document.id, &document.path, &focus.document_version, raw_text, None, raw_text[..raw_text.len() - document.body.len()].chars().count());
-        } else { metadata_source = Some(document.id.clone()); }
-    }
+        None => {
+            // Course-less exploration freeze: the content hash is the whole version
+            // identity; no Git snapshot, no read catalog, no focus body projection.
+            // Exercise and asset views stay course-only.
+            if i.view != "read" || i.asset_id.is_some() || document.metadata.kind == "exercise" { return Err(conflict()); }
+            let addr = crate::file_metadata::FileAddr { id: i.document_id.clone(), path: document.path.clone(), kind: "markdown".into(), course: None };
+            Focus { id: String::new(), course_id: String::new(), session_id: session.id.clone(), document_id: i.document_id.clone(), source_document_id, path: document.path.clone(), r#type: "markdown".into(), commit_hash: String::new(), material_tree_oid: String::new(), repository_version: None, excluded_files: vec![], document_version: crate::versioning::version_hash(core, &addr)?, view: i.view.clone(), binary: false, paragraphs: vec![], exercise: None, asset: None }
+        }
+    };
     // Explicit sources keep their existing validation/lifecycle and deduplicate full current text.
     if !request.selection.is_empty() {
-        context::inject(&core.content, &mut ctx, &[context::ContextInjection { document_id: i.document_id.clone(), expected_version: content::hash(raw_text), selection: Some(request.selection.clone()), locator: None }])?;
+        context::inject(&core.content, &mut ctx, &[context::ContextInjection { document_id: i.document_id.clone(), expected_version: document.version.clone(), selection: Some(request.selection.clone()), locator: None }])?;
     }
     crate::exercise_references::inject_request(&mut core.content, &mut ctx, &session, &request.injections, &request.assistant_references, &request.exercise_references)?;
     if let Some(id) = metadata_source {
@@ -176,11 +179,13 @@ pub fn freeze(core: &mut Core, request: FreezeRequest) -> Result<Focus> {
         }
         ctx.warnings.push(format!("BINARY_MATERIAL_METADATA_ONLY: {id} 自动材料仅保留元数据。"));
     }
-    for m in &ctx.manifest {
-        if !catalog.iter().any(|source| source.id == m.id && source.version == m.version) { return Err(conflict()); }
+    if course.is_some() {
+        for m in &ctx.manifest {
+            if !catalog.iter().any(|source| source.id == m.id && source.version == m.version) { return Err(conflict()); }
+        }
     }
     ctx.history_manifest.clear();
-    let mut record = Frozen { focus, materials: ctx.automatic_materials.clone(), context: ctx, course_read_manifest: Some(catalog), assets, requested: context::RequestedContext { focus: None, document_id: i.document_id.clone(), selection: request.selection, injections: request.injections, assistant_references: request.assistant_references, exercise_references: request.exercise_references } };
+    let mut record = Frozen { focus, materials: ctx.automatic_materials.clone(), context: ctx, course_read_manifest: course.is_some().then_some(catalog), assets, requested: context::RequestedContext { focus: None, document_id: i.document_id.clone(), selection: request.selection, injections: request.injections, assistant_references: request.assistant_references, exercise_references: request.exercise_references } };
     record.focus.id = hash(&serde_json::to_string(&record)?);
     let bytes = serde_json::to_vec(&record)?;
     if bytes.len() > 4 * 1024 * 1024 { return Err(CoreError::new("LIMIT_EXCEEDED", "聚焦冻结超过4MiB，请缩小材料后重试。")); }
@@ -200,9 +205,15 @@ pub fn load(core: &mut Core, session: &Session, focus: &Focus) -> Result<Frozen>
     if hash(&serde_json::to_string(&record)?) != focus.id { return Err(conflict()); }
     record.focus.id = focus.id.clone();
     if crate::course_sessions::source(&core.content, session, &focus.document_id)? != focus.source_document_id { return Err(conflict()); }
-    if crate::course_sessions::course(&core.content, &focus.document_id)?.as_ref() != Some(&focus.course_id) { return Err(conflict()); }
-    let cp = open_materials(core, focus)?.checkpoint(&focus.course_id, &focus.commit_hash)?;
-    if cp.material_tree_oid != focus.material_tree_oid || cp.excluded_files != focus.excluded_files { return Err(conflict()); }
+    match crate::course_sessions::course(&core.content, &focus.document_id)? {
+        Some(course) if course == focus.course_id => {
+            let cp = open_materials(core, focus)?.checkpoint(&focus.course_id, &focus.commit_hash)?;
+            if cp.material_tree_oid != focus.material_tree_oid || cp.excluded_files != focus.excluded_files { return Err(conflict()); }
+        }
+        // Course-less records carry a content hash, not a Git checkpoint to reopen.
+        None if focus.course_id.is_empty() && focus.commit_hash.is_empty() => {}
+        _ => return Err(conflict()),
+    }
     for m in &record.context.manifest {
         if record.assets.contains_key(&m.id) {
             if !crate::assets::list(&core.content, &focus.course_id)?.iter().any(|a| a.id == m.id) { return Err(conflict()); }
@@ -252,6 +263,9 @@ pub fn append_entry(core: &mut Core, session_id: &str, entry: Entry, expected: O
 }
 pub fn read_document(core: &Core, focus: &Focus, id: &str) -> Result<Document> {
     if !valid_id(id) { return Err(conflict()); }
+    // Course-less content-hash focuses pin the recorded hash; the caller's
+    // version check fails closed once the live library file has moved on.
+    if focus.course_id.is_empty() { return core.content.read(id); }
     let text = String::from_utf8(open_materials(core, focus)?.read(&focus.course_id, &focus.commit_hash, &format!("documents/{id}.md"))?).map_err(|_| conflict())?;
     let (metadata, body) = content::parse(&text)?;
     Ok(Document { id: id.into(), path: if focus.repository_version == Some(2) { crate::course_project::material_path(&focus.course_id, id)? } else { format!("courses/{id}.md") }, version: content::hash(&text), content: text, metadata, body, modified_at: String::new() })
@@ -280,7 +294,7 @@ mod tests {
     fn frozen_bytes_and_view_survive_edits_navigation_and_engine_reopen() {
         let (dir, e, a, b, sid) = setup();
         let mut c = e.lock().unwrap(); let r = request(&c, &sid, &a); let f = freeze(&mut c, r).unwrap();
-        assert_eq!(f.paragraphs[0]["text"], "原文😀");
+        assert!(f.paragraphs.is_empty(), "new freezes never carry visible paragraphs");
         let other = request(&c, &sid, &b); let fb = freeze(&mut c, other).unwrap();
         assert_ne!(f.document_id, fb.document_id); assert_ne!(f.path, fb.path);
         let d = c.content.read(&a).unwrap(); c.content.save(&a, &content::serialize(&d.metadata, "NEW WORKSPACE").unwrap(), &d.version).unwrap();
@@ -326,8 +340,61 @@ mod tests {
         assert_eq!(f.course_id, course);
         assert_eq!(f.path, format!("documents/{child}.md"));
         assert_eq!(f.commit_hash.len(), 40);
-        assert_eq!(f.paragraphs[0]["text"], "平铺聚焦");
+        assert!(f.paragraphs.is_empty());
         assert!(crate::course_project::course_project_root(c.content.root(), course).is_ok());
+    }
+    #[test]
+    fn course_less_exploration_freeze_uses_content_hash_without_a_git_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::new(dir.path().join("library"), dir.path().join("state")).unwrap();
+        let mut c = e.lock().unwrap();
+        let launch = crate::exploration::begin(&mut c.content, "EXPLORATION_FREEZE_QUESTION", "focus-exploration-launch").unwrap();
+        let note = launch.document.id.clone();
+        let sid = launch.session.id.clone();
+        let path = c.content.read(&note).unwrap().path;
+        let make = |c: &Core, view: &str| {
+            let d = c.content.read(&note).unwrap();
+            FreezeRequest { session_id: sid.clone(), input: Input { document_id: note.clone(), expected_body: d.body, expected_version: Some(d.version), view: view.into(), ranges: vec![Range { start: 0, end: 4 }], question_id: None, asset_id: None }, selection: String::new(), injections: vec![], assistant_references: vec![], exercise_references: vec![] }
+        };
+        let read = make(&c, "read");
+        let f = freeze(&mut c, read).unwrap();
+        assert!(f.course_id.is_empty() && f.commit_hash.is_empty() && f.material_tree_oid.is_empty() && f.excluded_files.is_empty());
+        assert_eq!(f.repository_version, None);
+        assert_eq!(f.path, path);
+        assert!(f.paragraphs.is_empty() && !f.document_version.is_empty());
+        // The version identity comes from the versioning content-hash exit, not a Git object.
+        let addr = crate::file_metadata::FileAddr { id: note.clone(), path: path.clone(), kind: "markdown".into(), course: None };
+        assert_eq!(f.document_version, crate::versioning::version_hash(&mut c, &addr).unwrap());
+        // No course project or private materials Git is created for a content-hash freeze.
+        assert!(crate::course_project::course_project_root(c.content.root(), &note).is_err());
+        assert!(!c.state_dir.join("material-git").exists());
+        let session = crate::sessions::get(&mut c.content, &sid).unwrap();
+        let frozen = load(&mut c, &session, &f).unwrap();
+        assert_eq!(frozen.focus, f);
+        assert!(frozen.course_read_manifest.is_none());
+        // The exploration note keeps flowing through the session material channel.
+        assert!(frozen.context.automatic_materials.iter().any(|m| m.id == note));
+        // Exercise and asset views stay course-only; a course-less note supports read alone.
+        let edit = make(&c, "edit"); assert!(freeze(&mut c, edit).is_err());
+        let mut asset_view = make(&c, "asset"); asset_view.input.asset_id = Some("missing-asset".into());
+        assert!(freeze(&mut c, asset_view).is_err());
+        // Later workspace edits never leak into the frozen record or its fixed version.
+        let d = c.content.read(&note).unwrap();
+        c.content.save(&note, &content::serialize(&d.metadata, "EXPLORATION_NEW_WORKSPACE_ONLY").unwrap(), &d.version).unwrap();
+        let again = load(&mut c, &session, &f).unwrap();
+        assert!(!serde_json::to_string(&again).unwrap().contains("EXPLORATION_NEW_WORKSPACE_ONLY"));
+    }
+    #[test]
+    fn content_hash_focuses_never_establish_a_material_changes_callback() {
+        let loose: Focus = serde_json::from_value(json!({
+            "id":"fixture","courseId":"","documentId":"note","sourceDocumentId":"note",
+            "path":"courses/note.md","type":"markdown","commitHash":"","materialTreeOid":"",
+            "excludedFiles":[],"documentVersion":"hash","view":"read","paragraphs":[]
+        })).unwrap();
+        assert_eq!(crate::generation::changes_focus(&None), None);
+        assert_eq!(crate::generation::changes_focus(&Some(loose.clone())), None, "a content-hash focus has no checkpoint to diff against");
+        let mut pinned = loose; pinned.commit_hash = "a".repeat(40);
+        assert!(crate::generation::changes_focus(&Some(pinned)).is_some());
     }
     #[test]
     fn citation_user_save_uses_same_fixed_snapshot_and_receipt_after_workspace_edits() {
@@ -452,9 +519,10 @@ mod tests {
         assert!(!serde_json::to_string(&f).unwrap().contains("HIDDEN_SECRET")); assert!(!ctx.text.contains("HIDDEN_SECRET"));
     }
     #[test]
-    fn invalid_ranges_foreign_courses_and_tampered_snapshots_fail_closed() {
+    fn ignored_ranges_foreign_courses_and_tampered_snapshots_fail_closed() {
         let (_dir, e, a, _b, sid) = setup(); let mut c = e.lock().unwrap();
-        let mut r = request(&c, &sid, &a); r.input.ranges[0].end = 3; assert!(freeze(&mut c, r).is_err()); // split emoji
+        // Layer 2 ignores request ranges entirely; a range splitting an emoji no longer rejects the freeze.
+        let mut r = request(&c, &sid, &a); r.input.ranges[0].end = 3; assert!(freeze(&mut c, r).unwrap().paragraphs.is_empty());
         let r = request(&c, &sid, &a); let mut f = freeze(&mut c, r).unwrap();
         let session = crate::sessions::get(&mut c.content, &sid).unwrap(); f.view = "edit".into(); assert!(load(&mut c, &session, &f).is_err());
         let foreign = crate::library_tree::create(&mut c.content, "course", "Other", None, "", "focus-other-course").unwrap();
@@ -477,7 +545,7 @@ mod tests {
 
     }
     #[test]
-    fn focused_attachment_inventory_records_identity_partial_ranges_and_deduplicates_existing_sources() {
+    fn focused_attachment_inventory_records_identity_and_deduplicates_existing_sources() {
         let (_dir, e, a, _b, sid) = setup(); let mut c = e.lock().unwrap();
         let owner = crate::library_tree::course_id(&c.content, &a).unwrap();
         let bytes = "prefix\nVISIBLE😀\ntail".as_bytes();
@@ -490,8 +558,12 @@ mod tests {
         let projection = crate::automatic_context::prepare_native(&c.state_dir,&session,&ctx);
         let prompt = crate::context_bridge::ContextBridge::freeze(&req,&ctx,&session,None,&projection,crate::time_context::for_operation(&c.state_dir,"focus-inventory").unwrap()).unwrap();
         let envelope:Value = serde_json::from_str(prompt.messages[0]["content"].as_str().unwrap()).unwrap();
-        let entry = envelope["contextBridgeManifest"]["entries"].as_array().unwrap().iter().find(|e|e["id"]=="focus:0").unwrap();
-        assert_eq!(entry["sourceId"],asset.id); assert_eq!(entry["includedChars"],8); assert_eq!(entry["range"]["startChar"],7); assert_eq!(entry["range"]["endChar"],15); assert_eq!(entry["range"]["complete"],false);
+        let entries = envelope["contextBridgeManifest"]["entries"].as_array().unwrap();
+        // No visible-body projection survives in the manifest; the focus turn stays metadata-only
+        // and the full text belongs to the material channel alone.
+        assert!(entries.iter().all(|e|e["id"]!="focus:0"));
+        let entry = entries.iter().find(|e|e["id"]=="focus").unwrap();
+        assert_eq!(entry["sourceId"],asset.id); assert_eq!(entry["version"],f.document_version); assert_eq!(entry["includedChars"],0);
         let d = c.content.read(&a).unwrap(); c.content.save(&a,&content::serialize(&d.metadata,&format!("{}\n\n[Text]({})",d.body,asset.reference)).unwrap(),&d.version).unwrap();
         let mut r = request(&c,&sid,&a); r.input.view="asset".into();r.input.asset_id=Some(asset.id.clone());r.input.ranges.clear();
         let quoted = freeze(&mut c,r).unwrap(); let quoted_ctx=load(&mut c,&session,&quoted).unwrap().context;assert_eq!(quoted_ctx.manifest.iter().filter(|m|m.id==asset.id).count(),1);
