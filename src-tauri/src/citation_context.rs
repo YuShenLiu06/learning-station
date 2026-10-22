@@ -1123,7 +1123,9 @@ pub(crate) fn bridge_references(text: &str, ctx: &Context, focus: Option<&crate:
             v["textHash"].as_str().map(str::to_owned)
         }
         .unwrap_or_default();
-        let quote = quoted_original(&inline_text(v["quotedText"].as_str(), v.get("quotedTextProjection"), ctx));
+        // Selection boundaries often swallow leading/trailing newlines; the
+        // delimiters must hug the quoted text, inner line structure stays intact.
+        let quote = quoted_original(inline_text(v["quotedText"].as_str(), v.get("quotedTextProjection"), ctx).trim_matches(['\n', '\r']));
         let locator = match (v["locator"]["startChar"].as_u64(), v["locator"]["endChar"].as_u64()) {
             (Some(start), Some(end)) => Some((start, end)),
             _ => None,
@@ -1150,12 +1152,12 @@ pub(crate) fn bridge_references(text: &str, ctx: &Context, focus: Option<&crate:
                 _ => 2,
             };
             if placement == 0 {
-                let trimmed = content.trim_end_matches(['\n', '\r']);
+                let trimmed = content.trim_matches(['\n', '\r']);
                 if !trimmed.is_empty() {
                     before = if before.is_empty() { trimmed.to_owned() } else { format!("{before}\n{trimmed}") };
                 }
             } else if placement == 1 {
-                let trimmed = content.trim_start_matches(['\n', '\r']);
+                let trimmed = content.trim_matches(['\n', '\r']);
                 if !trimmed.is_empty() {
                     after = if after.is_empty() { trimmed.to_owned() } else { format!("{after}\n{trimmed}") };
                 }
@@ -1164,7 +1166,7 @@ pub(crate) fn bridge_references(text: &str, ctx: &Context, focus: Option<&crate:
                 blocks.push((
                     source_label(supplement["source"]["path"].as_str().unwrap_or_default(), focus),
                     supplement["source"]["version"].as_str().unwrap_or_default().to_owned(),
-                    content,
+                    content.trim_matches(['\n', '\r']).to_owned(),
                 ));
             }
         }
