@@ -162,7 +162,13 @@ async fn trash_library_node(
     let _gate = engine.model.lock().await;
     ensure_library_write_idle(&engine)?;
     work(engine.clone(), move |e| {
-        crate::trash::trash(&mut e.lock()?.content, &id, &expected_version, &request_id)
+        let mut core = e.lock()?;
+        let receipt = crate::trash::trash(&mut core.content, &id, &expected_version, &request_id)?;
+        // A trashed conversation must stop being the remembered active chat.
+        if receipt.kind == "session" {
+            core.forget_session(&receipt.id)?;
+        }
+        Ok(receipt)
     })
     .await
 }

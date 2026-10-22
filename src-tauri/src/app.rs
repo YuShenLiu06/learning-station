@@ -793,6 +793,23 @@ impl Core {
         context::protect_trashed_history(&mut context, &session, &self.content.trashed_ids());
         Ok((session, context))
     }
+    /// Drop routing references to a session that just entered the trash, so a
+    /// hidden conversation never stays the remembered active or fallback chat.
+    pub fn forget_session(&mut self, id: &str) -> Result<()> {
+        self.preferences.session_by_course.retain(|_, value| value != id);
+        self.preferences
+            .active_session_by_course
+            .retain(|_, value| value != id);
+        self.preferences.session_by_section.retain(|_, value| value != id);
+        self.preferences.last_run_by_session.remove(id);
+        if self.preferences.active_session_id.as_deref() == Some(id) {
+            self.preferences.active_session_id = None;
+        }
+        if self.preferences.exploration_session_id.as_deref() == Some(id) {
+            self.preferences.exploration_session_id = None;
+        }
+        self.save_preferences()
+    }
     pub fn save_preferences(&self) -> Result<()> {
         atomic_json(&self.state_dir.join("preferences.json"), &self.preferences)
     }

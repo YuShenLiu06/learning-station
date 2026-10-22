@@ -47,6 +47,6 @@ export type CourseAssetPreview = { asset: CourseAsset; text?: string; dataUrl?: 
 
 export type SessionSummary = { id: string; title: string; modifiedAt?: string; path?: string; version?: string };
 export type CourseConversations = { courseId: string; activeSessionId: string | null; sessions: SessionSummary[] };
-export type TrashPreview = { id: string; title: string; kind: LibraryNodeKind; nodeCount: number; sessionCount: number; version: string };
-export type TrashReceipt = { trashId: string; id: string; title: string; kind: LibraryNodeKind; nodeCount: number; sessionCount: number; createdAt: string; restoredAt: string | null; status: 'trashed' | 'restored' };
+export type TrashPreview = { id: string; title: string; kind: LibraryNodeKind | 'session'; nodeCount: number; sessionCount: number; version: string };
+export type TrashReceipt = { trashId: string; id: string; title: string; kind: LibraryNodeKind | 'session'; nodeCount: number; sessionCount: number; createdAt: string; restoredAt: string | null; status: 'trashed' | 'restored' };
 export type ExplorationNote = { document: Section; session: LearningSession; userEntryId: string; folderId: string };
