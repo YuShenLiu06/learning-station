@@ -12,7 +12,7 @@ import {LEARNING_PLUGIN} from '../learning-plugin.mjs';
 const hash=v=>createHash('sha256').update(v).digest('hex');
 const text=m=>typeof m.content==='string'?m.content:(m.content??[]).filter(p=>p.type==='text').map(p=>p.text).join('');
 const part=(key,value)=>({key,description:'合成冻结输入：'+key,value});
-const position='【Focus：用户当前阅读的位置】',changesTitle='【Changes：课程材料相对已知版本的变化】';
+const position='【Focus：当前文件】',changesSection='课程材料变化';
 test('actual SDK HTTP follows the readable Focus/Changes contract with native Git text across turns',{timeout:60000},async()=>{
   const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'readable-context-'))),repo=path.join(root,'course'),directory=path.join(root,'native');
   fs.mkdirSync(path.join(repo,'materials/documents'),{recursive:true});fs.mkdirSync(directory);
@@ -64,11 +64,11 @@ test('actual SDK HTTP follows the readable Focus/Changes contract with native Gi
     assert(!wire.includes(hash(body)),'custom body hash stays internal');
     assert.equal(messages.filter(m=>m.role==='user'&&text(m)==='相同问题').length,i>=7?i-6:i+1,'repeated text is a distinct native question');
     const full=currentTexts.filter(v=>v.startsWith('以下为当前用户正在看的内容'));
-    const changes=currentTexts.find(v=>v.startsWith(changesTitle));
+    const changes=location;
     if(i===0||i===7){assert.equal(full.length,1);assert(full[0].startsWith('以下为当前用户正在看的内容（固定 Git 版本；'+(i===0?'首次正文基准':'正文基准已丢失，重新载入')+'）'));assert(full[0].endsWith(body));assert(changes.includes('首次建立课程材料基准'));assert.equal(statCalls[0].base,null);assert(!changes.includes('diff --git'));}
     else assert.equal(full.length,0,'valid historical body is retained without another full');
-    if([1,3,4,8].includes(i))assert.equal(changes,undefined,'unchanged course/body adds no stat or patch');
-    if([2,5,6].includes(i)){assert(changes.includes(statCalls[0].stat),'native stat bytes reach HTTP unchanged');if(i!==5){assert(changes.endsWith(statCalls[0].patch));assert(changes.indexOf(statCalls[0].stat)<changes.indexOf('当前聚焦文件的完整 Git diff'));assert(statCalls[0].stat.includes('focus.md'));}else assert(!changes.includes('diff --git'),'other file has only stat');}
+    if([1,3,4,8].includes(i)){assert(!changes.includes(changesSection)&&!changes.includes('diff --git'),'unchanged course/body adds no stat or patch inside Focus');}
+    if([2,5,6].includes(i)){assert(changes.includes(changesSection));assert(changes.includes(statCalls[0].stat),'native stat bytes reach HTTP unchanged');if(i!==5){assert(changes.endsWith(statCalls[0].patch));assert(changes.indexOf(statCalls[0].stat)<changes.indexOf('当前聚焦文件的完整 Git diff'));assert(statCalls[0].stat.includes('focus.md'));}else assert(!changes.includes('diff --git'),'other file has only stat');}
     assert(currentTexts.every(v=>messages.indexOf(messages.find(m=>text(m)===v))<at));
     snapshots.push({round:i,runId,focusAt,questionAt:at,currentTexts});gitTexts.push(...statCalls);
     return {start,packet};

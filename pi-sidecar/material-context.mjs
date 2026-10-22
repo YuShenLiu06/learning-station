@@ -61,11 +61,8 @@ export async function registerMaterialContext({manager,spec,loadChanges,envelope
     for(const [index,excluded] of (changes.checkpoint.excludedFiles??[]).entries())inventory.entries.push({id:'excluded:'+index+':'+excluded.assetId,kind:'material',status:'retained',...(excluded.assetId?{sourceId:excluded.assetId}:{}),version:focus.commitHash,includedChars:0,reason:'excluded:'+excluded.reason,fileName:excluded.fileName});
     courseChanges=changes;focusPath=changes.focusPath;
   }
-  if(envelope.focus){
-    const f=envelope.focus;
-    bridge.message('focus','【Focus：用户当前阅读的位置】','learning-station-focus',focusLocation(f,focusPath),{courseId:f.courseId,checkpointCommitOid:f.commitHash});
-  }
   let patchSource,patchBaseline;
+  const bodyMessages=[]; // Full-body reloads queue behind the merged Focus part so the location stays first.
   for(const source of currentSources){
     if(source.projectionError)throw new NativeSessionError('CONTEXT_CONFLICT');
     if(typeof source.text!=='string'||sha(source.text)!==source.textHash||!spec.authorizedSourceIds.includes(source.id))throw new NativeSessionError();
@@ -80,16 +77,22 @@ export async function registerMaterialContext({manager,spec,loadChanges,envelope
       const description=source.range?.complete===false?'以下为已提供范围的正文（部分内容）':source.gitCommitOid?'以下为当前用户正在看的内容（固定 Git 版本；'+(ever?'正文基准已丢失，重新载入':'首次正文基准')+'）':'以下为当前用户正在看的内容';
       const prefix=envelope.focus?'':('文件：'+(source.modelPath??source.path??'未记录路径')+'\n');
       const value=prefix+source.text,start=renderBridgePart(description,prefix).length;
-      bridge.message('focus',description,'learning-station-material',value,{sourceId:source.id,path:source.path,textHash:source.textHash,version:source.version,range:source.range,...(source.gitCommitOid?{gitCommitOid:source.gitCommitOid,gitBlobOid:source.gitBlobOid}:{}),materialFrames:[{kind:'full',textHash:source.textHash,start,end:start+source.text.length}]});
+      bodyMessages.push({description,value,details:{sourceId:source.id,path:source.path,textHash:source.textHash,version:source.version,range:source.range,...(source.gitCommitOid?{gitCommitOid:source.gitCommitOid,gitBlobOid:source.gitBlobOid}:{}),materialFrames:[{kind:'full',textHash:source.textHash,start,end:start+source.text.length}]}});
     }
     const item=inventory.entries.find(e=>e.sourceId===source.id&&e.kind==='material');
     if(item){item.includedChars=[...source.text].length;item.range=source.range;item.bodyStartChar=0;item.coordinateSpace='body';item.status=status;item.reason=status==='retained'?'native_projection_contains_baseline':status==='updated'?'native_projection_verified_diff':'native_baseline_reload';}
   }
-  if(courseChanges&&(courseChanges.stat||patchSource)){
-    const description='【Changes：课程材料相对已知版本的变化】',f=envelope.focus;
-    let value=courseChanges.baseCommitOid?'比较版本：'+courseChanges.baseCommitOid+' → '+f.commitHash:'首次建立课程材料基准：'+f.commitHash+'（以下为 Git 空树比较的原生 stat）';
-    value+='\n\n'+(courseChanges.stat||'课程材料相对已知版本无变化。\n');
+  if(envelope.focus){
+    // One Focus registration: fixed location, then the course change section and the
+    // focused Git diff. The diff frame rides on this entry's details, keeping the
+    // materialBaseline full→diff hash chain on the entry the model actually receives.
+    const f=envelope.focus,description='【Focus：当前文件】';
+    let value=focusLocation(f,focusPath);
     const details={courseId:f.courseId,checkpointCommitOid:f.commitHash};
+    if(courseChanges&&(courseChanges.stat||patchSource)){
+      value+='\n'+(courseChanges.baseCommitOid?'课程材料变化（比较版本 '+courseChanges.baseCommitOid+' → '+f.commitHash+'）：':'课程材料变化（首次建立课程材料基准：'+f.commitHash+'（以下为 Git 空树比较的原生 stat））：');
+      value+='\n'+(courseChanges.stat||'课程材料相对已知版本无变化。\n');
+    }
     if(patchSource){
       const patch=patchSource.gitChange.unifiedDiff;
       value+='\n当前聚焦文件的完整 Git diff（正文基准 '+patchBaseline.gitCommitOid+' → '+f.commitHash+'）：\n';
@@ -97,8 +100,9 @@ export async function registerMaterialContext({manager,spec,loadChanges,envelope
       Object.assign(details,{sourceId:patchSource.id,path:patchSource.path,textHash:patchSource.textHash,version:patchSource.version,range:patchSource.range,gitCommitOid:patchSource.gitCommitOid,gitBlobOid:patchSource.gitBlobOid,materialFrames:[{kind:'diff',baseHash:patchBaseline.textHash,textHash:patchSource.textHash,patchHash:sha(patch),start,end:start+patch.length}]});
       value+=patch;
     }
-    bridge.message('material_changes',description,'learning-station-changes',value,details);
+    bridge.message('focus',description,'learning-station-focus',value,details);
   }
+  for(const body of bodyMessages)bridge.message('focus',body.description,'learning-station-material',body.value,body.details);
   for(const item of inventory.entries)if(item.kind==='turn'&&(item.id==='focus'||item.id.startsWith('focus:'))&&currentSources.length){item.includedChars=0;item.reason='focus_location';}
   return inventory;
 }

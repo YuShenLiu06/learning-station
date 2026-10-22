@@ -61,7 +61,7 @@ test('final SDK wire allows only registered supplements in declared order and on
       const capture=captures[round];assert.deepEqual(capture.body,packet);
       const application=capture.sources.filter(s=>s.origin==='bridge');
       assert(application.every(s=>s.registrationKey&&s.description&&s.runId));
-      const keys=application.map(s=>s.registrationKey),priority=['current_time','references','focus','material_changes'];
+      const keys=application.map(s=>s.registrationKey),priority=['current_time','references','focus'];
       assert(keys.every(key=>priority.includes(key)),'no undeclared application key');
       for(const source of capture.sources.filter(s=>s.origin==='unknown')){const role=source.path[0]==='messages'?packet.messages[source.path[1]].role:'system';if(['assistant','tool'].includes(role))continue;let value=packet;for(const at of source.path)value=value[at];if(source.start!==undefined)value=value.slice(source.start,source.end);assert.equal(value.trim(),'','no unregistered application text at the final wire boundary');}
       for(const userEntryId of new Set(application.map(s=>s.userEntryId))){
@@ -76,11 +76,14 @@ test('final SDK wire allows only registered supplements in declared order and on
       const values=application.map(s=>{let value=packet;for(const at of s.path)value=value[at];return value;});
       const material=values.filter(v=>v.startsWith('以下为当前用户正在看的内容'));
       if(round===0||round===3)assert.equal(material.length,1);
-      if(round===1)assert(values.some(v=>v.includes(`-${first}\n+${second}\n`)),'native focus diff is in Changes');
+      if(round===1)assert(values.filter(v=>v.startsWith('【Focus：')).some(v=>v.includes(`-${first}\n+${second}\n`)),'native focus diff is inside the merged Focus part');
       if(round===2)assert.equal(material.length,1,'unchanged preserves the initial body without appending a full');
       assert.equal(serialized.split(first).length-1,round===0?1:round===3?0:2); // full baseline plus diff removal line
-      const locations=values.filter(v=>v.startsWith('【Focus：'));assert(locations.length);assert(locations.every(v=>!v.includes(first)&&!v.includes(second)&&!v.includes('documentId')));
-      const notifications=values.filter(v=>v.startsWith('【Changes：'));assert(notifications.every(v=>v.includes('documents/doc_1.md')&&v.includes('documents/other.md')),'full course stat deliberately includes the focused file');
+      const locations=values.filter(v=>v.startsWith('【Focus：当前文件】'));assert(locations.length);assert(locations.every(v=>!v.includes('documentId')));
+      assert(!serialized.includes('【Changes：'),'no standalone Changes part remains after the merge');
+      assert(locations.every(v=>v.includes(first)||v.includes(second)?v.includes('当前聚焦文件的完整 Git diff'):true),'the merged Focus carries body text only through its Git diff');
+      assert.equal(locations.at(-1).includes('课程材料变化'),round!==2,'the current turn carries the course change section only when something changed');
+      const notifications=locations.filter(v=>v.includes('课程材料变化'));assert(notifications.every(v=>v.includes('documents/doc_1.md')&&v.includes('documents/other.md')),'full course stat deliberately includes the focused file');
       assert.deepEqual(packet.tools.map(t=>t.function.name).sort(),[...LEARNING_PLUGIN.tools].sort());
       assert(packet.tools.every(t=>t.function.description.length<180));
     }

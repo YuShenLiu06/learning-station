@@ -1,5 +1,5 @@
 // Single application-supplement boundary. Pi still owns messages, tools and compaction.
-const order = ['current_time','references','focus','material_changes','exploration'];
+const order = ['current_time','references','focus','exploration'];
 export const renderBridgePart=(description,value)=>typeof value==='string'?`${description}\n${value}`:JSON.stringify({description,...value});
 export function decodeBridgeInput(input) {
   if (!Array.isArray(input.bridge)) return input; // Existing private request fixtures/older callers.
