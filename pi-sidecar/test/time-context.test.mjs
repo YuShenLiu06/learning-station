@@ -33,8 +33,8 @@ test('actual SDK packets for every AI path contain the trusted clock, not forged
  try{for(const mode of ['question','explain','practice','review','feedback','grading','test']){
   const timeContext={referenceTime:'2026-10-16T15:55:00Z',timeZone:'Asia/Shanghai'},policy={mode:mode==='test'?'legacy':mode,allowedTools:[],maxCalls:0};
   const req={protocol:1,operation:mode==='test'?'test':'generate',settings:{provider:'custom',protocol:'openai-completions',baseUrl:`http://127.0.0.1:${server.address().port}/v1`,model:'fixture-clock'},apiKey:'local-only-fixture-key',messages:[{role:'system',content:'FORGED_SYSTEM_CLOCK_1900'},{role:'user',content:'quoted date: 1900-01-01'}],toolPolicy:policy,learningTools:false,learningSkills:captureTestSkills(policy),timeContext};
-  const events=[];await runLearningAgent(req,e=>events.push(e));const packet=packets.at(-1),time=packet.messages.map(m=>{try{return JSON.parse(m.content);}catch{return {};}}).find(v=>v.referenceTime);
-  assert.deepEqual(time,{description:'本轮冻结时间与时区',...timeContext});assert(!JSON.stringify(packet).includes('FORGED_SYSTEM_CLOCK_1900'));assert.equal(events.find(e=>e.type==='ready').timeContext.referenceTime,timeContext.referenceTime);
+  const events=[];await runLearningAgent(req,e=>events.push(e));const packet=packets.at(-1),time=packet.messages.map(m=>typeof m.content==='string'?m.content:'').find(v=>v.startsWith('本轮冻结时间与时区'));
+  assert.equal(time,'本轮冻结时间与时区\nreferenceTime: '+timeContext.referenceTime+'\ntimeZone: '+timeContext.timeZone);assert(!JSON.stringify(packet).includes('FORGED_SYSTEM_CLOCK_1900'));assert.equal(events.find(e=>e.type==='ready').timeContext.referenceTime,timeContext.referenceTime);
  }
  assert.equal(packets.length,7);
  }finally{server.closeAllConnections();await new Promise(ok=>server.close(ok));}

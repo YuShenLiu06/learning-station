@@ -230,7 +230,7 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
             &format!("generation:{}:{}", session.id, entry_id),
         )
         .unwrap();
-        clocks.push(json!({"description":"本轮冻结时间与时区","referenceTime":clock.reference_time,"timeZone":clock.time_zone}));
+        clocks.push(format!("本轮冻结时间与时区\nreferenceTime: {}\ntimeZone: {}", clock.reference_time, clock.time_zone.as_deref().unwrap_or("")));
         let messages = {
             let c = e.lock().unwrap();
             let projection = crate::context_bridge::ContextBridge::snapshot(
@@ -303,12 +303,10 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
         let prior = if i==0 {&[][..]} else {packets[0]["messages"].as_array().unwrap().as_slice()};
         assert_eq!(&messages[..prior.len()],prior,"reopening preserves the original wire prefix including its one-shot references");
         let current_text = texts[prior.len()..].join("\n");
-        let payloads: Vec<Value> = texts.iter().filter_map(|t|serde_json::from_str(t).ok()).collect();
-        let times: Vec<_> = payloads.iter().filter(|v|v["referenceTime"].is_string()).collect();
+        let times: Vec<_> = texts.iter().filter(|t|t.starts_with("本轮冻结时间与时区")).collect();
         assert_eq!(times.len(),i+1,"each native turn retains its own frozen clock");
         for (round,time) in times.iter().enumerate() { assert_eq!(*time, &clocks[round]); }
-        let time = times.last().expect("independent current frozen time");
-        assert!(time["timeZone"].is_string());
+        assert!(times.last().unwrap().contains("timeZone: "));
         assert!(!all_text.contains("learning_request"));
         assert!(!all_text.contains("contextBridgeManifest"));
         assert!(!all_text.contains("UNREVEALED_TYPED_ANSWER_SENTINEL"));

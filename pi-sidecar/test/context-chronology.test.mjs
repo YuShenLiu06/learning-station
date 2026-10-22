@@ -51,7 +51,7 @@ test('actual multi-turn HTTP wire keeps each bridge with its native question, in
   };
   const label=m=>{
     const value=text(m);let parsed;try{parsed=JSON.parse(value);}catch{}
-    if(parsed?.referenceTime)return `time:${parsed.referenceTime.slice(-3,-1)}`;
+    if(value.startsWith('本轮冻结时间与时区\nreferenceTime: '))return `time:${value.split('\n')[1].slice(-3,-1)}`;
     if(parsed?.type==='automatic_material_projection')return `focus:${parsed.frames[0].text}`;
     if(parsed?.scenario)return 'exploration';
     if(value.startsWith('以下为当前用户正在看的内容'))return 'focus:'+value.split('\n').slice(2).join('\n');
