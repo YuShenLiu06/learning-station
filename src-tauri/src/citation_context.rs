@@ -942,42 +942,247 @@ pub fn inventory(ctx: &Context) -> Vec<Value> {
 mod tests;
 
 /// Render the existing, validated reference protocol without its storage metadata.
-/// Projection-piece ranges already address the body; quoted/code strings stay literal.
+/// Model-facing citations are real inlined text with explicit delimiters (citation-context-v1):
+/// a two-line 文件/版本 header, line-rounded context and the quoted original between
+/// 引用开始/引用结束. Coordinates never appear in this projection; deduplicated pieces
+/// are resolved back to their real source text instead of pointing at it.
 pub(crate) fn bridge_references(text: &str, ctx: &Context, focus: Option<&crate::focus::Focus>) -> String {
+    /// Quoted originals are capped at 8000 Unicode characters; longer ones are
+    /// cut and marked at the tail.
+    const QUOTE_CHARS: usize = 8_000;
+    const CONTEXT_CHARS: usize = 200;
+    const QUOTE_TRUNCATION: &str = "\n（引用超长，已截断）";
     fn path(value: &str, focus: Option<&crate::focus::Focus>) -> String {
         focus.and_then(|f|value.strip_prefix(&format!("courses/{}/",f.course_id))).unwrap_or(value).to_owned()
     }
+    fn part_label(part: Option<&str>) -> String {
+        match part {
+            Some("question") => "练习题目",
+            Some("answer") => "已显示答案",
+            Some("explanation") => "已显示解析",
+            Some("attempt") => "已提交作答",
+            Some("feedback") => "批改反馈",
+            Some("reference") => "已提交参考",
+            _ => "用户选取的练习分区",
+        }
+        .into()
+    }
     fn source_label(value: &str, focus: Option<&crate::focus::Focus>) -> String {
         if value.starts_with("ai-answer/") { return "历史回答".into(); }
-        if value.starts_with("exercise-part/") {
-            return match value.split('/').nth(3) {
-                Some("question") => "练习题目", Some("answer") => "已显示答案",
-                Some("explanation") => "已显示解析", Some("attempt") => "已提交作答",
-                Some("feedback") => "批改反馈", _ => "用户选取的练习分区",
-            }.into();
+        if let Some(rest) = value.strip_prefix("exercise-part/") {
+            return part_label(rest.split('/').nth(2));
         }
-        format!("文件：{}",path(value,focus))
+        path(value, focus)
     }
-    fn range(v: &Value) -> String {
-        match (v["startChar"].as_u64(),v["endChar"].as_u64()) { (Some(a),Some(b))=>format!("[{a}, {b})（正文 Unicode 字符，从 0 开始，左闭右开）"), _=>"未记录唯一范围".into() }
+    fn chars_of(text: &str, start: usize, end: usize) -> String {
+        if start >= end || end > text.chars().count() {
+            return String::new();
+        }
+        text.chars().skip(start).take(end - start).collect()
     }
-    fn pieces(v: &Value) -> String {
-        v.as_array().into_iter().flatten().map(|p|p["text"].as_str().map(str::to_owned).unwrap_or_else(||format!("原文见{} {}",if p["textFrom"]["provider"]=="material" {"已提供的正文"}else{"前述引用"},range(&p["range"])))).collect::<Vec<_>>().join("\n")
+    /// A deduplicated piece must still resolve to its real text, never a placeholder.
+    fn piece_text(piece: &Value, ctx: &Context) -> String {
+        if let Some(raw) = piece["text"].as_str() {
+            return raw.to_owned();
+        }
+        let from = &piece["textFrom"];
+        let (Some(id), Some(version)) = (from["sourceId"].as_str(), from["version"].as_str()) else {
+            return String::new();
+        };
+        if from["provider"] == "material" {
+            // textFrom.materialRange addresses the complete material projection, body included.
+            if let Some(m) = ctx
+                .automatic_materials
+                .iter()
+                .find(|m| m.id == id && m.version == version)
+            {
+                let start = from["materialRange"]["startChar"].as_u64().unwrap_or_default() as usize;
+                let end = from["materialRange"]["endChar"].as_u64().unwrap_or_default() as usize;
+                return chars_of(&m.text, start, end);
+            }
+            return String::new();
+        }
+        let start = piece["range"]["startChar"].as_u64().unwrap_or_default() as usize;
+        let end = piece["range"]["endChar"].as_u64().unwrap_or_default() as usize;
+        let Some(references) = ctx.citation_context.as_ref().map(|c| c.references.as_slice()) else {
+            return String::new();
+        };
+        for prior in references {
+            if prior.source.id != id || prior.source.version != version {
+                continue;
+            }
+            if let Some(span) = &prior.locator {
+                if span.start_char <= start && end <= span.end_char {
+                    return chars_of(&prior.quoted_text, start - span.start_char, end - span.start_char);
+                }
+            }
+            for part in &prior.supplemental_context {
+                if part.range.start_char <= start && end <= part.range.end_char {
+                    return chars_of(&part.text, start - part.range.start_char, end - part.range.start_char);
+                }
+            }
+        }
+        String::new()
+    }
+    fn pieces_text(pieces: &[Value], ctx: &Context) -> String {
+        pieces.iter().map(|p| piece_text(p, ctx)).collect()
+    }
+    fn inline_text(raw: Option<&str>, projection: Option<&Value>, ctx: &Context) -> String {
+        if let Some(raw) = raw {
+            return raw.to_owned();
+        }
+        projection
+            .and_then(Value::as_array)
+            .map(|pieces| pieces_text(pieces, ctx))
+            .unwrap_or_default()
+    }
+    fn quoted_original(text: &str) -> String {
+        if text.chars().count() <= QUOTE_CHARS {
+            return text.to_owned();
+        }
+        let mut cut: String = text.chars().take(QUOTE_CHARS).collect();
+        cut.push_str(QUOTE_TRUNCATION);
+        cut
+    }
+    /// Keep whole source lines within the budget, extending outward from the quoted
+    /// side; a fragment shorter than a line stays whole, and a single line above the
+    /// budget is hard-cut on the side nearest the quote.
+    fn line_bounded(text: &str, keep_tail: bool) -> String {
+        if text.chars().count() <= CONTEXT_CHARS {
+            return text.to_owned();
+        }
+        let lines: Vec<&str> = text.split('\n').collect();
+        let candidates: Vec<&str> = if keep_tail {
+            lines.iter().rev().copied().collect()
+        } else {
+            lines.clone()
+        };
+        let mut kept: Vec<&str> = Vec::new();
+        for line in candidates {
+            let width = line.chars().count();
+            let used = kept.iter().map(|k| k.chars().count()).sum::<usize>() + kept.len();
+            if used + width > CONTEXT_CHARS {
+                if kept.is_empty() {
+                    return if keep_tail {
+                        line.chars().skip(width - CONTEXT_CHARS).collect()
+                    } else {
+                        line.chars().take(CONTEXT_CHARS).collect()
+                    };
+                }
+                break;
+            }
+            kept.push(line);
+        }
+        if keep_tail {
+            kept.reverse();
+        }
+        kept.join("\n")
+    }
+    fn citation_source_id(ctx: &Context, v: &Value) -> Option<String> {
+        match v["type"].as_str() {
+            Some("quoted_material") => v["documentId"].as_str().map(str::to_owned),
+            Some("quoted_ai_answer") => v["entryId"].as_str().map(str::to_owned),
+            Some("quoted_exercise_part") => {
+                let path = format!(
+                    "exercise-part/{}/{}/{}/{}",
+                    v["documentId"].as_str().unwrap_or_default(),
+                    v["questionId"].as_str().unwrap_or_default(),
+                    v["part"].as_str().unwrap_or_default(),
+                    v["entryId"].as_str().unwrap_or_default()
+                );
+                ctx.manifest
+                    .iter()
+                    .chain(&ctx.exercise_reference_manifest)
+                    .find(|m| m.path == path)
+                    .map(|m| m.id.clone())
+                    .or_else(|| {
+                        ctx.citation_context.as_ref().and_then(|c| {
+                            c.references
+                                .iter()
+                                .find(|r| r.source.path == path)
+                                .map(|r| r.source.id.clone())
+                        })
+                    })
+            }
+            _ => None,
+        }
     }
     fn readable(v: &Value, ctx: &Context, focus: Option<&crate::focus::Focus>) -> String {
-        let mut out=match v["type"].as_str() {
-            Some("quoted_material")=>ctx.manifest.iter().find(|m|v["documentId"]==m.id).map(|m|format!("文件：{}",path(&m.path,focus))).unwrap_or_else(||"用户材料引用".into()),
-            Some("quoted_ai_answer")=>"历史回答引用".into(),
-            _=>format!("练习引用分区：{}",match v["part"].as_str(){Some("question")=>"题目",Some("answer")=>"已显示答案",Some("explanation")=>"已显示解析",_=>"用户明确选取的内容"}),
+        let kind = v["type"].as_str().unwrap_or_default();
+        let file = match kind {
+            "quoted_material" => ctx.manifest.iter().find(|m|v["documentId"]==m.id).map(|m|path(&m.path,focus)).unwrap_or_else(||"用户材料引用".into()),
+            "quoted_ai_answer" => "历史回答".into(),
+            _ => part_label(v["part"].as_str()),
         };
-        if v["type"]=="quoted_material" { if let Some(f)=focus {out.push_str(&format!("\n版本：{}",f.commit_hash));} }
-        if !v["locator"].is_null(){out.push_str(&format!("\n引用范围：{}",range(&v["locator"])));}
-        if let Some(raw)=v["quotedText"].as_str(){out.push('\n');out.push_str(raw);} else if v["quotedTextProjection"].is_array(){out.push('\n');out.push_str(&pieces(&v["quotedTextProjection"]));}
-        for supplement in v["supplementalContext"].as_array().into_iter().flatten(){
-            out.push_str(&format!("\n引用周边正文（{}）{}：\n",source_label(supplement["source"]["path"].as_str().unwrap_or("未记录路径"),focus),range(&supplement["range"])));
-            if let Some(raw)=supplement["text"].as_str(){out.push_str(raw);}else{out.push_str(&pieces(&supplement["projection"]));}
+        // Prefer the fixed Git checkpoint when one exists; otherwise the content version.
+        let version = if kind == "quoted_material" {
+            focus.map(|f| f.commit_hash.clone())
+                .or_else(|| v["version"].as_str().map(str::to_owned))
+                .or_else(|| ctx.manifest.iter().find(|m|v["documentId"]==m.id).map(|m|m.version.clone()))
+        } else {
+            v["textHash"].as_str().map(str::to_owned)
         }
-        if v["supplementalContextTruncated"]==true { out.push_str("\n引用周边正文仅包含本次提供的部分范围。"); }
+        .unwrap_or_default();
+        let quote = quoted_original(&inline_text(v["quotedText"].as_str(), v.get("quotedTextProjection"), ctx));
+        let locator = match (v["locator"]["startChar"].as_u64(), v["locator"]["endChar"].as_u64()) {
+            (Some(start), Some(end)) => Some((start, end)),
+            _ => None,
+        };
+        let citation_id = citation_source_id(ctx, v);
+        let mut before = String::new();
+        let mut after = String::new();
+        let mut blocks = vec![];
+        for supplement in v["supplementalContext"].as_array().into_iter().flatten() {
+            let content = inline_text(supplement["text"].as_str(), supplement.get("projection"), ctx);
+            if content.is_empty() {
+                continue;
+            }
+            let start = supplement["range"]["startChar"].as_u64();
+            let end = supplement["range"]["endChar"].as_u64();
+            let same = citation_id.as_deref().is_some_and(|id| supplement["source"]["id"].as_str() == Some(id));
+            // Context above/below the quote: same-source ranges around the locator.
+            // Without a resolvable source id, exact adjacency to the locator decides.
+            let placement = match (locator, start, end, same) {
+                (Some((locator_start, _)), Some(_), Some(e), true) if e <= locator_start => 0,
+                (Some((_, locator_end)), Some(s), Some(_), true) if s >= locator_end => 1,
+                (Some((locator_start, _)), Some(_), Some(e), false) if citation_id.is_none() && e == locator_start => 0,
+                (Some((_, locator_end)), Some(s), Some(_), false) if citation_id.is_none() && s == locator_end => 1,
+                _ => 2,
+            };
+            if placement == 0 {
+                let trimmed = content.trim_end_matches(['\n', '\r']);
+                if !trimmed.is_empty() {
+                    before = if before.is_empty() { trimmed.to_owned() } else { format!("{before}\n{trimmed}") };
+                }
+            } else if placement == 1 {
+                let trimmed = content.trim_start_matches(['\n', '\r']);
+                if !trimmed.is_empty() {
+                    after = if after.is_empty() { trimmed.to_owned() } else { format!("{after}\n{trimmed}") };
+                }
+            } else {
+                // Supplementary sources keep their own two-line header and delimiters.
+                blocks.push((
+                    source_label(supplement["source"]["path"].as_str().unwrap_or_default(), focus),
+                    supplement["source"]["version"].as_str().unwrap_or_default().to_owned(),
+                    content,
+                ));
+            }
+        }
+        let mut out = format!("文件：{file}\n版本：{version}");
+        if !before.is_empty() {
+            out.push_str("\n");
+            out.push_str(&line_bounded(&before, true));
+        }
+        out.push_str("\n引用开始");
+        out.push_str(&quote);
+        out.push_str("引用结束");
+        if !after.is_empty() {
+            out.push_str("\n");
+            out.push_str(&line_bounded(&after, false));
+        }
+        for (file, version, content) in blocks {
+            out.push_str(&format!("\n文件：{file}\n版本：{version}\n引用开始{}引用结束", quoted_original(&content)));
+        }
         out
     }
     let mut result = String::new();
