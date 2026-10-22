@@ -944,7 +944,7 @@ mod tests;
 /// Render the existing, validated reference protocol without its storage metadata.
 /// Model-facing citations are real inlined text with explicit delimiters (citation-context-v1):
 /// a two-line 文件/版本 header, line-rounded context and the quoted original between
-/// 引用开始/引用结束. Coordinates never appear in this projection; deduplicated pieces
+/// <引用开始>/<引用结束>. Coordinates never appear in this projection; deduplicated pieces
 /// are resolved back to their real source text instead of pointing at it.
 pub(crate) fn bridge_references(text: &str, ctx: &Context, focus: Option<&crate::focus::Focus>) -> String {
     /// Quoted originals are capped at 8000 Unicode characters; longer ones are
@@ -1173,15 +1173,15 @@ pub(crate) fn bridge_references(text: &str, ctx: &Context, focus: Option<&crate:
             out.push_str("\n");
             out.push_str(&line_bounded(&before, true));
         }
-        out.push_str("\n引用开始");
+        out.push_str("\n<引用开始>");
         out.push_str(&quote);
-        out.push_str("引用结束");
+        out.push_str("<引用结束>");
         if !after.is_empty() {
             out.push_str("\n");
             out.push_str(&line_bounded(&after, false));
         }
         for (file, version, content) in blocks {
-            out.push_str(&format!("\n文件：{file}\n版本：{version}\n引用开始{}引用结束", quoted_original(&content)));
+            out.push_str(&format!("\n文件：{file}\n版本：{version}\n<引用开始>{}<引用结束>", quoted_original(&content)));
         }
         out
     }
