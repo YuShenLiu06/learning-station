@@ -19,17 +19,13 @@ const wait=async check=>{for(let i=0;i<150;i++){if(check())return;await tick(10)
 const click=async el=>{assert.ok(el);await React.act(async()=>el.dispatchEvent(new MouseEvent('click',{bubbles:true})));};
 const button=text=>[...document.querySelectorAll('button')].find(el=>el.textContent.includes(text));
 
-test('view adapters capture visible raw paragraphs, active question and metadata without sharing mutable state',()=>{
- const root=document.createElement('div');document.body.append(root);root.innerHTML='<div data-focus-start="0" data-focus-end="4"></div><div data-focus-start="6" data-focus-end="8"></div><article data-focus-question="q1"></article><article data-focus-question="q2"><textarea></textarea></article>';
- root.getBoundingClientRect=()=>({top:0,bottom:200,height:200});
- const blocks=root.querySelectorAll('[data-focus-start]');blocks[0].getBoundingClientRect=()=>({top:20,bottom:70,height:50});blocks[1].getBoundingClientRect=()=>({top:250,bottom:300,height:50});
- const captured=ui.captureFocus('note_a','原文😀\n\n尾段','v1','read',root);assert.deepEqual(captured.ranges,[{start:0,end:4}]);assert.equal(captured.documentId,'note_a');
- root.querySelector('textarea').focus();assert.equal(ui.captureFocus('exercise','body','v1','exercise',root).questionId,'q2');
- assert.deepEqual(ui.captureFocus('note_a','body','v1','asset',root,undefined,'image_asset').ranges,[]);
- root.querySelector('textarea').blur();assert.equal(ui.captureFocus('exercise','body','v1','exercise',root,undefined,undefined,'q2').questionId,'q2');
+test('focus adapters assemble identity and view metadata only, without visible ranges or selection coordinates',()=>{
+ const captured=ui.captureFocus('note_a','原文😀\n\n尾段','v1','read');assert.deepEqual(captured,{documentId:'note_a',expectedBody:'原文😀\n\n尾段',expectedVersion:'v1',view:'read',ranges:[]});
+ assert.equal('expectedVersion' in ui.captureFocus('note_a','body',undefined,'read'),false);
+ assert.equal(ui.captureFocus('exercise','body','v1','exercise',undefined,'q2').questionId,'q2');
+ assert.deepEqual(ui.captureFocus('note_a','body',undefined,'asset','image_asset'),{documentId:'note_a',expectedBody:'body',view:'asset',ranges:[],assetId:'image_asset'});
  const parsed=ui.readFocus(focus());const original=focus();assert.deepEqual(parsed,original);assert.equal(ui.readFocus({...focus(),binary:true,paragraphs:[]}).binary,true);assert.equal(ui.readFocus({...focus(),sessionId:'chat_one'}).sessionId,'chat_one');assert.equal(ui.readFocus({...focus(),repositoryVersion:2}).repositoryVersion,2);original.paragraphs[0].text='later';assert.equal(parsed.paragraphs[0].text,'原文😀');
  for(const bad of [{...focus(),commitHash:'HEAD'},{...focus(),binary:'yes'},{...focus(),sessionId:42},{...focus(),sessionId:''},{...focus(),repositoryVersion:1},{...focus(),repositoryVersion:'2'},{...focus(),paragraphs:[{start:4,end:0,text:'x'}]},{...focus(),asset:{id:'image',mime:'image/png',size:-1}},{...focus(),exercise:{questionId:'q',number:0,answered:false,graded:false}}])assert.equal(ui.readFocus(bad),undefined);
- root.remove();
 });
 test('empty course sources stay empty, frozen Focus wins and citation metadata remains deeply frozen',()=>{
  const citation={documentId:'note_b',expectedVersion:'v1',selection:'文',locator:{startChar:1,endChar:2}};

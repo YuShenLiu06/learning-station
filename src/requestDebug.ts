@@ -116,7 +116,7 @@ export function sourcePresentation(record:DebugRecord,source:DebugSource):DebugP
  if(source.origin!=='bridge')return null;
  const raw=sourceValue(record,source);let value:Record<string,unknown>;
  try{value=(typeof raw==='string'?JSON.parse(raw):raw) as Record<string,unknown>;}catch{
-  if(typeof raw==='string'&&['focus','material_changes'].includes(source.registrationKey??''))return {facts:[],sections:[{title:'实发正文',text:raw,format:source.registrationKey==='material_changes'?'diff':'text'}]};
+  if(typeof raw==='string'&&source.registrationKey==='focus')return {facts:[],sections:[{title:'实发正文',text:raw,format:'text'}]};
   return null;
  }
  if(!value||typeof value!=='object'||Array.isArray(value))return null;

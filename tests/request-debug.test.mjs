@@ -90,12 +90,11 @@ test('timing annotations use actual wire role and original round without moving 
  assert.equal(isCurrentQuestion(r,old),false);assert.equal(isCurrentQuestion(r,current),true);assert.match(sourceContent(r,call),/tool_calls/);
 });
 
-test('Focus and Changes readers preserve actual readable wire and Git diff without decoding literals twice',()=>{
- const focus='【Focus：用户当前阅读的位置】\n文件：documents/focus.md\n版本：'+('a'.repeat(40))+'\n可见范围：第 12–20 行\n\n以下为文件全文\nline one\ncode: \\n';
- const changes='【Changes：课程材料相对已知版本的变化】\n documents/focus.md | 2 +-\n\n当前聚焦文件的完整 Git diff：\ndiff --git a/documents/focus.md b/documents/focus.md\n--- a/documents/focus.md\n+++ b/documents/focus.md\n@@ -1 +1 @@\n-old line\n+new line\n';
- const r=record(5,'s',{messages:[{role:'user',content:focus},{role:'user',content:changes}]});const original=JSON.stringify(r);
+test('Focus reader preserves the merged wire with course changes without decoding literals twice',()=>{
+ const focus='【Focus：当前文件】\n文件：documents/focus.md\n版本：'+('a'.repeat(40))+'\n课程材料变化（比较版本 '+('b'.repeat(40))+' → '+('a'.repeat(40))+'）：\n documents/focus.md | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n\n当前聚焦文件的完整 Git diff（正文基准 '+('b'.repeat(40))+' → '+('a'.repeat(40))+'）：\ndiff --git a/documents/focus.md b/documents/focus.md\n--- a/documents/focus.md\n+++ b/documents/focus.md\n@@ -1 +1 @@\n-old line\n+new line\n\n以下为当前用户正在看的内容\nline one\ncode: \\n';
+ const r=record(5,'s',{messages:[{role:'user',content:focus}]});
+ const original=JSON.stringify(r);
  const f=sourcePresentation(r,{path:['messages',0,'content'],origin:'bridge',name:'learning-station-focus',registrationKey:'focus'});
- const c=sourcePresentation(r,{path:['messages',1,'content'],origin:'bridge',name:'learning-station-changes',registrationKey:'material_changes'});
- assert.equal(f.sections[0].text,focus);assert.equal(f.sections[0].format,'text');assert.equal(c.sections[0].text,changes);assert.equal(c.sections[0].format,'diff');assert.equal(JSON.stringify(r),original);
+ assert.equal(f.sections[0].text,focus);assert.equal(f.sections[0].format,'text');assert.equal(JSON.stringify(r),original);
  assert.ok(f.sections[0].text.endsWith('code: \\n'));
 });
