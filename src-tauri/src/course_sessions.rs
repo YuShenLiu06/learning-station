@@ -725,6 +725,41 @@ mod tests {
                 .is_ok()
         );
     }
+    #[test]
+    fn trashed_active_conversation_stops_being_the_routed_chat_and_course_stays_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("library");
+        let state = dir.path().join("state");
+        let engine = Engine::new(root.clone(), state.clone()).unwrap();
+        let (owner, note, a, b) = {
+            let mut c = engine.lock().unwrap();
+            let owner = node(&mut c, "course", None, "forget-course");
+            let note = node(&mut c, "section", Some(&owner.id), "forget-note");
+            let a = create(&mut c, &owner.id, "forget-chat-a").unwrap();
+            let b = create(&mut c, &owner.id, "forget-chat-b").unwrap();
+            select(&mut c, &owner.id, &a.id).unwrap();
+            assert!(c.preferences.active_session_by_course.contains_key(&owner.id));
+            let scope = crate::trash::preview(&mut c.content, &a.id).unwrap();
+            let receipt =
+                crate::trash::trash(&mut c.content, &a.id, &scope.version, "forget-chat-a").unwrap();
+            c.forget_session(&receipt.id).unwrap();
+            assert!(c.preferences.active_session_by_course.values().all(|id| id != &a.id));
+            assert!(!c.preferences.session_by_course.values().any(|id| id == &a.id));
+            assert_ne!(c.preferences.active_session_id.as_deref(), Some(a.id.as_str()));
+            let menu = list(&mut c, &owner.id).unwrap();
+            assert_eq!(menu.sessions.len(), 1);
+            assert_eq!(menu.sessions[0].id, b.id);
+            assert_eq!(menu.active_session_id, None);
+            (owner.id, note.id, a.id, b.id)
+        };
+        drop(engine);
+        let engine = Engine::new(root, state).unwrap();
+        let mut c = engine.lock().unwrap();
+        // A surviving chat reopens without dangling references to the trashed one.
+        let (session, _) = open(&mut c, &note, &owner).unwrap();
+        assert_eq!(session.id, b);
+        assert_eq!(select(&mut c, &owner, &a).unwrap_err().code, "TRASHED");
+    }
     #[cfg(unix)]
     #[test]
     fn failed_backup_does_not_switch_route_or_touch_original_history() {

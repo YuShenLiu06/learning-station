@@ -263,7 +263,7 @@ fn collect(store: &mut ContentStore, id: &str) -> Result<(Preview, Vec<Snapshot>
     let root = store.read(id)?;
     let tree = library_tree::list(store)?;
     if !tree.nodes.iter().any(|node| node.id == id) {
-        return Err(invalid("只能回收课程树节点。"));
+        return collect_session(store, &root);
     }
     let mut ids = BTreeSet::from([id.to_owned()]);
     loop {
@@ -392,6 +392,91 @@ fn collect(store: &mut ContentStore, id: &str) -> Result<(Preview, Vec<Snapshot>
         },
         snapshots,
         parent_id,
+    ))
+}
+// A course conversation is not a tree node; it enters the same recoverable
+// ledger together with its whole entries directory. Section-anchored and
+// exploration sessions keep their existing node-attached lifecycle.
+fn collect_session(
+    store: &mut ContentStore,
+    root: &Document,
+) -> Result<(Preview, Vec<Snapshot>, Option<String>)> {
+    if root.metadata.kind != "session" {
+        return Err(invalid("只能回收课程树节点或课程对话。"));
+    }
+    let owner = root
+        .metadata
+        .extra
+        .get("courseId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("只能回收课程对话；独立探索与小节会话随所属内容回收。"))?
+        .to_owned();
+    if !library_tree::list(store)?
+        .nodes
+        .iter()
+        .any(|node| node.id == owner && node.kind == "course")
+    {
+        return Err(CoreError::new(
+            "TRASHED",
+            "所属课程不在当前目录，请先恢复课程再处理对话。",
+        ));
+    }
+    // Materialized exercises keep their journal in this session's entries;
+    // hiding that ledger would break live exercise views.
+    for node in library_tree::list(store)?
+        .nodes
+        .iter()
+        .filter(|node| node.kind == "exercise")
+    {
+        let doc = store.read(&node.id)?;
+        if doc
+            .metadata
+            .extra
+            .get("originSessionId")
+            .and_then(Value::as_str)
+            == Some(root.id.as_str())
+        {
+            return Err(CoreError::new(
+                "SOURCE_IN_USE",
+                "此对话仍被练习用作作答账本，请先处理这些练习；原对话与练习均保留。",
+            ));
+        }
+    }
+    let mut documents = BTreeMap::new();
+    documents.insert(root.id.clone(), root.clone());
+    for summary in store.summaries().into_iter().filter(|s| s.kind == "entry") {
+        let document = store.read(&summary.id)?;
+        if document
+            .metadata
+            .extra
+            .get("sessionId")
+            .and_then(Value::as_str)
+            == Some(root.id.as_str())
+        {
+            documents.insert(document.id.clone(), document);
+        }
+    }
+    let snapshots: Vec<_> = documents
+        .into_values()
+        .map(|doc| Snapshot {
+            id: doc.id,
+            path: doc.path,
+            version: doc.version,
+            kind: doc.metadata.kind,
+        })
+        .collect();
+    let version = hash(&serde_json::to_string(&snapshots)?);
+    Ok((
+        Preview {
+            id: root.id.clone(),
+            title: root.metadata.title.clone(),
+            kind: "session".into(),
+            node_count: 0,
+            session_count: 1,
+            version,
+        },
+        snapshots,
+        Some(owner),
     ))
 }
 // A materialized exercise is a child of its source material, but its journal
@@ -649,9 +734,13 @@ fn validate_ledger(ledger: &Ledger) -> Result<()> {
         if id != &receipt.trash_id
             || !valid_trash_id(id)
             || !valid_id(&receipt.id)
-            || !node_kind(&receipt.kind)
+            || !receipt_kind(&receipt.kind)
             || receipt.title.trim().is_empty()
-            || receipt.node_count == 0
+            || if receipt.kind == "session" {
+                receipt.node_count != 0 || receipt.session_count != 1
+            } else {
+                receipt.node_count == 0
+            }
             || record.snapshots.len() > 4096
             || !matches!(receipt.status.as_str(), "trashed" | "restored")
             || (receipt.status == "trashed") != receipt.restored_at.is_none()
@@ -829,6 +918,10 @@ fn node_kind(kind: &str) -> bool {
         kind,
         "course" | "folder" | "section" | "knowledge" | "exploration" | "exercise"
     )
+}
+/// A session record targets one course conversation instead of a tree node.
+fn receipt_kind(kind: &str) -> bool {
+    node_kind(kind) || kind == "session"
 }
 fn sha(value: &str, length: usize) -> bool {
     value.len() == length && value.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -1300,6 +1393,193 @@ mod tests {
             );
         }
         assert_eq!(review::list(&mut store, "").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn course_conversation_recovers_with_history_and_neighbor_chats_stay_visible() {
+        let (dir, mut store, course, child, _session, _entry) = fixture();
+        let first = sessions::create_course(
+            &mut store,
+            "",
+            &[],
+            "chat_trash_first",
+            &course.id,
+            &[],
+        )
+        .unwrap();
+        let second = sessions::create_course(
+            &mut store,
+            "",
+            &[],
+            "chat_trash_second",
+            &course.id,
+            &[],
+        )
+        .unwrap();
+        let saved = sessions::append(
+            &mut store,
+            &first.id,
+            Entry {
+                id: String::new(),
+                kind: "note".into(),
+                content: "FIRST_CHAT_NOTE".into(),
+                created_at: String::new(),
+                selection: None,
+                related_ids: vec![],
+                data: None,
+            },
+            None,
+            "trash-session-first-note",
+        )
+        .unwrap();
+        let entry = saved.entries[0].id.clone();
+        let stale = preview(&mut store, &first.id).unwrap();
+        sessions::append(
+            &mut store,
+            &first.id,
+            Entry {
+                id: String::new(),
+                kind: "note".into(),
+                content: "SECOND_CHAT_NOTE".into(),
+                created_at: String::new(),
+                selection: None,
+                related_ids: vec![],
+                data: None,
+            },
+            None,
+            "trash-session-second-note",
+        )
+        .unwrap();
+        assert_eq!(
+            trash(&mut store, &first.id, &stale.version, "trash-session-stale")
+                .unwrap_err()
+                .code,
+            "CONFLICT"
+        );
+        let scope = preview(&mut store, &first.id).unwrap();
+        assert_eq!(scope.kind, "session");
+        assert_eq!(scope.node_count, 0);
+        assert_eq!(scope.session_count, 1);
+        let receipt = trash(
+            &mut store,
+            &first.id,
+            &scope.version,
+            "trash-session-request",
+        )
+        .unwrap();
+        assert_eq!(receipt.kind, "session");
+        assert_eq!(
+            trash(&mut store, &first.id, &scope.version, "trash-session-request").unwrap(),
+            receipt
+        );
+        assert_eq!(store.read(&first.id).unwrap_err().code, "TRASHED");
+        assert_eq!(store.read(&entry).unwrap_err().code, "TRASHED");
+        assert!(store.read(&child.id).is_ok());
+        assert!(!store.is_trashed(&second.id));
+        assert_eq!(
+            sessions::get(&mut store, &second.id).unwrap().id,
+            second.id
+        );
+        let course_scope = preview(&mut store, &course.id).unwrap();
+        assert_eq!(course_scope.node_count, 2);
+        // The fixture's section-anchored session plus the surviving chat; the
+        // hidden conversation must not be counted or collected again.
+        assert_eq!(course_scope.session_count, 2);
+        drop(store);
+        let mut reopened =
+            ContentStore::new(dir.path().join("library"), dir.path().join("runtime")).unwrap();
+        assert!(reopened.is_trashed(&first.id));
+        let restored = restore(
+            &mut reopened,
+            &receipt.trash_id,
+            "restore-session-request",
+        )
+        .unwrap();
+        assert_eq!(restored.status, "restored");
+        assert_eq!(
+            restore(
+                &mut reopened,
+                &receipt.trash_id,
+                "restore-session-request"
+            )
+            .unwrap(),
+            restored
+        );
+        let back = sessions::get(&mut reopened, &first.id).unwrap();
+        assert_eq!(back.title, first.title);
+        assert_eq!(back.entries.len(), 2);
+        assert_eq!(back.entries[0].content, "FIRST_CHAT_NOTE");
+    }
+    #[test]
+    fn conversation_trash_waits_for_dependent_exercise_ledgers_and_restore_orders_dependencies() {
+        let (_dir, mut store, course, child, _session, _entry) = fixture();
+        let chat = sessions::create_course(
+            &mut store,
+            "",
+            &[],
+            "chat_trash_dep",
+            &course.id,
+            &[],
+        )
+        .unwrap();
+        let created = exercises::create_manual(
+            &mut store,
+            &chat.id,
+            &child.id,
+            exercises::ManualExercise {
+                question: "Trash dependency question?".into(),
+                format: "exact".into(),
+                answers: vec!["answer".into()],
+                explanation: "Synthetic explanation".into(),
+            },
+            "trash-session-exercise",
+        )
+        .unwrap();
+        assert_eq!(
+            preview(&mut store, &chat.id).unwrap_err().code,
+            "SOURCE_IN_USE"
+        );
+        let exercise_scope = preview(&mut store, &created.document.id).unwrap();
+        let exercise_receipt = trash(
+            &mut store,
+            &created.document.id,
+            &exercise_scope.version,
+            "trash-session-exercise-node",
+        )
+        .unwrap();
+        let chat_scope = preview(&mut store, &chat.id).unwrap();
+        let chat_receipt = trash(
+            &mut store,
+            &chat.id,
+            &chat_scope.version,
+            "trash-session-chat-after-exercise",
+        )
+        .unwrap();
+        assert_eq!(
+            restore(
+                &mut store,
+                &exercise_receipt.trash_id,
+                "restore-exercise-first"
+            )
+            .unwrap_err()
+            .code,
+            "DEPENDENCY_TRASHED"
+        );
+        restore(&mut store, &chat_receipt.trash_id, "restore-chat-first").unwrap();
+        restore(
+            &mut store,
+            &exercise_receipt.trash_id,
+            "restore-exercise-second",
+        )
+        .unwrap();
+        assert!(store.read(&created.document.id).is_ok());
+        assert_eq!(
+            exercises::get(&mut store, &created.document.id)
+                .unwrap()
+                .session
+                .id,
+            chat.id
+        );
     }
 
     #[test]
