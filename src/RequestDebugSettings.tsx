@@ -48,6 +48,6 @@ export function RequestDebugSettings() {
           <><div className="debug-section-toolbar"><div><h4>与上次请求的差异</h4><p>同一会话 · #{record.previousSequence||'无'} → #{record.sequence}</p></div></div><pre tabIndex={0} aria-label="请求差异">{requestDiff(previous,record)}</pre></>}
       </div>
     </div>}
-    <p className="debug-footnote">默认关闭。仅保留本机易失内存中的最近 40 条 / 4 MiB，单条请求体上限 256 KiB。关闭、退出应用或离开会话清空对应记录。仅显式导出写入当前 state/exports，不自动上传；已导出文件由你自行管理。</p>
+    <p className="debug-footnote">默认关闭。仅保留本机易失内存中的最近 40 条 / 4 MiB，单条请求体上限 256 KiB。开启后按会话连续记录全部请求与工具轮，切换视图或会话不清空；关闭或退出应用才清空，超限自动淘汰最早记录。仅显式导出写入当前 state/exports，不自动上传；已导出文件由你自行管理。</p>
   </section>;
 }

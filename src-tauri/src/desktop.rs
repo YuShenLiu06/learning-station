@@ -25,10 +25,6 @@ fn request_debug_get() -> Value { crate::request_debug::snapshot() }
 #[tauri::command]
 fn request_debug_set(enabled: bool) -> Value { crate::request_debug::set(enabled) }
 #[tauri::command]
-fn request_debug_enter_session(session_id: String) { crate::request_debug::enter_session(&session_id); }
-#[tauri::command]
-fn request_debug_clear_session(session_id: String) { crate::request_debug::clear_session(&session_id); }
-#[tauri::command]
 fn request_debug_decode(sequence: u64) -> Result<Value> { crate::request_debug::export::decode(sequence) }
 #[tauri::command]
 async fn request_debug_export(state: State<'_, Arc<Engine>>, sequence: u64) -> Result<Value> {
@@ -1040,7 +1036,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             open_content_url,
-            request_debug_get, request_debug_set, request_debug_clear_session, request_debug_enter_session, request_debug_decode, request_debug_export,
+            request_debug_get, request_debug_set, request_debug_decode, request_debug_export,
             get_app_state,
             get_library_tree,
             list_sessions,

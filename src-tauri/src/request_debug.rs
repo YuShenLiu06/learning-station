@@ -7,7 +7,6 @@ const MAX_BYTES: usize = 4 * 1024 * 1024;
 #[derive(Default)]
 pub struct DebugState {
     enabled: bool,
-    active_session: Option<String>,
     last_sequences: Vec<(String,u64)>,
     epoch: u64,
     sequence: u64,
@@ -19,10 +18,10 @@ impl DebugState {
         self.enabled=enabled; self.epoch+=1;
         self.records.clear(); self.last_sequences.clear(); self.dropped=0;
     }
+    // While enabled every actual send is captured, including runs whose session
+    // the user is not currently viewing; records stay separated by identity.
     fn gate(&self,meta:&Value)->(Option<u64>,Value) {
-        let sid=meta["sessionId"].as_str().unwrap_or("");
-        let visible=self.active_session.as_deref().is_none_or(|active|active==sid)||sid=="utility:test";
-        ((self.enabled&&visible).then_some(self.epoch),meta.clone())
+        (self.enabled.then_some(self.epoch),meta.clone())
     }
     fn snapshot(&self) -> Value { json!({"enabled":self.enabled,"records":self.records,"dropped":self.dropped}) }
     fn capture(&mut self, epoch: u64, key: &str, meta: &Value, event: &Value) {
@@ -56,14 +55,6 @@ fn state() -> &'static Mutex<DebugState> { static STATE:OnceLock<Mutex<DebugStat
 pub fn set(enabled: bool) -> Value { let mut s=state().lock().unwrap_or_else(|e|e.into_inner()); s.set(enabled); s.snapshot() }
 pub fn enabled() -> bool { state().lock().unwrap_or_else(|e|e.into_inner()).enabled }
 pub fn snapshot() -> Value { state().lock().unwrap_or_else(|e|e.into_inner()).snapshot() }
-pub fn clear_session(session: &str) {
-    let mut s=state().lock().unwrap_or_else(|e|e.into_inner());
-    s.epoch+=1;
-    s.records.retain(|r|r["identity"]["sessionId"]!=session);
-    s.last_sequences.retain(|(id,_)|id!=session);
-    if s.active_session.as_deref()==Some(session) {s.active_session=Some(String::new());}
-}
-pub fn enter_session(session: &str) { state().lock().unwrap_or_else(|e|e.into_inner()).active_session=Some(session.into()); }
 pub fn gate(meta: &Value) -> (Option<u64>, Value) {
     let s=state().lock().unwrap_or_else(|e|e.into_inner());
     s.gate(meta)
@@ -83,9 +74,12 @@ pub fn finish_attempt(attempt:&str,error:Option<&str>) {
         s.capture(s.epoch,"a1",&a,&json!({"type":"debug_request"}));
         s.capture(s.epoch,"b1",&b,&json!({"type":"debug_request"}));
         s.capture(s.epoch,"a2",&a,&json!({"type":"debug_request"}));
+        assert_eq!(s.records.len(),3);
         assert_eq!(s.records[2]["previousSequence"],1);assert!(s.records[1]["previousSequence"].is_null());
         s.set(false);s.set(true);assert_eq!(s.gate(&a).1,a);assert!(s.records.is_empty());
-        s.active_session=Some("b".into());assert!(s.gate(&a).0.is_none());assert!(s.gate(&b).0.is_some());
+        // Records from different sessions accumulate together while enabled; the
+        // per-session chain stays intact so a full run remains replayable in place.
+        assert!(s.gate(&a).0.is_some()&&s.gate(&b).0.is_some());
     }
     #[test] fn volatile_gate_limits_and_late_events() {
         let mut s=DebugState::default(); let e=json!({"type":"debug_request","body":{"messages":["fixture"]}});

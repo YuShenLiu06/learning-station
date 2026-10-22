@@ -14,11 +14,11 @@ test('actual captured JSON strings expose Focus, citations and Changes; diff nev
   assert.match(requestText({...after,complete:false,omitted:'256 KiB'}),/不完整：256 KiB/);
   assert.match(requestDiff(before,before),/未变化/);
 });
-test('only Settings contains the debug switch; lifecycle clears departed session; packaged sidecar includes capture',()=>{
+test('only Settings contains the debug switch; records persist across view switches; packaged sidecar includes capture',()=>{
   const settings=readFileSync(new URL('../src/SettingsPage.tsx',import.meta.url),'utf8');
   const app=readFileSync(new URL('../src/App.tsx',import.meta.url),'utf8');
   assert.match(settings,/RequestDebugSettings/);assert.doesNotMatch(app,/RequestDebugSettings|开启请求调试/);
-  assert.match(app,/request_debug_clear_session/);
+  assert.doesNotMatch(app,/request_debug_/,'leaving a view or session must not clear captured records');
   const config=JSON.parse(readFileSync(new URL('../src-tauri/tauri.conf.json',import.meta.url)));
   assert.equal(config.bundle.resources['../pi-sidecar/request-debug.mjs'],'pi-sidecar/request-debug.mjs');
 });
@@ -29,11 +29,12 @@ test('debug commands pass through the real native adapter to Tauri invoke',async
   const calls=[];globalThis.debugNativeInvoke=async(command,args)=>{calls.push([command,args]);return {enabled:args.enabled??false,records:[],dropped:0};};
   try{
     const {nativeCall}=await import(file.href);
-    for(const [command,args] of [['request_debug_decode',{sequence:1}],['request_debug_export',{sequence:1}],['request_debug_get',{}],['request_debug_set',{enabled:true}],['request_debug_enter_session',{sessionId:'synthetic-session'}],['request_debug_clear_session',{sessionId:'synthetic-session'}]]) {
+    for(const [command,args] of [['request_debug_decode',{sequence:1}],['request_debug_export',{sequence:1}],['request_debug_get',{}],['request_debug_set',{enabled:true}]]) {
       await nativeCall(command,args);assert.deepEqual(calls.at(-1),[command,args]);
     }
-    assert.equal(calls.length,6);
-    await assert.rejects(nativeCall('request_debug_not_registered',{}));assert.equal(calls.length,6);
+    assert.equal(calls.length,4);
+    await assert.rejects(nativeCall('request_debug_not_registered',{}));assert.equal(calls.length,4);
+    await assert.rejects(nativeCall('request_debug_enter_session',{sessionId:'synthetic-session'}));assert.equal(calls.length,4);
   }finally{delete globalThis.debugNativeInvoke;await unlink(file);}
 });
 test('real settings component toggles capture and clears shown request after disabling',async()=>{

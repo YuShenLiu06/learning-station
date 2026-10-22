@@ -15,6 +15,11 @@ export function decodeBridgeInput(input) {
 export class ContextBridge {
   constructor(manager, identity) { this.manager=manager; this.identity=identity; this.pending=[]; this.removed=new Set(); }
   exclude(id) { this.removed.add(id); }
+  // Session-scoped registrations (the exploration entry) anchor to their opening
+  // turn for the whole session life; a pending replacement does not count as live.
+  registered(key) {
+    return this.manager.buildSessionProjection().entries.some(e=>e.messages.length&&e.sourceEntry.type==='custom_message'&&e.sourceEntry.details?.bridgeKey===key&&!this.removed.has(e.sourceEntry.id));
+  }
   message(key,description,customType,value,details={}) {
     if (!order.includes(key) || !description) throw new Error('INVALID_CONTEXT_REQUEST');
     this.pending.push({key,description,customType,value,details});

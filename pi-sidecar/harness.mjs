@@ -161,7 +161,7 @@ export function createControlledFetch({ endpoint, apiKey, fail, protocol = 'open
         }
       } catch {} // Observability must never change model/tool behavior.
     }
-    const report = async event => { if(capture) await debug.emit({...event,epoch:capture.epoch,id:capture.id}).catch(()=>{}); };
+    const report = async event => { if(capture) await Promise.resolve(debug.emit({...event,epoch:capture.epoch,id:capture.id})).catch(()=>{}); };
     const headersController = new AbortController();
     // A bounded connect/headers phase, followed by the outer first-response and total deadlines.
     const timer = setTimeout(() => { fail('TIMEOUT'); headersController.abort(); }, 10_000);

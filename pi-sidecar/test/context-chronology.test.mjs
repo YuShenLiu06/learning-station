@@ -38,10 +38,12 @@ test('actual multi-turn HTTP wire keeps each bridge with its native question, in
     part('materials',[{id:'doc',path:'courses/doc.md',version:hash(bodies[i]),text:bodies[i],textHash:hash(bodies[i]),range:{startChar:0,endChar:[...bodies[i]].length,complete:true,totalBytes:Buffer.byteLength(bodies[i])},frames:[{kind:'full',version:hash(bodies[i]),textHash:hash(bodies[i]),text:bodies[i]}]}]),
     part('exploration',{scenario:'question-led-exploration',storageDocumentId:'doc',materialSourceIds:[]}),part('question',questions[i]),
   ];
+  const captures=[];
   const run=async(i,runId=`run_${i}`)=>{
     const bridge=freeze(i);
-    await runLearningAgent({protocol:1,operation:'generate',apiKey:'synthetic-chronology-key',settings:{provider:'custom',protocol:'openai-completions',baseUrl:`http://127.0.0.1:${server.address().port}/v1`,model:'fixture'},timeContext:clock(i),learningTools:true,learningSkills:[],toolPolicy:{mode:'question',authorization:'read',allowedTools:[...LEARNING_PLUGIN.tools,'read'],maxCalls:6},nativeSession:{directory,learningSessionId:'chronology',runId,userEntryId:`user_${i}`,authorizedSourceIds:['doc'],protectHistory:false,legacyRecords:[]},messages:[{role:'user',content:JSON.stringify({bridge,contextBridgeManifest:{version:1,entries:[]}})}]},()=>{},{requestTool:async call=>{
+    await runLearningAgent({protocol:1,operation:'generate',apiKey:'synthetic-chronology-key',settings:{provider:'custom',protocol:'openai-completions',baseUrl:`http://127.0.0.1:${server.address().port}/v1`,model:'fixture'},timeContext:clock(i),learningTools:true,learningSkills:[],toolPolicy:{mode:'question',authorization:'read',allowedTools:[...LEARNING_PLUGIN.tools,'read'],maxCalls:6},debugProtocol:true,nativeSession:{directory,learningSessionId:'chronology',runId,userEntryId:`user_${i}`,authorizedSourceIds:['doc'],protectHistory:false,legacyRecords:[]},messages:[{role:'user',content:JSON.stringify({bridge,contextBridgeManifest:{version:1,entries:[]}})}]},event=>{if(event.type==='debug_request')captures.push(event);},{requestTool:async call=>{
       if(call.type==='session_sync')return {result:{synced:true}};
+      if(call.type==='debug_probe')return {result:{epoch:process.env.LS_DBG_NULL?null:1}};
       if(call.name==='read')return {error:{code:'NOT_FOUND',message:'Synthetic missing workspace file'}};
       if(call.name==='list_learning_skills')return {result:{skills:[]}};
       assert.fail(`Unexpected synthetic request: ${call.type}/${call.name}`);
@@ -59,7 +61,8 @@ test('actual multi-turn HTTP wire keeps each bridge with its native question, in
     if(m.role==='tool')return `tool:${parsed?.ok===false?'NOT_FOUND':'skills'}`;
     return `${m.role}:${value}`;
   };
-  const turn=i=>[`time:0${i}`,`user:QUOTE_${i}`,...(i===1?[]:[`focus:${bodies[i]}`]),'exploration',`user:${questions[i]}`];
+  // Exploration is session-scoped: only the opening turn registers it.
+  const turn=i=>[`time:0${i}`,`user:QUOTE_${i}`,...(i===1?[]:[`focus:${bodies[i]}`]),...(i===0?['exploration']:[]),`user:${questions[i]}`];
   const history=[];
   try {
     for(stage=0;stage<4;stage++){
@@ -72,6 +75,14 @@ test('actual multi-turn HTTP wire keeps each bridge with its native question, in
         const continuation=packets[start+1].messages.filter(m=>m.role!=='system').map(label);
         assert.deepEqual(continuation,[...history,'assistant:tools','tool:NOT_FOUND','tool:skills']);
         history.push('assistant:tools','tool:NOT_FOUND','tool:skills');
+        // A click-to-finish run with a tool round captures every actual send,
+        // each under its own id, instead of keeping only the latest request.
+        const round=captures.slice(-2);
+        assert.equal(round.length,2,'both sends of the tool run are captured');
+        assert.notEqual(round[0].id,round[1].id);
+        assert.equal(round[0].phase,'initial');
+        assert.equal(round[1].phase,'tool_continuation');
+        assert.deepEqual(round[1].body,packets[start+1]);
       }
       history.push(`assistant:answer-${stage}`);
     }
@@ -89,7 +100,8 @@ test('actual multi-turn HTTP wire keeps each bridge with its native question, in
     stage=5;await run(3,'retry_after_compaction');
     const compacted=packets.at(-1).messages.filter(m=>m.role!=='system').map(label);
     const at=compacted.indexOf('user:。');
-    assert.deepEqual(compacted.slice(at-4,at),turn(3).slice(0,-1));
+    // Compaction dropped the opening registration, so this turn re-anchors it.
+    assert.deepEqual(compacted.slice(at-4,at),[...turn(3).slice(0,-1),'exploration']);
     assert(!compacted.includes('user:QUOTE_0'));
     assert(!compacted.includes('focus:test'));
     assert.equal(compacted.filter(v=>v==='user:。').length,1);

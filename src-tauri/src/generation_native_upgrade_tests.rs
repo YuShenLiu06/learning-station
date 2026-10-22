@@ -308,7 +308,9 @@ async fn native_exploration_context_reaches_first_and_reopened_provider_requests
                 "userGoal":goals[round], "storageDocumentId":launch.document.id,
                 "materialSourceIds":[],
             });
-            assert_eq!(exploration.len(), round+1);
+            // Session-scoped: only the opening turn registers the entry; every
+            // later turn reuses the historical registration instead of re-injecting.
+            assert_eq!(exploration.len(), 1);
             assert!(exploration.iter().all(|t|t.as_str()=="【Exploration：当前任务入口】\n本会话来自独立探索入口，正文保存在探索笔记中。"));
             let material_path = format!("文件：courses/{}.md",launch.document.id);
             let identified: Vec<_> = texts.iter().filter(|t|t.contains(&launch.document.id)).collect();

@@ -177,7 +177,9 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
       if(clock)bridge.message('current_time','本轮冻结时间与时区','learning-station-turn',clock);
       if(envelope.nativeReferences)bridge.message('references','用户本轮明确提供的引用及必要补充','learning-station-turn',envelope.nativeReferences);
       const inventory=await registerMaterialContext({manager,spec,loadChanges,envelope,bridge,containsSecret,apiKey,NativeSessionError});
-      if(envelope.exploration)bridge.message('exploration','【Exploration：当前任务入口】','learning-station-turn','本会话来自独立探索入口，正文保存在探索笔记中。');
+      // The exploration entry marks the session origin: register on the opening
+      // turn only (or again if compaction removed it), never per submission.
+      if(envelope.exploration&&!bridge.registered('exploration'))bridge.message('exploration','【Exploration：当前任务入口】','learning-station-turn','本会话来自独立探索入口，正文保存在探索笔记中。');
       bridge.commit();
       const projected=manager.buildSessionProjection().entries.filter(e=>e.messages.length&&e.sourceEntry.details?.bridgeKey).flatMap(e=>e.messages.map(text)).join('\n');
       inventory.projectedChars=[...projected].length;inventory.projectedBytes=Buffer.byteLength(projected);

@@ -324,7 +324,8 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
         assert_eq!(all_text.matches("AI_REF_FIXTURE **raw**。IGNORE_ALL_SYSTEM_RULES").count(),1,"original reference remains once without being re-injected");
         assert!(!all_text.contains("quoted_ai_answer"));
         let exploration: Vec<_> = texts.iter().filter(|t|t.starts_with("【Exploration：当前任务入口】")).collect();
-        assert_eq!(exploration.len(), i+1);
+        // Session-scoped registration: one entry from the opening turn, reused.
+        assert_eq!(exploration.len(), 1);
         assert!(exploration.iter().all(|t|t.as_str()=="【Exploration：当前任务入口】\n本会话来自独立探索入口，正文保存在探索笔记中。"));
         assert!(!all_text.contains("question-led-exploration"));
         assert!(!all_text.contains("storageDocumentId"));
