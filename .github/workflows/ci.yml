@@ -67,10 +67,13 @@ jobs:
           npm --prefix tools/feishu-bot ci --ignore-scripts
       - name: Prepare pinned runtime Node (sha256 verified against runtime/manifest.json)
         run: node scripts/prepare-runtime.mjs
-      - name: Core tests (locked)
-        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --no-default-features
-      - name: Bridge harness tests (locked)
-        run: cargo test --locked --manifest-path tests/bridge-harness/Cargo.toml
+      # The suite shares process-global debug state, OS ledger locks and local
+      # TCP fixtures; parallel threads produce known false failures (observed
+      # identically on db3c433 and a64d0c8 before this change).
+      - name: Core tests (locked, serial)
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --no-default-features -- --test-threads=1
+      - name: Bridge harness tests (locked, serial)
+        run: cargo test --locked --manifest-path tests/bridge-harness/Cargo.toml -- --test-threads=1
 
   macos-app-build:
     name: macos-app-build
