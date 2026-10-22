@@ -1,11 +1,16 @@
 use crate::{
     assets,
     content::{self, ContentStore},
-    course_project::{course_project_root, create_material},
+    course_project::{course_project_root, create_material, ensure_project},
     library_tree,
+    material_git::{FrozenMaterials, MaterialGit},
     types::{Document, Metadata, Result},
 };
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+};
 use tempfile::TempDir;
 
 fn metadata(id: &str, kind: &str, parent: Option<&str>) -> Metadata {
@@ -752,4 +757,241 @@ fn review51_project_creation_does_not_report_legacy_path_success() {
                 .is_ok_and(|d| course_project_root(store.root(), &d.id).is_ok()),
         "create_project returns success while no project exists"
     );
+}
+
+// A realistic flat course: the root sits directly under courses/, children
+// keep their historical flat or arbitrary paths, plus one legacy attachment.
+fn flat_course(
+    store: &mut ContentStore,
+) -> (
+    Document,
+    Document,
+    Document,
+    Document,
+    assets::Asset,
+) {
+    let root = store
+        .create(
+            metadata("legacy", "course", None),
+            "课程正文\n",
+            "courses/legacy.md",
+        )
+        .unwrap();
+    let child = store
+        .create(
+            metadata("legacy_child", "section", Some("legacy")),
+            "子材料\n",
+            "courses/legacy_child.md",
+        )
+        .unwrap();
+    let archived = store
+        .create(
+            metadata("archived_lesson", "section", Some("legacy")),
+            "旧路径材料\n",
+            "archive/lesson.md",
+        )
+        .unwrap();
+    let exercise = store
+        .create(
+            metadata("legacy_exercise", "exercise", Some("legacy")),
+            "",
+            "exercises/legacy_exercise.md",
+        )
+        .unwrap();
+    let asset = retry_busy(|| {
+        assets::import(
+            store,
+            "legacy",
+            "原始%:资料.md",
+            b"legacy asset\n",
+            "legacy_asset_request",
+        )
+    })
+    .unwrap();
+    (root, child, archived, exercise, asset)
+}
+
+fn course_tree_files(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                files.insert(
+                    path.strip_prefix(root).unwrap().to_str().unwrap().to_owned(),
+                    fs::read(&path).unwrap(),
+                );
+            }
+        }
+    }
+    files
+}
+
+#[test]
+fn ensure_project_returns_existing_roots_without_writes() {
+    let (_dir, mut store) = fixture();
+    let created = course(&mut store, "course_a");
+    let expected = course_project_root(store.root(), &created.id).unwrap();
+    let before = fs::read(store.root().join(&created.path)).unwrap();
+    assert_eq!(ensure_project(&mut store, &created.id).unwrap(), expected);
+    assert_eq!(ensure_project(&mut store, &created.id).unwrap(), expected);
+    assert_eq!(
+        fs::read(store.root().join(&created.path)).unwrap(),
+        before,
+        "idempotent calls must not rewrite the project document"
+    );
+    assert!(!expected.join(".migration-staging").exists());
+    assert!(!expected.join(".migration-backup").exists());
+}
+
+#[test]
+fn migrated_flat_course_supports_the_git_checkpoint_chain() {
+    let (_dir, mut store) = fixture();
+    let (root, child, archived, exercise, asset) = flat_course(&mut store);
+    let originals: BTreeMap<_, _> = [&root, &child, &archived, &exercise]
+        .into_iter()
+        .map(|document| (document.id.clone(), document.content.clone()))
+        .collect();
+    let project = ensure_project(&mut store, "legacy").unwrap();
+    assert_eq!(
+        project,
+        fs::canonicalize(store.root().join("courses/legacy")).unwrap()
+    );
+    let frozen = FrozenMaterials::capture_project(&store, "legacy").unwrap();
+    let git = MaterialGit::init_course(store.root(), "legacy").unwrap();
+    let checkpoint = git.commit(&frozen, None).unwrap();
+    assert_eq!(checkpoint.course_id, "legacy");
+    let paths: BTreeSet<String> = git
+        .files("legacy", &checkpoint.checkpoint_commit_oid)
+        .unwrap()
+        .into_iter()
+        .map(|file| file.path)
+        .collect();
+    for id in ["legacy", "legacy_child", "archived_lesson", "legacy_exercise"] {
+        let path = format!("documents/{id}.md");
+        assert!(paths.contains(&path), "missing {path}");
+        assert_eq!(
+            git.read("legacy", &checkpoint.checkpoint_commit_oid, &path).unwrap(),
+            originals[id].as_bytes(),
+            "checkpoint bytes must be the original flat bytes for {id}"
+        );
+    }
+    let asset_path = format!("assets/legacy/{}/原始%25%3A资料.md", asset.id);
+    assert!(paths.contains(&asset_path));
+    assert_eq!(
+        git.read("legacy", &checkpoint.checkpoint_commit_oid, &asset_path).unwrap(),
+        b"legacy asset\n"
+    );
+}
+
+#[test]
+fn ensure_project_migration_is_idempotent() {
+    let (_dir, mut store) = fixture();
+    let (root, _child, _archived, _exercise, _asset) = flat_course(&mut store);
+    let first = ensure_project(&mut store, "legacy").unwrap();
+    let before = course_tree_files(&store.root().join("courses/legacy"));
+    let second = ensure_project(&mut store, "legacy").unwrap();
+    assert_eq!(first, second);
+    assert_eq!(
+        course_tree_files(&store.root().join("courses/legacy")),
+        before,
+        "the second call must not touch any file"
+    );
+    assert!(!store.root().join(&root.path).exists());
+    assert_eq!(
+        store.read("legacy").unwrap().path,
+        document_path("legacy", "legacy")
+    );
+}
+
+#[test]
+fn migration_preserves_ids_versions_and_keeps_a_backup() {
+    let (dir, mut store) = fixture();
+    let (root, child, archived, exercise, asset) = flat_course(&mut store);
+    let originals: BTreeMap<_, _> = [&root, &child, &archived, &exercise]
+        .into_iter()
+        .map(|document| {
+            (
+                document.id.clone(),
+                (document.path.clone(), document.version.clone(), document.content.clone()),
+            )
+        })
+        .collect();
+    let project = ensure_project(&mut store, "legacy").unwrap();
+    for (id, (old_path, version, content)) in &originals {
+        let document = store.read(id).unwrap();
+        assert_eq!(document.path, document_path("legacy", id));
+        assert_eq!(document.version, *version, "{id} version changed");
+        assert_eq!(document.content, *content, "{id} content changed");
+        assert!(!store.root().join(old_path).exists());
+    }
+    let backup = project.join(".migration-backup");
+    for (id, (_old_path, _version, content)) in &originals {
+        assert_eq!(
+            fs::read_to_string(backup.join(format!("documents/{id}.md"))).unwrap(),
+            *content,
+            "backup must keep the original flat bytes for {id}"
+        );
+    }
+    let asset_backup = backup.join(format!("assets/legacy/{}", asset.id));
+    assert!(asset_backup.join("metadata.json").is_file());
+    assert_eq!(
+        fs::read_to_string(asset_backup.join("content.md")).unwrap(),
+        "legacy asset\n"
+    );
+    assert!(!store.root().join(format!("assets/legacy/{}", asset.id)).exists());
+    // The legacy course directory itself may stay behind empty; crash-staging
+    // leftovers there are deliberately preserved, never auto-deleted.
+    if let Ok(entries) = fs::read_dir(store.root().join("assets/legacy")) {
+        assert!(entries.into_iter().next().is_none());
+    }
+    let mut reopened =
+        ContentStore::new(dir.path().join("library"), dir.path().join("state")).unwrap();
+    reopened.refresh().unwrap();
+    for (id, (_old_path, version, content)) in &originals {
+        let document = reopened.read(id).unwrap();
+        assert_eq!(document.path, document_path("legacy", id));
+        assert_eq!(document.version, *version);
+        assert_eq!(document.content, *content);
+    }
+}
+
+#[test]
+fn conflicting_target_aborts_without_touching_flat_originals() {
+    let (_dir, mut store) = fixture();
+    let (root, child, _archived, _exercise, _asset) = flat_course(&mut store);
+    let blocker = store
+        .root()
+        .join("courses/legacy/materials/documents/legacy_child.md");
+    fs::create_dir_all(blocker.parent().unwrap()).unwrap();
+    fs::write(&blocker, "# 占用目标位置的非法文件\n").unwrap();
+    let error = ensure_project(&mut store, "legacy").unwrap_err();
+    assert_eq!(error.code, "CONFLICT");
+    for document in [&root, &child] {
+        assert_eq!(
+            fs::read_to_string(store.root().join(&document.path)).unwrap(),
+            document.content,
+            "{} must stay byte-identical",
+            document.id
+        );
+    }
+    assert_eq!(store.read(&child.id).unwrap().path, child.path);
+    store.refresh().unwrap();
+    assert_eq!(store.read(&child.id).unwrap().path, child.path);
+    assert!(!store
+        .root()
+        .join("courses/legacy/.migration-staging")
+        .exists());
+    // Clearing the conflict lets the same call complete the migration.
+    fs::remove_file(&blocker).unwrap();
+    let project = ensure_project(&mut store, "legacy").unwrap();
+    assert!(project.join("materials/documents/legacy_child.md").is_file());
+    assert_eq!(
+        store.read(&child.id).unwrap().path,
+        document_path("legacy", &child.id)
+    );
+    assert_eq!(store.read(&child.id).unwrap().content, child.content);
 }
