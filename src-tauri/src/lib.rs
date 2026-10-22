@@ -13,6 +13,7 @@ pub mod course_project;
 mod desktop;
 pub mod drafts;
 pub mod feishu;
+pub mod file_metadata;
 pub mod generation;
 pub mod focus;
 pub mod learning_skills;
@@ -42,6 +43,7 @@ pub mod trash;
 pub mod grading;
 pub mod material_git;
 mod material_changes;
+pub mod versioning;
 
 pub mod anki;
 
