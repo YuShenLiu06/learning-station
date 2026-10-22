@@ -315,7 +315,7 @@ async fn native_exploration_context_reaches_first_and_reopened_provider_requests
             let material_path = format!("文件：courses/{}.md",launch.document.id);
             let identified: Vec<_> = texts.iter().filter(|t|t.contains(&launch.document.id)).collect();
             assert_eq!(identified.len(),1,"the legitimate frozen material path remains once in history");
-            assert!(identified[0].starts_with("以下为笔记全文（未绑定 Git 版本）\n"));
+            assert!(identified[0].starts_with("以下为当前用户正在看的内容\n"));
             assert!(identified[0].lines().any(|line|line==material_path));
             assert_eq!(identified[0].matches(&launch.document.id).count(),1,"source identity is a real path, never bare exploration metadata");
             assert!(!system.contains(goals[0]));

@@ -54,7 +54,7 @@ test('actual multi-turn HTTP wire keeps each bridge with its native question, in
     if(parsed?.referenceTime)return `time:${parsed.referenceTime.slice(-3,-1)}`;
     if(parsed?.type==='automatic_material_projection')return `focus:${parsed.frames[0].text}`;
     if(parsed?.scenario)return 'exploration';
-    if(value.startsWith('以下为笔记全文'))return 'focus:'+value.split('\n').slice(2).join('\n');
+    if(value.startsWith('以下为当前用户正在看的内容'))return 'focus:'+value.split('\n').slice(2).join('\n');
     if(value.startsWith('【Exploration：'))return 'exploration';
     if(value.startsWith('用户本轮明确提供的引用及必要补充\n'))return 'user:'+value.split('\n').slice(1).join('\n');
     if(m.role==='assistant'&&m.tool_calls?.length)return 'assistant:tools';

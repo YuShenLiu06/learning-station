@@ -12,17 +12,8 @@ export function receivedMaterialFrames(entry) {
   if(entry.details?.materialFrames)return entry.details.materialFrames.map(f=>frameValue(entry,f));
   return JSON.parse(entry.content).frames??[]; // Previously accepted native JSON projections.
 }
-function viewport(f) {
-  const groups=[];
-  for(const p of f.paragraphs??[]){
-    if(Number.isSafeInteger(p.startChar)&&Number.isSafeInteger(p.endChar))groups.push('['+p.startChar+', '+p.endChar+')（Unicode 字符）');
-    else if(Number.isSafeInteger(p.start)&&Number.isSafeInteger(p.end))groups.push('['+p.start+', '+p.end+')（UTF-16）');
-  }
-  return groups.length?groups.join('、')+'；从 0 开始，左闭右开':'本次未捕获';
-}
 function focusLocation(f,path) {
-  let value='文件：'+path+'\n版本：'+(f.commitHash??'未绑定 Git 版本')+'\n可见范围：'+viewport(f);
-  if(f.selectionRanges?.length)value+='\n用户选区：'+f.selectionRanges.map(r=>'['+r.startChar+', '+r.endChar+')').join('、')+'（正文 Unicode 字符，从 0 开始，左闭右开）';
+  let value='文件：'+path+'\n'+(f.commitHash?'版本：'+f.commitHash:'内容版本：'+f.documentVersion);
   if(f.exercise)value+='\n当前题目：第 '+f.exercise.number+' 题';
   return value;
 }
@@ -86,7 +77,7 @@ export async function registerMaterialContext({manager,spec,loadChanges,envelope
     if(unchanged)status='retained';
     else if(diff){patchSource=source;patchBaseline=last;status='updated';}
     else {
-      const description=source.range?.complete===false?'以下为已提供范围的正文（部分内容）':source.gitCommitOid?'以下为文件全文（固定 Git 版本；'+(ever?'正文基准已丢失，重新载入':'首次正文基准')+'）':'以下为笔记全文（未绑定 Git 版本）';
+      const description=source.range?.complete===false?'以下为已提供范围的正文（部分内容）':source.gitCommitOid?'以下为当前用户正在看的内容（固定 Git 版本；'+(ever?'正文基准已丢失，重新载入':'首次正文基准')+'）':'以下为当前用户正在看的内容';
       const prefix=envelope.focus?'':('文件：'+(source.modelPath??source.path??'未记录路径')+'\n');
       const value=prefix+source.text,start=renderBridgePart(description,prefix).length;
       bridge.message('focus',description,'learning-station-material',value,{sourceId:source.id,path:source.path,textHash:source.textHash,version:source.version,range:source.range,...(source.gitCommitOid?{gitCommitOid:source.gitCommitOid,gitBlobOid:source.gitBlobOid}:{}),materialFrames:[{kind:'full',textHash:source.textHash,start,end:start+source.text.length}]});

@@ -74,7 +74,7 @@ test('final SDK wire allows only registered supplements in declared order and on
       assert.equal(texts.filter(text=>text.includes('EXACT_QUOTE')).length,round===3?0:1,'the original quotation remains in its historical turn until Pi compacts it');
       if(round===0)assert(texts.some(v=>v.endsWith(quote)),'reference preserves real newlines and literal backslash-n');
       const values=application.map(s=>{let value=packet;for(const at of s.path)value=value[at];return value;});
-      const material=values.filter(v=>v.startsWith('以下为文件全文'));
+      const material=values.filter(v=>v.startsWith('以下为当前用户正在看的内容'));
       if(round===0||round===3)assert.equal(material.length,1);
       if(round===1)assert(values.some(v=>v.includes(`-${first}\n+${second}\n`)),'native focus diff is in Changes');
       if(round===2)assert.equal(material.length,1,'unchanged preserves the initial body without appending a full');

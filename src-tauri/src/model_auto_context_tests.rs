@@ -315,7 +315,7 @@ async fn context_bridge_real_pi_wire_replays_legacy_full_once_per_tool_loop_and_
         assert!(!t.contains("unifiedDiff"));
         assert!(!t.contains("readcache"));
     }
-    let legacy_full = |packet: &Value| packet["messages"].as_array().unwrap().iter().map(&message_text).filter(|t|t.starts_with("以下为笔记全文（未绑定 Git 版本）\n")).collect::<Vec<_>>();
+    let legacy_full = |packet: &Value| packet["messages"].as_array().unwrap().iter().map(&message_text).filter(|t|t.starts_with("以下为当前用户正在看的内容\n")).collect::<Vec<_>>();
     for packet in &packets {
         let full = legacy_full(packet);
         assert!(!full.is_empty());
@@ -472,7 +472,7 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
         let delivery = &deliveries.iter().rev().find(|(i,_)|*i==round).unwrap().1;
         let focus = &focuses[round];
         let location = texts.iter().rev().find(|t|t.starts_with("【Focus：用户当前阅读的位置】")).unwrap();
-        assert_eq!(location, &format!("【Focus：用户当前阅读的位置】\n文件：{}\n版本：{}\n可见范围：[0, 8)（Unicode 字符）；从 0 开始，左闭右开\n用户选区：[0, 4)（正文 Unicode 字符，从 0 开始，左闭右开）", delivery["focusPath"].as_str().unwrap(), focus.commit_hash));
+        assert_eq!(location, &format!("【Focus：用户当前阅读的位置】\n文件：{}\n版本：{}", delivery["focusPath"].as_str().unwrap(), focus.commit_hash));
         assert!(!location.contains(delivery["focused"]["text"].as_str().unwrap()));
         let reference = texts.iter().rev().find(|t|t.contains("引用范围：[0, 4)（正文 Unicode 字符")).unwrap();
         assert!(reference.contains(&format!("文件：{}",delivery["focusPath"].as_str().unwrap())));
@@ -488,7 +488,7 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
     }
     for packet in &packets[..2] { let text=packet.to_string();assert!(!text.contains("B_NOT_YET_FOCUSED_BODY")&&!text.contains("B_FIXED_SECOND_BODY"));assert_eq!(text.matches("A_FIXED_FIRST_BODY").count(),1); }
     let texts = |packet: &Value| packet["messages"].as_array().unwrap().iter().map(&message_text).collect::<Vec<_>>();
-    assert!(texts(&packets[2]).iter().any(|t|t.starts_with("以下为文件全文（固定 Git 版本；首次正文基准）\n")&&t.ends_with("B_FIXED_SECOND_BODY\n+111")));
+    assert!(texts(&packets[2]).iter().any(|t|t.starts_with("以下为当前用户正在看的内容（固定 Git 版本；首次正文基准）\n")&&t.ends_with("B_FIXED_SECOND_BODY\n+111")));
     let patch = deliveries.iter().find(|(i,_)|*i==3).unwrap().1["focused"]["gitChange"]["unifiedDiff"].as_str().unwrap();
     let model_path = format!("materials/{}",focuses[3].path);
     assert!(patch.starts_with(&format!("diff --git a/{model_path} b/{model_path}\n")));
@@ -497,7 +497,7 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
     let previous = packets[3]["messages"].as_array().unwrap();
     let unchanged = packets[4]["messages"].as_array().unwrap();
     assert_eq!(&unchanged[..previous.len()], previous.as_slice(), "unchanged Focus must preserve the exact earlier wire prefix, including historical time, references and locations");
-    let projections = |messages: &[Value]| messages.iter().map(&message_text).filter(|t|t.starts_with("以下为文件全文")||t.contains("当前聚焦文件的完整 Git diff（正文基准")).count();
+    let projections = |messages: &[Value]| messages.iter().map(&message_text).filter(|t|t.starts_with("以下为当前用户正在看的内容")||t.contains("当前聚焦文件的完整 Git diff（正文基准")).count();
     assert_eq!(projections(unchanged), projections(previous), "unchanged Focus must not append another body");
     let suffix = &unchanged[previous.len()..];
     assert_eq!(suffix.first().unwrap()["role"], "assistant", "previous answer remains after its original question");
@@ -508,7 +508,7 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
     assert!(packets[5].to_string().contains("A_FIXED_CHANGED_GIT_BODY"));
     for (round,packet) in packets.iter().enumerate().skip(5) {
         let content = texts(packet);
-        let full: Vec<_> = content.iter().filter(|t|t.starts_with("以下为文件全文（固定 Git 版本；")).collect();
+        let full: Vec<_> = content.iter().filter(|t|t.starts_with("以下为当前用户正在看的内容（固定 Git 版本；")).collect();
         assert_eq!(full.len(),1,"new session or compaction must recover one complete body");
         assert_eq!(full[0].split_once('\n').unwrap().1,"A_FIXED_CHANGED_GIT_BODY");
         assert!(full[0].contains(if round==5 {"首次正文基准"} else {"正文基准已丢失，重新载入"}));
