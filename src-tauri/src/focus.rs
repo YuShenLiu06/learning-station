@@ -1,5 +1,5 @@
 //! One request's view and authorized materials. Git identifies bytes, never Pi acceptance.
-use crate::{app::{atomic_json, Core}, automatic_context::MaterialSnapshot, content, context, material_git::{FrozenMaterials, MaterialGit}, types::*};
+use crate::{app::{atomic_json, Core}, automatic_context::MaterialSnapshot, content, context, material_git::MaterialGit, types::*};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -111,12 +111,12 @@ pub fn freeze(core: &mut Core, request: FreezeRequest) -> Result<Focus> {
     let document = core.content.read(&i.document_id)?;
     if document.body != i.expected_body || i.expected_version.as_ref().is_some_and(|v| v != &document.version) { return Err(conflict()); }
     let course = crate::course_sessions::course(&core.content, &i.document_id)?.ok_or_else(conflict)?;
-    // Capture once. A course's editable materials and its normal .git are the only new source.
-    let captured = FrozenMaterials::capture_project(&core.content, &course)?;
-    let git = MaterialGit::init_course(core.content.root(), &course)?;
-    let cp = git.commit(&captured, None)?;
-    let binary_paths: BTreeSet<_> = git.compare(&course, None, &cp.checkpoint_commit_oid, None)?.changes.into_iter().filter(|f| f.binary).map(|f| f.path).collect();
-    let available: BTreeSet<_> = git.files(&course, &cp.checkpoint_commit_oid)?.into_iter().map(|f| f.path).collect();
+    // One freeze equals one snapshot: a flat course gets its physical project
+    // here first, then capture → init → commit records the fixed checkpoint.
+    let snap = crate::versioning::snapshot(core, &course)?;
+    let git = MaterialGit::open_course(core.content.root(), &course)?;
+    let binary_paths: BTreeSet<_> = git.compare(&course, None, &snap.commit_hash, None)?.changes.into_iter().filter(|f| f.binary).map(|f| f.path).collect();
+    let available: BTreeSet<_> = git.files(&course, &snap.commit_hash)?.into_iter().map(|f| f.path).collect();
     let inventory = crate::assets::list(&core.content, &course)?;
     let assets: BTreeMap<_, _> = inventory.iter().map(|a| (a.id.clone(), format!("assets/{}/{}/{}", course, a.id, crate::assets::editable_name(&a.file_name)))).collect();
     let path_for = |id: &str| assets.get(id).cloned().unwrap_or_else(|| format!("documents/{id}.md"));
@@ -124,12 +124,12 @@ pub fn freeze(core: &mut Core, request: FreezeRequest) -> Result<Focus> {
     let mut catalog = context::course_read_manifest(&core.content, &course)?;
     catalog.retain(|m| available.contains(&path_for(&m.id)));
     for m in &catalog {
-        if format!("{:x}", Sha256::digest(git.read(&course, &cp.checkpoint_commit_oid, &path_for(&m.id))?)) != m.version { return Err(conflict()); }
+        if format!("{:x}", Sha256::digest(git.read(&course, &snap.commit_hash, &path_for(&m.id))?)) != m.version { return Err(conflict()); }
     }
-    let raw = git.read(&course, &cp.checkpoint_commit_oid, &format!("documents/{}.md", i.document_id))?;
+    let raw = git.read(&course, &snap.commit_hash, &format!("documents/{}.md", i.document_id))?;
     let raw_text = std::str::from_utf8(&raw).map_err(|_| conflict())?;
     if content::hash(raw_text) != document.version { return Err(conflict()); }
-    let mut focus = Focus { id: String::new(), course_id: course.clone(), session_id: session.id.clone(), document_id: i.document_id.clone(), source_document_id, path: format!("documents/{}.md", i.document_id), r#type: "markdown".into(), commit_hash: cp.checkpoint_commit_oid, material_tree_oid: cp.material_tree_oid, repository_version: Some(2), excluded_files: cp.excluded_files, document_version: document.version, view: i.view.clone(), binary: binary_paths.contains(&format!("documents/{}.md", i.document_id)), paragraphs: vec![], exercise: None, asset: None };
+    let mut focus = Focus { id: String::new(), course_id: course.clone(), session_id: session.id.clone(), document_id: i.document_id.clone(), source_document_id, path: format!("documents/{}.md", i.document_id), r#type: "markdown".into(), commit_hash: snap.commit_hash, material_tree_oid: snap.material_tree_oid, repository_version: Some(2), excluded_files: snap.excluded_files, document_version: document.version, view: i.view.clone(), binary: binary_paths.contains(&format!("documents/{}.md", i.document_id)), paragraphs: vec![], exercise: None, asset: None };
     let mut metadata_source: Option<String> = None;
     if document.metadata.kind == "exercise" && i.asset_id.is_none() {
         if i.view != "exercise" && i.view != "edit" { return Err(conflict()); }
@@ -301,6 +301,33 @@ mod tests {
         let mut c = reopened.lock().unwrap(); c.content.refresh().unwrap();
         let session = crate::sessions::get(&mut c.content, &sid).unwrap();
         assert_eq!(load(&mut c, &session, &f).unwrap().focus, f);
+    }
+    #[test]
+    fn flat_course_freeze_migrates_to_a_project_on_first_snapshot() {
+        // P0 regression: a legacy flat course used to fail freeze with
+        // COURSE_PROJECT_REQUIRED; one freeze now migrates and records a checkpoint.
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::new(dir.path().join("library"), dir.path().join("state")).unwrap();
+        let library = dir.path().join("library");
+        std::fs::create_dir_all(library.join("courses")).unwrap();
+        let course = "node_flat_focus_course";
+        let child = "node_flat_focus_child";
+        let flat = |id: &str, kind: &str, parent: Option<&str>, body: &str| {
+            let parent = match parent { Some(p) => format!("\"{p}\""), None => "null".into() };
+            format!("```json\n{{\"id\":\"{id}\",\"title\":\"{id}\",\"kind\":\"{kind}\",\"goals\":[],\"tags\":[],\"links\":[],\"version\":1,\"parentId\":{parent},\"order\":0}}\n```\n\n{body}")
+        };
+        std::fs::write(library.join(format!("courses/{course}.md")), flat(course, "course", None, "课程根")).unwrap();
+        std::fs::write(library.join(format!("courses/{child}.md")), flat(child, "section", Some(course), "平铺聚焦正文\n\n末段")).unwrap();
+        let mut c = e.lock().unwrap();
+        c.content.refresh().unwrap();
+        let sid = c.start_session(&child, false).unwrap().0.id;
+        let r = request(&c, &sid, &child);
+        let f = freeze(&mut c, r).unwrap();
+        assert_eq!(f.course_id, course);
+        assert_eq!(f.path, format!("documents/{child}.md"));
+        assert_eq!(f.commit_hash.len(), 40);
+        assert_eq!(f.paragraphs[0]["text"], "平铺聚焦");
+        assert!(crate::course_project::course_project_root(c.content.root(), course).is_ok());
     }
     #[test]
     fn citation_user_save_uses_same_fixed_snapshot_and_receipt_after_workspace_edits() {
