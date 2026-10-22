@@ -269,23 +269,11 @@ impl ToolPolicy {
         }
     }
 }
-fn validate_tool_policy(policy: &ToolPolicy, has_handler: bool) -> Result<()> {
-    let (allowed, maximum): (&[&str], usize) = match policy.mode.as_str() {
-        "question" => (
-            &[
-                "query_related_knowledge",
-                "record_question",
-                "create_note",
-                "create_todo",
-                "generate_exercises",
-                "list_learning_skills",
-                "load_learning_skill",
-            ],
-            4,
-        ),
-        "explain" => (ALL_TOOLS, 6),
-        // Only practice may pull extra guidance on demand; review keeps its
-        // fixed injected guidance without widening the tool surface.
+// question/explain are compatibility labels for the same interactive task.
+// Keep task construction and validation on one Rust allowlist.
+fn task_tools(mode: &str) -> Result<(&'static [&'static str], usize)> {
+    Ok(match mode {
+        "question" | "explain" => (ALL_TOOLS, 6),
         "practice" => (
             &[
                 "query_related_knowledge",
@@ -298,7 +286,27 @@ fn validate_tool_policy(policy: &ToolPolicy, has_handler: bool) -> Result<()> {
         "feedback" | "grading" => (&[], 0),
         "legacy" => (&ALL_TOOLS[..3], 8),
         _ => return Err(sidecar_error("TOOL_PROTOCOL")),
+    })
+}
+pub(crate) fn task_tool_policy(mode: &str, authorization: &str) -> ToolPolicy {
+    let (names, max_calls) = task_tools(mode).unwrap_or((&[], 0));
+    let mut policy = ToolPolicy {
+        mode: mode.into(),
+        allowed_tools: names.iter().map(|name| (*name).into()).collect(),
+        max_calls,
+        authorization: authorization.into(),
     };
+    if matches!(mode, "question" | "explain") {
+        if let Ok(extra) = authorization_tools(authorization) {
+            policy
+                .allowed_tools
+                .extend(extra.iter().map(|name| (*name).into()));
+        }
+    }
+    policy
+}
+fn validate_tool_policy(policy: &ToolPolicy, has_handler: bool) -> Result<()> {
+    let (allowed, maximum) = task_tools(&policy.mode)?;
     let authorized = authorization_tools(&policy.authorization)?;
     // Tier tools ride on top of the interactive exploration modes only.
     let tier_applies = matches!(policy.mode.as_str(), "question" | "explain");
@@ -307,7 +315,8 @@ fn validate_tool_policy(policy: &ToolPolicy, has_handler: bool) -> Result<()> {
         || policy.max_calls > MAX_TOOL_CALLS
         || unique.len() != policy.allowed_tools.len()
         || policy.allowed_tools.iter().any(|name| {
-            !allowed.contains(&name.as_str()) && !(tier_applies && authorized.contains(&name.as_str()))
+            !allowed.contains(&name.as_str())
+                && !(tier_applies && authorized.contains(&name.as_str()))
         })
         || (!policy.allowed_tools.is_empty() && (policy.max_calls == 0 || !has_handler))
     {
@@ -2638,19 +2647,7 @@ mod tests {
     #[test]
     fn mode_tool_policy_rejects_cross_mode_tools_and_excess_budget() {
         for (mode, allowed, maximum) in [
-            (
-                "question",
-                vec![
-                    "query_related_knowledge",
-                    "record_question",
-                    "create_note",
-                    "create_todo",
-                    "generate_exercises",
-                    "list_learning_skills",
-                    "load_learning_skill",
-                ],
-                4,
-            ),
+            ("question", ALL_TOOLS.to_vec(), 6),
             ("explain", ALL_TOOLS.to_vec(), 6),
             (
                 "practice",

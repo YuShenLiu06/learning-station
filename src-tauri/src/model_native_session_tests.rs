@@ -41,7 +41,7 @@ fn receive(s: &mut std::net::TcpStream) -> Value {
     serde_json::from_slice(&b[start..start + len]).unwrap()
 }
 #[tokio::test]
-async fn real_rust_node_pi_native_restart_roles_tool_pairs_and_course_isolation() {
+async fn real_rust_node_pi_chat_cards_restart_recover_and_keep_course_isolation() {
     let dir = tempfile::tempdir().unwrap();
     let mut e = Engine::new(dir.path().join("lib"), dir.path().join("state")).unwrap();
     let (doc, sid, other) = {
@@ -77,7 +77,7 @@ async fn real_rust_node_pi_native_restart_roles_tool_pairs_and_course_isolation(
             };
             packets.push(receive(&mut socket));
             let delta = if index == 0 {
-                json!({"tool_calls":[{"index":0,"id":"native_call","type":"function","function":{"name":"create_note","arguments":"{\"content\":\"Durable native note\"}"}}]})
+                json!({"tool_calls":[{"index":0,"id":"native_call","type":"function","function":{"name":"create_review_card","arguments":"{\"front\":\"Durable native card\",\"back\":\"Saved locally\",\"tags\":[\"native\"]}"}}]})
             } else {
                 json!({"content":match index{1=>"FIRST_NATIVE_REPLY",2=>"SECOND_NATIVE_REPLY",3=>"OTHER_NATIVE_REPLY",_=>"MODEL_CHANGED_REPLY"}})
             };
@@ -94,13 +94,14 @@ async fn real_rust_node_pi_native_restart_roles_tool_pairs_and_course_isolation(
     let mut first_native = None;
     let mut first_user = String::new();
     for round in 0..4 {
+        let mode = if round == 3 { "explain" } else { "question" };
         if round == 1 {
             e = Engine::new(dir.path().join("lib"), dir.path().join("state")).unwrap();
             e.lock().unwrap().content.refresh().unwrap();
         }
         let active = if round == 2 { &other } else { &sid };
         let prompt = if round == 0 {
-            format!("QUESTION_NATIVE_0 {}", "x".repeat(6000))
+            format!("QUESTION_NATIVE_0 请创建复习卡 {}", "x".repeat(6000))
         } else {
             format!("QUESTION_NATIVE_{round}")
         };
@@ -132,7 +133,7 @@ async fn real_rust_node_pi_native_restart_roles_tool_pairs_and_course_isolation(
             first_user = user.clone();
         }
         let run_id = format!("native_wire_run_{round}");
-        let tracked:crate::generation::Run=serde_json::from_value(json!({"id":run_id,"sessionId":active,"userEntryId":user,"mode":"question","status":"succeeded","content":"fixture","error":null,"createdAt":timestamp(),"updatedAt":timestamp(),"requestDigest":"native-fixture","contextManifest":ctx.manifest,"contextSnapshotVersion":1})).unwrap();
+        let tracked:crate::generation::Run=serde_json::from_value(json!({"id":run_id,"sessionId":active,"userEntryId":user,"mode":mode,"status":"succeeded","content":"fixture","error":null,"createdAt":timestamp(),"updatedAt":timestamp(),"requestDigest":"native-fixture","contextManifest":ctx.manifest,"contextSnapshotVersion":1})).unwrap();
         std::fs::create_dir_all(state.join("runs")).unwrap();
         crate::app::atomic_json(&state.join("runs").join(format!("{run_id}.json")), &tracked)
             .unwrap();
@@ -152,7 +153,7 @@ async fn real_rust_node_pi_native_restart_roles_tool_pairs_and_course_isolation(
         }
         let request = GenerationRequest {
             session_id: active.clone(),
-            mode: "question".into(),
+            mode: mode.into(),
             selection: String::new(),
             prompt: prompt.clone(),
             request_id: format!("native_wire_op_{round}"),
@@ -207,13 +208,12 @@ async fn real_rust_node_pi_native_restart_roles_tool_pairs_and_course_isolation(
             Arc::new(AtomicBool::new(false)),
             |_| {},
             Some(handler),
-            ToolPolicy {
-                mode: "question".into(),
-                allowed_tools: vec!["create_note".into()],
-                max_calls: 2,
-                authorization: "off".into(),
-            },
-            crate::learning_skills::capture("question", &["create_note".into()]).unwrap(),
+            crate::generation::task_tool_policy(mode, "off"),
+            crate::learning_skills::capture(
+                mode,
+                &crate::generation::task_tool_policy(mode, "off").allowed_tools,
+            )
+            .unwrap(),
             Some(RequestContext {
                 output_validator: None,
                 time: frozen.time,
@@ -276,7 +276,7 @@ async fn real_rust_node_pi_native_restart_roles_tool_pairs_and_course_isolation(
         let md = c.content.read(&sid).unwrap().content;
         (s, ctx, p, md, c.state_dir.clone())
     };
-    let prompt = format!("QUESTION_NATIVE_0 {}", "x".repeat(6000));
+    let prompt = format!("QUESTION_NATIVE_0 请创建复习卡 {}", "x".repeat(6000));
     let request = GenerationRequest {
         session_id: sid.clone(),
         mode: "question".into(),
@@ -342,13 +342,12 @@ async fn real_rust_node_pi_native_restart_roles_tool_pairs_and_course_isolation(
         Arc::new(AtomicBool::new(false)),
         |_| {},
         Some(forbidden),
-        ToolPolicy {
-            mode: "question".into(),
-            allowed_tools: vec!["create_note".into()],
-            max_calls: 2,
-            authorization: "off".into(),
-        },
-        crate::learning_skills::capture("question", &["create_note".into()]).unwrap(),
+        crate::generation::task_tool_policy("question", "off"),
+        crate::learning_skills::capture(
+            "question",
+            &crate::generation::task_tool_policy("question", "off").allowed_tools,
+        )
+        .unwrap(),
         Some(RequestContext {
             output_validator: None,
             time: frozen.time,
@@ -368,9 +367,16 @@ async fn real_rust_node_pi_native_restart_roles_tool_pairs_and_course_isolation(
         assert!(!serde_json::to_string(packet)
             .unwrap()
             .contains("/pi-native/"));
-        for tool in packet["tools"].as_array().unwrap() {
-            assert_eq!(tool["function"]["name"], "create_note");
-        }
+        let names: Vec<_> = packet["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ALL_TOOLS);
+        assert!(!names
+            .iter()
+            .any(|name| ["read", "write", "bash", "edit"].contains(name)));
     }
     let second = serde_json::to_string(&packets[2]).unwrap();
     assert!(second.contains("FIRST_NATIVE_REPLY"));
@@ -401,19 +407,74 @@ async fn real_rust_node_pi_native_restart_roles_tool_pairs_and_course_isolation(
     assert!(raw.contains("\"role\":\"toolResult\""));
     assert!(raw.contains("\"type\":\"toolCall\""));
     assert!(p.join("legacy-backup.md").is_file());
+    // A retry may have a new run and tool-call ID, but the saved question is unchanged.
+    let mut retry_run = crate::generation::get(&e, "native_wire_run_0").unwrap();
+    retry_run.id = "native_card_retry_run".into();
+    crate::app::atomic_json(
+        &dir.path().join("state/runs/native_card_retry_run.json"),
+        &retry_run,
+    )
+    .unwrap();
+    let retry_scope = ToolScope {
+        session_id: sid.clone(),
+        section_id: doc.clone(),
+        run_id: retry_run.id,
+        allowed_ids: vec![doc.clone()],
+    };
+    let card_args = json!({"front":"Durable native card","back":"Saved locally","tags":["native"]});
+    let replayed = learning_tools::execute(
+        &e,
+        &retry_scope,
+        "new-card-call",
+        "create_review_card",
+        card_args.clone(),
+    )
+    .unwrap();
+    assert_eq!(replayed["persisted"], true);
+    assert_eq!(replayed["replayed"], true);
+    let mut foreign_scope = retry_scope.clone();
+    foreign_scope.section_id = sessions::get(&mut e.lock().unwrap().content, &other)
+        .unwrap()
+        .section_id;
+    assert_eq!(
+        learning_tools::execute(
+            &e,
+            &foreign_scope,
+            "foreign-card-call",
+            "create_review_card",
+            card_args
+        )
+        .unwrap_err()
+        .code,
+        "TOOL_SCOPE"
+    );
     let mut c = e.lock().unwrap();
     let s = sessions::get(&mut c.content, &sid).unwrap();
     assert_eq!(
         s.entries
             .iter()
-            .filter(|e| e.content.contains("Durable native note"))
+            .filter(|e| e.content.contains("Durable native card"))
             .count(),
         1
     );
     assert_eq!(doc, s.section_id);
+    let cards = crate::review::list_for_course(&mut c.content, "", Some(&doc)).unwrap();
+    assert_eq!(cards.len(), 1);
+    assert_eq!(cards[0]["front"], "Durable native card");
+    assert!(cards[0]["back"].as_str().unwrap().contains("Saved locally"));
+    assert_eq!(cards[0]["sourceDocumentId"], doc);
+    assert_eq!(cards[0]["sessionId"], sid);
+    assert_eq!(cards[0]["courseId"], doc);
+    let other_session = sessions::get(&mut c.content, &other).unwrap();
+    assert!(
+        crate::review::list_for_course(&mut c.content, "", Some(&other_session.section_id))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(c.content.read(&doc).unwrap().body, "MATERIAL_NATIVE_STABLE");
     if let Ok(target) = std::env::var("LEARNING_STATION_NATIVE_EVIDENCE") {
         std::fs::create_dir_all(&target).unwrap();
-        std::fs::write(Path::new(&target).join("actual-packets.json"),serde_json::to_vec_pretty(&json!({"syntheticOnly":true,"realRustNodePinnedPi":true,"packets":packets,"manifests":*inventory.lock().unwrap()})).unwrap()).unwrap();
+        std::fs::write(Path::new(&target).join("actual-packets.json"),serde_json::to_vec_pretty(&json!({"syntheticOnly":true,"realRustNodePinnedPi":true,"packets":packets,"localCards":cards,"retryReceipt":replayed,"manifests":*inventory.lock().unwrap()})).unwrap()).unwrap();
     }
 }
 

@@ -300,7 +300,7 @@ export async function runLearningAgent(request, emit, { signal, streamFn: fixtur
     onProviderStreamEvent: chunk => { diagnostic.chunk(chunk); if (diagnostic.snapshot().invalidDelta) { fail('MODEL_FORMAT'); throw new SafeError('MODEL_FORMAT'); } },
   });
   const agentOptions = {
-    initialState: { systemPrompt: (request.operation === 'test' ? 'You are a connection test. Reply only with OK. Tools are disabled.' : policy.mode === 'grading' ? GRADING_SYSTEM : policy.mode === 'feedback' ? FEEDBACK_SYSTEM : plugin ? `${FIXED_SYSTEM}\n当前模式：${policy.mode}。已注册工具仅${policy.allowedTools.join('、')}。写入必须依据用户明确请求；AI整理的疑问和错因均待本人确认。` : `${FIXED_SYSTEM}\n本次没有注册工具，禁止请求任何工具。`) + (skills.system ? `\n\n${skills.system}` : '') + `\n\n${timeSystemContext(timeContext)}` + intentSystem + authorizationSystem(policy.authorization),
+    initialState: { systemPrompt: (request.operation === 'test' ? 'You are a connection test. Reply only with OK. Tools are disabled.' : policy.mode === 'grading' ? GRADING_SYSTEM : policy.mode === 'feedback' ? FEEDBACK_SYSTEM : plugin ? `${FIXED_SYSTEM}\n本轮已注册工具仅${policy.allowedTools.join('、')}。写入必须依据用户明确请求；AI整理的疑问和错因均待本人确认。` : `${FIXED_SYSTEM}\n本次没有注册工具，禁止请求任何工具。`) + (skills.system ? `\n\n${skills.system}` : '') + `\n\n${timeSystemContext(timeContext)}` + intentSystem + authorizationSystem(policy.authorization),
       model, thinkingLevel: glm ? 'max' : 'off', tools: plugin?.tools ?? [], messages: history.slice(0, -1) },
     streamFn: fixtureStream ?? productionStream,
     getApiKey: () => request.apiKey,

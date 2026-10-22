@@ -599,64 +599,7 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
     Ok(returned)
 }
 
-pub(crate) fn task_tool_policy(mode: &str, authorization: &str) -> model::ToolPolicy {
-    let (names, max_calls): (&[&str], usize) = match mode {
-        "question" => (
-            &[
-                "query_related_knowledge",
-                "record_question",
-                "create_note",
-                "create_todo",
-                "generate_exercises",
-                "list_learning_skills",
-                "load_learning_skill",
-            ],
-            4,
-        ),
-        "explain" => (
-            &[
-                "record_question",
-                "create_error",
-                "query_related_knowledge",
-                "create_review_card",
-                "create_note",
-                "create_todo",
-                "generate_exercises",
-                "list_learning_skills",
-                "load_learning_skill",
-            ],
-            6,
-        ),
-        // Practice keeps its small budget; only guidance listing/loading joins it.
-        "practice" => (
-            &[
-                "query_related_knowledge",
-                "list_learning_skills",
-                "load_learning_skill",
-            ],
-            2,
-        ),
-        "review" => (&["query_related_knowledge"], 2),
-        _ => (&[], 0),
-    };
-    let mut policy = model::ToolPolicy {
-        mode: mode.into(),
-        allowed_tools: names.iter().map(|name| (*name).to_owned()).collect(),
-        max_calls,
-        authorization: authorization.into(),
-    };
-    // Only the interactive exploration modes gain tier-authorized workspace tools.
-    if matches!(mode, "question" | "explain") {
-        if let Ok(extra) = model::authorization_tools(authorization) {
-            for name in extra {
-                if !policy.allowed_tools.iter().any(|tool| tool == name) {
-                    policy.allowed_tools.push((*name).to_owned());
-                }
-            }
-        }
-    }
-    policy
-}
+pub(crate) use crate::model::task_tool_policy;
 
 fn learning_tool_handler(
     engine: Arc<Engine>,
@@ -2252,52 +2195,17 @@ mod history_audit_tests {
         assert!(history_warnings(&state)[0].contains("未生成摘要"));
     }
     #[test]
-    fn context_audit_does_not_broaden_mode_tool_permissions() {
-        for (mode, maximum, names) in [
-            (
-                "question",
-                4,
-                vec![
-                    "query_related_knowledge",
-                    "record_question",
-                    "create_note",
-                    "create_todo",
-                    "generate_exercises",
-                    "list_learning_skills",
-                    "load_learning_skill",
-                ],
-            ),
-            (
-                "explain",
-                6,
-                vec![
-                    "record_question",
-                    "create_error",
-                    "query_related_knowledge",
-                    "create_review_card",
-                    "create_note",
-                    "create_todo",
-                    "generate_exercises",
-                    "list_learning_skills",
-                    "load_learning_skill",
-                ],
-            ),
-            (
-                "practice",
-                2,
-                vec![
-                    "query_related_knowledge",
-                    "list_learning_skills",
-                    "load_learning_skill",
-                ],
-            ),
-            ("review", 2, vec!["query_related_knowledge"]),
-            ("feedback", 0, vec![]),
-        ] {
-            let policy = task_tool_policy(mode, "off");
-            assert_eq!(policy.max_calls, maximum);
-            assert_eq!(policy.allowed_tools, names);
-            assert_eq!(policy.authorization, "off");
+    fn chat_entries_share_all_learning_tools_without_workspace_authorization() {
+        let question = task_tool_policy("question", "off");
+        let explain = task_tool_policy("explain", "off");
+        assert_eq!(question.allowed_tools, explain.allowed_tools);
+        assert_eq!(question.max_calls, explain.max_calls);
+        for name in ["create_review_card", "create_error", "load_learning_skill"] {
+            assert!(question.allowed_tools.contains(&name.into()));
+        }
+        assert_eq!(question.authorization, "off");
+        for mode in ["feedback", "grading", "unknown"] {
+            assert!(task_tool_policy(mode, "bash").allowed_tools.is_empty());
         }
     }
     #[test]
