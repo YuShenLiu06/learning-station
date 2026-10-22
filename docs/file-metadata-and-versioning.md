@@ -1,6 +1,6 @@
 # 文件元数据与版本管理接口（file_metadata / versioning）
 
-> 状态：设计定稿（2026-10-22）。实现随 Focus/Changes 重构批次交付；落地前以现行契约（focus-v1、material-changes-v1）为准，本文描述目标契约。
+> 状态：已实现（Layer 1＋2，refactor/versioning-interfaces 分支）。无课程文件经内容哈希取得版本；课程级变化（stat 与聚焦 diff）已并入 Focus 部件呈现；Focus 部件不再携带正文。本页即现行契约。
 
 ## 定位
 

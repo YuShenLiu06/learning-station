@@ -1,6 +1,6 @@
 # Focus v1（M2 #12）
 
-Focus 是本次提交的视图状态，不是学习模式，也不改变课程会话归属。定位为上层组装部件：唯一消费 file_metadata/versioning 两个底层接口拼接聚焦上下文（[接口契约](../docs/file-metadata-and-versioning.md)），原 Focus/Changes 的底层版本与 Git 职责并入 versioning，不再以旧名扩展底层。前端传 `documentId`、预期正文/版本、`view`、UTF-16 可见原文范围、可选 `questionId/assetId`；身份、正文与状态由 Rust 校验。阅读按 Markdown 原文块、编辑按 CodeMirror 可见范围冻结；最多16段/8000字符。练习只提供当前题号及已作答/已批改状态，不自动注入参考答案；图片/PDF 只提供元数据。现有导入器不支持 PDF，本层不新增 PDF 正文读取。Layer 2 将移除 paragraphs 正文与可见范围/坐标投影，部件只保留元数据、版本 hash 与 diff/全文；Layer 1 现状：FocusSnapshot envelope 结构暂不变，paragraphs 与坐标仍随冻结返回。
+Focus 是本次提交的视图状态，不是学习模式，也不改变课程会话归属。定位为上层组装部件：唯一消费 file_metadata/versioning 两个底层接口拼接聚焦上下文（[接口契约](../docs/file-metadata-and-versioning.md)），原 Focus/Changes 的底层版本与 Git 职责并入 versioning，不再以旧名扩展底层。前端传 `documentId`、预期正文/版本、`view`、可选 `questionId/assetId`（`ranges` 字段保留但后端忽略）；身份与状态由 Rust 校验。部件只保留元数据、版本 hash 与正文（首见全文/此后差量，经材料通道），`paragraphs` 恒为空（字段保留兼容旧记录），不再捕获可见范围。练习只提供当前题号及已作答/已批改状态，不自动注入参考答案；图片/PDF 只提供元数据。现有导入者不支持 PDF，本层不新增 PDF 正文读取。无课程文档（探索）走内容哈希版本：`commitHash`/`materialTreeOid` 为空、`documentVersion` 为内容哈希，不建 Git 检查点；课程级变化并入 Focus 部件呈现（见 material-changes-v1）。
 
 ## 唯一冻结入口与 Changes 消费
 
