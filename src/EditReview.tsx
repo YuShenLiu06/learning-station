@@ -4,12 +4,25 @@ import { marked } from 'marked';
 import { call, nativeAvailable } from './api';
 import { diffParts } from './editDiff';
 import { Markdown } from './Markdown';
+import { sanitizeMarkdown } from './sanitize';
 
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 export type EditProposal = { id: string; courseId: string; path: string; original: string; content: string; status: string; expectedVersion?: string };
 type Props = { courseId: string; documentId: string; isDirty: (id: string) => boolean; isLoaded: (id: string) => boolean; onAccepted: (id: string) => Promise<void>; onOpen: (id: string) => void; notify: (message: string) => void };
 export const proposalDocumentId = (path: string) => /^documents\/([^/]+)\.md$/u.exec(path)?.[1] || '';
 export const proposalFileName = (path: string) => path.split('/').at(-1) || '文本文件';
+
+// Some Markdown constructs lose essential source information in the reading
+// renderer (targets/definitions/HTML), or would create an embedded preview.
+// Changed versions of those constructs must remain inert, exact text.
+function needsReviewSource(text: string) {
+  let source = !sanitizeMarkdown(text).replace(/<[^>]*>/gu, '').trim();
+  marked.walkTokens(marked.lexer(text), token => {
+    if (['def', 'html', 'link', 'image'].includes(token.type)
+      || token.type === 'code' && ['html', 'learning-embed'].includes((token.lang || '').toLowerCase())) source = true;
+  });
+  return source;
+}
 
 export function useEditReview(props: Props) {
   const [items, setItems] = useState<EditProposal[]>([]);
@@ -51,7 +64,17 @@ export function useEditReview(props: Props) {
     // Keep code fences, lists and tables intact; never split their Markdown
     // delimiters across independently rendered fragments.
     const tokenize = (text: string) => marked.lexer(text).map(token => token.raw);
-    return diffParts(tokenize(proposal.original), tokenize(proposal.content));
+    const grouped: ReturnType<typeof diffParts> = [];
+    for (const block of diffParts(tokenize(proposal.original), tokenize(proposal.content))) {
+      const previous = grouped.at(-1);
+      if (previous?.kind === block.kind) previous.text += block.text;
+      else grouped.push({ ...block });
+    }
+    return grouped.map((block, index) => {
+      const neighbors = [grouped[index - 1], grouped[index + 1]];
+      const indistinguishable = neighbors.some(other => other && other.kind !== 'same' && other.kind !== block.kind && other.text !== block.text && sanitizeMarkdown(other.text) === sanitizeMarkdown(block.text));
+      return { ...block, source: block.kind !== 'same' && (needsReviewSource(block.text) || indistinguishable) };
+    });
   }, [proposal]);
   const hunks = blocks.flatMap((block, i) => block.kind !== 'same' && (i === 0 || blocks[i - 1].kind === 'same') ? [i] : []);
   useEffect(() => { setHunk(0); setError(''); }, [proposal?.id]);
@@ -110,7 +133,7 @@ export function EditReviewContent({ review, onAsset, hideTitle }: { review: Edit
       ? <Markdown key={index} text={block.text} referenceText={review.proposal!.original} courseId={review.proposal!.courseId} onAsset={onAsset}/>
       : <div key={index} className={`review-change review-${block.kind}`} data-review-hunk={review.hunks.includes(index) ? '' : undefined}>
         <span className="review-change-sign" aria-label={block.kind === 'removed' ? '删除原文' : '新增建议'}>{block.kind === 'removed' ? '−' : '+'}</span>
-        <div><span className="review-change-label">{block.kind === 'removed' ? '原文' : '建议'}</span><Markdown text={block.text} referenceText={block.kind === 'added' ? review.proposal!.content : review.proposal!.original} courseId={review.proposal!.courseId} onAsset={onAsset}/></div>
+        <div><span className="review-change-label">{block.kind === 'removed' ? '原文' : '建议'}</span>{block.source ? <pre className="review-source" aria-label="准确源码"><code>{block.text}</code></pre> : <Markdown text={block.text} referenceText={block.kind === 'added' ? review.proposal!.content : review.proposal!.original} courseId={review.proposal!.courseId} onAsset={onAsset}/>}</div>
       </div>)}
   </div>;
 }

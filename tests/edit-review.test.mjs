@@ -59,6 +59,26 @@ test('inline review is contextual, protects drafts, navigates changes and disapp
    assert.equal(document.querySelectorAll('.review-added').length > 0, !!content);
    assert.equal(document.querySelectorAll('.review-removed').length > 0, !!original);
   }
+  visible = [{ ...a, original: '', content: '# Added heading\n\nNew paragraph\n\n```js\nnew()\n```\n\nLast paragraph' }]; await render({}, true);
+  assert.equal(document.querySelectorAll('.review-added').length, 1);
+  assert.equal(document.querySelectorAll('.review-change-label').length, 1);
+  assert.equal(document.querySelectorAll('.review-source').length, 0);
+  assert.equal(document.querySelector('.review-added h1').textContent, 'Added heading');
+  assert.equal(document.querySelector('.review-added pre code').textContent.trim(), 'new()');
+  for (const [original, content] of [
+   ['[x]: https://old.example', '[x]: https://new.example'],
+   ['<!-- old hidden note -->', '<!-- new hidden note -->'],
+   ['Before <span data-value="old">same</span> after', 'Before <span data-value="new">same</span> after'],
+   ['[same](https://old.example)', '[same](https://new.example)'],
+   ['```html\n<script>window.reviewExecuted=1</script>\n```', '```html\n<script>window.reviewExecuted=2</script>\n```'],
+   ['*same*', '_same_'],
+  ]) {
+   visible = [{ ...a, original, content }]; await render({}, true);
+   assert.equal(document.querySelector('.review-removed .review-source code').textContent, original);
+   assert.equal(document.querySelector('.review-added .review-source code').textContent, content);
+   assert.equal(document.querySelectorAll('.review-change script,.review-change iframe,.review-change [data-value]').length, 0);
+   assert.equal(window.reviewExecuted, undefined);
+  }
   visible = []; await React.act(async () => { await new Promise(r => setTimeout(r, 1100)); });
   assert.equal(document.querySelector('.review-dock'), null); assert.equal(document.querySelector('.review-file-links'), null);
  } finally { await React.act(async () => root.unmount()); dom.window.close(); delete globalThis.reviewCall; await unlink(filename).catch(() => {}); }
