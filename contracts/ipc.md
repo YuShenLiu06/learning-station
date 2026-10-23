@@ -117,7 +117,9 @@ Tauri devUrl约定 `http://127.0.0.1:1420`，release嵌入 `dist/`。命令snake
 | `check_feishu_status()` | `{ready,reason}`，只读已验证本人通道，不登录、不发送、不返回凭据或收件人参数。 |
 | `test_feishu_notification({requestId})` | `{status:sent|blocked|failed|unknown,messageId:string|null,reason}`。ID为8–128字母数字/下划线/连字符；正文固定测试通知，用户点击才发。发前私有原子Unknown占位；同ID重开/超时均不重发；仅真实成功+messageId才sent。不会启用全部提醒。 |
 
-ToolActivity=`{id,toolCallId,runId,sessionId,name,status:running|succeeded|failed,title,summary,startedAt,updatedAt,persisted,object?,errorCode?}`。id/toolCallId由Core对run+模型opaque ID哈希，不返回rawargs或内部路径。object=`{kind:todo|learning-entry|review-card,id,sessionId,sectionId}`；仅真实保存回执提供。查询成功persisted=false，不能显示“已保存”。
+ToolActivity=`{id,toolCallId,runId,sessionId,userEntryId?,sequence?,name,status:running|succeeded|failed,title,summary,startedAt,updatedAt,persisted,object?,errorCode?}`。id/toolCallId由Core对run+模型opaque ID哈希，不返回rawargs或内部路径。object=`{kind:todo|learning-entry|review-card,id,sessionId,sectionId}`；仅真实保存回执提供。查询成功persisted=false，不能显示“已保存”。
+
+userEntryId 由 Rust 从准确 Run 绑定写入，不能来自模型参数。旧活动缺此字段时，读取会话仅从该 runId 的原运行文件核实 id/sessionId/userEntryId 并检查问题仍在该会话；只补返回投影、不改旧文件，不按时间或相邻正文推断。前端把活动放在对应问题后，重试沿同一问题归属；缺绑定但有同 runId 回复时贴该回复。sequence 由原 Run.toolCalls 的顺序确定，同轮卡片按其排列；无法核实归属的旧回执保留在原活动记录位置，标注所属问题未确认。最近 30 条裁剪不会把早期工具堆到末尾。
 
 工具开始/回执后更新`get_run.toolCalls`并发`generation.tool`事件。历史复用Session.entries：kind=note，data=`{origin:"pi-tool-activity",toolActivity}`；按toolCallId取最新快照，不当普通学习正文、不回灌模型历史。历史只有running而无终态显示结果未确认，不自动重跑；打开仅按稳定ID调用已有待办/学习记录/复习接口。
 

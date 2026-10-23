@@ -102,6 +102,10 @@ pub struct ToolObject {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolActivity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_entry_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<usize>,
     pub id: String,
     pub tool_call_id: String,
     pub run_id: String,
@@ -1539,6 +1543,8 @@ fn new_tool_activity(
     );
     let stamp = timestamp();
     Ok(ToolActivity {
+        user_entry_id: None,
+        sequence: None,
         id: id.clone(),
         tool_call_id: id,
         run_id: scope.run_id.clone(),
@@ -1668,6 +1674,14 @@ pub(crate) fn settle_proposal_activity(
 }
 
 fn publish_tool_activity(engine: &Engine, activity: &ToolActivity, sink: &Sink) -> Result<()> {
+    let run = get(engine, &activity.run_id)?;
+    if run.id != activity.run_id || run.session_id != activity.session_id {
+        return Err(CoreError::new("CONFLICT", "工具活动与原会话不匹配。"));
+    }
+    let mut attributed = activity.clone();
+    attributed.sequence = Some(run.tool_calls.iter().position(|item| item.id == activity.id).unwrap_or(run.tool_calls.len()));
+    attributed.user_entry_id = run.user_entry_id;
+    let activity = &attributed;
     // A decision IPC and the waiting handler may both settle the same call.
     // Reuse the first persisted activity (including timestamps) for idempotency.
     let mut core = engine.lock()?;
@@ -1911,6 +1925,14 @@ mod lifecycle_tests {
         let (temp, engine, session) = setup();
         let mut current = run(&session.id);
         current.id = "run_lifecycle".into();
+        let saved_question = sessions::append(
+            &mut engine.lock().unwrap().content, &session.id,
+            Entry { id: String::new(), kind: "user".into(), content: "fixture question".into(),
+                created_at: String::new(), selection: None, related_ids: vec![], data: None },
+            None, "tool-question",
+        ).unwrap();
+        let user_id = saved_question.entries.iter().find(|entry| entry.kind == "user").unwrap().id.clone();
+        current.user_entry_id = Some(user_id.clone());
         engine.runs.lock().unwrap().insert(
             current.id.clone(),
             ManagedRun {
@@ -1949,6 +1971,9 @@ mod lifecycle_tests {
                 .len(),
             1
         );
+        let recorded = get(&engine, "run_lifecycle").unwrap();
+        assert_eq!(recorded.tool_calls[0].user_entry_id.as_deref(), Some(user_id.as_str()));
+        assert_eq!(recorded.tool_calls[0].sequence, Some(0));
         let serialized = serde_json::to_string(&*events.lock().unwrap()).unwrap();
         assert!(!serialized.contains("opaque-secret-id"));
         assert!(!serialized.contains("synthetic private title"));
