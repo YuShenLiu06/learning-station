@@ -588,6 +588,16 @@ impl MaterialGit {
         Ok(files)
     }
 
+    pub(crate) fn blob_version(&self, bytes: &[u8]) -> Result<String> {
+        let output = self.git(&["hash-object", "--stdin"], bytes)?;
+        let version = String::from_utf8(output)
+            .map_err(|_| scope())?
+            .trim()
+            .to_owned();
+        check_oid(&version)?;
+        Ok(version)
+    }
+
     /// Exact blob bytes, including binary or text beyond preview limits.
     pub fn read(&self, course_id: &str, commit_oid: &str, path: &str) -> Result<Vec<u8>> {
         check_path(path)?;

@@ -126,6 +126,12 @@ pub fn read(core: &Core, course: &str, path: &str, version: &str) -> Result<Vec<
     MaterialGit::open_course(core.content.root(), course)?.read(course, version, path)
 }
 
+/// Identity of exactly the bytes about to be published, never a later live read.
+pub(crate) fn write_version(core: &mut Core, course: &str, bytes: &[u8]) -> Result<String> {
+    let (git, _) = record(core, course)?;
+    git.blob_version(bytes)
+}
+
 /// Returns bytes and their blob identity from one immutable checkpoint.
 /// A live filesystem read followed by version_hash would mix two revisions.
 pub fn read_versioned(core: &mut Core, course: &str, path: &str) -> Result<(Vec<u8>, String)> {

@@ -73,7 +73,7 @@ pub(crate) fn recover(
     let ledger_path = workspace_root(&state_dir, session_id)
         .join("receipts")
         .join(format!("{request_id}.json"));
-    let entry = read_ledger(&ledger_path).map_err(|_| unknown())?;
+    let entry = read_ledger(&ledger_path).map_err(|_| course_write_unknown(engine, session_id, &ledger_path))?;
     let arguments_hash = hash(&serde_json::to_string(&call.args).map_err(|_| unknown())?);
     if entry.name != call.name || entry.arguments_hash != arguments_hash {
         // A ledger exists but for different arguments: that is a conflict with
@@ -294,9 +294,46 @@ pub(crate) fn execute(
     outcome.map_err(|error| {
         if name == "write" && ledger_path.with_extension("pending").exists()
             && read_ledger(&ledger_path).is_err() {
-            CoreError::new("NATIVE_TOOL_UNKNOWN", "写入结果尚不可核实；请保留原请求并核对回执，未重复执行。")
+            course_write_unknown(engine, &scope.session_id, &ledger_path)
         } else { error }
     })
+}
+
+fn course_write_unknown(engine: &crate::app::Engine, session_id: &str, ledger: &Path) -> CoreError {
+    let mut error = CoreError::new(
+        "NATIVE_TOOL_UNKNOWN",
+        "写入结果需核对恢复目录；未重复执行。请保留原请求、旧稿与新稿。",
+    );
+    let inspect = (|| -> Result<Value> {
+        let pending = crate::assets::bounded_read(&ledger.with_extension("pending"), 16 * 1024)?;
+        let pending: Value = serde_json::from_slice(&pending)?;
+        let course = pending["courseId"].as_str().ok_or_else(invalid)?;
+        let path = pending["path"].as_str().ok_or_else(invalid)?;
+        let operation = ledger
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(invalid)?;
+        let mut core = engine.lock()?;
+        let session = crate::sessions::get(&mut core.content, session_id)?;
+        let owner = match session.course_id {
+            Some(id) => Some(id),
+            None => crate::course_sessions::course(&core.content, &session.section_id)?,
+        };
+        if owner.as_deref() != Some(course) {
+            return Err(out_of_scope());
+        }
+        crate::material_git::check_path(path)?;
+        let relative = format!("courses/{course}/materials/{path}");
+        Ok(crate::course_write_transaction::inspect(core.content.root(),&relative,operation)
+            .unwrap_or_else(|_|json!({"recoveryPath":crate::course_write_transaction::recovery_path(&relative,operation),"recovery":"inspect-only","state":"unverified"})))
+    })();
+    if let Ok(details) = inspect {
+        if let Some(path) = details["recoveryPath"].as_str() {
+            error.message = format!("写入结果需核对，未重复执行。恢复目录（相对资料库）：{path}；请保留 old/new 并先比较现有目标，不覆盖第三份文件。");
+        }
+        error.details = Some(details);
+    }
+    error
 }
 
 /// Receipts prove an earlier read, not continuing permission to disclose it.
@@ -938,6 +975,13 @@ mod tests {
         assert_eq!(updated.metadata.id, original.metadata.id);
         assert_eq!(updated.metadata.extra["parentId"], original.metadata.extra["parentId"]);
         assert_ne!(updated.version, original.version);
+        let (operation,_) = crate::learning_tools::operation_id(&engine,&scope,"edit-body","write",&args).unwrap();
+        let recovery=engine.lock().unwrap().content.root().join(crate::course_write_transaction::recovery_path(&original.path,&operation));
+        assert_eq!(std::fs::read_to_string(recovery.join("old")).unwrap(),original.content);
+        assert_eq!(std::fs::read_to_string(recovery.join("new")).unwrap(),updated.content);
+        let restored=crate::content::parse(&std::fs::read_to_string(recovery.join("old")).unwrap()).unwrap().0;
+        assert_eq!(restored.id,original.id);
+
         assert_eq!(run(&engine, &scope, "stale-body", "write", args.clone()).unwrap_err().code, "CONFLICT");
         assert_eq!(run(&engine, &scope, "edit-body", "write", args).unwrap()["replayed"], true);
         assert_eq!(run(&engine, &scope, "missing-version", "write", json!({"path":path,"content":"overwrite"})).unwrap_err().code, "CONFLICT");
@@ -985,6 +1029,15 @@ mod tests {
         let read = run(&engine,&scope,"read-persisted","read",json!({"path":"result.txt"})).unwrap();
         assert_eq!(read["content"],"already persisted");
         assert!(ledger.with_extension("pending").is_file());
+        let call=crate::model::ToolCall{id:"receipt-failure".into(),name:"write".into(),args:args.clone()};
+        let recovery=super::recover(&engine,&scope.session_id,&scope.run_id,&call).unwrap_err();
+        assert_eq!(recovery.code,"NATIVE_TOOL_UNKNOWN");
+        assert!(recovery.message.contains(".learning-write-"));
+        let detail=recovery.details.unwrap();
+        assert_eq!(detail["new"]["exists"],true);
+        assert_eq!(detail["published.json"]["exists"],true);
+        assert!(detail["recoveryPath"].as_str().unwrap().contains(".learning-write-"));
+
         assert_eq!(run(&engine,&scope,"receipt-failure","write",args).unwrap_err().code,"NATIVE_TOOL_UNKNOWN");
     }
 

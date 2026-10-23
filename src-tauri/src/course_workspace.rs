@@ -1,7 +1,7 @@
 //! Course routing for the existing authorized read/write tools. The private
 //! receipt ledger and Bash cwd remain session-scoped.
 use super::*;
-use crate::{app::Core, file_metadata::FileAddr};
+use crate::app::Core;
 
 fn conflict() -> CoreError {
     CoreError::new(
@@ -31,7 +31,9 @@ fn course(core: &mut Core, scope: &ToolScope) -> Result<Option<String>> {
 // Reject every symlink component before creating directories. Canonicalizing
 // only after create_dir_all could already have created directories outside.
 fn target(core: &Core, course: &str, path: &str) -> Result<PathBuf> {
-    if path.chars().count() > 128 { return Err(invalid()); }
+    if path.chars().count() > 128 {
+        return Err(invalid());
+    }
     let root =
         crate::course_project::course_project_root(core.content.root(), course)?.join("materials");
     crate::material_git::validate_material_write_path(&root, path)?;
@@ -62,7 +64,10 @@ fn document(
 ) -> Result<Option<crate::types::Document>> {
     let first = path.split('/').next().unwrap_or("");
     if (first.eq_ignore_ascii_case("documents") && first != "documents")
-        || first.eq_ignore_ascii_case("assets") { return Err(out_of_scope()); }
+        || first.eq_ignore_ascii_case("assets")
+    {
+        return Err(out_of_scope());
+    }
     if let Some(id) = path
         .strip_prefix("documents/")
         .and_then(|p| p.strip_suffix(".md"))
@@ -87,15 +92,6 @@ fn document(
         return Err(out_of_scope());
     }
     Ok(None)
-}
-
-fn addr(course: &str, path: &str) -> FileAddr {
-    FileAddr {
-        id: String::new(),
-        path: path.into(),
-        kind: "text".into(),
-        course: Some(course.into()),
-    }
 }
 
 pub(super) fn course_read(
@@ -126,7 +122,13 @@ pub(super) fn course_read(
     Ok(Some(read_result(scope, &course, path, &text, &version)?))
 }
 
-fn read_result(scope: &ToolScope, course: &str, path: &str, text: &str, version: &str) -> Result<Value> {
+fn read_result(
+    scope: &ToolScope,
+    course: &str,
+    path: &str,
+    text: &str,
+    version: &str,
+) -> Result<Value> {
     let (content, truncated) = bounded_text(text, MAX_READ_BYTES);
     let mut result = json!({"sessionId":scope.session_id,"courseId":course,"path":path,
         "version":version,"bytes":text.len(),"content":content,"truncated":truncated});
@@ -151,7 +153,8 @@ pub(super) fn course_write(
             "原写入结果尚不可核实；未重复执行。",
         ));
     }
-    let root = crate::course_project::course_project_root(core.content.root(), &course)?.join("materials");
+    let root =
+        crate::course_project::course_project_root(core.content.root(), &course)?.join("materials");
     crate::material_git::validate_material_write_path(&root, &args.path)?;
     let target = target(&core, &course, &args.path)?;
     let doc = document(&core, scope, &course, &args.path)?;
@@ -164,13 +167,18 @@ pub(super) fn course_write(
     } else if existing.is_some() {
         let (bytes, version) = crate::versioning::read_versioned(&mut core, &course, &args.path)?;
         Some((String::from_utf8(bytes).map_err(|_| invalid())?, version))
-    } else { None };
+    } else {
+        None
+    };
     if let Some((body, version)) = &baseline {
         if read_result(scope, &course, &args.path, body, version)?["truncated"] == true {
-            return Err(CoreError::new("TOOL_LIMIT", "原文件超出完整读取范围，不能用前缀覆盖；请在编辑器中修改，原文件保留。"));
+            return Err(CoreError::new(
+                "TOOL_LIMIT",
+                "原文件超出完整读取范围，不能用前缀覆盖；请在编辑器中修改，原文件保留。",
+            ));
         }
     }
-    let current_version = baseline.map(|(_, version)| version);
+    let current_version = baseline.as_ref().map(|(_, version)| version.clone());
     if args.expected_version != current_version {
         return Err(conflict());
     }
@@ -190,6 +198,19 @@ pub(super) fn course_write(
         )?;
         args.content.clone()
     };
+    let operation = ledger
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .ok_or_else(invalid)?;
+    let published_version = if doc.is_none() {
+        Some(crate::versioning::write_version(
+            &mut core,
+            &course,
+            content.as_bytes(),
+        )?)
+    } else {
+        None
+    };
     // Course files use the existing per-document / material validation above.
     // The 2 MiB scratch-workspace quota must not count the user's whole course.
     // Durable intent closes the write→receipt interruption gap. Unknown writes
@@ -197,32 +218,21 @@ pub(super) fn course_write(
     fs::create_dir_all(ledger.parent().ok_or_else(invalid)?).map_err(io)?;
     crate::app::atomic_json(
         &pending,
-        &json!({"path":args.path,"expectedVersion":args.expected_version}),
+        &json!({"path":args.path,"courseId":course,"expectedVersion":args.expected_version}),
     )?;
     let version = if let Some(doc) = doc {
-        core.content.save(&doc.id, &content, &doc.version)?.version
+        core.content
+            .save_course_tool(&doc.id, &content, &doc.version, operation)?
+            .version
     } else {
-        let parent = target.parent().ok_or_else(invalid)?;
-        fs::create_dir_all(parent).map_err(io)?;
-        // Recheck after parent creation and immediately before the write.
-        let checked = self::target(&core, &course, &args.path)?;
-        if checked != target {
-            return Err(out_of_scope());
-        }
-        if current_version.is_some()
-            && crate::versioning::version_hash(&mut core, &addr(&course, &args.path))?
-                != current_version.clone().unwrap()
-        {
-            return Err(conflict());
-        }
-        if current_version.is_none() && target.exists() {
-            return Err(conflict());
-        }
-        write_atomic(&target, content.as_bytes())?;
-        fs::File::open(parent)
-            .and_then(|d| d.sync_all())
-            .map_err(io)?;
-        crate::versioning::version_hash(&mut core, &addr(&course, &args.path))?
+        crate::course_write_transaction::publish(
+            &root,
+            &args.path,
+            baseline.as_ref().map(|(body, _)| body.as_bytes()),
+            content.as_bytes(),
+            operation,
+        )?;
+        published_version.unwrap()
     };
     Ok(Some(
         json!({"persisted":true,"sessionId":scope.session_id,"courseId":course,

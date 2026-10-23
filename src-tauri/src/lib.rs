@@ -50,3 +50,5 @@ pub mod anki;
 pub mod feishu_bot;
 #[path = "../../tools/feishu-bot/bridge.rs"]
 pub mod feishu_ws;
+
+mod course_write_transaction;
