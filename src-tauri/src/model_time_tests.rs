@@ -302,9 +302,10 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
         let all_text = texts.join("\n");
         let prior: Vec<_> = if i==0 {vec![]} else {packets[0]["messages"].as_array().unwrap().iter().filter(|m| {
             let text=m["content"].as_str().map(str::to_owned).unwrap_or_else(||m["content"].as_array().into_iter().flatten().filter_map(|p|p["text"].as_str()).collect());
-            !text.starts_with("本轮冻结时间与时区")&&!text.starts_with("用户本轮明确提供的引用及必要补充")
+            !text.starts_with("本轮冻结时间与时区")&&!text.starts_with("用户本轮明确提供的引用及必要补充")&&!text.contains("本轮练习可引用来源")
         }).cloned().collect()};
         assert_eq!(&messages[..prior.len()],prior.as_slice(),"reopening preserves materials, exploration entry and native history without stale turn references");
+        assert_eq!(texts.iter().filter(|t| t.contains("本轮练习可引用来源")).count(), 1, "only this user turn declares exercise sources");
         let current_text = &all_text;
         let times: Vec<_> = texts.iter().filter(|t|t.starts_with("本轮冻结时间与时区")).collect();
         assert_eq!(times.len(),1,"only this user turn declares a frozen clock");
