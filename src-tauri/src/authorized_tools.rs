@@ -164,7 +164,7 @@ pub(crate) fn list_receipt_summaries(
         let path = entry
             .result["path"]
             .as_str()
-            .filter(|path| valid_relative_path(path));
+            .filter(|path| valid_relative_path(path) || crate::material_git::check_path(path).is_ok());
         summaries.push(json!({
             "requestId": request_id,
             "tool": entry.name,
@@ -273,6 +273,7 @@ pub(crate) fn execute(
         result["replayed"] = json!(true);
         return Ok(result);
     }
+    let outcome = (|| {
     let mut result = match name {
         "read" => execute_read(engine, scope, decode::<ReadArgs>(args)?),
         "write" => execute_write(engine, &state_dir, scope, decode::<WriteArgs>(args)?, &ledger_path),
@@ -289,6 +290,13 @@ pub(crate) fn execute(
     fs::create_dir_all(&receipts).map_err(io)?;
     crate::app::atomic_json(&ledger_path, &entry)?;
     Ok(result)
+    })();
+    outcome.map_err(|error| {
+        if name == "write" && ledger_path.with_extension("pending").exists()
+            && read_ledger(&ledger_path).is_err() {
+            CoreError::new("NATIVE_TOOL_UNKNOWN", "写入结果尚不可核实；请保留原请求并核对回执，未重复执行。")
+        } else { error }
+    })
 }
 
 /// Receipts prove an earlier read, not continuing permission to disclose it.
@@ -386,10 +394,8 @@ fn execute_read(engine: &crate::app::Engine, scope: &ToolScope, args: ReadArgs) 
             "delivery":"tool-result","range":{"startChar":0,"endChar":included_chars,"complete":!content.1,"totalBytes":document.content.len()}}),)
     } else {
         let path = args.path.as_deref().ok_or_else(invalid)?;
-        if !valid_relative_path(path) {
-            return Err(invalid());
-        }
         if let Some(result) = course_read(engine, scope, path)? { return Ok(result); }
+        if !valid_relative_path(path) { return Err(invalid()); }
         let files_root = ensure_workspace_files(engine, scope)?;
         let target = resolve_existing(&files_root, path)?;
         let bytes = fs::read(&target).map_err(io)?;
@@ -410,12 +416,13 @@ fn execute_write(
     args: WriteArgs,
     ledger_path: &Path,
 ) -> Result<Value> {
-    if !valid_relative_path(&args.path) || args.content.chars().count() > MAX_CONTENT_CHARS {
+    if args.content.chars().count() > MAX_CONTENT_CHARS {
         return Err(invalid());
     }
     if let Some(result) = course_write(engine, scope, &args, ledger_path)? {
         return Ok(result);
     }
+    if !valid_relative_path(&args.path) { return Err(invalid()); }
     let files_root = ensure_workspace_files_at(state_dir, &scope.session_id)?;
     let target = resolve_for_write(&files_root, &args.path)?;
     let (count, bytes) = workspace_usage(&files_root)?;
@@ -963,6 +970,71 @@ mod tests {
         std::fs::remove_file(&host).unwrap();
         assert_eq!(run(&engine, &scope, "new-file", "write", args).unwrap_err().code,"NATIVE_TOOL_UNKNOWN");
         assert!(!host.exists());
+    }
+
+    #[test]
+    fn course_write_reports_unknown_when_completion_receipt_cannot_be_saved() {
+        let (dir, engine, scope, _, _) = course_fixture("write");
+        let args = json!({"path":"result.txt","content":"already persisted"});
+        let (request, _) = crate::learning_tools::operation_id(&engine,&scope,"receipt-failure","write",&args).unwrap();
+        let ledger = dir.path().join(format!("state/workspaces/{}/receipts/{request}.json",scope.session_id));
+        // A directory at the final ledger path deterministically fails atomic
+        // receipt replacement after the actual course material has been saved.
+        std::fs::create_dir_all(&ledger).unwrap();
+        assert_eq!(run(&engine,&scope,"receipt-failure","write",args.clone()).unwrap_err().code,"NATIVE_TOOL_UNKNOWN");
+        let read = run(&engine,&scope,"read-persisted","read",json!({"path":"result.txt"})).unwrap();
+        assert_eq!(read["content"],"already persisted");
+        assert!(ledger.with_extension("pending").is_file());
+        assert_eq!(run(&engine,&scope,"receipt-failure","write",args).unwrap_err().code,"NATIVE_TOOL_UNKNOWN");
+    }
+
+    #[test]
+    fn course_write_reports_unknown_for_content_save_failure_after_intent() {
+        let (dir, engine, scope, id, _) = course_fixture("write");
+        let path = format!("documents/{id}.md");
+        let read = run(&engine,&scope,"read-before-fail","read",json!({"path":path})).unwrap();
+        std::fs::write(dir.path().join("state/history"),"occupied").unwrap();
+        let args = json!({"path":path,"content":"attempt","expectedVersion":read["version"]});
+        assert_eq!(run(&engine,&scope,"save-failure","write",args).unwrap_err().code,"NATIVE_TOOL_UNKNOWN");
+        assert_eq!(engine.lock().unwrap().content.read(&id).unwrap().body,read["content"].as_str().unwrap());
+    }
+
+    #[test]
+    fn course_write_refuses_incomplete_baselines_including_json_budget_truncation() {
+        let (dir, engine, scope, id, _) = course_fixture("write");
+        let mut core = engine.lock().unwrap();
+        let doc = core.content.read(&id).unwrap();
+        let root = crate::course_project::ensure_project(&mut core.content,doc.metadata.extra["parentId"].as_str().unwrap()).unwrap().join("materials");
+        let content = crate::content::serialize(&doc.metadata,&"长".repeat(8000)).unwrap();
+        core.content.save(&id,&content,&doc.version).unwrap();
+        drop(core);
+        // Both raw UTF-8 byte truncation and escaped-JSON transport truncation
+        // must reject replacement, even with the correct full-file version.
+        for (path, body) in [(format!("documents/{id}.md"),None),("long.txt".into(),Some("x".repeat(21000))),("escaped.txt".into(),Some("\t".repeat(18000)))] {
+            if let Some(body) = body { std::fs::write(root.join(&path),body).unwrap(); }
+            let before = std::fs::read(root.join(&path)).unwrap();
+            let read = run(&engine,&scope,&format!("read-{}",path.len()),"read",json!({"path":path})).unwrap();
+            assert_eq!(read["truncated"],true);
+            let args=json!({"path":path,"content":"prefix","expectedVersion":read["version"]});
+            let (request,_) = crate::learning_tools::operation_id(&engine,&scope,"truncate-write","write",&args).unwrap();
+            assert_eq!(run(&engine,&scope,"truncate-write","write",args).unwrap_err().code,"TOOL_LIMIT");
+            assert_eq!(std::fs::read(root.join(&path)).unwrap(),before);
+            assert!(!dir.path().join(format!("state/workspaces/{}/receipts/{request}.pending",scope.session_id)).exists());
+        }
+    }
+
+    #[test]
+    fn course_paths_support_unicode_spaces_depth_and_leading_underscore_only_in_courses() {
+        let (_dir, engine, scope, _, _) = course_fixture("write");
+        let path = "中文目录/含 空格/三层/四层/五层/_总结.txt";
+        let written = run(&engine,&scope,"unicode-new","write",json!({"path":path,"content":"original"})).unwrap();
+        let read = run(&engine,&scope,"unicode-read","read",json!({"path":path})).unwrap();
+        assert_eq!(read["version"],written["version"]);
+        run(&engine,&scope,"unicode-edit","write",json!({"path":path,"content":"updated","expectedVersion":read["version"]})).unwrap();
+        let receipts = super::list_receipt_summaries(&engine,&scope.session_id).unwrap();
+        assert!(receipts["receipts"].as_array().unwrap().iter().any(|r|r["path"]==path));
+        let (_dir, legacy, legacy_scope) = fixture("write");
+        assert_eq!(run(&legacy,&legacy_scope,"unicode-legacy","write",json!({"path":path,"content":"x"})).unwrap_err().code,"INVALID_TOOL_INPUT");
     }
 
     #[test]

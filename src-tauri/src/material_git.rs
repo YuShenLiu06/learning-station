@@ -933,7 +933,7 @@ fn check_oid(oid: &str) -> Result<()> {
         Err(scope())
     }
 }
-fn check_path(path: &str) -> Result<()> {
+pub(crate) fn check_path(path: &str) -> Result<()> {
     if path.is_empty()
         || path.contains(['\\', ':'])
         || path.chars().any(char::is_control)

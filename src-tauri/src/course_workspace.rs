@@ -31,11 +31,10 @@ fn course(core: &mut Core, scope: &ToolScope) -> Result<Option<String>> {
 // Reject every symlink component before creating directories. Canonicalizing
 // only after create_dir_all could already have created directories outside.
 fn target(core: &Core, course: &str, path: &str) -> Result<PathBuf> {
-    if !valid_relative_path(path) {
-        return Err(invalid());
-    }
+    if path.chars().count() > 128 { return Err(invalid()); }
     let root =
         crate::course_project::course_project_root(core.content.root(), course)?.join("materials");
+    crate::material_git::validate_material_write_path(&root, path)?;
     let mut target = root;
     for part in path.split('/') {
         target.push(part);
@@ -124,11 +123,15 @@ pub(super) fn course_read(
         let text = String::from_utf8(bytes).map_err(|_| invalid())?;
         (text, version)
     };
-    let (content, truncated) = bounded_text(&text, MAX_READ_BYTES);
-    Ok(Some(
-        json!({"sessionId":scope.session_id,"courseId":course,"path":path,
-        "version":version,"bytes":text.len(),"content":content,"truncated":truncated}),
-    ))
+    Ok(Some(read_result(scope, &course, path, &text, &version)?))
+}
+
+fn read_result(scope: &ToolScope, course: &str, path: &str, text: &str, version: &str) -> Result<Value> {
+    let (content, truncated) = bounded_text(text, MAX_READ_BYTES);
+    let mut result = json!({"sessionId":scope.session_id,"courseId":course,"path":path,
+        "version":version,"bytes":text.len(),"content":content,"truncated":truncated});
+    fit_result_bytes(&mut result)?;
+    Ok(result)
 }
 
 pub(super) fn course_write(
@@ -156,16 +159,18 @@ pub(super) fn course_write(
     if existing.as_ref().is_some_and(|m| !m.is_file()) {
         return Err(invalid());
     }
-    let current_version = if let Some(doc) = &doc {
-        Some(doc.version.clone())
+    let baseline = if let Some(doc) = &doc {
+        Some((doc.body.clone(), doc.version.clone()))
     } else if existing.is_some() {
-        Some(crate::versioning::version_hash(
-            &mut core,
-            &addr(&course, &args.path),
-        )?)
-    } else {
-        None
-    };
+        let (bytes, version) = crate::versioning::read_versioned(&mut core, &course, &args.path)?;
+        Some((String::from_utf8(bytes).map_err(|_| invalid())?, version))
+    } else { None };
+    if let Some((body, version)) = &baseline {
+        if read_result(scope, &course, &args.path, body, version)?["truncated"] == true {
+            return Err(CoreError::new("TOOL_LIMIT", "原文件超出完整读取范围，不能用前缀覆盖；请在编辑器中修改，原文件保留。"));
+        }
+    }
+    let current_version = baseline.map(|(_, version)| version);
     if args.expected_version != current_version {
         return Err(conflict());
     }
