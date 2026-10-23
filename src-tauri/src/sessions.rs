@@ -9,6 +9,10 @@ use std::path::Path;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Preferences {
+    #[serde(default)]
+    pub session_by_course: BTreeMap<String, String>,
+    #[serde(default)]
+    pub active_session_by_course: BTreeMap<String, String>,
     pub active_document_id: Option<String>,
     pub active_session_id: Option<String>,
     #[serde(default)]
@@ -59,7 +63,14 @@ pub fn create_with_id(
     manifest: &[ManifestItem],
     id: &str,
 ) -> Result<Session> {
-    if !valid_id(id) || !valid_id(section_id) {
+    create_scoped(store, section_id, manifest, id, None, &[])
+}
+pub fn create_course(store: &mut ContentStore, section_id: &str, manifest: &[ManifestItem], id: &str, course: &str, legacy: &[String]) -> Result<Session> {
+    create_scoped(store, section_id, manifest, id, Some(course), legacy)
+}
+fn create_scoped(store: &mut ContentStore, section_id: &str, manifest: &[ManifestItem], id: &str, course: Option<&str>, legacy: &[String]) -> Result<Session> {
+    if !valid_id(id) || (!section_id.is_empty() && !valid_id(section_id))
+        || (section_id.is_empty() && course.is_none()) {
         return Err(CoreError::new("INVALID_INPUT", "会话或来源编号无效。"));
     }
     if store.is_trashed(id) || store.is_trashed(section_id) {
@@ -80,6 +91,7 @@ pub fn create_with_id(
                     .get("sectionId")
                     .and_then(Value::as_str)
                     != Some(section_id)
+                || existing.metadata.extra.get("courseId").and_then(Value::as_str) != course
             {
                 return Err(CoreError::new(
                     "CONFLICT",
@@ -91,8 +103,8 @@ pub fn create_with_id(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    let section = store.read(section_id)?;
-    if !matches!(
+    let section = store.read(if section_id.is_empty() { course.unwrap() } else { section_id })?;
+    if !(section_id.is_empty() && course.is_some() && section.metadata.kind == "course") && !matches!(
         section.metadata.kind.as_str(),
         "section" | "knowledge" | "exploration"
     ) {
@@ -116,10 +128,19 @@ pub fn create_with_id(
         &format!("{} · 学习记录", section.metadata.title),
         "session",
     );
-    meta.links = vec![section_id.into()];
+    if let Some(course) = course {
+        meta.title = if section_id.is_empty() {
+            let count = store.summaries().iter().filter(|d| d.kind == "session")
+                .filter(|d| store.read(&d.id).is_ok_and(|d| d.metadata.extra.get("courseId").and_then(Value::as_str) == Some(course))).count();
+            format!("新对话 {}", count + 1)
+        } else { format!("{} · 课程对话", store.read(course)?.metadata.title) };
+        meta.extra.insert("courseId".into(), json!(course));
+    }
+    meta.extra.insert("legacySessionIds".into(), json!(legacy));
+    meta.links = if section_id.is_empty() { vec![] } else { vec![section_id.into()] };
     meta.extra.insert("sectionId".into(), json!(section_id));
     meta.extra
-        .insert("associateCurrentSection".into(), json!(true));
+        .insert("associateCurrentSection".into(), json!(!section_id.is_empty()));
     meta.extra.insert("createdAt".into(), json!(timestamp()));
     meta.extra.insert("contextManifest".into(), json!(manifest));
     let body=format!("# {}\n\n本次学习记录。每条提问、练习和作答存于同目录 entries/ 的 Markdown 文件；课程正文不被改写。\n",meta.title);
@@ -165,6 +186,7 @@ pub fn get(store: &mut ContentStore, id: &str) -> Result<Session> {
         .ok_or_else(|| CoreError::new("INVALID_DOCUMENT", "学习记录缺少小节编号。"))?
         .to_string();
     if section_id.is_empty()
+        && doc.metadata.extra.get("courseId").and_then(Value::as_str).is_none()
         && (doc
             .metadata
             .extra
@@ -279,6 +301,8 @@ pub fn get(store: &mut ContentStore, id: &str) -> Result<Session> {
         .map(|e| e.created_at.clone())
         .unwrap_or_else(|| doc.modified_at.clone());
     Ok(Session {
+        course_id: doc.metadata.extra.get("courseId").and_then(Value::as_str).map(str::to_owned),
+        legacy_session_ids: serde_json::from_value(doc.metadata.extra.get("legacySessionIds").cloned().unwrap_or(json!([])))?,
         id: id.into(),
         section_id,
         title: doc.metadata.title,
@@ -347,6 +371,7 @@ pub fn set_context_manifest(
 ) -> Result<Session> {
     let session = get(store, session_id)?;
     let mut context = Context {
+        citation_context: None,
         automatic_materials: vec![],
         text: String::new(),
         manifest: manifest.to_vec(),
@@ -386,7 +411,7 @@ pub fn set_context_snapshot_explicit(
             "排除的历史来源编号无效或过多。",
         ));
     }
-    if session.section_id.is_empty() && !context.manifest.is_empty() && !explicit {
+    if session.course_id.is_none() && session.section_id.is_empty() && !context.manifest.is_empty() && !explicit {
         return Err(CoreError::new(
             "INVALID_INPUT",
             "独立探索不能写入课程来源。",
@@ -497,9 +522,19 @@ fn validate_entry(entry: &Entry) -> Result<()> {
 pub fn append(
     store: &mut ContentStore,
     session_id: &str,
+    entry: Entry,
+    expected: Option<&str>,
+    request_id: &str,
+) -> Result<Session> {
+    append_citation(store, session_id, entry, expected, request_id, None)
+}
+pub(crate) fn append_citation(
+    store: &mut ContentStore,
+    session_id: &str,
     mut entry: Entry,
     expected: Option<&str>,
     request_id: &str,
+    citation: Option<&crate::citation_context::CitationContext>,
 ) -> Result<Session> {
     if request_id.len() < 8 || request_id.len() > 128 {
         return Err(CoreError::new("INVALID_INPUT", "请求缺少防重复编号。"));
@@ -532,13 +567,46 @@ pub fn append(
         }
         return Ok(old);
     }
-    if let Some(frozen) = crate::context::requested_context(&entry, Some(&old.section_id))? {
+    if entry.kind == "user"
+        && entry
+            .data
+            .as_ref()
+            .is_some_and(|d| d.get("citationContext").is_some())
+    {
+        return Err(CoreError::new(
+            "INVALID_CONTEXT_REQUEST",
+            "补充引用快照只能由来源校验后生成，不能由客户端提供。",
+        ));
+    }
+    if let Some(frozen) = crate::context::requested_context(&entry, old.course_id.is_none().then_some(old.section_id.as_str()))? {
+        let source = crate::course_sessions::source(store, &old, &frozen.document_id)?;
+        crate::course_sessions::validate_injections(store, &old, &frozen.injections)?;
+        if entry.data.as_ref().and_then(|d| d.get("sourceDocumentId")).and_then(Value::as_str).is_some_and(|id| id != source) {
+            return Err(CoreError::new("CONTEXT_CONFLICT", "问题的冻结来源与当前材料不一致，未改变原请求。"));
+        }
+        entry.data.as_mut().unwrap()["sourceDocumentId"] = json!(source);
+
         crate::assistant_references::validate_references(
             store,
             &old,
             &frozen.assistant_references,
         )?;
         crate::exercise_references::validate_references(store, &old, &frozen.exercise_references)?;
+        let citation = if let Some(citation) = citation {
+            // Internal callers supply the already verified same-request Context. Focus
+            // may refer to fixed Git bytes after the editable workspace has changed.
+            citation.clone()
+        } else {
+            crate::citation_context::freeze(
+                store,
+                &old,
+                &frozen.injections,
+                &frozen.assistant_references,
+                &frozen.exercise_references,
+            )?
+        };
+        if !citation.references.is_empty(){entry.data.as_mut().unwrap()["citationContext"] = serde_json::to_value(citation)?;}
+        validate_entry(&entry)?;
     }
     if entry.kind == "exercise" {
         let questions = entry
@@ -732,6 +800,16 @@ pub fn append(
                     }
                 }
             }
+        }
+    }
+    if entry.kind == "error" || entry.data.as_ref().is_some_and(|d| d["reviewCard"] == true) {
+        let data = entry.data.as_ref().cloned().unwrap_or_else(|| json!({}));
+        let mut source = record_source(&old, &data);
+        if !source.is_empty() {
+            if data.get("exerciseId").is_none() || data["origin"] == "pi-tool" {
+                source = crate::course_sessions::source(store, &old, &source)?;
+            }
+            entry.data.get_or_insert_with(|| json!({}))["sourceDocumentId"] = json!(source);
         }
     }
     entry.id = id;
@@ -1088,10 +1166,21 @@ pub fn review_items(store: &mut ContentStore, query: &str) -> Result<Vec<Value>>
     items.truncate(200);
     Ok(items)
 }
+// Exercise ownership comes from the original question entry, never the session anchor.
+fn record_source(session: &Session, data: &Value) -> String {
+    if let Some(question) = data.get("exerciseId").and_then(Value::as_str) {
+        if let Some(exercise) = session.entries.iter().filter(|e| e.kind == "exercise").find(|e| e.data.as_ref().and_then(|d| d.get("exercises")).and_then(Value::as_array).is_some_and(|qs| qs.iter().any(|q| q["id"].as_str() == Some(question)))) {
+            return exercise.data.as_ref().and_then(|d| d.get("sourceDocumentId")).and_then(Value::as_str).unwrap_or(if session.course_id.is_none() { &session.section_id } else { "" }).to_owned();
+        }
+    }
+    data.get("sourceDocumentId").and_then(Value::as_str).filter(|id| valid_id(id))
+        .unwrap_or(if session.course_id.is_none() { &session.section_id } else { "" }).to_owned()
+}
 /// Complete bounded-library candidates for exact-ID operations, independent from UI search limits.
 pub fn review_items_all(store: &mut ContentStore) -> Result<Vec<Value>> {
     let summaries = store.summaries();
     let mut grouped: BTreeMap<String, Value> = BTreeMap::new();
+    let mut session_cache = BTreeMap::new();
     for summary in summaries.into_iter().filter(|s| s.kind == "entry") {
         let doc = store.read(&summary.id)?;
         let kind = doc
@@ -1129,20 +1218,9 @@ pub fn review_items_all(store: &mut ContentStore) -> Result<Vec<Value>> {
             .unwrap_or("")
             .to_string();
         let section_id = if valid_id(&session_id) {
-            store
-                .read_relative(&format!("sessions/{session_id}/session.md"))
-                .ok()
-                .and_then(|d| {
-                    d.metadata
-                        .extra
-                        .get("sectionId")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
+            if !session_cache.contains_key(&session_id) { if let Ok(session) = get(store, &session_id) { session_cache.insert(session_id.clone(), session); } }
+            session_cache.get(&session_id).map(|session| record_source(session, &data)).unwrap_or_default()
+        } else { String::new() };
         let key = if kind == "error" {
             format!(
                 "{}:{}",
@@ -1160,7 +1238,8 @@ pub fn review_items_all(store: &mut ContentStore) -> Result<Vec<Value>> {
             .get("createdAt")
             .cloned()
             .unwrap_or_else(|| json!(doc.modified_at));
-        let item = json!({"id":doc.id,"front":front,"back":back,"sectionId":section_id,"source":if kind=="error"{"错题"}else if data.get("origin").and_then(Value::as_str)==Some("pi-tool"){"AI复习（待确认）"}else{"手动复习"},"sessionId":session_id,"tags":data.get("tags").cloned().unwrap_or_else(||json!([])),"createdAt":stamp});
+        let course_id = session_cache.get(&session_id).and_then(|session| session.course_id.as_deref());
+        let item = json!({"id":doc.id,"front":front,"back":back,"sectionId":section_id,"courseId":course_id,"source":if kind=="error"{"错题"}else if data.get("origin").and_then(Value::as_str)==Some("pi-tool"){"AI复习（待确认）"}else{"手动复习"},"sessionId":session_id,"tags":data.get("tags").cloned().unwrap_or_else(||json!([])),"createdAt":stamp});
         if grouped.get(&key).is_none_or(|old| {
             old["createdAt"].as_str().unwrap_or("") <= item["createdAt"].as_str().unwrap_or("")
         }) {

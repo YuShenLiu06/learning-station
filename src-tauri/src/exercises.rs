@@ -265,7 +265,7 @@ fn request(request_id: &str) -> Result<()> {
 }
 fn source(store: &ContentStore, session: &Session, id: &str) -> Result<Document> {
     let document = store.read(id)?;
-    if session.section_id != id
+    if crate::course_sessions::source(store, session, id)? != id
         || !matches!(
             document.metadata.kind.as_str(),
             "section" | "knowledge" | "exploration"
@@ -422,8 +422,14 @@ pub fn create(
     store: &mut ContentStore,
     session_id: &str,
     source_document_id: &str,
-    mut data: Value,
+    data: Value,
     request_id: &str,
+) -> Result<Document> {
+    create_from_snapshot(store, session_id, source_document_id, data, request_id, None)
+}
+pub(crate) fn create_from_snapshot(
+    store: &mut ContentStore, session_id: &str, source_document_id: &str,
+    mut data: Value, request_id: &str, frozen: Option<&[ManifestItem]>,
 ) -> Result<Document> {
     request(request_id)?;
     let session = sessions::get(store, session_id)?;
@@ -461,8 +467,7 @@ pub fn create(
         .iter()
         .any(|entry| entry.id == entry_id && entry.kind == "exercise");
     let manifest = stored_manifest(&data, &session.context_manifest)?;
-    let authorized: BTreeSet<_> = session
-        .context_manifest
+    let authorized: BTreeSet<_> = frozen.unwrap_or(&session.context_manifest)
         .iter()
         .map(|item| item.id.as_str())
         .collect();
@@ -523,30 +528,47 @@ pub fn create(
         request_id,
     )
 }
+pub struct ExerciseOrigin {
+    pub session_id: String,
+    pub entry_id: String,
+    pub source_document_id: String,
+}
+/// The page is an editable view; only its verified immutable ledger mapping is provenance.
+pub fn origin(store: &ContentStore, document: &Document) -> Result<ExerciseOrigin> {
+    let bad = || CoreError::new("CONTEXT_CONFLICT", "练习页面与原账本的来源映射不一致，请保留页面并重新打开原练习。").details(json!({"documentId":document.id}));
+    let field = |key: &str| document.metadata.extra.get(key).and_then(Value::as_str)
+        .filter(|id| valid_id(id)).map(str::to_owned).ok_or_else(&bad);
+    if document.metadata.kind != "exercise" { return Err(bad()); }
+    let session_id = field("originSessionId")?;
+    let entry_id = field("exerciseEntryId")?;
+    let native_page = entry_id.strip_prefix("entry_").map(|suffix| format!("exdoc_{suffix}"));
+    let legacy_request = format!("legacy_{}", &hash(&format!("{session_id}\n{entry_id}"))[..32]);
+    let legacy_page = format!("exdoc_{}", &hash(&legacy_request)[..32]);
+    if native_page.as_deref() != Some(&document.id) && legacy_page != document.id { return Err(bad()); }
+    let owner = store.read_relative(&format!("sessions/{session_id}/session.md"))?;
+    let entry = store.read_relative(&format!("sessions/{session_id}/entries/{entry_id}.md"))?;
+    if owner.id != session_id || owner.metadata.kind != "session" || entry.id != entry_id
+        || entry.metadata.kind != "entry" || entry.metadata.extra.get("sessionId").and_then(Value::as_str) != Some(&session_id)
+        || entry.metadata.extra.get("entryKind").and_then(Value::as_str) != Some("exercise") { return Err(bad()); }
+    let data = entry.metadata.extra.get("data").ok_or_else(&bad)?;
+    let source_document_id = data.get("sourceDocumentId").or_else(|| owner.metadata.extra.get("sectionId"))
+        .and_then(Value::as_str).filter(|id| valid_id(id)).ok_or_else(&bad)?.to_owned();
+    let digest = hash(&serde_json::to_string(&json!({"sessionId":session_id,"sourceDocumentId":source_document_id,"exerciseEntryId":entry_id,"data":data}))?);
+    if document.metadata.extra.get("sourceDocumentId").and_then(Value::as_str) != Some(&source_document_id)
+        || document.metadata.extra.get("requestDigest").and_then(Value::as_str) != Some(&digest) { return Err(bad()); }
+    Ok(ExerciseOrigin { session_id, entry_id, source_document_id })
+}
 pub fn get(store: &mut ContentStore, document_id: &str) -> Result<ExerciseDocument> {
     let document = read_document(store, document_id)?;
     if document.metadata.kind != "exercise" {
         return Err(CoreError::new("INVALID_INPUT", "请选择练习文档。"));
     }
-    let session_id = document
-        .metadata
-        .extra
-        .get("originSessionId")
-        .and_then(Value::as_str)
-        .filter(|id| valid_id(id))
-        .ok_or_else(invalid)?;
-    let entry_id = document
-        .metadata
-        .extra
-        .get("exerciseEntryId")
-        .and_then(Value::as_str)
-        .filter(|id| valid_id(id))
-        .ok_or_else(invalid)?;
-    let session = sessions::get(store, session_id)?;
+    let provenance = origin(store, &document)?;
+    let session = sessions::get(store, &provenance.session_id)?;
     let entry = session
         .entries
         .iter()
-        .find(|entry| entry.id == entry_id && entry.kind == "exercise")
+        .find(|entry| entry.id == provenance.entry_id && entry.kind == "exercise")
         .ok_or_else(|| CoreError::new("NOT_FOUND", "原练习记录缺失，未把页面正文当作评分依据。"))?;
     let exercises = entry.data.clone().ok_or_else(invalid)?;
     validate_stored(
@@ -568,12 +590,15 @@ pub fn create_manual(
     request_id: &str,
 ) -> Result<ExerciseDocument> {
     let session = sessions::get(store, session_id)?;
-    let data = validate(
+    source(store, &session, source_document_id)?;
+    let manifest = crate::context::load(store, source_document_id, None)?.manifest;
+    let mut data = validate(
         json!({"exercises":[{"question":input.question,"format":input.format,"answers":input.answers,"explanation":input.explanation,"tags":[],"sourceIds":[]}],"summary":"手动创建练习"}),
-        &session.context_manifest,
+        &manifest,
         &format!("manual_{}", &hash(request_id)[..32]),
     )?;
-    let document = create(store, session_id, source_document_id, data, request_id)?;
+    data["contextManifest"] = json!(manifest);
+    let document = create_from_snapshot(store, session_id, source_document_id, data, request_id, Some(&manifest))?;
     get(store, &document.id)
 }
 /// Explicit migration only. Existing question IDs and original Markdown receipts remain untouched.
@@ -583,7 +608,6 @@ pub fn materialize_legacy(
     exercise_entry_id: &str,
 ) -> Result<Document> {
     let session = sessions::get(store, session_id)?;
-    let source_document = source(store, &session, &session.section_id)?;
     let entry = session
         .entries
         .iter()
@@ -599,6 +623,9 @@ pub fn materialize_legacy(
         "legacy_{}",
         &hash(&format!("{session_id}\n{exercise_entry_id}"))[..32]
     );
+    let source_id = data.get("sourceDocumentId").and_then(Value::as_str).unwrap_or(&session.section_id);
+    let source_document = store.read(source_id)?;
+    if !matches!(source_document.metadata.kind.as_str(), "section" | "knowledge" | "exploration") { return Err(invalid()); }
     materialize(
         store,
         &session,

@@ -12,10 +12,13 @@
   },
   "dependencies": {
     "@codemirror/commands": "^6.8.1",
+    "@codemirror/lang-json": "^6.0.2",
     "@codemirror/lang-markdown": "^6.3.3",
     "@codemirror/language": "^6.11.3",
+    "@codemirror/search": "^6.5.11",
     "@codemirror/state": "^6.5.2",
     "@codemirror/view": "^6.38.1",
+    "@lezer/highlight": "^1.2.3",
     "@tauri-apps/api": "^2.8.0",
     "dompurify": "^3.2.7",
     "lucide-react": "^0.468.0",
@@ -28,9 +31,9 @@
     "@types/react": "^19.1.16",
     "@types/react-dom": "^19.1.9",
     "@vitejs/plugin-react": "^5.0.4",
+    "esbuild": "0.28.2",
     "jsdom": "^26.1.0",
     "typescript": "~5.9.3",
-    "vite": "^7.1.10",
-    "esbuild": "0.28.2"
+    "vite": "^7.1.10"
   }
 }

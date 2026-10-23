@@ -26,7 +26,9 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app"],
+    "targets": [
+      "app"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -56,7 +58,11 @@
       "../skills/learning-exercises/SKILL.md": "skills/learning-exercises/SKILL.md",
       "../pi-sidecar/time-context.mjs": "pi-sidecar/time-context.mjs",
       "../THIRD_PARTY_NOTICES/pi-readcache.txt": "licenses/pi-readcache.txt",
-      "../pi-sidecar/native-session.mjs": "pi-sidecar/native-session.mjs"
+      "../THIRD_PARTY_NOTICES/codemirror-json.txt": "licenses/codemirror-json.txt",
+      "../pi-sidecar/request-debug.mjs": "pi-sidecar/request-debug.mjs",
+      "../pi-sidecar/native-session.mjs": "pi-sidecar/native-session.mjs",
+      "../pi-sidecar/context-bridge.mjs": "pi-sidecar/context-bridge.mjs",
+      "../pi-sidecar/material-context.mjs": "pi-sidecar/material-context.mjs"
     }
   }
 }

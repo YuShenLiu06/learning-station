@@ -5,18 +5,25 @@ pub mod automatic_context;
 pub mod content;
 pub mod content_url;
 pub mod context;
+pub mod citation;
+pub mod citation_context;
 pub mod context_bridge;
+pub mod course_project;
 #[cfg(feature = "desktop")]
 mod desktop;
 pub mod drafts;
 pub mod feishu;
+pub mod file_metadata;
 pub mod generation;
+pub mod focus;
 pub mod learning_skills;
 pub mod learning_tools;
 pub mod model;
+pub mod request_debug;
 pub mod native_session;
 pub mod reminders;
 pub mod sessions;
+pub mod course_sessions;
 pub mod time_context;
 pub mod types;
 #[cfg(feature = "desktop")]
@@ -34,6 +41,9 @@ pub mod exploration;
 pub mod trash;
 
 pub mod grading;
+pub mod material_git;
+mod material_changes;
+pub mod versioning;
 
 pub mod anki;
 

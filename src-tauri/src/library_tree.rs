@@ -95,6 +95,32 @@ pub fn list(store: &ContentStore) -> Result<LibraryTree> {
         nodes.insert(node.id.clone(), node);
     }
     let ids: Vec<String> = nodes.keys().cloned().collect();
+    let physical: BTreeMap<_, _> = nodes
+        .values()
+        .map(|node| {
+            crate::course_project::project_course(store, &node.path, &node.id)
+                .map(|course| (node.id.clone(), course))
+        })
+        .collect::<Result<_>>()?;
+    for id in &ids {
+        let node = &nodes[id];
+        let owner = &physical[id];
+        let parent_owner = node
+            .parent_id
+            .as_ref()
+            .and_then(|id| physical.get(id))
+            .cloned()
+            .flatten();
+        if owner != &parent_owner
+            && (owner.is_some() || parent_owner.is_some())
+            && owner.as_deref() != Some(id.as_str())
+        {
+            warnings.push(format!(
+                "PHYSICAL_PARENT: {id} 的父节点与材料目录不一致，按物理课程显示"
+            ));
+            nodes.get_mut(id).unwrap().parent_id = owner.clone();
+        }
+    }
     for id in &ids {
         let node = &nodes[id];
         let warning = if node.kind == "course" && node.parent_id.is_some() {
@@ -185,6 +211,16 @@ pub fn course_id(store: &ContentStore, id: &str) -> Result<String> {
     Ok(ancestry(store, id)?.last().unwrap().id.clone())
 }
 
+/// Explicit new-course entry point; legacy create remains migration-free.
+pub fn create_project(
+    store: &mut ContentStore,
+    title: &str,
+    body: &str,
+    request_id: &str,
+) -> Result<Document> {
+    create_impl(store, "course", title, None, body, request_id, true)
+}
+
 pub fn create(
     store: &mut ContentStore,
     kind: &str,
@@ -192,6 +228,18 @@ pub fn create(
     parent_id: Option<&str>,
     body: &str,
     request_id: &str,
+) -> Result<Document> {
+    create_impl(store, kind, title, parent_id, body, request_id, false)
+}
+
+fn create_impl(
+    store: &mut ContentStore,
+    kind: &str,
+    title: &str,
+    parent_id: Option<&str>,
+    body: &str,
+    request_id: &str,
+    project: bool,
 ) -> Result<Document> {
     if !matches!(kind, "course" | "folder" | "section" | "exploration")
         || title.trim().is_empty()
@@ -214,7 +262,21 @@ pub fn create(
     let digest = hash(&serde_json::to_string(
         &json!({"kind":kind,"title":title,"parentId":parent_id,"body":body}),
     )?);
-    let relative = format!("courses/{id}.md");
+    let relative = if project {
+        crate::course_project::material_path(&id, &id)?
+    } else if let Some(parent) = parent_id {
+        let document = store.read(parent)?;
+        if let Some(course) =
+            crate::course_project::project_course(store, &document.path, &document.id)?
+        {
+            crate::course_project::material_path(&course, &id)?
+        } else {
+            format!("courses/{id}.md")
+        }
+    } else {
+        format!("courses/{id}.md")
+    };
+    let expects_project = crate::course_project::project_course(store, &relative, &id)?.is_some();
     let existing = match store.read(&id) {
         Ok(document) => Some(document),
         Err(error) if error.code == "NOT_FOUND" => {
@@ -232,6 +294,16 @@ pub fn create(
         Err(error) => return Err(error),
     };
     if let Some(existing) = existing {
+        if expects_project && existing.path != relative {
+            return Err(CoreError::new(
+                "COURSE_PROJECT_REQUIRED",
+                "原请求仍对应旧路径，未创建或迁移独立课程项目。",
+            ));
+        }
+        if expects_project {
+            crate::course_project::validate_placement(store, &existing.path, &existing.metadata)?;
+        }
+
         if existing.id != id
             || existing
                 .metadata
@@ -296,6 +368,14 @@ pub fn move_node(
             "节点已被其他操作更新，请刷新后再移动。",
         ));
     }
+    if current.metadata.kind == "exercise" {
+        let origin = crate::exercises::origin(store, &current)?;
+        let source_root = course_id(store, &origin.source_document_id)?;
+        if parent_id.map(|id| course_id(store, id)).transpose()?.as_deref() != Some(source_root.as_str()) {
+            return Err(hierarchy("练习不能单独跨课程移动，请连同来源材料一起移动；原页面和账本未改变。"));
+        }
+    }
+
     let parent_depth = validate_parent(store, id, &current.metadata.kind, parent_id)?;
     let height = subtree_height(store, id)?;
     if parent_depth + height > MAX_DEPTH {
@@ -321,7 +401,8 @@ fn parent(metadata: &Metadata) -> Result<Option<String>> {
         _ => Err(hierarchy("Markdown中的parentId不是有效稳定ID。")),
     }
 }
-fn ancestry(store: &ContentStore, id: &str) -> Result<Vec<Document>> {
+/// The returned documents are the exact versions whose metadata resolved scope.
+pub(crate) fn ancestry(store: &ContentStore, id: &str) -> Result<Vec<Document>> {
     checked_id(id)?;
     let mut result = Vec::new();
     let mut visited = BTreeSet::new();
@@ -345,6 +426,19 @@ fn ancestry(store: &ContentStore, id: &str) -> Result<Vec<Document>> {
             return Err(hierarchy("课程只能位于根层级。"));
         }
         result.push(document);
+    }
+    let root = result.last().ok_or_else(|| hierarchy("父节点链为空。"))?;
+    let owner = crate::course_project::project_course(store, &root.path, &root.id)?;
+    if owner
+        .as_ref()
+        .is_some_and(|id| id != &root.id || root.metadata.kind != "course")
+    {
+        return Err(hierarchy("材料必须归属其物理课程。"));
+    }
+    for document in &result {
+        if crate::course_project::project_course(store, &document.path, &document.id)? != owner {
+            return Err(hierarchy("父节点链不能跨越物理课程。"));
+        }
     }
     Ok(result)
 }
