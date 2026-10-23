@@ -1130,6 +1130,78 @@ mod tests {
     }
 
     #[test]
+    fn proposal_decisions_settle_cancelled_saved_question_retries_only() {
+        for accept in [false, true] {
+            for legacy in [false, true] {
+                let (dir, engine, scope, id, _) = read_replay_fixture();
+                engine.save_ui_preferences(UiPreferences { tool_authorization_tier: "write".into(), ..UiPreferences::default() }).unwrap();
+                let before = engine.lock().unwrap().content.read(&id).unwrap();
+                let args = json!({"path":format!("documents/{id}.md"),"content":"Retry draft","expectedVersion":before.version});
+                let pending = super::execute(&engine, &scope, "first-call", "write", args.clone()).unwrap();
+                let retry = retry_read_run(&engine, &scope, false);
+                let replay = super::execute(&engine, &retry, "retry-call", "write", args.clone()).unwrap();
+                assert_eq!(replay["proposalId"], pending["proposalId"]);
+                assert_eq!(replay["replayed"], true);
+                let course = pending["courseId"].as_str().unwrap();
+                let proposal = pending["proposalId"].as_str().unwrap();
+                let proposal_path = dir.path().join(format!("state/edit-proposals/{course}/{proposal}.json"));
+                if legacy {
+                    let mut data: Value = serde_json::from_slice(&std::fs::read(&proposal_path).unwrap()).unwrap();
+                    data.as_object_mut().unwrap().remove("callId");
+                    crate::course_write_transaction::durable_json(&proposal_path, &data).unwrap();
+                }
+                let native = dir.path().join("state/pi-native").join(crate::types::hash(&scope.session_id));
+                std::fs::create_dir_all(&native).unwrap();
+                let mut other_args = args.clone();
+                other_args["content"] = json!("Unrelated draft");
+                // Real runs share one saved question; journal/activity checkpoints
+                // reproduce cancellation while both handlers awaited the decision.
+                for (current, call, call_args) in [(&scope, "first-call", &args), (&retry, "retry-call", &args), (&retry, "different-args", &other_args)] {
+                    let name = format!("tool-{}.json", crate::types::hash(&serde_json::to_string(&json!([current.run_id, call])).unwrap()));
+                    crate::native_session::atomic(&native.join(name), &json!({"version":1,"runId":current.run_id,"callId":call,"name":"write","argsHash":crate::types::hash(&serde_json::to_string(call_args).unwrap()),"reply":null})).unwrap();
+                    let activity_id = format!("tool_{}", &crate::types::hash(&format!("{}\n{call}", current.run_id))[..32]);
+                    let activity = serde_json::from_value(json!({"id":activity_id,"toolCallId":activity_id,"runId":current.run_id,"sessionId":current.session_id,"name":"write","status":"unknown","title":"受控写入","summary":"等待核对","startedAt":"2026-10-23T00:00:00Z","updatedAt":"2026-10-23T00:00:00Z","persisted":false,"object":null,"errorCode":"NATIVE_TOOL_UNKNOWN"})).unwrap();
+                    let mut runs = engine.runs.lock().unwrap();
+                    let run = &mut runs.get_mut(&current.run_id).unwrap().run;
+                    run.status = "cancelled".into();
+                    run.tool_calls.push(activity);
+                    crate::app::atomic_json(&dir.path().join(format!("state/runs/{}.json", current.run_id)), run).unwrap();
+                }
+                // Matching args in a different saved question must stay unknown.
+                let mut unrelated = crate::generation::get(&engine, &retry.run_id).unwrap();
+                unrelated.id = "run_unrelated_question".into();
+                unrelated.user_entry_id = Some("different_saved_question".into());
+                unrelated.tool_calls.truncate(1);
+                unrelated.tool_calls[0].run_id = unrelated.id.clone();
+                crate::app::atomic_json(&dir.path().join(format!("state/runs/{}.json", unrelated.id)), &unrelated).unwrap();
+                let name = format!("tool-{}.json", crate::types::hash(&serde_json::to_string(&json!([unrelated.id, "retry-call"])).unwrap()));
+                crate::native_session::atomic(&native.join(name), &json!({"version":1,"runId":unrelated.id,"callId":"retry-call","name":"write","argsHash":crate::types::hash(&serde_json::to_string(&args).unwrap()),"reply":null})).unwrap();
+                let reopened = Engine::new(dir.path().join("library"), dir.path().join("state")).unwrap();
+                let receipt = super::proposal_decide(&reopened, course, proposal, accept).unwrap();
+                for current in [&scope, &retry] {
+                    let run = crate::generation::get(&reopened, &current.run_id).unwrap();
+                    assert_eq!(run.status, "cancelled");
+                    assert_eq!(run.tool_calls[0].status, "succeeded");
+                    assert_eq!(run.tool_calls[0].persisted, accept);
+                }
+                assert_eq!(crate::generation::get(&reopened, &retry.run_id).unwrap().tool_calls[1].status, "unknown");
+                assert_eq!(crate::generation::get(&reopened, &unrelated.id).unwrap().tool_calls[0].status, "unknown");
+                let run_path = dir.path().join(format!("state/runs/{}.json", retry.run_id));
+                let checkpoint: Value = serde_json::from_slice(&std::fs::read(&run_path).unwrap()).unwrap();
+                assert_eq!(super::proposal_decide(&reopened, course, proposal, accept).unwrap(), receipt);
+                assert_eq!(super::proposal_result(&reopened, pending.clone()).unwrap(), receipt);
+                let repeated: Value = serde_json::from_slice(&std::fs::read(&run_path).unwrap()).unwrap();
+                assert_eq!(repeated["toolCalls"], checkpoint["toolCalls"]);
+                assert!(super::proposal_list(&reopened, course).unwrap().as_array().unwrap().is_empty());
+                assert!(!proposal_path.exists());
+                let mut core = reopened.lock().unwrap();
+                core.content.refresh().unwrap();
+                assert_eq!(core.content.read(&id).unwrap().body.trim(), if accept { "Retry draft" } else { before.body.trim() });
+            }
+        }
+    }
+
+    #[test]
     fn proposal_terminal_checkpoint_repairs_activity_before_archiving() {
         for accept in [false, true] {
             for previously_archived in [false, true] {
@@ -1254,8 +1326,8 @@ mod tests {
 
     #[test]
     fn proposal_publication_serializes_with_both_preference_save_paths() {
-        use std::sync::{mpsc, TryLockError};
-        use std::time::{Duration, Instant};
+        use std::sync::mpsc;
+        use std::time::Duration;
         for patch in [false, true] {
             let (_dir, engine, scope, id, _) = course_fixture("write");
             let before = engine.lock().unwrap().content.read(&id).unwrap();
@@ -1266,17 +1338,13 @@ mod tests {
             // already owns the same boundary as both settings writers.
             let core = engine.lock().unwrap();
             let deciding = engine.clone(); let c = course.clone(); let p = proposal.clone();
-            let decision = std::thread::spawn(move || super::proposal_decide(&deciding, &c, &p, true));
-            let deadline = Instant::now() + Duration::from_secs(2);
-            let serialized = loop {
-                match crate::app::UI_PREFERENCE_WRITE.try_lock() {
-                    Err(TryLockError::WouldBlock) => break true,
-                    Err(_) => panic!("preference lock poisoned"),
-                    Ok(guard) => drop(guard),
-                }
-                if Instant::now() >= deadline { break false; }
-                std::thread::yield_now();
-            };
+            let (locked_tx, locked_rx) = mpsc::channel();
+            let decision = std::thread::spawn(move || {
+                super::course_workspace::DECISION_AUTHORIZATION_LOCKED.with(|notification| *notification.borrow_mut() = Some(locked_tx));
+                super::proposal_decide(&deciding, &c, &p, true)
+            });
+            locked_rx.recv_timeout(Duration::from_secs(5)).expect("the deciding thread must acquire the authorization lock");
+            assert!(crate::app::UI_PREFERENCE_WRITE.try_lock().is_err(), "decision must hold the authorization lock while waiting for core");
             let saving = engine.clone(); let (tx, rx) = mpsc::channel();
             let revoke = std::thread::spawn(move || {
                 let result = if patch {
@@ -1288,7 +1356,6 @@ mod tests {
             drop(core);
             let receipt = decision.join().unwrap().unwrap();
             rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap(); revoke.join().unwrap();
-            assert!(serialized, "publication must own the settings boundary before waiting for core");
             assert_eq!(receipt["persisted"], true);
             // Already committed results remain queryable at off/read, while a
             // new pending publication is forbidden after revocation succeeds.

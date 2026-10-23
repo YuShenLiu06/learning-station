@@ -3,6 +3,11 @@
 use super::*;
 use crate::app::Core;
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static DECISION_AUTHORIZATION_LOCKED: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+}
+
 fn conflict() -> CoreError {
     CoreError::new(
         "CONFLICT",
@@ -444,6 +449,12 @@ pub(crate) fn proposal_decide(
     let _authorization = crate::app::UI_PREFERENCE_WRITE
         .lock()
         .map_err(|_| CoreError::new("BUSY", "界面设置暂不可用。"))?;
+    #[cfg(test)]
+    DECISION_AUTHORIZATION_LOCKED.with(|notification| {
+        if let Some(sender) = notification.borrow_mut().take() {
+            sender.send(()).unwrap();
+        }
+    });
     let tier = engine.ui_preferences()?.tool_authorization_tier;
     let mut core = engine.lock()?;
     check_course(&mut core, course_id)?;
@@ -625,72 +636,93 @@ fn settle_decision(engine: &crate::app::Engine, p: &Proposal) -> Result<Value> {
         run_id: p.run_id.clone(),
         allowed_ids: p.allowed_ids.clone(),
     };
-    let mut calls = p.call_id.iter().cloned().collect::<Vec<_>>();
-    if calls.is_empty() {
-        // Old proposals predate callId. The native dispatch journal is written
-        // before invoking the handler, including when its future is cancelled.
-        // Match original session, run, exact args and stable operation identity;
-        // never infer identity from the currently selected conversation.
-        let directory = engine
-            .lock()?
-            .state_dir
-            .join("pi-native")
-            .join(hash(&p.session_id));
-        let entries = match fs::read_dir(&directory) {
-            Ok(entries) => Some(entries),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(io(e)),
-        };
-        if let Some(entries) = entries {
-            for item in entries {
-                let item = item.map_err(io)?;
-                let name = item.file_name();
-                if !name
-                    .to_str()
-                    .is_some_and(|name| name.starts_with("tool-") && name.ends_with(".json"))
-                {
-                    continue;
-                }
-                let record: Value = serde_json::from_slice(&crate::assets::bounded_read(
-                    &item.path(),
-                    128 * 1024,
-                )?)?;
-                if record["version"] != 1
-                    || record["runId"] != p.run_id
-                    || record["name"] != "write"
-                {
-                    continue;
-                }
-                let Some(call) = record["callId"].as_str() else {
-                    continue;
-                };
-                let expected_name = format!(
-                    "tool-{}.json",
-                    hash(&serde_json::to_string(&json!([p.run_id, call]))?)
-                );
-                if name != std::ffi::OsStr::new(&expected_name) {
-                    continue;
-                }
-                let mut args =
-                    json!({"path":p.path,"content":p.content,"expectedVersion":p.expected_version});
-                for omit_null in [false, true] {
-                    if omit_null && p.expected_version.is_none() {
-                        args.as_object_mut().unwrap().remove("expectedVersion");
-                    }
-                    if record["argsHash"] == hash(&serde_json::to_string(&args)?)
-                        && crate::learning_tools::operation_id(
-                            engine, &scope, call, "write", &args,
-                        )?
-                        .0 == p.id
-                    {
-                        calls.push(call.into());
-                        break;
-                    }
-                }
+    let original_run = crate::generation::get(engine, &p.run_id)?;
+    if original_run.session_id != p.session_id {
+        return Err(out_of_scope());
+    }
+    let mut calls = p
+        .call_id
+        .iter()
+        .map(|call| (scope.clone(), call.clone()))
+        .collect::<Vec<_>>();
+    // Every dispatch is journaled before the handler, even if waiting for the
+    // decision is cancelled. A saved-question retry may use another run/call.
+    // Keep the original call fallback for older records without a journal.
+    let directory = engine
+        .lock()?
+        .state_dir
+        .join("pi-native")
+        .join(hash(&p.session_id));
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => Some(entries),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(io(e)),
+    };
+    let args = json!({"path":p.path,"content":p.content,"expectedVersion":p.expected_version});
+    let mut argument_variants = vec![(hash(&serde_json::to_string(&args)?), args)];
+    if p.expected_version.is_none() {
+        let args = json!({"path":p.path,"content":p.content});
+        argument_variants.push((hash(&serde_json::to_string(&args)?), args));
+    }
+    if let Some(entries) = entries {
+        for item in entries {
+            let item = item.map_err(io)?;
+            let name = item.file_name();
+            if !name
+                .to_str()
+                .is_some_and(|name| name.starts_with("tool-") && name.ends_with(".json"))
+            {
+                continue;
+            }
+            let record: Value =
+                serde_json::from_slice(&crate::assets::bounded_read(&item.path(), 128 * 1024)?)?;
+            if record["version"] != 1 || record["name"] != "write" {
+                continue;
+            }
+            let (Some(run_id), Some(call)) = (record["runId"].as_str(), record["callId"].as_str())
+            else {
+                continue;
+            };
+            let expected_name = format!(
+                "tool-{}.json",
+                hash(&serde_json::to_string(&json!([run_id, call]))?)
+            );
+            if name != std::ffi::OsStr::new(&expected_name) || !crate::types::valid_id(run_id) {
+                continue;
+            }
+            let Some((_, args)) = argument_variants
+                .iter()
+                .find(|(digest, _)| record["argsHash"] == *digest)
+            else {
+                continue;
+            };
+            let candidate = match crate::generation::get(engine, run_id) {
+                Ok(run) => run,
+                Err(error) if error.code == "NOT_FOUND" => continue,
+                Err(error) => return Err(error),
+            };
+            if candidate.id != run_id
+                || candidate.session_id != p.session_id
+                || candidate.user_entry_id != original_run.user_entry_id
+                || (original_run.user_entry_id.is_none() && run_id != p.run_id)
+            {
+                continue;
+            }
+            let candidate_scope = ToolScope {
+                run_id: run_id.into(),
+                ..scope.clone()
+            };
+            if crate::learning_tools::operation_id(engine, &candidate_scope, call, "write", args)?.0
+                == p.id
+                && !calls
+                    .iter()
+                    .any(|(scope, id)| scope.run_id == run_id && id == call)
+            {
+                calls.push((candidate_scope, call.into()));
             }
         }
     }
-    for call in calls {
+    for (scope, call) in calls {
         crate::generation::settle_proposal_activity(engine, &scope, &call, &receipt)?;
     }
     let core = engine.lock()?;
