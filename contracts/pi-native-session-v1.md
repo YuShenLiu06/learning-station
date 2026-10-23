@@ -98,6 +98,6 @@ Focus 的 `metadataOnlySourceIds` 由 Rust 冻结 Context 生成并限制在本�
 
 `read.path` / `write.path` 对课程会话以当前课程 `materials/` 为根，拒绝绝对路径、上级路径、隐藏路径和符号链接组件。`documents/<id>.md` 只允许本轮授权的笔记类来源，read返回正文及业务version；write.content只替换正文，保留稳定ID、归属、类型、来源及其他元数据。创建业务笔记仍使用既有学习服务。附件目录和课程/练习元数据不开放raw写入。
 
-普通材料文件可在根下新建，进入既有课程Git变化清单，后续可按path读取；不冒充侧栏业务笔记。支持现有材料类型校验，raw Markdown不得携带有效业务frontmatter。覆盖必须传read返回的`expectedVersion`，新建省略；缺版本覆盖、旧版本、跨课或未授权来源均拒绝。旧无课程请求继续使用原会话工作区。Bash目录不随此次write路由改变。
+普通材料文件可在根下新建，进入既有课程Git变化清单，后续可按path读取；不冒充侧栏业务笔记。支持现有材料类型校验，raw Markdown不得携带有效业务frontmatter；与Git捕获共用路径排除规则（含大小写别名），不纳入版本的路径在写入与intent前拒绝。覆盖必须传read返回的`expectedVersion`，新建省略；缺版本覆盖、旧版本、跨课或未授权来源均拒绝。旧无课程请求继续使用原会话工作区。Bash目录不随此次write路由改变。
 
-回执仍在私有session账本中，完成回执重放不检查当前内容也不重写文件。课程写入前持久化intent；有intent而缺完成回执视为unknown，不盲目重放。Git沿既有versioning接口记录材料，不在模型参数中接受仓库或绝对路径。普通路径读返回实时材料版本，sourceId读取继续遵循原冻结manifest契约。
+回执仍在私有session账本中，完成回执重放不检查当前内容也不重写文件。课程写入前持久化intent；有intent而缺完成回执视为unknown，不盲目重放。Git沿既有versioning接口记录材料，不在模型参数中接受仓库或绝对路径。普通路径读从同一次不可变快照返回正文与版本，sourceId读取继续遵循原冻结manifest契约。

@@ -139,15 +139,7 @@ impl FrozenMaterials {
                     {
                         continue;
                     }
-                    let reason = exclusion_reason(name).or_else(|| {
-                        (metadata.is_dir()
-                            && (matches!(
-                                name,
-                                "node_modules" | "target" | "dist" | "vendor" | "cache"
-                            ) || path.join(".git").exists()
-                                || path.join("objects").is_dir() && path.join("HEAD").exists()))
-                        .then_some("source_or_cache_directory")
-                    });
+                    let reason = path_exclusion(&path, name, metadata.is_dir());
                     if let Some(reason) = reason {
                         let asset_id = if relative.starts_with(&format!("assets/{course_id}/")) {
                             relative.split('/').nth(2).unwrap_or("").to_owned()
@@ -967,6 +959,28 @@ pub fn attachment_path(asset_id: &str, file_name: &str) -> Result<String> {
     let path = format!("attachments/{asset_id}/{encoded}");
     check_path(&path)?;
     Ok(path)
+}
+
+// Shared by capture and authorized writes, so writes cannot publish files
+// which the next checkpoint intentionally excludes.
+fn path_exclusion(path: &Path, name: &str, directory: bool) -> Option<&'static str> {
+    exclusion_reason(name).or_else(|| {
+        (directory && (matches!(name.to_ascii_lowercase().as_str(), "node_modules" | "target" | "dist" | "vendor" | "cache")
+            || path.join(".git").exists()
+            || path.join("objects").is_dir() && path.join("HEAD").exists()))
+        .then_some("source_or_cache_directory")
+    })
+}
+
+pub(crate) fn validate_material_write_path(root: &Path, relative: &str) -> Result<()> {
+    check_path(relative)?;
+    let mut path = root.to_path_buf();
+    let parts: Vec<_> = relative.split('/').collect();
+    for (index, name) in parts.iter().enumerate() {
+        path.push(name);
+        if path_exclusion(&path, name, index + 1 < parts.len()).is_some() { return Err(scope()); }
+    }
+    Ok(())
 }
 
 fn exclusion_reason(name: &str) -> Option<&'static str> {

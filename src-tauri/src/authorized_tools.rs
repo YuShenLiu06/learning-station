@@ -965,6 +965,28 @@ mod tests {
         assert!(!host.exists());
     }
 
+    #[test]
+    fn excluded_material_write_paths_create_neither_file_nor_intent() {
+        let (dir, engine, scope, _, _) = course_fixture("write");
+        {
+            let mut core = engine.lock().unwrap();
+            let session = crate::sessions::get(&mut core.content,&scope.session_id).unwrap();
+            let root = crate::course_project::ensure_project(&mut core.content,session.course_id.as_ref().unwrap()).unwrap();
+            std::fs::create_dir_all(root.join("materials/cache")).unwrap();
+            std::fs::create_dir_all(root.join("materials/dist")).unwrap();
+        }
+        for path in ["cache/summary.md", "Cache/summary.md", "config.json", "dist/summary.txt", "Dist/summary.txt", "notes/auth.json"] {
+            let args = json!({"path":path,"content":"{}"});
+            let (request, _) = crate::learning_tools::operation_id(&engine,&scope,"excluded-file","write",&args).unwrap();
+            assert_eq!(run(&engine,&scope,"excluded-file","write",args).unwrap_err().code,"MATERIAL_SCOPE");
+            assert!(!dir.path().join(format!("state/workspaces/{}/receipts/{request}.pending",scope.session_id)).exists());
+            let mut core = engine.lock().unwrap();
+            let session = crate::sessions::get(&mut core.content,&scope.session_id).unwrap();
+            let root = crate::course_project::course_project_root(core.content.root(),session.course_id.as_ref().unwrap()).unwrap();
+            assert!(!root.join("materials").join(path).exists());
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn course_paths_reject_symlinks_reserved_paths_and_absolute_paths() {
@@ -974,7 +996,7 @@ mod tests {
         let outside = dir.path().join("outside");
         std::fs::create_dir(&outside).unwrap();
         std::os::unix::fs::symlink(&outside,root.join("escape")).unwrap();
-        for path in ["escape/new/deep.txt", "../outside.txt", "/tmp/outside.txt", ".git/config", "assets/new.txt"] {
+        for path in ["escape/new/deep.txt", "../outside.txt", "/tmp/outside.txt", ".git/config", "assets/new.txt", "Documents/forged.md", "ASSETS/new.txt"] {
             assert!(run(&engine,&scope,"invalid-path","write",json!({"path":path,"content":"x"})).is_err(),"{path}");
         }
         assert!(!outside.join("new").exists());

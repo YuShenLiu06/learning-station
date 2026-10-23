@@ -61,6 +61,9 @@ fn document(
     course: &str,
     path: &str,
 ) -> Result<Option<crate::types::Document>> {
+    let first = path.split('/').next().unwrap_or("");
+    if (first.eq_ignore_ascii_case("documents") && first != "documents")
+        || first.eq_ignore_ascii_case("assets") { return Err(out_of_scope()); }
     if let Some(id) = path
         .strip_prefix("documents/")
         .and_then(|p| p.strip_suffix(".md"))
@@ -110,7 +113,7 @@ pub(super) fn course_read(
     let (text, version) = if let Some(doc) = doc {
         (doc.body, doc.version)
     } else {
-        let bytes = crate::assets::bounded_read(&target, MAX_WORKSPACE_BYTES as usize)?;
+        let (bytes, version) = crate::versioning::read_versioned(&mut core, &course, path)?;
         crate::assets::inspect(
             target
                 .file_name()
@@ -119,7 +122,6 @@ pub(super) fn course_read(
             &bytes,
         )?;
         let text = String::from_utf8(bytes).map_err(|_| invalid())?;
-        let version = crate::versioning::version_hash(&mut core, &addr(&course, path))?;
         (text, version)
     };
     let (content, truncated) = bounded_text(&text, MAX_READ_BYTES);
@@ -146,6 +148,8 @@ pub(super) fn course_write(
             "原写入结果尚不可核实；未重复执行。",
         ));
     }
+    let root = crate::course_project::course_project_root(core.content.root(), &course)?.join("materials");
+    crate::material_git::validate_material_write_path(&root, &args.path)?;
     let target = target(&core, &course, &args.path)?;
     let doc = document(&core, scope, &course, &args.path)?;
     let existing = fs::symlink_metadata(&target).ok();

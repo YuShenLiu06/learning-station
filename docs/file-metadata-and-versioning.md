@@ -51,6 +51,7 @@ FileAddr {
 | `all_stat(course, base?)` | 变更文件清单 | `course: CourseId`（取自 `addr.course`）；课程级变更统计，UI 变化视图与 Focus 部件的课程变化块消费，不物化 diff。 |
 | `file_diff(addr, base?)` | diff 或全文 | `addr: FileAddr`；`base = None`（首见、基准被压缩丢失或超预算）时允许返回全文。 |
 | `all_diff(course, base?)` | 全文件 diff | 全量补丁，受预算约束。 |
+| `read_versioned(course, path)` | `{ bytes, version }` | 普通课程材料工具读取：从同一次固定 checkpoint 取正文与 blob OID，避免外部编辑让正文与版本错配。 |
 | `read(addr, version)` | 固定版本内容 | `addr: FileAddr`；read 学习工具授权、回执与幂等校验的唯一固定版本入口。 |
 
 实现由接口屏蔽，仅两种：
