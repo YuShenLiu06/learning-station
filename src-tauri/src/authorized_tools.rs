@@ -1028,7 +1028,7 @@ mod tests {
         let mut data: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         data["status"] = json!("accepting"); data["receipt"] = Value::Null;
         crate::course_write_transaction::durable_json(&path, &data).unwrap();
-        assert_eq!(super::proposal_result(&engine, pending).unwrap(), receipt);
+        assert_eq!(super::proposal_result(&engine, pending.clone()).unwrap(), receipt);
         assert_eq!(super::proposal_decide(&engine, course, proposal, true).unwrap(), receipt);
         assert_eq!(super::proposal_get(&engine, course, proposal).unwrap()["status"], "accepted");
     }
