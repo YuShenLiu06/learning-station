@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { ChevronRight, Copy } from 'lucide-react';
 import { DebugJsonView } from './DebugJsonView';
 import { DebugContextContent } from './DebugContextContent';
-import { isCurrentQuestion, orderedSources, sourceLabel, sourceValue, sourceRole, sourceRound } from './requestDebug';
+import { isCurrentQuestion, currentContextSources, completeContextSources, sourceLabel, sourceValue, sourceRole, sourceRound } from './requestDebug';
 import type { DebugRecord, DebugSource } from './requestDebug';
 function SourceRow({record,source,index,reading}: {record:DebugRecord;source:DebugSource;index:number;reading?:boolean}) {
   const [copied,setCopied]=useState('');
@@ -17,14 +17,15 @@ function SourceRow({record,source,index,reading}: {record:DebugRecord;source:Deb
   </details>;
 }
 export function DebugReading({record}: {record:DebugRecord}) {
-  const sources=orderedSources(record).filter(s=>s.origin==='bridge'||isCurrentQuestion(record,s)||s.origin==='unknown'&&String(sourceValue(record,s)??'').trim());
+  const sources=currentContextSources(record);
   if(!record.complete)return <p className="debug-notice">请求体不完整：{record.omitted}。缺失正文无法展示或导出。</p>;
-  if(!sources.length)return <p className="debug-notice">本次未记录可定位的上下文正文，请查看原始请求；不能据此推断桥内容为空。</p>;
-  return <div>{sources.map((source,index)=><SourceRow key={index} record={record} source={source} index={index} reading/>)}</div>;
+  if(!sources.length)return <p className="debug-notice">未记录可确认属于本轮的新注册部件。请查看完整上下文；来源或轮次缺失不代表未发送。</p>;
+  return <div><p className="debug-notice">仅列有注册键和本轮身份的实发片段；来源未定位的内容请到完整上下文核对。</p>{sources.map((source,index)=><SourceRow key={index} record={record} source={source} index={index} reading/>)}</div>;
 }
 export function DebugSourceList({record}: {record:DebugRecord}) {
-  const sources=orderedSources(record);
-  return <div className="debug-source-layout"><SnapshotDetails record={record}/><div>{sources.length?sources.map((source,index)=><SourceRow key={index} record={record} source={source} index={index}/>):<p className="debug-notice">本请求未记录来源定位，请查看原始请求。</p>}
+  const sources=completeContextSources(record);
+  if(!record.complete)return <p className="debug-notice">请求体不完整：{record.omitted}。无法恢复完整上下文。</p>;
+  return <div className="debug-source-layout"><SnapshotDetails record={record}/><div>{sources.length?sources.map((source,index)=><SourceRow key={index} record={record} source={source} index={index}/>):<p className="debug-notice">本请求未记录可识别的 system/messages，请查看原始请求。</p>}
     <details className="debug-tools"><summary>工具定义 · tools <ChevronRight className="debug-chevron" size={14}/></summary><DebugJsonView value={(record.body as {tools?:unknown})?.tools??[]} label="工具定义JSON"/></details></div>
   </div>;
 }

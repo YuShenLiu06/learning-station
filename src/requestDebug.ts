@@ -143,3 +143,29 @@ export function sourcePresentation(record:DebugRecord,source:DebugSource):DebugP
  }
  return null;
 }
+
+// Only actual wire fragments with explicit registration and turn identity qualify.
+// A tool continuation belongs to the same saved user turn; never diff against the
+// previous HTTP request (which may have been evicted or be a compaction request).
+export function currentContextSources(record: DebugRecord): DebugSource[] {
+  return orderedSources(record).filter(source => source.origin === 'bridge'
+    && !!source.registrationKey && sourceRound(record, source) === '本轮');
+}
+export function currentContextSnapshot(record: DebugRecord) {
+  return currentContextSources(record).map(source => ({...source, value: sourceValue(record, source)}));
+}
+// Whole messages retain tool calls/results, images and provider-specific blocks
+// even when the optional text provenance capture could not map those fields.
+export function completeContextSources(record: DebugRecord): DebugSource[] {
+  const body = record.body as {system?: unknown; messages?: {role?: string}[]} | null;
+  const sources: DebugSource[] = [];
+  if (body?.system !== undefined) sources.push({path:['system'], origin:'unknown', name:'system'});
+  for (const [index, message] of (body?.messages ?? []).entries()) {
+    const mapped = (record.sources ?? []).filter(source => source.path[0] === 'messages' && source.path[1] === index);
+    const names = [...new Set(mapped.map(source => source.name))];
+    const owner = mapped.length === 1 ? mapped[0] : undefined;
+    sources.push({...owner,path:['messages',index],start:undefined,end:undefined, origin:owner?.origin ?? (message.role === 'assistant' ? 'model' : ['tool','function'].includes(message.role ?? '') ? 'tool' : 'unknown'),
+      name:message.role + (names.length ? ' · ' + names.join(' / ') : ' · 来源未定位')});
+  }
+  return sources;
+}
