@@ -329,13 +329,6 @@ impl MaterialGit {
         if fs::symlink_metadata(root.join(".git")).is_ok() {
             return Self::open_course(library_root, course_id);
         }
-        for ancestor in root.parent().ok_or_else(scope)?.ancestors() {
-            if ancestor.join(".git").exists()
-                || ancestor.join("objects").is_dir() && ancestor.join("HEAD").exists()
-            {
-                return Err(scope());
-            }
-        }
         let bytes = crate::assets::bounded_read(
             &root.join(format!("materials/documents/{course_id}.md")),
             crate::content::MAX_DOCUMENT_BYTES as usize,
@@ -353,6 +346,11 @@ impl MaterialGit {
             course: Some(course_id.into()),
             writable: true,
         };
+        // A library may live inside a source checkout (including a linked
+        // worktree). git() always pins both --git-dir and --work-tree: ancestor
+        // discovery is neither needed nor allowed. Claim only an absent local
+        // .git; never let init reinitialize an unknown/concurrently created one.
+        fs::create_dir(repo.directory.join(".git"))?;
         repo.git(&["init", "--template=", "--object-format=sha1", "."], &[])?;
         let marker = repo.directory.join(".git/learning-materials-v2");
         let mut file = fs::OpenOptions::new()

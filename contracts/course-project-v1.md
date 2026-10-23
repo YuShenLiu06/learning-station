@@ -25,7 +25,8 @@
 
 `MaterialGit::init_course(libraryRoot, courseId)` 只初始化新物理课程的普通 `.git/`；
 `open_course` 校验课程绑定、独立 objects/refs，拒绝共享 worktree、alternates、symlink/hardlink 或其他课程仓库。
-不重置既有仓库；旧平铺课程仅在首次版本冻结时经 `ensure_project` 幂等迁移建仓，其余路径不隐式初始化或迁移。`MaterialGit::open` 仅只读兼容旧 bare 快照；旧创建器仅在合成测试编译。
+不重置既有仓库；旧平铺课程仅在首次版本冻结时经 `ensure_project` 幂等迁移建仓。已是物理课程但缺 `.git` 时，版本冻结或普通聊天的原生项目入口可补建课程仓库，保留材料、迁移备份和稳定 ID。
+资料库允许位于源码仓库或 linked worktree 内；每次 Git 调用显式指定课程 `--git-dir` 与 `--work-tree`，不发现、写入或复用祖先仓库。初始化前排他创建不存在的课程 `.git`，既有未标记、损坏或指向外部的仓库仍拒绝接管；初始化中断留下的未知 `.git` 保留并报错，不自动重置。`MaterialGit::open` 仅只读兼容旧 bare 快照；旧创建器仅在合成测试编译。
 
 `FrozenMaterials::capture_project(store, courseId)` 冻结该课程当前 `materials/` 文件；两次捕获相同才返回。
 无文件系统事务承诺；返回后 owned bytes 不受后续编辑影响。附件采用物理路径，不再生成第二套可编辑投影。

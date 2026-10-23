@@ -566,3 +566,6 @@ fn trash_visibility_requires_a_fresh_ledger_and_hides_copied_managed_ids() {
         || file.path.starts_with("documents/renamed")));
     assert_eq!(f.read(&first, CHILD), f.child.content.as_bytes());
 }
+
+#[path = "nested_course_git_tests.rs"]
+mod nested;
