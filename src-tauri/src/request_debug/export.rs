@@ -187,6 +187,7 @@ pub fn save(sequence: u64, state_dir: &Path) -> Result<Value> {
         assert_eq!(doc["registrationSnapshot"]["entries"][0]["finalLocations"][0]["path"][1],2);
     }
     #[test] fn explicit_save_matches_decode_is_private_and_survives_capture_clear() {
+        let _capture_guard = super::super::TEST_CAPTURE_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let r = record();
         {

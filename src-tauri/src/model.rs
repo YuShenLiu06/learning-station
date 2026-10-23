@@ -2212,6 +2212,7 @@ mod tests {
     #[tokio::test]
     async fn request_debug_real_stdio_boundary_on_off_and_failed_response() {
         use crate::request_debug;
+        let _capture_guard = request_debug::TEST_CAPTURE_LOCK.lock().unwrap();
         for (enabled,complete) in [(false,true),(true,true),(true,false)] {
             request_debug::set(enabled);
             let (credentials,server)=fixture(complete,true);
