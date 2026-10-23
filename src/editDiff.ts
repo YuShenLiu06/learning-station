@@ -2,7 +2,10 @@ export type DiffLine = { kind: 'same' | 'removed' | 'added'; text: string };
 // LCS within a fixed memory/work budget. Common edges are stripped first;
 // very large unmatched spans remain one honest, reversible changed region.
 export function editDiff(before: string, after: string): DiffLine[] {
-  const a = before.split('\n'), b = after.split('\n');
+  return diffParts(before.split('\n'), after.split('\n'));
+}
+
+export function diffParts(a: string[], b: string[]): DiffLine[] {
   let start = 0, end = 0;
   while (start < a.length && start < b.length && a[start] === b[start]) start++;
   while (end < a.length - start && end < b.length - start && a[a.length - 1 - end] === b[b.length - 1 - end]) end++;

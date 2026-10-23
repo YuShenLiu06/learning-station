@@ -1,89 +1,135 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { ArrowDown, ArrowUp, ArrowUpRight, FileText } from 'lucide-react';
+import { marked } from 'marked';
 import { call, nativeAvailable } from './api';
-import { editDiff } from './editDiff';
+import { diffParts } from './editDiff';
+import { Markdown } from './Markdown';
 
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
+export type EditProposal = { id: string; courseId: string; path: string; original: string; content: string; status: string; expectedVersion?: string };
+type Props = { courseId: string; documentId: string; isDirty: (id: string) => boolean; isLoaded: (id: string) => boolean; onAccepted: (id: string) => Promise<void>; onOpen: (id: string) => void; notify: (message: string) => void };
+export const proposalDocumentId = (path: string) => /^documents\/([^/]+)\.md$/u.exec(path)?.[1] || '';
+export const proposalFileName = (path: string) => path.split('/').at(-1) || '文本文件';
 
-type Proposal = { id: string; courseId: string; path: string; original: string; content: string; status: string; expectedVersion?: string };
-type Props = { courseId: string; documentId: string; isDirty: (id: string) => boolean; isLoaded: (id: string) => boolean; onAccepted: (id: string) => Promise<void> };
-const documentId = (path: string) => /^documents\/([^/]+)\.md$/u.exec(path)?.[1] || '';
-
-export function EditReview(props: Props) {
-  const [items, setItems] = useState<Proposal[]>([]);
-  const [selected, setSelected] = useState('');
+export function useEditReview(props: Props) {
+  const [items, setItems] = useState<EditProposal[]>([]);
+  const [selectedRaw, setSelectedRaw] = useState('');
+  const [jump, setJump] = useState('');
   const [busy, setBusy] = useState(false);
-  const diffRoot = useRef<HTMLPreElement>(null);
+  const diffRoot = useRef<HTMLDivElement>(null);
   const [hunk, setHunk] = useState(0);
-  const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const latest = useRef(props); latest.current = props;
+  // A late poll must not put a just-decided proposal back into the document.
+  const settled = useRef(new Set<string>());
   useEffect(() => {
+    setItems([]); setSelectedRaw(''); setError(''); settled.current.clear();
     if (!nativeAvailable || !props.courseId) return;
     let stopped = false;
-    const cache = new Map<string, { stamp: string; proposal: Proposal }>();
+    const cache = new Map<string, { stamp: string; proposal: EditProposal }>();
     let timer: ReturnType<typeof setTimeout>;
-    setItems([]); setSelected(''); setMessage(''); setError('');
     async function poll() {
       try {
         const list = await call<{ id: string; stamp: string }[]>('edit_proposals', { courseId: props.courseId });
         for (const item of list) {
           if (cache.get(item.id)?.stamp !== item.stamp) {
-            const proposal = await call<Proposal>('edit_proposal', { courseId: props.courseId, id: item.id });
+            const proposal = await call<EditProposal>('edit_proposal', { courseId: props.courseId, id: item.id });
             cache.set(item.id, { stamp: item.stamp, proposal });
           }
         }
-        if (!stopped) setItems(list.map(item => cache.get(item.id)!.proposal).filter(p => ['pending', 'unknown', 'accepting'].includes(p.status)));
+        if (!stopped) setItems(list.map(item => cache.get(item.id)!.proposal).filter(p => !settled.current.has(p.id) && ['pending', 'unknown', 'accepting'].includes(p.status)));
       } catch (e) { if (!stopped) setError(errorText(e)); }
       finally { if (!stopped) timer = setTimeout(() => { void poll(); }, 1000); }
     }
     void poll();
     return () => { stopped = true; clearTimeout(timer); };
   }, [props.courseId]);
-  const current = items.find(p => documentId(p.path) === props.documentId);
-  const proposal = items.find(p => p.id === selected) || current;
-  const lines = useMemo(() => proposal ? editDiff(proposal.original, proposal.content) : [], [proposal]);
-  const hunks = lines.flatMap((line, i) => line.kind !== 'same' && (i === 0 || lines[i - 1].kind === 'same') ? [i] : []);
+  const raw = items.find(p => p.id === selectedRaw && !proposalDocumentId(p.path));
+  const proposal = raw || items.find(p => proposalDocumentId(p.path) === props.documentId);
+  const blocks = useMemo(() => {
+    if (!proposal) return [];
+    // Keep code fences, lists and tables intact; never split their Markdown
+    // delimiters across independently rendered fragments.
+    const tokenize = (text: string) => marked.lexer(text).map(token => token.raw);
+    return diffParts(tokenize(proposal.original), tokenize(proposal.content));
+  }, [proposal]);
+  const hunks = blocks.flatMap((block, i) => block.kind !== 'same' && (i === 0 || blocks[i - 1].kind === 'same') ? [i] : []);
+  useEffect(() => { setHunk(0); setError(''); }, [proposal?.id]);
   function navigate(delta: number) {
+    if (!hunks.length) return;
     const index = (hunk + delta + hunks.length) % hunks.length;
     setHunk(index);
-    const line = diffRoot.current?.children[hunks[index]] as HTMLElement | undefined;
-    line?.scrollIntoView({ block: 'nearest' });
+    diffRoot.current?.querySelectorAll<HTMLElement>('[data-review-hunk]')[index]?.scrollIntoView({ block: 'center', behavior: 'smooth' });
   }
-  const dirty = proposal ? props.isDirty(documentId(proposal.path)) : false;
+  useEffect(() => {
+    if (!jump || proposal?.id !== jump) return;
+    const frame = requestAnimationFrame(() => { diffRoot.current?.scrollIntoView({ block: 'start' }); setJump(''); });
+    return () => cancelAnimationFrame(frame);
+  }, [jump, proposal?.id]);
+  function locate(p: EditProposal) {
+    const id = proposalDocumentId(p.path);
+    if (id) { setSelectedRaw(''); latest.current.onOpen(id); }
+    else setSelectedRaw(p.id);
+    setJump(p.id);
+  }
+  const dirty = proposal ? props.isDirty(proposalDocumentId(proposal.path)) : false;
   async function decide(accept: boolean) {
     if (!proposal || busy) return;
-    const id = documentId(proposal.path);
-    if (accept && latest.current.isDirty(id)) { setError('当前文件有未保存编辑。草稿和建议均已保留，请先处理草稿。'); return; }
+    const id = proposalDocumentId(proposal.path);
+    if (accept && proposal.status === 'pending' && latest.current.isDirty(id)) { setError('还有未保存的编辑。请先处理草稿，建议和原文均已保留。'); return; }
     setBusy(true); setError('');
     try {
-      if (accept && id && !latest.current.isLoaded(id)) {
-        // An unopened document may still have a durable draft from a previous
-        // launch. A failed read is never evidence of a clean editor.
+      if (accept && proposal.status === 'pending' && id && !latest.current.isLoaded(id)) {
         const [section, draft] = await Promise.all([
           call<{ body: string }>('section_open', { id }),
           call<{ data: { body?: string } } | null>('draft_get', { key: `section:${id}` }),
         ]);
         if (draft?.data.body !== undefined && draft.data.body !== section.body) throw new Error('该文件有未保存的本机草稿。请先打开并处理草稿；建议和正文均保留。');
       }
-      if (accept && latest.current.isDirty(id)) throw new Error('当前文件有未保存编辑。请先处理草稿；建议和正文均保留。');
+      if (accept && proposal.status === 'pending' && latest.current.isDirty(id)) throw new Error('当前文件有未保存编辑。请先处理草稿；建议和正文均保留。');
       const receipt = await call<{ persisted: boolean; status?: string }>('decide_edit_proposal', { courseId: proposal.courseId, id: proposal.id, accept });
       if (receipt.persisted) {
         if (id) await latest.current.onAccepted(id);
-        setMessage(id ? '修改已保存到正文。' : `修改已保存：courses/${proposal.courseId}/materials/${proposal.path}。可从课程资料目录用对应程序打开。`);
-      } else if (receipt.status === 'rejected') setMessage('已拒绝本次建议，正文未修改。');
+        latest.current.notify(id ? '修改已保存到正文。' : `修改已保存：${proposalFileName(proposal.path)}。可从课程资料目录用对应程序打开。`);
+      } else if (receipt.status === 'rejected') latest.current.notify('已拒绝本次建议，正文未修改。');
       else throw new Error('结果尚未确认，请核对原建议，勿重复写入。');
-      setItems(old => old.filter(p => p.id !== proposal.id)); setSelected('');
+      settled.current.add(proposal.id);
+      setItems(old => old.filter(p => p.id !== proposal.id)); setSelectedRaw('');
     } catch (e) { setError(errorText(e)); }
     finally { setBusy(false); }
   }
-  if (!items.length && !message && !error) return null;
-  return <section className="edit-review" aria-label="AI 修改审阅">
-    <div className="edit-review-bar"><strong>AI 修改待确认 · {items.length} 个文件</strong>{items.length > 0 && <select aria-label="选择待审阅文件" value={proposal?.id || ''} onChange={e => setSelected(e.target.value)}><option value="">选择待审阅文件</option>{items.map(p => <option key={p.id} value={p.id}>{p.path}</option>)}</select>}</div>
-    {proposal && <><p>建议已保留，正文未修改。可停止生成后继续审阅；超时或关闭也不会丢失建议。{dirty && ' 当前文件有未保存编辑；草稿保留，暂不能接受。'}</p>
-      <div className="edit-review-actions"><button disabled={busy || dirty || proposal.status !== 'pending'} onClick={() => { void decide(true); }}>接受修改</button><button disabled={busy || proposal.status !== 'pending'} onClick={() => { void decide(false); }}>拒绝修改</button></div>
-      {proposal.status !== 'pending' && <p role="alert">写入结果需要核对。旧稿与新稿仍保留，请勿重复执行。<button disabled={busy} onClick={() => { void decide(true); }}>核对写入结果</button></p>}
-      <div className="edit-review-actions"><span>{hunks.length} 处变化</span><button disabled={!hunks.length} onClick={() => navigate(-1)}>上一处</button><button disabled={!hunks.length} onClick={() => navigate(1)}>下一处</button></div><details open key={proposal.id}><summary>查看 Diff · − 原文 / + 建议</summary><pre ref={diffRoot} className="edit-diff">{lines.map((line, i) => <span key={i} className={`diff-${line.kind}`}>{line.kind === 'added' ? '+ ' : line.kind === 'removed' ? '− ' : '  '}{line.text}{'\n'}</span>)}</pre></details></>}
-    {message && <p role="status">{message}<button onClick={() => setMessage('')}>关闭提示</button></p>}
-    {error && <p role="alert">{error}<button onClick={() => setError('')}>关闭提示</button></p>}
-  </section>;
+  return { items, proposal, raw: !!raw, blocks, hunks, hunk, diffRoot, dirty, busy, error, navigate, locate, decide, closeRaw: () => setSelectedRaw(''), dismissError: () => setError('') };
+}
+export type EditReviewState = ReturnType<typeof useEditReview>;
+
+export function EditReviewContent({ review, onAsset, hideTitle }: { review: EditReviewState; hideTitle?: boolean; onAsset?: (courseId: string, assetId: string) => void }) {
+  if (!review.proposal) return null;
+  return <div ref={review.diffRoot} className={`inline-edit-review${hideTitle ? ' hide-redundant-title' : ''}`} aria-label="正文修改差异">
+    {review.dirty && <p className="review-draft-warning" role="status">还有未保存的编辑。以下对照 AI 读取的原文；你的草稿仍在编辑器中，请先处理后再接受。</p>}
+    {review.blocks.map((block, index) => block.kind === 'same'
+      ? <Markdown key={index} text={block.text} referenceText={review.proposal!.original} courseId={review.proposal!.courseId} onAsset={onAsset}/>
+      : <div key={index} className={`review-change review-${block.kind}`} data-review-hunk={review.hunks.includes(index) ? '' : undefined}>
+        <span className="review-change-sign" aria-label={block.kind === 'removed' ? '删除原文' : '新增建议'}>{block.kind === 'removed' ? '−' : '+'}</span>
+        <div><span className="review-change-label">{block.kind === 'removed' ? '原文' : '建议'}</span><Markdown text={block.text} referenceText={block.kind === 'added' ? review.proposal!.content : review.proposal!.original} courseId={review.proposal!.courseId} onAsset={onAsset}/></div>
+      </div>)}
+  </div>;
+}
+export function EditReviewDock({ review, editing, onRead }: { review: EditReviewState; editing?: boolean; onRead?: () => void }) {
+  if (!review.proposal) return null;
+  const unknown = review.proposal.status !== 'pending';
+  return <div className="review-dock-wrap">
+    {(review.error || unknown) && <p className="review-recovery" role="alert">{review.error || '写入结果需要核对，旧稿和新稿均保留。'}{review.error && <button onClick={review.dismissError}>关闭提示</button>}</p>}
+    <section className="review-dock" aria-label="本文件修改审阅">
+      <div className="review-dock-copy"><strong>{unknown ? '核对这页修改' : '审阅这页修改'}</strong><small>{review.busy ? '正在核对保存结果…' : review.dirty ? '先处理未保存的编辑' : '接受后保存正文'}</small></div>
+      <div className="review-navigation"><button aria-label="上一处修改" disabled={!review.hunks.length || editing} onClick={() => review.navigate(-1)}><ArrowUp size={15}/></button><span>{review.hunks.length ? `${review.hunk + 1} / ${review.hunks.length}` : '无差异'}</span><button aria-label="下一处修改" disabled={!review.hunks.length || editing} onClick={() => review.navigate(1)}><ArrowDown size={15}/></button></div>
+      <div className="review-dock-actions">{editing && <button className="review-secondary" onClick={onRead}>查看差异</button>}{unknown ? <button className="review-primary" disabled={review.busy} onClick={() => { void review.decide(true); }}>核对写入结果</button> : <><button className="review-secondary" disabled={review.busy} onClick={() => { void review.decide(false); }}>拒绝</button><button className="review-primary" disabled={review.busy || review.dirty} onClick={() => { void review.decide(true); }}>接受{review.hunks.length ? `这 ${review.hunks.length} 处` : '修改'}</button></>}</div>
+    </section>
+  </div>;
+}
+export function EditReviewLinks({ review, title }: { review: EditReviewState; title: (p: EditProposal) => string }) {
+  if (!review.items.length && !review.error) return null;
+  return <div className="review-file-links" aria-label="待审阅文件">
+    {review.items.map(p => <button className="review-file-link" key={p.id} onClick={() => review.locate(p)}><FileText size={17}/><span><strong>{title(p)}</strong><small>{p.status === 'pending' ? '修改待确认 · 查看正文差异' : '写入待核对 · 查看保留的内容'}</small></span><ArrowUpRight size={15}/></button>)}
+    {!review.items.length && review.error && <p className="inline-error" role="alert">修改建议暂未读到：{review.error}<button onClick={review.dismissError}>关闭提示</button></p>}
+  </div>;
 }

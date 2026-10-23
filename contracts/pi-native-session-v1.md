@@ -125,3 +125,5 @@ macOS/Linux 课程 AI 写入（普通材料和业务笔记）共用 dirfd 发布
 
 ToolPolicy 只携带 mode、allowedTools、authorization，不再携带 maxCalls。Rust 与 Pi 均不对学习工具调用、原回执恢复或材料变化查询设置固定次数预算，普通聊天与探索共用此规则。工具白名单、用户取消、请求超时、参数/结果字节上限和写入版本/恢复约束保持有效；参数或结果容量超限使用 TOOL_SIZE_LIMIT，不再误报调用预算。练习最终输出保留原有至多三次校验修正，独立错误码 OUTPUT_VALIDATION_LIMIT，不参与工具调用计数。
 课程 `write` 的 #71 审阅状态：`proposalPersisted=true` 仅证明修改建议已保留，`persisted=false,status=pending` 不代表正文写入。生成 handler 等待用户决定；接受返回真实写入回执，拒绝返回 `persisted=false,status=rejected`。停止/超时保留提案，恢复时 pending 为未决错误，不作为完成回执注入 Pi；不自动接受或延长模型预算。无课程 scratch write/Bash 不纳入此文本审阅承诺。
+
+#71 接受前要求初始 ledger 完整且身份匹配，缺失/损坏不发布但可拒绝后重请。`accepting`/`unknown` 查询已执行结果不依赖当前 write 授权，不能借核对重放发布。接受/拒绝均结算原 session+run 工具活动，不要求原生成仍运行；终结提案归档后继续按原 ID 恢复，未决列表不返回历史终结项（旧平铺终结项首次遇到迁移）。该流程不引入新的工具数量上限。
