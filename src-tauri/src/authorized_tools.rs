@@ -1130,6 +1130,60 @@ mod tests {
     }
 
     #[test]
+    fn proposal_terminal_checkpoint_repairs_activity_before_archiving() {
+        for accept in [false, true] {
+            for previously_archived in [false, true] {
+                let (dir, engine, scope, id, _) = course_fixture("write");
+                let before = engine.lock().unwrap().content.read(&id).unwrap();
+                let pending = super::execute(&engine, &scope, "terminal-checkpoint", "write", json!({"path":format!("documents/{id}.md"),"content":"Final body","expectedVersion":before.version})).unwrap();
+                let course = pending["courseId"].as_str().unwrap();
+                let proposal = pending["proposalId"].as_str().unwrap();
+                let session_path = {
+                    let mut core = engine.lock().unwrap();
+                    let session = crate::sessions::get(&mut core.content, &scope.session_id).unwrap();
+                    core.content.root().join(session.path)
+                };
+                let run_path = dir.path().join(format!("state/runs/{}.json", scope.run_id));
+                let session_checkpoint = std::fs::read(&session_path).unwrap();
+                let run_checkpoint = std::fs::read(&run_path).unwrap();
+                let receipt = super::proposal_decide(&engine, course, proposal, accept).unwrap();
+                let path = dir.path().join(format!("state/edit-proposals/{course}/{proposal}.json"));
+                let archive = path.parent().unwrap().join("archive").join(path.file_name().unwrap());
+                // Preserve the real durable decision/publication but restore
+                // activity records to the pre-settlement crash checkpoint.
+                std::fs::write(&session_path, session_checkpoint).unwrap();
+                std::fs::write(&run_path, run_checkpoint).unwrap();
+                if !previously_archived { std::fs::rename(&archive, &path).unwrap(); }
+                let reopened = Engine::new(dir.path().join("library"), dir.path().join("state")).unwrap();
+                if previously_archived {
+                    // Compatibility with the previous archive-before-settle window.
+                    assert_eq!(super::proposal_result(&reopened, pending.clone()).unwrap(), receipt);
+                } else {
+                    let original_run = std::fs::read(&run_path).unwrap();
+                    std::fs::write(&run_path, "broken run checkpoint").unwrap();
+                    assert!(super::proposal_list(&reopened, course).is_err());
+                    assert!(path.exists(), "failed settlement must remain discoverable");
+                    assert!(!archive.exists());
+                    std::fs::write(&run_path, original_run).unwrap();
+                    assert!(super::proposal_list(&reopened, course).unwrap().as_array().unwrap().is_empty());
+                    assert!(!path.exists());
+                    assert!(archive.exists());
+                }
+                let again = Engine::new(dir.path().join("library"), dir.path().join("state")).unwrap();
+                let run = crate::generation::get(&again, &scope.run_id).unwrap();
+                assert_eq!(run.tool_calls.len(), 1);
+                assert_eq!(run.tool_calls[0].status, "succeeded");
+                assert_eq!(run.tool_calls[0].persisted, accept);
+                let mut core = again.lock().unwrap();
+                let session = crate::sessions::get(&mut core.content, &scope.session_id).unwrap();
+                assert!(session.entries.iter().any(|entry| entry.data.as_ref().is_some_and(|data| data["toolActivity"]["status"] == "succeeded")));
+                core.content.refresh().unwrap();
+                assert_eq!(core.content.read(&id).unwrap().body.trim(), if accept { "Final body" } else { before.body.trim() });
+            }
+        }
+    }
+
+    #[test]
     fn proposal_poll_migrates_legacy_terminal_files_and_ignores_archive_contents() {
         let (dir, engine, scope, _, _) = course_fixture("write");
         let pending = super::execute(&engine, &scope, "legacy", "write", json!({"path":"legacy.txt","content":"draft"})).unwrap();

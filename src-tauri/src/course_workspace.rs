@@ -344,7 +344,9 @@ fn stage(
     fs::create_dir_all(directory).map_err(io)?;
     let active = active_proposals(core, course)?;
     for other in active {
-        if other.path == args.path {
+        if other.path == args.path
+            && matches!(other.status.as_str(), "pending" | "accepting" | "unknown")
+        {
             return Err(CoreError::new(
                 "CONFLICT",
                 "该文件已有待审阅建议，请先接受或拒绝；正文未修改。",
@@ -378,11 +380,22 @@ pub(crate) fn proposal_list(engine: &crate::app::Engine, course: &str) -> Result
     let mut core = engine.lock()?;
     check_course(&mut core, course)?;
     let mut result = Vec::new();
+    let mut terminal = Vec::new();
     for p in active_proposals(&core, course)? {
+        if matches!(p.status.as_str(), "accepted" | "rejected") {
+            terminal.push(p);
+            continue;
+        }
         let meta = fs::metadata(proposal_path(&core, course, &p.id)?).map_err(io)?;
         result.push(
             json!({"id":p.id,"stamp":format!("{:?}-{}",meta.modified().map_err(io)?,meta.len())}),
         );
+    }
+    drop(core);
+    // A crash after the decision was saved leaves a flat terminal record.
+    // Settle its original activity before removing it from this recovery queue.
+    for p in terminal {
+        settle_decision(engine, &p)?;
     }
     Ok(json!(result))
 }
@@ -407,11 +420,16 @@ pub(crate) fn proposal_result(engine: &crate::app::Engine, result: Value) -> Res
             .join(format!("{}.json", p.id));
         if let Ok(entry) = read_ledger(&ledger) {
             if entry.result["persisted"] == true {
-                return Ok(entry.result);
+                drop(core);
+                return proposal_decide(engine, course, id, false);
             }
         }
         drop(core);
         return Err(course_write_unknown(engine, &p.session_id, &ledger));
+    }
+    drop(core);
+    if matches!(p.status.as_str(), "accepted" | "rejected") {
+        return settle_decision(engine, &p);
     }
     Ok(proposal_receipt(&p))
 }
@@ -438,7 +456,6 @@ pub(crate) fn proposal_decide(
                         &proposal_path(&core, course_id, id)?,
                         &p,
                     )?;
-                    archive_proposal(&core, &p)?;
                     drop(core);
                     return settle_decision(engine, &p);
                 }
@@ -446,7 +463,6 @@ pub(crate) fn proposal_decide(
             drop(core);
             return Err(course_write_unknown(engine, &p.session_id, &ledger));
         }
-        archive_proposal(&core, &p)?;
         drop(core);
         return settle_decision(engine, &p);
     }
@@ -460,7 +476,6 @@ pub(crate) fn proposal_decide(
             json!({"persisted":false,"status":"rejected","proposalId":id,"courseId":course_id,"path":p.path,"message":"用户已拒绝建议，正文未修改。"}),
         );
         crate::course_write_transaction::durable_json(&path, &p)?;
-        archive_proposal(&core, &p)?;
         drop(core);
         return settle_decision(engine, &p);
     }
@@ -525,7 +540,6 @@ pub(crate) fn proposal_decide(
         drop(core);
         return Err(course_write_unknown(engine, &p.session_id, &ledger));
     }
-    archive_proposal(&core, &p)?;
     drop(core);
     settle_decision(engine, &p)
 }
@@ -567,8 +581,8 @@ fn archive_proposal(core: &Core, p: &Proposal) -> Result<()> {
         .sync_all()
         .map_err(io)
 }
-// Legacy flat files are migrated on first encounter. Subsequent polls and
-// collision checks visit unresolved proposals only, never the archive tree.
+// Flat files are the recovery queue, including decisions not yet settled.
+// Only settle_decision may archive them; scans never visit the archive tree.
 fn active_proposals(core: &Core, course: &str) -> Result<Vec<Proposal>> {
     let directory = core.state_dir.join("edit-proposals").join(course);
     let entries = match fs::read_dir(directory) {
@@ -587,11 +601,7 @@ fn active_proposals(core: &Core, course: &str) -> Result<Vec<Proposal>> {
             continue;
         }
         let p = read_proposal(core, course, id)?;
-        if matches!(p.status.as_str(), "accepted" | "rejected") {
-            archive_proposal(core, &p)?;
-        } else {
-            active.push(p);
-        }
+        active.push(p);
     }
     Ok(active)
 }
@@ -671,5 +681,7 @@ fn settle_decision(engine: &crate::app::Engine, p: &Proposal) -> Result<Value> {
     for call in calls {
         crate::generation::settle_proposal_activity(engine, &scope, &call, &receipt)?;
     }
+    let core = engine.lock()?;
+    archive_proposal(&core, p)?;
     Ok(receipt)
 }
