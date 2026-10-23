@@ -11,7 +11,7 @@ test('inline review is contextual, protects drafts, navigates changes and disapp
  let scrolls = 0; dom.window.HTMLElement.prototype.scrollIntoView = () => scrolls++;
  const filename = new URL(`./.edit-review-${process.pid}.mjs`, import.meta.url);
  await build({ stdin: { contents: `import React from 'react'; import { useEditReview, EditReviewContent, EditReviewDock, EditReviewLinks } from './src/EditReview';
- export function Harness(props) { const review=useEditReview(props); return <><article className="reading-content">{review.proposal?<EditReviewContent review={review}/>:<p>Normal document</p>}</article><EditReviewDock review={review}/><aside><EditReviewLinks review={review} title={p=>p.id==='proposal_a'?'Lesson A':'Lesson B'}/></aside></> }`, resolveDir: process.cwd(), loader: 'tsx' }, outfile: filename.pathname, bundle: true, packages: 'external', platform: 'node', format: 'esm', jsx: 'automatic', plugins: [{ name: 'isolated-review-ipc', setup(b) {
+ export function Harness(props) { const review=useEditReview(props); return <><article className="reading-content" data-read-only={review.readOnly}>{review.proposal?<EditReviewContent review={review}/>:<p>Normal document</p>}</article><EditReviewDock review={review}/><aside><EditReviewLinks review={review} title={p=>p.id==='proposal_a'?'Lesson A':'Lesson B'}/></aside></> }`, resolveDir: process.cwd(), loader: 'tsx' }, outfile: filename.pathname, bundle: true, packages: 'external', platform: 'node', format: 'esm', jsx: 'automatic', plugins: [{ name: 'isolated-review-ipc', setup(b) {
   b.onResolve({ filter: /^\.\/api$/ }, () => ({ path: 'review-ipc', namespace: 'fixture' }));
   b.onLoad({ filter: /.*/, namespace: 'fixture' }, () => ({ contents: 'export const nativeAvailable=true; export const call=(...args)=>globalThis.reviewCall(...args);', loader: 'js' }));
  }}] });
@@ -78,6 +78,20 @@ test('inline review is contextual, protects drafts, navigates changes and disapp
    assert.equal(document.querySelector('.review-added .review-source code').textContent, content);
    assert.equal(document.querySelectorAll('.review-change script,.review-change iframe,.review-change [data-value]').length, 0);
    assert.equal(window.reviewExecuted, undefined);
+  }
+  for (const reason of ['文件已移至回收区', '文件暂时无法读取', '来源有未保存的编辑，请先处理草稿']) {
+   visible = [b]; dirty = reason.includes('草稿');
+   await render({ documentId: 'doc_a', onOpen: async () => { throw Error(reason); } }, true);
+   assert.equal(document.querySelector('.review-dock'), null);
+   await React.act(async () => document.querySelector('.review-file-link').click());
+   assert.equal(document.querySelector('.reading-content').dataset.readOnly, 'true');
+   assert.match(document.querySelector('.inline-edit-review').textContent, /Old paragraph/);
+   assert.match(document.querySelector('.inline-edit-review').textContent, /New paragraph/);
+   assert.equal(accept(), undefined, 'failed navigation never exposes an acceptance bypass');
+   const count = decisions.length;
+   await React.act(async () => button('拒绝').click());
+   assert.equal(decisions.length, count + 1); assert.equal(decisions.at(-1).accept, false);
+   assert.equal(document.querySelector('.review-dock'), null);
   }
   visible = []; await React.act(async () => { await new Promise(r => setTimeout(r, 1100)); });
   assert.equal(document.querySelector('.review-dock'), null); assert.equal(document.querySelector('.review-file-links'), null);

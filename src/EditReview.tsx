@@ -8,7 +8,7 @@ import { sanitizeMarkdown } from './sanitize';
 
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 export type EditProposal = { id: string; courseId: string; path: string; original: string; content: string; status: string; expectedVersion?: string };
-type Props = { courseId: string; documentId: string; isDirty: (id: string) => boolean; isLoaded: (id: string) => boolean; onAccepted: (id: string) => Promise<void>; onOpen: (id: string) => void; notify: (message: string) => void };
+type Props = { courseId: string; documentId: string; isDirty: (id: string) => boolean; isLoaded: (id: string) => boolean; onAccepted: (id: string) => Promise<void>; onOpen: (id: string) => void | Promise<void>; notify: (message: string) => void };
 export const proposalDocumentId = (path: string) => /^documents\/([^/]+)\.md$/u.exec(path)?.[1] || '';
 export const proposalFileName = (path: string) => path.split('/').at(-1) || '文本文件';
 
@@ -57,7 +57,8 @@ export function useEditReview(props: Props) {
     void poll();
     return () => { stopped = true; clearTimeout(timer); };
   }, [props.courseId]);
-  const raw = items.find(p => p.id === selectedRaw && !proposalDocumentId(p.path));
+  const raw = items.find(p => p.id === selectedRaw);
+  const readOnly = !!raw && !!proposalDocumentId(raw.path);
   const proposal = raw || items.find(p => proposalDocumentId(p.path) === props.documentId);
   const blocks = useMemo(() => {
     if (!proposal) return [];
@@ -89,15 +90,23 @@ export function useEditReview(props: Props) {
     const frame = requestAnimationFrame(() => { diffRoot.current?.scrollIntoView({ block: 'start' }); setJump(''); });
     return () => cancelAnimationFrame(frame);
   }, [jump, proposal?.id]);
-  function locate(p: EditProposal) {
+  async function locate(p: EditProposal) {
+    const owner = latest.current.courseId;
     const id = proposalDocumentId(p.path);
-    if (id) { setSelectedRaw(''); latest.current.onOpen(id); }
-    else setSelectedRaw(p.id);
-    setJump(p.id);
+    setSelectedRaw('');
+    if (id) {
+      try { await latest.current.onOpen(id); }
+      catch {
+        if (latest.current.courseId !== owner) return;
+        // Failed navigation must never offer a second route around draft guards.
+        setSelectedRaw(p.id);
+      }
+    } else setSelectedRaw(p.id);
+    if (latest.current.courseId === owner) setJump(p.id);
   }
   const dirty = proposal ? props.isDirty(proposalDocumentId(proposal.path)) : false;
   async function decide(accept: boolean) {
-    if (!proposal || busy) return;
+    if (!proposal || busy || (accept && readOnly && proposal.status === 'pending')) return;
     const id = proposalDocumentId(proposal.path);
     if (accept && proposal.status === 'pending' && latest.current.isDirty(id)) { setError('还有未保存的编辑。请先处理草稿，建议和原文均已保留。'); return; }
     setBusy(true); setError('');
@@ -121,7 +130,7 @@ export function useEditReview(props: Props) {
     } catch (e) { setError(errorText(e)); }
     finally { setBusy(false); }
   }
-  return { items, proposal, raw: !!raw, blocks, hunks, hunk, diffRoot, dirty, busy, error, navigate, locate, decide, closeRaw: () => setSelectedRaw(''), dismissError: () => setError('') };
+  return { items, proposal, raw: !!raw, readOnly, blocks, hunks, hunk, diffRoot, dirty, busy, error, navigate, locate, decide, closeRaw: () => setSelectedRaw(''), dismissError: () => setError('') };
 }
 export type EditReviewState = ReturnType<typeof useEditReview>;
 
@@ -143,9 +152,9 @@ export function EditReviewDock({ review, editing, onRead }: { review: EditReview
   return <div className="review-dock-wrap">
     {(review.error || unknown) && <p className="review-recovery" role="alert">{review.error || '写入结果需要核对，旧稿和新稿均保留。'}{review.error && <button onClick={review.dismissError}>关闭提示</button>}</p>}
     <section className="review-dock" aria-label="本文件修改审阅">
-      <div className="review-dock-copy"><strong>{unknown ? '核对这页修改' : '审阅这页修改'}</strong><small>{review.busy ? '正在核对保存结果…' : review.dirty ? '先处理未保存的编辑' : '接受后保存正文'}</small></div>
+      <div className="review-dock-copy"><strong>{unknown ? '核对这页修改' : '审阅这页修改'}</strong><small>{review.busy ? '正在核对保存结果…' : review.readOnly ? '文件未打开，可查看保留内容或拒绝建议' : review.dirty ? '先处理未保存的编辑' : '接受后保存正文'}</small></div>
       <div className="review-navigation"><button aria-label="上一处修改" disabled={!review.hunks.length || editing} onClick={() => review.navigate(-1)}><ArrowUp size={15}/></button><span>{review.hunks.length ? `${review.hunk + 1} / ${review.hunks.length}` : '无差异'}</span><button aria-label="下一处修改" disabled={!review.hunks.length || editing} onClick={() => review.navigate(1)}><ArrowDown size={15}/></button></div>
-      <div className="review-dock-actions">{editing && <button className="review-secondary" onClick={onRead}>查看差异</button>}{unknown ? <button className="review-primary" disabled={review.busy} onClick={() => { void review.decide(true); }}>核对写入结果</button> : <><button className="review-secondary" disabled={review.busy} onClick={() => { void review.decide(false); }}>拒绝</button><button className="review-primary" disabled={review.busy || review.dirty} onClick={() => { void review.decide(true); }}>接受{review.hunks.length ? `这 ${review.hunks.length} 处` : '修改'}</button></>}</div>
+      <div className="review-dock-actions">{editing && <button className="review-secondary" onClick={onRead}>查看差异</button>}{unknown ? <button className="review-primary" disabled={review.busy} onClick={() => { void review.decide(true); }}>核对写入结果</button> : <><button className="review-secondary" disabled={review.busy} onClick={() => { void review.decide(false); }}>拒绝</button>{!review.readOnly && <button className="review-primary" disabled={review.busy || review.dirty} onClick={() => { void review.decide(true); }}>接受{review.hunks.length ? `这 ${review.hunks.length} 处` : '修改'}</button>}</>}</div>
     </section>
   </div>;
 }
