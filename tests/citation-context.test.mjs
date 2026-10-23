@@ -1,0 +1,17 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {readCitationContext} from '../src/citationContext.ts';
+import {sessionMessages} from '../src/sessionMessages.ts';
+const snapshot=()=>({version:1,references:[{source:{id:'doc_fixture',path:'notes/doc_fixture.md',version:'saved_version',includedChars:2},quotedText:'🙂句',locator:{startChar:4,endChar:6},supplementalContext:[{source:{id:'doc_fixture',path:'notes/doc_fixture.md',version:'saved_version',includedChars:4},range:{startChar:0,endChar:4},requestedRange:{startChar:0,endChar:4},totalChars:10,totalBytes:20,text:'前文段。',truncated:false}]}]});
+test('auxiliary wire retains exact quote, version/ranges and deep copies each level',()=>{
+ const input=snapshot(),parsed=readCitationContext(input);assert.deepEqual(parsed,input);assert.notEqual(parsed,input);assert.notEqual(parsed.references[0].supplementalContext[0].range,input.references[0].supplementalContext[0].range);input.references[0].quotedText='changed';input.references[0].supplementalContext[0].text='edited';input.references[0].supplementalContext[0].range.endChar=100;assert.equal(parsed.references[0].quotedText,'🙂句');assert.equal(parsed.references[0].supplementalContext[0].text,'前文段。');assert.equal(parsed.references[0].source.version,'saved_version');
+});
+test('malformed range, size, eligibility state and forged duplicate records fail closed',()=>{
+ for(const mutate of [x=>x.version=2,x=>x.references.push(structuredClone(x.references[0])),x=>x.references[0].locator.endChar++,x=>x.references[0].supplementalContext[0].range.startChar=-1,x=>x.references[0].supplementalContext[0].source.includedChars++,x=>x.references[0].supplementalContext[0].requestedRange.endChar=100,x=>x.references[0].supplementalContext[0].truncated=true,x=>x.references[0].exerciseState={questionId:'q',status:'graded',attemptId:'real_attempt',feedbackEntryId:null},x=>x.references[0].exerciseState={questionId:'q',status:'unanswered',attemptId:'invented',feedbackEntryId:null}]){const value=snapshot();mutate(value);assert.equal(readCitationContext(value),undefined);}
+ const tooLarge=snapshot();tooLarge.references[0].quotedText='x'.repeat(8001);tooLarge.references[0].source.includedChars=8001;tooLarge.references[0].locator={startChar:0,endChar:8001};assert.equal(readCitationContext(tooLarge),undefined);
+});
+test('own saved user snapshot survives later Session state; old records remain readable and corrupt auxiliaries keep the quote',()=>{
+ const requestedContext={documentId:'doc_fixture',selection:'',injections:[{documentId:'doc_fixture',expectedVersion:'saved_version',selection:'🙂句',locator:{startChar:4,endChar:6}}]};
+ const entries=[{id:'user_old',kind:'user',content:'question',createdAt:'fixture',data:{requestedContext,citationContext:snapshot()}},{id:'user_legacy',kind:'user',content:'old',createdAt:'fixture',data:{requestedContext}},{id:'user_bad',kind:'user',content:'bad auxiliary',createdAt:'fixture',data:{requestedContext,citationContext:{version:9}}}];
+ const messages=sessionMessages(entries);assert.equal(messages[0].requestedContext.citationContext.references[0].source.version,'saved_version');assert.equal(messages[1].requestedContext.citationContext,undefined);assert.equal(messages[2].requestedContext.citationContextError,true);assert.equal(messages[2].requestedContext.injections[0].selection,'🙂句');entries[0].data.citationContext.references[0].supplementalContext[0].text='new state';assert.equal(messages[0].requestedContext.citationContext.references[0].supplementalContext[0].text,'前文段。');
+});

@@ -206,6 +206,8 @@ pub struct ModelStore {
     config_path: PathBuf,
     keychain_namespace: String,
     settings: ModelSettings,
+    #[cfg(test)]
+    fixture_credentials: Option<(ModelSettings, String)>,
 }
 // Never Serialize credentials or derive Debug: no secrets cross IPC or logs.
 pub struct ModelCredentials {
@@ -269,23 +271,11 @@ impl ToolPolicy {
         }
     }
 }
-fn validate_tool_policy(policy: &ToolPolicy, has_handler: bool) -> Result<()> {
-    let (allowed, maximum): (&[&str], usize) = match policy.mode.as_str() {
-        "question" => (
-            &[
-                "query_related_knowledge",
-                "record_question",
-                "create_note",
-                "create_todo",
-                "generate_exercises",
-                "list_learning_skills",
-                "load_learning_skill",
-            ],
-            4,
-        ),
-        "explain" => (ALL_TOOLS, 6),
-        // Only practice may pull extra guidance on demand; review keeps its
-        // fixed injected guidance without widening the tool surface.
+// question/explain are compatibility labels for the same interactive task.
+// Keep task construction and validation on one Rust allowlist.
+fn task_tools(mode: &str) -> Result<(&'static [&'static str], usize)> {
+    Ok(match mode {
+        "question" | "explain" => (ALL_TOOLS, 6),
         "practice" => (
             &[
                 "query_related_knowledge",
@@ -298,7 +288,27 @@ fn validate_tool_policy(policy: &ToolPolicy, has_handler: bool) -> Result<()> {
         "feedback" | "grading" => (&[], 0),
         "legacy" => (&ALL_TOOLS[..3], 8),
         _ => return Err(sidecar_error("TOOL_PROTOCOL")),
+    })
+}
+pub(crate) fn task_tool_policy(mode: &str, authorization: &str) -> ToolPolicy {
+    let (names, max_calls) = task_tools(mode).unwrap_or((&[], 0));
+    let mut policy = ToolPolicy {
+        mode: mode.into(),
+        allowed_tools: names.iter().map(|name| (*name).into()).collect(),
+        max_calls,
+        authorization: authorization.into(),
     };
+    if matches!(mode, "question" | "explain") {
+        if let Ok(extra) = authorization_tools(authorization) {
+            policy
+                .allowed_tools
+                .extend(extra.iter().map(|name| (*name).into()));
+        }
+    }
+    policy
+}
+fn validate_tool_policy(policy: &ToolPolicy, has_handler: bool) -> Result<()> {
+    let (allowed, maximum) = task_tools(&policy.mode)?;
     let authorized = authorization_tools(&policy.authorization)?;
     // Tier tools ride on top of the interactive exploration modes only.
     let tier_applies = matches!(policy.mode.as_str(), "question" | "explain");
@@ -307,7 +317,8 @@ fn validate_tool_policy(policy: &ToolPolicy, has_handler: bool) -> Result<()> {
         || policy.max_calls > MAX_TOOL_CALLS
         || unique.len() != policy.allowed_tools.len()
         || policy.allowed_tools.iter().any(|name| {
-            !allowed.contains(&name.as_str()) && !(tier_applies && authorized.contains(&name.as_str()))
+            !allowed.contains(&name.as_str())
+                && !(tier_applies && authorized.contains(&name.as_str()))
         })
         || (!policy.allowed_tools.is_empty() && (policy.max_calls == 0 || !has_handler))
     {
@@ -405,7 +416,18 @@ impl ModelStore {
             config_path,
             keychain_namespace: crate::types::hash(&identity.to_string_lossy()),
             settings,
+            #[cfg(test)]
+            fixture_credentials: None,
         })
+    }
+    #[cfg(test)]
+    pub(crate) fn use_local_fixture(&mut self, endpoint: String) {
+        assert!(endpoint.starts_with("http://127.0.0.1:"));
+        self.fixture_credentials = Some((ModelSettings {
+            configured: true, provider: "custom".into(), protocol: PROTOCOL.into(),
+            model: "offline-fixture".into(), base_url: endpoint, active_profile: "custom".into(),
+            ..ModelSettings::default()
+        }, "synthetic-local-key".into()));
     }
     pub fn settings(&self) -> ModelSettings {
         let mut settings = self.settings.clone();
@@ -601,6 +623,10 @@ impl ModelStore {
         Ok(self.settings())
     }
     pub fn credentials(&self) -> Result<ModelCredentials> {
+        #[cfg(test)]
+        if let Some((settings, key)) = &self.fixture_credentials {
+            return ModelCredentials::new(settings.clone(), key.clone());
+        }
         if !self.settings.configured {
             return Err(CoreError::new(
                 "NOT_CONFIGURED",
@@ -784,8 +810,12 @@ pub type ToolRecoveryHandler = Arc<
 pub type OutputValidator = Arc<dyn Fn(&str) -> Result<()> + Send + Sync>;
 pub type ContextObserver = Arc<dyn Fn(Value) -> Result<()> + Send + Sync>;
 pub type CompactionObserver = Arc<dyn Fn() + Send + Sync>;
+pub type MaterialChangesHandler = Arc<dyn Fn(Option<String>, Option<String>) -> Result<Value> + Send + Sync>;
 #[derive(Clone)]
 pub struct RequestContext {
+    pub debug_identity: Option<Value>,
+    pub debug_registrations: Option<Value>,
+    pub material_changes: Option<MaterialChangesHandler>,
     pub time: crate::time_context::TimeContext,
     pub exploration: Option<crate::exploration::ExplorationContext>,
     pub native_session: Option<crate::native_session::NativeSession>,
@@ -797,6 +827,9 @@ pub struct RequestContext {
 impl RequestContext {
     fn capture() -> Self {
         Self {
+            debug_identity: None,
+            debug_registrations: None,
+            material_changes: None,
             time: crate::time_context::TimeContext::capture(),
             exploration: None,
             native_session: None,
@@ -838,6 +871,97 @@ pub async fn generate_scoped(
     )
     .await
 }
+fn configured_agent_dir(sidecar_dir: &Path) -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    if let Some(path) = std::env::var_os("PI_CODING_AGENT_DIR") {
+        let path = PathBuf::from(path);
+        if path == Path::new("~") {
+            return home;
+        }
+        if let Ok(rest) = path.strip_prefix("~/") {
+            return home.join(rest);
+        }
+        return if path.is_absolute() {
+            path
+        } else {
+            sidecar_dir.join(path)
+        };
+    }
+    home.join(".pi/agent")
+}
+
+/// Read-only SDK resource paths for native project discovery. Project root is recursive;
+/// outside it, only known ancestor instruction filenames and user resource directories pass.
+fn native_project_read_allowlist(
+    project_root: &Path,
+    agent_dir: &Path,
+    home: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut paths = vec![project_root.to_path_buf()];
+    let context_names = [
+        "AGENTS.override.md",
+        "AGENTS.md",
+        "AGENTS.MD",
+        "CLAUDE.md",
+        "CLAUDE.MD",
+    ];
+    let mut dir = project_root.to_path_buf();
+    loop {
+        for name in context_names {
+            paths.push(dir.join(name));
+        }
+        let parent = match dir.parent() {
+            Some(parent) if parent != dir => parent,
+            _ => break,
+        };
+        dir = parent.to_path_buf();
+    }
+    for name in [
+        "SYSTEM.md",
+        "APPEND_SYSTEM.md",
+        "AGENTS.override.md",
+        "AGENTS.md",
+        "AGENTS.MD",
+        "CLAUDE.md",
+        "CLAUDE.MD",
+    ] {
+        paths.push(agent_dir.join(name));
+    }
+    for name in ["skills", "prompts", "themes", "extensions"] {
+        paths.push(agent_dir.join(name));
+    }
+    if let Some(home) = home.filter(|home| home.is_absolute()) {
+        paths.push(home.join(".agents/skills"));
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+#[cfg(test)]
+mod native_project_scope_tests {
+    use super::native_project_read_allowlist;
+    use std::path::Path;
+
+    #[test]
+    fn project_scope_does_not_grant_sibling_course_or_user_auth_file() {
+        let root = Path::new("/fixture/library/courses/course-a");
+        let agent = Path::new("/fixture/home/.pi/agent");
+        let home = Path::new("/fixture/home");
+        let paths = native_project_read_allowlist(root, agent, Some(home));
+
+        assert!(paths.contains(&root.to_path_buf()));
+        assert!(paths.contains(&agent.join("skills")));
+        assert!(paths.contains(&home.join(".agents/skills")));
+        assert!(
+            !paths.contains(&Path::new("/fixture/library/courses/course-b/notes.md").to_path_buf())
+        );
+        assert!(!paths.contains(&agent.join("auth.json")));
+    }
+}
+
 async fn run_sidecar(
     mut credentials: ModelCredentials,
     messages: Vec<Value>,
@@ -849,9 +973,17 @@ async fn run_sidecar(
     skills: Vec<crate::learning_skills::SkillSnapshot>,
     request_context: Option<RequestContext>,
 ) -> Result<String> {
-    let request_context = request_context.unwrap_or_else(RequestContext::capture);
+    let mut request_context = request_context.unwrap_or_else(RequestContext::capture);
     request_context.time.validate()?;
     ensure_usage_allowed(&credentials.settings)?;
+    let debug_attempt = uuid::Uuid::new_v4().to_string();
+    let mut debug_fallback=request_context.debug_identity.clone().unwrap_or_else(||json!({}));
+    let debug_run = request_context.native_session.as_ref().map(|n|n.run_id.clone()).unwrap_or_else(||debug_attempt.clone());
+    if debug_fallback["sessionId"].is_null(){debug_fallback["sessionId"]=json!(request_context.native_session.as_ref().map(|n|n.learning_session_id.clone()).unwrap_or_else(||format!("utility:{}",operation)));}
+    if debug_fallback["runId"].is_null(){debug_fallback["runId"]=json!(debug_run);}
+    debug_fallback["attempt"]=json!(debug_attempt); debug_fallback["operation"]=json!(operation);
+    let mut debug_epoch = None;
+    let mut debug_metadata = Value::Null;
     let diagnostic_path = credentials.diagnostic_path.take();
     validate_tool_policy(&policy, tool_handler.is_some())?;
     crate::learning_skills::validate(&policy.mode, &policy.allowed_tools, &skills)?;
@@ -866,6 +998,11 @@ async fn run_sidecar(
         .cloned()
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../pi-sidecar"));
     let directory = std::fs::canonicalize(directory).map_err(|_| runtime_error())?;
+    if let Some(native) = request_context.native_session.as_mut() {
+        if native.project_root.is_some() {
+            native.agent_dir.get_or_insert_with(|| configured_agent_dir(&directory));
+        }
+    }
     if !node_path().is_file()
         || !directory.join("sidecar.mjs").is_file()
         || !directory.join("harness.mjs").is_file()
@@ -880,6 +1017,9 @@ async fn run_sidecar(
     #[serde(rename_all = "camelCase")]
     struct Input<'a> {
         protocol: u8,
+        debug_protocol: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        debug_registrations: Option<&'a Value>,
         operation: &'a str,
         settings: &'a ModelSettings,
         api_key: &'a str,
@@ -891,9 +1031,12 @@ async fn run_sidecar(
         exploration_context: Option<&'a crate::exploration::ExplorationContext>,
         native_session: Option<&'a crate::native_session::NativeSession>,
         output_validation: bool,
+        material_changes: bool,
     }
-    let mut input = serde_json::to_vec(&Input {
+    let mut sidecar_input = Input {
         protocol: 1,
+        debug_protocol: true,
+        debug_registrations: request_context.debug_registrations.as_ref(),
         operation,
         settings: &credentials.settings,
         api_key: &credentials.api_key,
@@ -907,8 +1050,13 @@ async fn run_sidecar(
         exploration_context: request_context.exploration.as_ref(),
         native_session: request_context.native_session.as_ref(),
         output_validation: request_context.output_validator.is_some(),
-    })
-    .map_err(|_| sidecar_error("INVALID_INPUT"))?;
+        material_changes: request_context.material_changes.is_some(),
+    };
+    let mut input = serde_json::to_vec(&sidecar_input).map_err(|_| sidecar_error("INVALID_INPUT"))?;
+    if input.len()>4*MAX_OUTPUT-1 && sidecar_input.debug_registrations.is_some() {
+        input.fill(0);sidecar_input.debug_registrations=None;
+        input=serde_json::to_vec(&sidecar_input).map_err(|_|sidecar_error("INVALID_INPUT"))?;
+    }
     if input.len() > 4 * MAX_OUTPUT - 1 {
         input.fill(0);
         return Err(sidecar_error("INVALID_INPUT"));
@@ -923,6 +1071,26 @@ async fn run_sidecar(
         command
             .arg(format!("--allow-fs-read={}", native.directory.display()))
             .arg(format!("--allow-fs-write={}", native.directory.display()));
+        if let Some(project_root) = &native.project_root {
+            let canonical_root =
+                std::fs::canonicalize(project_root).map_err(|_| runtime_error())?;
+            if !project_root.is_absolute()
+                || &canonical_root != project_root
+                || !std::fs::symlink_metadata(&canonical_root)
+                    .map(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+                    .unwrap_or(false)
+            {
+                return Err(runtime_error());
+            }
+            let agent_dir = native.agent_dir.as_ref().ok_or_else(runtime_error)?;
+            if !agent_dir.is_absolute() {
+                return Err(runtime_error());
+            }
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            for path in native_project_read_allowlist(&canonical_root, agent_dir, home.as_deref()) {
+                command.arg(format!("--allow-fs-read={}", path.display()));
+            }
+        }
     }
     let mut child = command
         .arg(directory.join("sidecar.mjs"))
@@ -966,6 +1134,7 @@ async fn run_sidecar(
         let mut final_content = None;
         let mut had_response = false;
         let mut tool_attempts = 0usize;
+        let mut material_change_requests = 0usize;
         let mut output_validations = 0usize;
         let mut tool_cache: std::collections::BTreeMap<String, (String, Value)> =
             std::collections::BTreeMap::new();
@@ -996,6 +1165,18 @@ async fn run_sidecar(
                     serde_json::from_slice(&line).map_err(|_| sidecar_error("MODEL_RESPONSE"))?;
                 line.clear();
                 match event.get("type").and_then(Value::as_str) {
+                    Some("debug_probe") if ready && !settled => {
+                        let (epoch,meta)=crate::request_debug::gate(&debug_fallback);
+                        debug_epoch=epoch; debug_metadata=meta;
+                        stdin.write_all(format!("{}\n",json!({"type":"tool_result","id":event["id"],"result":{"epoch":epoch}})).as_bytes()).await.map_err(|_|runtime_error())?;
+                    }
+                    Some("debug_request" | "debug_status") if ready && !settled => {
+                        if let Some(epoch)=debug_epoch.filter(|epoch|event["epoch"].as_u64()==Some(*epoch)) {
+                            if let Some(id)=event["id"].as_str().filter(|id|id.len()<=64) {
+                                crate::request_debug::capture(epoch,&format!("{}:{}",debug_attempt,id),&debug_metadata,&event);
+                            }
+                        }
+                    }
                     Some("ready") if !ready && !settled => {
                         if event
                             .get("timeContext")
@@ -1067,6 +1248,17 @@ async fn run_sidecar(
                         output.push_str(text);
                         on_delta(text);
                     }
+                    Some("material_changes") if ready && !settled => {
+                        material_change_requests += 1;
+                        if material_change_requests > 8 { return Err(sidecar_error("TOOL_LIMIT")); }
+                        let handler=request_context.material_changes.as_ref().ok_or_else(||sidecar_error("TOOLS_DISABLED"))?;
+                        let id=event["id"].as_str().filter(|s|crate::types::valid_id(s)).ok_or_else(||sidecar_error("TOOL_PROTOCOL"))?;
+                        let previous=match &event["baseCommitOid"] {Value::Null=>None,Value::String(oid)=>Some(oid.clone()),_=>return Err(sidecar_error("TOOL_PROTOCOL"))};
+                        let focus_previous=match &event["focusBaseCommitOid"] {Value::Null=>None,Value::String(oid)=>Some(oid.clone()),_=>return Err(sidecar_error("TOOL_PROTOCOL"))};
+                        let result=handler(previous,focus_previous)?;
+                        let mut bytes=serde_json::to_vec(&json!({"type":"tool_result","id":id,"result":result}))?;bytes.push(b'\n');
+                        await_stage(async{stdin.write_all(&bytes).await.map_err(|_|runtime_error())},&cancel,deadline).await?;
+                    }
                     Some("session_sync") if !settled => {
                         let native=request_context.native_session.as_ref().ok_or_else(||sidecar_error("TOOLS_DISABLED"))?;
                         let id=event["id"].as_str().filter(|s|crate::types::valid_id(s)).ok_or_else(||sidecar_error("TOOL_PROTOCOL"))?;
@@ -1083,10 +1275,18 @@ async fn run_sidecar(
                         if !crate::types::valid_id(original){return Err(sidecar_error("TOOL_PROTOCOL"));}
                         let call=ToolCall{id:event["id"].as_str().unwrap_or_default().into(),name:event["name"].as_str().unwrap_or_default().into(),args:event["args"].clone()};
                         validate_tool_call(&call)?;
-                        let value=await_stage(recovery(original.into(),call.clone()),&cancel,deadline).await?;
-                        let reply=json!({"type":"tool_result","id":call.id,"result":value});
+                        let recovered=await_stage(recovery(original.into(),call.clone()),&cancel,deadline).await;
+                        let reply = match recovered {
+                            Ok(value) => json!({"type":"tool_result","id":call.id,"result":value}),
+                            Err(error) if call.name == "read" && matches!(error.code.as_str(),
+                                "TOOL_SCOPE" | "CONFLICT" | "TOOL_NOT_ALLOWED" | "TRASHED" | "NOT_FOUND") =>
+                                json!({"type":"tool_result","id":call.id,"error":{"code":error.code,"message":error.message}}),
+                            Err(error) => return Err(error),
+                        };
                         let path=native.directory.join(format!("tool-{}.json",crate::types::hash(&serde_json::to_string(&json!([original,call.id]))?)));
-                        crate::native_session::atomic(&path,&json!({"version":1,"runId":original,"callId":call.id,"name":call.name,"argsHash":crate::types::hash(&serde_json::to_string(&call.args)?),"reply":reply}))?;
+                        if call.name != "read" || !path.exists() {
+                            crate::native_session::atomic(&path,&json!({"version":1,"runId":original,"callId":call.id,"name":call.name,"argsHash":crate::types::hash(&serde_json::to_string(&call.args)?),"reply":reply}))?;
+                        }
                         let mut bytes=serde_json::to_vec(&reply)?;bytes.push(b'\n');
                         await_stage(async{stdin.write_all(&bytes).await.map_err(|_|runtime_error())},&cancel,deadline).await?;
                         had_response=true;
@@ -1258,6 +1458,7 @@ async fn run_sidecar(
         final_content.ok_or_else(|| sidecar_error("MODEL_RESPONSE"))
     }
     .await;
+    crate::request_debug::finish_attempt(&debug_attempt, result.as_ref().err().map(|error|error.code.as_str()));
     if result.is_err() {
         stop_child(&mut child, &mut stdin).await;
     }
@@ -1700,6 +1901,8 @@ fn sidecar_error(code: &str) -> CoreError {
             "模型输出超过限制，已停止；已收到的内容已保留。",
         ),
         "TOOL_LIMIT" => ("TOOL_LIMIT", "学习工具调用超过本次预算，已停止。"),
+        "LIMIT_EXCEEDED" => ("LIMIT_EXCEEDED", "完整材料变化及必要正文超过发送容量；未截断，原问题与版本保留。"),
+        "CONTEXT_CONFLICT" => ("CONTEXT_CONFLICT", "聚焦正文与固定材料类型不一致，正文未发送；请保留原问题并重新核对聚焦材料。"),
         "TIME_CONTEXT_INVALID" => ("TIME_CONTEXT_INVALID","请求时间或时区无效，未发送模型请求。"),
         "SKILL_MISSING" => ("SKILL_MISSING", "本次学习指导缺失，未发送模型请求。"),
         "SKILL_INVALID" => ("SKILL_INVALID", "学习指导版本或模式校验失败，未发送模型请求。"),
@@ -2034,6 +2237,31 @@ mod tests {
             server.join().unwrap();
         }
     }
+    #[tokio::test]
+    async fn request_debug_real_stdio_boundary_on_off_and_failed_response() {
+        use crate::request_debug;
+        for (enabled,complete) in [(false,true),(true,true),(true,false)] {
+            request_debug::set(enabled);
+            let (credentials,server)=fixture(complete,true);
+            let identity=json!({"courseId":"debug-course","sessionId":"debug-session","runId":"debug-run","requestId":"debug-request","retry":true});
+            let result=generate_scoped(credentials,vec![json!({"role":"user","content":"debug-wire-boundary-synthetic"})],Arc::new(AtomicBool::new(false)),|_|{},None,ToolPolicy::legacy(false),vec![],Some(RequestContext{debug_identity:Some(identity.clone()),debug_registrations:enabled.then(||json!([{"key":"actual_provider","lifetime":"OneShot","position":"References","value":"wire registration"}])),..RequestContext::capture()})).await;
+            let snapshot=request_debug::snapshot();
+            request_debug::set(false);
+            server.join().unwrap();
+            let records:Vec<_>=snapshot["records"].as_array().unwrap().iter().filter(|r|r["body"].to_string().contains("debug-wire-boundary-synthetic")).collect();
+            if !enabled {assert!(records.is_empty());continue;}
+            assert_eq!(records.len(),1,"actual stdio record missing: {snapshot}");
+            assert_eq!(records[0]["body"]["model"],"user-selected/model-2026");
+            assert_eq!(records[0]["body"]["max_tokens"],6144);
+            assert_eq!(records[0]["headers"]["authorization"],"[REDACTED]");
+            assert_eq!(records[0]["status"],"HTTP 200");
+            assert_eq!(records[0]["registrations"][0]["key"],"actual_provider");
+            for key in ["courseId","sessionId","runId","requestId","retry"]{assert_eq!(records[0]["identity"][key],identity[key]);}
+            assert!(!records[0].to_string().contains("fixture-secret"));
+            assert_eq!(records[0]["runOutcome"],if complete {"complete"} else {"MODEL_INCOMPLETE"});
+            assert_eq!(result.is_ok(),complete);
+        }
+    }
     fn fixture(finish: bool, custom: bool) -> (ModelCredentials, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -2147,7 +2375,7 @@ mod tests {
         assert_eq!(error.code, "MODEL_INCOMPLETE");
     }
     #[tokio::test]
-    async fn authorized_write_tool_round_trips_through_the_real_sidecar_with_tier_notice() {
+    async fn authorized_write_tool_round_trips_through_the_real_sidecar_without_internal_tier_notice() {
         use crate::{
             app::{Engine, UiPreferences},
             authorized_tools,
@@ -2169,6 +2397,15 @@ mod tests {
                 .create_section("受控工具fixture", "Workspace tool fixture body.", vec![], vec![])
                 .unwrap();
             let (session, context) = core.start_session(&section.id, false).unwrap();
+            let run: crate::generation::Run = serde_json::from_value(json!({
+                "id":"run_authorized_wire","sessionId":session.id,"sourceDocumentId":section.id,
+                "mode":"question","status":"running","content":"","error":null,
+                "createdAt":crate::types::timestamp(),"updatedAt":crate::types::timestamp(),"requestDigest":"fixture",
+                "contextSnapshotVersion":1,"contextManifest":context.manifest
+            })).unwrap();
+            engine.runs.lock().unwrap().insert(run.id.clone(), crate::generation::ManagedRun {
+                run, cancel: Arc::new(AtomicBool::new(false)),
+            });
             ToolScope {
                 session_id: session.id,
                 section_id: section.id,
@@ -2241,10 +2478,7 @@ mod tests {
                         "write"
                     ]
                 );
-                assert!(payload["messages"][0]["content"]
-                    .as_str()
-                    .unwrap()
-                    .contains("工具授权档位"));
+                assert!(!payload.to_string().contains("工具授权档位"));
                 let body = if turn == 0 {
                     let first = json!({"choices":[{"index":0,"delta":{"role":"assistant","content":"我把结论写入工作区。"},"finish_reason":null}]});
                     let call = json!({"choices":[{"index":0,"delta":{"tool_calls":[
@@ -2638,19 +2872,7 @@ mod tests {
     #[test]
     fn mode_tool_policy_rejects_cross_mode_tools_and_excess_budget() {
         for (mode, allowed, maximum) in [
-            (
-                "question",
-                vec![
-                    "query_related_knowledge",
-                    "record_question",
-                    "create_note",
-                    "create_todo",
-                    "generate_exercises",
-                    "list_learning_skills",
-                    "load_learning_skill",
-                ],
-                4,
-            ),
+            ("question", ALL_TOOLS.to_vec(), 6),
             ("explain", ALL_TOOLS.to_vec(), 6),
             (
                 "practice",

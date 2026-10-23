@@ -77,7 +77,9 @@ pub fn all(store: &mut ContentStore) -> Result<Vec<Value>> {
     for item in &mut items {
         let section_id = item["sectionId"].as_str().unwrap_or("").to_string();
         let node = tree.nodes.iter().find(|n| n.id == section_id);
-        let course = node.and_then(|n| tree.nodes.iter().find(|c| c.id == n.course_id));
+        // Material-free cards use their session; material cards keep the real source's course.
+        let owner = if section_id.is_empty() { item["courseId"].as_str() } else { node.map(|n| n.course_id.as_str()) };
+        let course = owner.and_then(|id| tree.nodes.iter().find(|c| c.id == id));
         item["courseId"] = course.map(|n| json!(n.id)).unwrap_or(Value::Null);
         item["courseTitle"] = course.map(|n| json!(n.title)).unwrap_or(Value::Null);
         item["sectionTitle"] = node
@@ -234,6 +236,60 @@ pub fn export(
 mod tests {
     use super::*;
     use crate::app::Engine;
+    #[test]
+    fn card_course_comes_from_persisted_session_without_inventing_material() {
+        let temp = tempfile::tempdir().unwrap();
+        let library = temp.path().join("library");
+        let state = temp.path().join("state");
+        let engine = Engine::new(library.clone(), state.clone()).unwrap();
+        let (owner, foreign, note, other, chat, legacy, independent) = {
+            let mut core = engine.lock().unwrap();
+            let mut node = |kind, parent, title| crate::library_tree::create(&mut core.content, kind, title, parent, "", title).unwrap();
+            let owner = node("course", None, "card-owner-course");
+            let foreign = node("course", None, "card-foreign-course");
+            let note = node("section", Some(owner.id.as_str()), "card-owner-note");
+            let other = node("section", Some(foreign.id.as_str()), "card-foreign-note");
+            let chat = crate::course_sessions::create(&mut core, &owner.id, "card-empty-chat").unwrap();
+            let legacy = sessions::create(&mut core.content, &note.id, &[]).unwrap();
+            let independent = sessions::create_exploration(&mut core.content).unwrap();
+            (owner.id, foreign.id, note.id, other.id, chat.id, legacy.id, independent.id)
+        };
+        let mut cards = vec![];
+        for (session, source) in [(&chat, ""), (&chat, note.as_str()), (&legacy, note.as_str()), (&independent, "")] {
+            let call = format!("card-owner-{}", cards.len());
+            let scope = crate::learning_tools::ToolScope { session_id: session.clone(), section_id: source.into(), run_id: call.clone(), allowed_ids: vec![] };
+            let args = json!({"front":call,"back":"Synthetic only"});
+            let receipt = crate::learning_tools::execute(&engine, &scope, &call, "create_review_card", args.clone()).unwrap();
+            assert_eq!(receipt["persisted"], true);
+            assert_eq!(crate::learning_tools::execute(&engine, &scope, &call, "create_review_card", args).unwrap(), receipt);
+            cards.push((receipt["entryId"].as_str().unwrap().to_owned(), source.to_owned(), session != &independent));
+        }
+        let foreign_scope = crate::learning_tools::ToolScope { session_id: chat.clone(), section_id: other.clone(), run_id: "card-cross-course".into(), allowed_ids: vec![other] };
+        assert_eq!(crate::learning_tools::execute(&engine, &foreign_scope, "card-cross-course", "create_review_card", json!({"front":"Foreign card","back":"Must not save"})).unwrap_err().code, "TOOL_SCOPE");
+        // Card payload metadata cannot override its owning session's course.
+        {
+            let mut core = engine.lock().unwrap();
+            let doc = core.content.read(&cards[0].0).unwrap();
+            let mut metadata = doc.metadata;
+            metadata.extra.get_mut("data").unwrap()["courseId"] = json!(foreign);
+            core.content.save(&doc.id, &crate::content::serialize(&metadata, &doc.body).unwrap(), &doc.version).unwrap();
+        }
+        drop(engine);
+        let engine = Engine::new(library, state).unwrap();
+        let mut core = engine.lock().unwrap();
+        core.refresh().unwrap();
+        let all = list(&mut core.content, "").unwrap();
+        assert_eq!(all.len(), cards.len());
+        for (id, source, owned) in cards {
+            let item = all.iter().find(|item| item["id"] == id).unwrap();
+            assert_eq!(item["courseId"], if owned { json!(owner) } else { Value::Null });
+            assert_eq!(item["sourceDocumentId"], if source.is_empty() { Value::Null } else { json!(source) });
+        }
+        assert_eq!(list_for_course(&mut core.content, "", Some(&owner)).unwrap().len(), 3);
+        assert!(list_for_course(&mut core.content, "", Some(&foreign)).unwrap().is_empty());
+        assert!(sessions::get(&mut core.content, &chat).unwrap().section_id.is_empty());
+    }
+
     #[test]
     fn exact_export_and_explicit_review_receipts_survive_reopen() {
         let temp = tempfile::tempdir().unwrap();

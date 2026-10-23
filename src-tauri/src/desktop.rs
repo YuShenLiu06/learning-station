@@ -21,6 +21,16 @@ async fn work<T: Send + 'static>(
 }
 // Only an explicit UI action can open a public HTTPS URL. No shell interpolation.
 #[tauri::command]
+fn request_debug_get() -> Value { crate::request_debug::snapshot() }
+#[tauri::command]
+fn request_debug_set(enabled: bool) -> Value { crate::request_debug::set(enabled) }
+#[tauri::command]
+fn request_debug_decode(sequence: u64) -> Result<Value> { crate::request_debug::export::decode(sequence) }
+#[tauri::command]
+async fn request_debug_export(state: State<'_, Arc<Engine>>, sequence: u64) -> Result<Value> {
+    work(state.inner().clone(), move |e| crate::request_debug::export::save(sequence, &e.lock()?.state_dir)).await
+}
+#[tauri::command]
 async fn open_content_url(url: String) -> Result<()> {
     let url = crate::content_url::validate(&url)?;
     tauri::async_runtime::spawn_blocking(move || {
@@ -77,6 +87,22 @@ async fn list_sessions(state: State<'_, Arc<Engine>>) -> Result<Vec<DocumentSumm
         Ok(sessions)
     })
     .await
+}
+#[tauri::command]
+async fn course_sessions(state: State<'_, Arc<Engine>>, course_id: String) -> Result<crate::course_sessions::CourseSessions> {
+    work(state.inner().clone(), move |e| { let mut core = e.lock()?; crate::course_sessions::list(&mut core, &course_id) }).await
+}
+#[tauri::command]
+async fn course_session_create(state: State<'_, Arc<Engine>>, course_id: String, request_id: String) -> Result<Session> {
+    work(state.inner().clone(), move |e| { let mut core = e.lock()?; crate::course_sessions::create(&mut core, &course_id, &request_id) }).await
+}
+#[tauri::command]
+async fn course_session_select(state: State<'_, Arc<Engine>>, course_id: String, session_id: String) -> Result<Session> {
+    work(state.inner().clone(), move |e| { let mut core = e.lock()?; crate::course_sessions::select(&mut core, &course_id, &session_id) }).await
+}
+#[tauri::command]
+async fn course_session_rename(state: State<'_, Arc<Engine>>, course_id: String, session_id: String, title: String, expected_version: String) -> Result<Session> {
+    work(state.inner().clone(), move |e| { let mut core = e.lock()?; crate::course_sessions::rename(&mut core, &course_id, &session_id, &title, &expected_version) }).await
 }
 #[tauri::command]
 async fn create_exploration_note(
@@ -146,7 +172,13 @@ async fn trash_library_node(
     let _gate = engine.model.lock().await;
     ensure_library_write_idle(&engine)?;
     work(engine.clone(), move |e| {
-        crate::trash::trash(&mut e.lock()?.content, &id, &expected_version, &request_id)
+        let mut core = e.lock()?;
+        let receipt = crate::trash::trash(&mut core.content, &id, &expected_version, &request_id)?;
+        // A trashed conversation must stop being the remembered active chat.
+        if receipt.kind == "session" {
+            core.forget_session(&receipt.id)?;
+        }
+        Ok(receipt)
     })
     .await
 }
@@ -464,9 +496,14 @@ async fn get_exercise_reference(
     .await
 }
 #[tauri::command]
+async fn freeze_focus(state: State<'_, Arc<Engine>>, request: crate::focus::FreezeRequest) -> Result<crate::focus::Focus> {
+    work(state.inner().clone(), move |e| { let mut core = e.lock()?; crate::focus::freeze(&mut core, request) }).await
+}
+#[tauri::command]
 async fn load_session_context(
     state: State<'_, Arc<Engine>>,
     session_id: String,
+    document_id: Option<String>,
     selection: Option<String>,
     injections: Option<Vec<context::ContextInjection>>,
     assistant_references: Option<Vec<context::AssistantReference>>,
@@ -474,7 +511,7 @@ async fn load_session_context(
 ) -> Result<Context> {
     work(state.inner().clone(), move |e| {
         let mut core = e.lock()?;
-        let (session, mut context) = core.session_context(&session_id, selection.as_deref())?;
+        let (session, mut context) = core.session_context_for(&session_id, document_id.as_deref(), selection.as_deref())?;
         crate::exercise_references::inject_request(
             &mut core.content,
             &mut context,
@@ -542,8 +579,8 @@ async fn append_entry(
     request_id: String,
 ) -> Result<Session> {
     work(state.inner().clone(), move |e| {
-        sessions::append(
-            &mut e.lock()?.content,
+        crate::focus::append_entry(
+            &mut *e.lock()?,
             &session_id,
             entry,
             Some(&expected_version),
@@ -568,6 +605,8 @@ async fn start_generation(
     app: tauri::AppHandle,
     state: State<'_, Arc<Engine>>,
     session_id: String,
+    focus: Option<crate::focus::Focus>,
+    document_id: Option<String>,
     mode: String,
     selection: String,
     prompt: String,
@@ -583,6 +622,8 @@ async fn start_generation(
     let run = generation::start(
         state.inner().clone(),
         GenerationRequest {
+            focus,
+            document_id,
             session_id,
             mode,
             selection,
@@ -1001,9 +1042,14 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             open_content_url,
+            request_debug_get, request_debug_set, request_debug_decode, request_debug_export,
             get_app_state,
             get_library_tree,
             list_sessions,
+            course_sessions,
+            course_session_create,
+            course_session_select,
+            course_session_rename,
             create_exploration_note,
             preview_library_trash,
             list_library_trash,
@@ -1028,6 +1074,7 @@ pub fn run() {
             start_session,
             start_exploration,
             load_session_context,
+            freeze_focus,
             get_exercise_reference,
             get_ui_preferences,
             save_ui_preferences,

@@ -203,19 +203,22 @@ test('question/explain/practice enforce their own call budgets', { timeout: 5000
     assert.equal(executions, policy.maxCalls); assert.equal(turns, policy.maxCalls + 1);
   }
 });
-test('explain registers card and note tools and consumes their real result envelopes', { timeout: 4000 }, async () => {
-  let turns = 0; const executed = [];
-  await withServer((body, res) => {
-    turns++;
-    assert.deepEqual(body.tools.map((tool) => tool.function.name), MODE_POLICIES.explain.allowedTools);
-    if (turns === 1) sse(res, { tool: call('card-1', 'create_review_card', { front: 'Since?', back: 'A starting point', tags: ['since'] }) });
-    else if (turns === 2) { assert.equal(JSON.parse(toolMessages(body).at(-1).content).result.persisted, true); sse(res, { tool: call('note-1', 'create_note', { content: 'Since marks a starting point.', selection: 'since Monday' }) }); }
-    else { assert.equal(toolMessages(body).length, 2); sse(res, { text: '卡片与笔记的保存回执已收到。', final: true }); }
-  }, async (endpoint) => {
-    const input = request(endpoint); input.toolPolicy = { mode: 'explain', ...MODE_POLICIES.explain };
-    await runLearningAgent(input, () => {}, { requestTool: async (tool) => { executed.push(tool.name); return { result: { persisted: true, entryId: tool.id } }; } });
-  });
-  assert.deepEqual(executed, ['create_review_card', 'create_note']); assert.equal(turns, 3);
+test('ordinary and exploration chat share all learning tools and consume card receipts', { timeout: 6000 }, async () => {
+  assert.deepEqual(MODE_POLICIES.question, MODE_POLICIES.explain);
+  for (const mode of ['question', 'explain']) {
+    let turns = 0; const executed = [];
+    await withServer((body, res) => {
+      turns++;
+      assert.deepEqual(body.tools.map((tool) => tool.function.name), MODE_POLICIES.explain.allowedTools);
+      if (turns === 1) sse(res, { tool: call('card-1', 'create_review_card', { front: 'Since?', back: 'A starting point', tags: ['since'] }) });
+      else if (turns === 2) { assert.equal(JSON.parse(toolMessages(body).at(-1).content).result.persisted, true); sse(res, { tool: call('note-1', 'create_note', { content: 'Since marks a starting point.', selection: 'since Monday' }) }); }
+      else { assert.equal(toolMessages(body).length, 2); sse(res, { text: '卡片与笔记的保存回执已收到。', final: true }); }
+    }, async (endpoint) => {
+      const input = request(endpoint); input.toolPolicy = { mode, ...MODE_POLICIES[mode] };
+      await runLearningAgent(input, () => {}, { requestTool: async (tool) => { executed.push(tool.name); return { result: { persisted: true, entryId: tool.id } }; } });
+    });
+    assert.deepEqual(executed, ['create_review_card', 'create_note']); assert.equal(turns, 3);
+  }
 });
 
 test('create_todo is registered in question mode and its result is consumed without enabling reminders', { timeout: 4000 }, async () => {
@@ -397,7 +400,7 @@ test('read returns results without persisted receipts; write and bash require th
   assert.equal(failed.isError, true);
 });
 
-test('authorized workspace tools register on top of question mode with an explicit boundary notice', { timeout: 4000 }, async () => {
+test('authorized workspace tools register without exposing internal authorization tiers', { timeout: 4000 }, async () => {
   let system = '';
   await withServer((body, res) => { system = body.messages[0].content; sse(res, { text: 'fixture answer', final: true }); }, async (endpoint) => {
     const input = request(endpoint);
@@ -405,9 +408,9 @@ test('authorized workspace tools register on top of question mode with an explic
     const result = await runLearningAgent(input, () => {}, { requestTool: async () => { throw new Error('unexpected tool'); } });
     assert.equal(result.output, 'fixture answer');
   });
-  assert(system.includes('工具授权档位'));
-  assert(system.includes('会话工作区'));
-  assert(system.includes('read'));
+  assert(!system.includes('工具授权档位'));
+  assert(!system.includes('本机设置'));
+  assert(!system.includes('本轮已注册工具'));
 });
 
 test('create_todo reminderEnabled is an opt-in boolean that requires a time', () => {
@@ -417,3 +420,33 @@ test('create_todo reminderEnabled is an opt-in boolean that requires a time', ()
     assert.throws(() => validateCall('reminder-bad', 'create_todo', args), (error) => error.code === 'TOOL_PROTOCOL', JSON.stringify(args));
   }
 });
+
+
+test('card execution needs no loaded skill and cancellation/retry never invents persistence', async () => {
+  const args = { front: '合成问题', back: '合成答案' };
+  const policy = validateToolPolicy({ mode: 'explain', allowedTools: ['create_review_card'], maxCalls: 6 });
+  let writes = 0;
+  const controller = new AbortController();
+  const plugin = createLearningPlugin({ ...policy, requestTool: async () => {
+    writes++; controller.abort(); return { result: { persisted: true, entryId: 'saved-card' } };
+  } });
+  const card = plugin.tools[0];
+  await assert.rejects(card.execute('before', args, controller.signal), e => e.code === 'CANCELLED');
+  assert.equal(writes, 1);
+  await assert.rejects(card.execute('before', args), e => e.code === 'CANCELLED');
+  assert.equal(writes, 1); // Pending/cancelled calls do not replay effects.
+  await assert.rejects(card.execute('never-started', args, controller.signal), e => e.code === 'CANCELLED');
+  assert.equal(writes, 1);
+  for (const reply of [{ error: { code: 'IO' } }, { result: { message: 'Saved' } }]) {
+    const failed = createLearningPlugin({ ...policy, requestTool: async () => reply });
+    const result = await failed.tools[0].execute('failed-card', args);
+    assert.equal(result.isError, true);
+    assert.equal(result.structuredContent.ok, false);
+  }
+});
+
+ test('exercise tool never expands supplied skill guidance into descriptions',()=>{
+ const plugin=createLearningPlugin({allowedTools:['generate_exercises'],exerciseGuidance:'FULL_SKILL_BODY_SENTINEL',requestTool:async()=>({})});
+ assert(!plugin.tools[0].description.includes('FULL_SKILL_BODY_SENTINEL'));
+ assert(plugin.tools[0].parameters.properties.exercises);
+ });

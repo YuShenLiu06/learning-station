@@ -16,7 +16,7 @@ test('controlled React flow preserves next draft, retries one saved user entry, 
   globalThis.cancelAnimationFrame=dom.window.cancelAnimationFrame.bind(dom.window);
   globalThis.IS_REACT_ACT_ENVIRONMENT=true;globalThis.isTauri=true;
   const {mockIPC,mockWindows,clearMocks}=await import('@tauri-apps/api/mocks');
-  const commands=[];const runs=new Map();let generationCount=0;let releaseSave;let contextFailed=false;let practiceReads=0;
+  const commands=[];const runs=new Map();let generationCount=0;let releaseSave;let practiceReads=0;
   const saveGate=new Promise(resolve=>{releaseSave=resolve;});
   const clone=value=>structuredClone(value);
   const model={configured:true,provider:'custom',protocol:'openai-completions',model:'fixture-original',baseUrl:'http://127.0.0.1:1/v1',requestUrl:'http://127.0.0.1:1/v1/chat/completions',verified:true,usageGate:''};
@@ -41,7 +41,8 @@ test('controlled React flow preserves next draft, retries one saved user entry, 
       case 'start_session':return {session:clone(session)};
       case 'get_session':return clone(session);
       case 'list_sessions':return [{id:session.id,title:'fixture session history',kind:'session',path:'fixture.md',version:session.version,modifiedAt:'2026-10-16T00:00:00Z'}];
-      case 'load_session_context':if(session.entries.length&&!contextFailed){contextFailed=true;throw {code:'REQUIRED_CONTEXT_UNAVAILABLE',message:'Controlled required material unavailable'};}return clone(context);
+      case 'load_session_context':return clone(context);
+      case 'freeze_focus':{const {input,sessionId}=args.request;assert.equal(input.documentId,'section_fixture');assert.deepEqual(input.ranges,[]);assert.equal(input.expectedBody,'# Local fixture\nReading material.');return {id:createHash('sha256').update(sessionId+input.documentId).digest('hex'),sessionId,courseId:'',documentId:input.documentId,sourceDocumentId:input.documentId,path:'fixture.md',type:'markdown',view:input.view,commitHash:'',materialTreeOid:'',documentVersion:'c'.repeat(64),excludedFiles:[],paragraphs:[]};}
       case 'append_entry':{
         await saveGate;
         if(!session.entries.some(entry=>entry.data?.clientMessageId===args.entry.data?.clientMessageId)) session.entries.push({...args.entry,id:'entry_user_fixture',createdAt:'now'});
@@ -83,7 +84,7 @@ test('controlled React flow preserves next draft, retries one saved user entry, 
     assert.equal(commands.filter(x=>x.command==='append_entry').length,1);
     await React.act(async()=>releaseSave());await waitFor(()=>button('重试生成'));
     assert.equal(composer.value,'next unsent draft');assert.equal(document.querySelectorAll('.message.user').length,1);
-    assert.equal(generationCount,0);assert.equal(session.entries.filter(x=>x.kind==='user').length,1);await click(button('重试生成'));await waitFor(()=>generationCount===1&&button('重试生成'));await click(button('重试生成'));await waitFor(()=>document.querySelector('.message.assistant'));
+    assert.equal(generationCount,1);assert.equal(session.entries.filter(x=>x.kind==='user').length,1);await click(button('重试生成'));await waitFor(()=>document.querySelector('.message.assistant'));
     assert.equal(document.querySelectorAll('.tool-activity').length,1);assert.ok(document.querySelector('.message.assistant .tool-activity'),'receipt must stay adjacent to its real run reply');assert.match(document.querySelector('.tool-activity').textContent,/创建待办.*成功/);assert.doesNotMatch(document.querySelector('.messages').textContent,/internal activity snapshot/);
     await click(button('打开待办'));await waitFor(()=>document.querySelector('[role="dialog"]'));assert.match(document.querySelector('[role="dialog"]').textContent,/Controlled persisted task/);await click(document.querySelector('[aria-label="关闭弹窗"]'));
     const starts=commands.filter(x=>x.command==='start_generation');assert.equal(starts.length,2);assert.notEqual(starts[0].args.requestId,starts[1].args.requestId);assert.equal(starts[0].args.userEntryId,starts[1].args.userEntryId);

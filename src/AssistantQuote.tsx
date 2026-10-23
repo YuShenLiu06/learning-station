@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef } from 'react';
 import { CornerUpLeft } from 'lucide-react';
 import { assistantPlainText } from './assistantReferences';
 import type { Message } from './types';
-export type AssistantReplyMenuState = { sessionId: string; message: Message; selection?: string; x: number; y: number; trigger: HTMLElement };
+export type AssistantReplyMenuState = { sessionId: string; message: Message; selection?: string; locator?: import('./types').CitationLocator; x: number; y: number; trigger: HTMLElement };
 // Reuses the local context-menu surface. Focus/escape behavior follows Radix's
 // documented menu pattern without introducing a second UI dependency stack.
 export function AssistantReplyMenu({ value, onReply, onClose }: { value: AssistantReplyMenuState; onReply: () => void; onClose: (restoreFocus?: boolean) => void }) {

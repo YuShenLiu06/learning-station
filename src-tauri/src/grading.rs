@@ -460,6 +460,7 @@ pub async fn start(
         );
     }
     drop(store);
+    let debug_course={let mut c=e.lock()?;sessions::get(&mut c.content,&session_id)?.course_id};
     tokio::spawn(async move {
         update(&e, &id, "running", None, None);
         let result = tokio::time::timeout(
@@ -478,10 +479,13 @@ pub async fn start(
                 },
                 vec![],
                 Some(model::RequestContext {
+                    debug_registrations: None,
+                debug_identity: Some(json!({"courseId":debug_course,"sessionId":session_id,"runId":id,"requestId":request_id,"answerAttemptId":attempt_id,"kind":"grading"})),
                     output_validator: None,
                     native_session: None,
                     context_observer: None,
                     tool_recovery: None,
+                    material_changes: None,
                     compaction_observer: None,
                     time: time_context,
                     exploration: None,
