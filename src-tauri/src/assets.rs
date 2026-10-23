@@ -430,22 +430,10 @@ fn list_course(root: &Path, course_id: &str, project: bool) -> Result<Vec<Asset>
     Ok(assets)
 }
 
-fn load_asset(
-    root: &Path,
-    course_id: &str,
-    id: &str,
-    project: bool,
-) -> Result<(StoredAsset, Vec<u8>)> {
-    validate_asset_id(id)?;
-    let directory =
-        checked_directory(root, &["assets", course_id, id], false)?.ok_or_else(not_found)?;
-    let receipt = if project {
-        ".asset.json"
-    } else {
-        "metadata.json"
-    };
+fn read_asset_record(directory: &Path, course_id: &str, id: &str, project: bool) -> Result<StoredAsset> {
+    let receipt = if project { ".asset.json" } else { "metadata.json" };
     let metadata = bounded_read(&directory.join(receipt), MAX_METADATA)?;
-    let mut record: StoredAsset = serde_json::from_slice(&metadata).map_err(|_| invalid_state())?;
+    let record: StoredAsset = serde_json::from_slice(&metadata).map_err(|_| invalid_state())?;
     if record.version != 1
         || !crate::types::valid_id(&record.request_id)
         || record.asset.id != id
@@ -469,6 +457,35 @@ fn load_asset(
     {
         return Err(invalid_state());
     }
+    Ok(record)
+}
+
+// Resolve provenance without loading attachment bytes, including oversized files.
+pub(crate) fn registered_project_asset_id(root: &Path, course_id: &str, relative: &str) -> Option<String> {
+    let parts: Vec<_> = relative.split('/').collect();
+    if parts.len() != 4 || parts[0] != "assets" || parts[1] != course_id {
+        return None;
+    }
+    let id = parts[2];
+    validate_asset_id(id).ok()?;
+    let directory = checked_directory(root, &["assets", course_id, id], false).ok()??;
+    let record = read_asset_record(&directory, course_id, id, true).ok()?;
+    (parts[3] == editable_name(&record.asset.file_name)).then_some(record.asset.id)
+}
+
+fn load_asset(
+    root: &Path,
+    course_id: &str,
+    id: &str,
+    project: bool,
+) -> Result<(StoredAsset, Vec<u8>)> {
+    validate_asset_id(id)?;
+    let directory =
+        checked_directory(root, &["assets", course_id, id], false)?.ok_or_else(not_found)?;
+    let mut record = read_asset_record(&directory, course_id, id, project)?;
+    let receipt = if project { ".asset.json" } else { "metadata.json" };
+    let ext = extension(&record.asset.file_name)?;
+    let (_, image) = mime_for(&ext).ok_or_else(invalid_state)?;
     let content_name = if project {
         editable_name(&record.asset.file_name)
     } else {

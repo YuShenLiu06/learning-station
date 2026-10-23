@@ -177,8 +177,11 @@ impl FrozenMaterials {
                     // from being snapshotted. Keep the bounded read below for files
                     // that grow after this metadata check; never load them unbounded.
                     if metadata.len() > 5 * 1024 * 1024 {
+                        let asset_id = crate::assets::registered_project_asset_id(
+                            &root.join("materials"), course_id, &relative,
+                        ).unwrap_or_default();
                         frozen.excluded_files.push(ExcludedFile {
-                            asset_id: String::new(),
+                            asset_id,
                             file_name: relative,
                             reason: "capacity_exceeded".into(),
                         });
