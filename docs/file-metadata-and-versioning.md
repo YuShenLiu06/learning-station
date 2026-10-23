@@ -82,3 +82,5 @@ versioning.all_stat(now.course, base)   // course 取自 FileAddr
 接口行为变更同步本文、[ContextBridge](context-bridge.md) 与相关契约（contracts/focus-v1、contracts/material-changes-v1、contracts/context-bridge-v1），并按仓库纪律串行运行对应回归。
 
 课程工具发布新文件时，`write_version(course, bytes)` 经同一 Git 后端计算待发布字节的 blob OID，不能用发布后重新读取的第三方内容作为本次写入版本；后续冻结仍按既有 snapshot 流程捕获当前材料。
+
+课程工具覆盖现有文件时，从同一已打开、移入恢复目录并核对正文的旧对象保留文件权限；发布失败的尽力恢复同样保留权限。新建文件与独立恢复新稿保持仅所有者读写，第三方文件仍不可被恢复操作覆盖。

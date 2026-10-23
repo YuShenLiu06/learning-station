@@ -112,14 +112,15 @@ mod platform {
         }
         Ok(fd)
     }
-    fn read(fd: &OwnedFd, name: &std::ffi::OsStr) -> Result<Option<Vec<u8>>> {
+    fn read_with_permissions(fd: &OwnedFd, name: &std::ffi::OsStr) -> Result<Option<(Vec<u8>, std::fs::Permissions)>> {
         let file = match fs::openat(fd, name, FILE, Mode::empty()) {
             Ok(file) => file,
             Err(rustix::io::Errno::NOENT) => return Ok(None),
             Err(e) => return Err(io(e)),
         };
         let mut file = std::fs::File::from(file);
-        if !file.metadata()?.is_file() {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
             return Err(io("not regular"));
         }
         let mut bytes = Vec::new();
@@ -129,9 +130,12 @@ mod platform {
         if bytes.len() as u64 > crate::content::MAX_DOCUMENT_BYTES {
             return Err(io("file too large"));
         }
-        Ok(Some(bytes))
+        Ok(Some((bytes, metadata.permissions())))
     }
-    fn write(fd: &OwnedFd, name: &str, bytes: &[u8]) -> Result<()> {
+    fn read(fd: &OwnedFd, name: &std::ffi::OsStr) -> Result<Option<Vec<u8>>> {
+        Ok(read_with_permissions(fd, name)?.map(|(bytes, _)| bytes))
+    }
+    fn write(fd: &OwnedFd, name: &str, bytes: &[u8], permissions: Option<std::fs::Permissions>) -> Result<()> {
         let file = fs::openat(
             fd,
             name,
@@ -141,6 +145,9 @@ mod platform {
         .map_err(io)?;
         let mut file = std::fs::File::from(file);
         file.write_all(bytes)?;
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions)?;
+        }
         file.sync_all()?;
         Ok(())
     }
@@ -169,30 +176,35 @@ mod platform {
         fs::mkdirat(&parent, recovery_name, Mode::RWXU).map_err(|_| unknown(&recovery))?;
         let txn = directory(&parent, recovery_name, false)?;
         let outcome = (|| {
-            write(&txn, "new", content)?;
+            write(&txn, "new", content, None)?;
             write(
                 &txn,
                 "manifest.json",
                 &serde_json::to_vec(
                     &serde_json::json!({"version":1,"path":relative,"operation":operation,"hadOriginal":expected.is_some(),"newHash":crate::types::hash(std::str::from_utf8(content).map_err(io)?)}),
                 )?,
+                None,
             )?;
             fs::fsync(&txn).map_err(io)?;
             fs::fsync(&parent).map_err(io)?;
             checkpoint("prepared")?;
+            let mut original_permissions = None;
             if expected.is_some() {
                 fs::renameat_with(&parent, name, &txn, "old", RenameFlags::NOREPLACE)
                     .map_err(io)?;
                 fs::fsync(&txn).map_err(io)?;
                 fs::fsync(&parent).map_err(io)?;
                 checkpoint("old-moved")?;
-                if read(&txn, std::ffi::OsStr::new("old"))?.as_deref() != expected {
+                let (old, permissions) = read_with_permissions(&txn, std::ffi::OsStr::new("old"))?
+                    .ok_or_else(|| unknown(&recovery))?;
+                if Some(old.as_slice()) != expected {
                     return Err(unknown(&recovery));
                 }
+                original_permissions = Some(permissions);
             }
             checkpoint("before-publish")?;
             // Keep `new` in the recovery directory even after publication.
-            write(&txn, "publish", content)?;
+            write(&txn, "publish", content, original_permissions)?;
             fs::fsync(&txn).map_err(io)?;
             fs::renameat_with(&txn, "publish", &parent, name, RenameFlags::NOREPLACE)
                 .map_err(io)?;
@@ -205,14 +217,14 @@ mod platform {
             if original.st_dev != current.st_dev || original.st_ino != current.st_ino {
                 return Err(unknown(&recovery));
             }
-            write(&txn, "published.json", b"{\"published\":true}")?;
+            write(&txn, "published.json", b"{\"published\":true}", None)?;
             fs::fsync(&txn).map_err(io)?;
             Ok(())
         })();
         if outcome.is_err() {
             // Best effort only: preserve old/new, never replace a third version.
-            if let Ok(Some(bytes)) = read(&txn, std::ffi::OsStr::new("old")) {
-                if write(&txn, "restore", &bytes).is_ok() {
+            if let Ok(Some((bytes, permissions))) = read_with_permissions(&txn, std::ffi::OsStr::new("old")) {
+                if write(&txn, "restore", &bytes, Some(permissions)).is_ok() {
                     let _ =
                         fs::renameat_with(&txn, "restore", &parent, name, RenameFlags::NOREPLACE);
                     let _ = fs::fsync(&parent);
@@ -501,4 +513,47 @@ mod tests {
                 .unwrap()
         );
     }
+    #[test]
+    fn replacement_keeps_permissions_of_actual_old_object() {
+        use std::os::unix::fs::PermissionsExt;
+        for mode in [0o640, 0o755] {
+            let (_d, root) = fixture();
+            std::fs::set_permissions(root.join("note.txt"), std::fs::Permissions::from_mode(0o600)).unwrap();
+            platform::publish(&root, "note.txt", Some(b"original"), b"model", "mode", |stage| {
+                if stage == "prepared" {
+                    std::fs::write(root.join("external.tmp"), b"original")?;
+                    std::fs::set_permissions(root.join("external.tmp"), std::fs::Permissions::from_mode(mode))?;
+                    std::fs::rename(root.join("external.tmp"), root.join("note.txt"))?;
+                }
+                Ok(())
+            }).unwrap();
+            assert_eq!(std::fs::metadata(root.join("note.txt")).unwrap().permissions().mode() & 0o7777, mode);
+            assert_eq!(std::fs::read(root.join("note.txt")).unwrap(), b"model");
+            let recovery = root.join(recovery_path("note.txt", "mode"));
+            assert_eq!(std::fs::metadata(recovery.join("new")).unwrap().permissions().mode() & 0o7777, 0o600);
+        }
+    }
+
+    #[test]
+    fn failed_publication_restores_original_permissions_and_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_d, root) = fixture();
+        std::fs::set_permissions(root.join("note.txt"), std::fs::Permissions::from_mode(0o754)).unwrap();
+        let result = platform::publish(&root, "note.txt", Some(b"original"), b"model", "restore_mode", |stage| {
+            if stage == "old-moved" { return Err(CoreError::io("synthetic stop")); }
+            Ok(())
+        });
+        assert_eq!(result.unwrap_err().code, "NATIVE_TOOL_UNKNOWN");
+        assert_eq!(std::fs::read(root.join("note.txt")).unwrap(), b"original");
+        assert_eq!(std::fs::metadata(root.join("note.txt")).unwrap().permissions().mode() & 0o7777, 0o754);
+    }
+
+    #[test]
+    fn newly_published_file_remains_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_d, root) = fixture();
+        publish(&root, "new.txt", None, b"model", "new_mode").unwrap();
+        assert_eq!(std::fs::metadata(root.join("new.txt")).unwrap().permissions().mode() & 0o7777, 0o600);
+    }
+
 }
