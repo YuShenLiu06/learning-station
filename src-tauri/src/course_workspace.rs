@@ -439,6 +439,11 @@ pub(crate) fn proposal_decide(
     id: &str,
     accept: bool,
 ) -> Result<Value> {
+    // Same lock order as both settings save paths: preferences, then core.
+    // Keep revocation serialized with authorization checking and publication.
+    let _authorization = crate::app::UI_PREFERENCE_WRITE
+        .lock()
+        .map_err(|_| CoreError::new("BUSY", "界面设置暂不可用。"))?;
     let tier = engine.ui_preferences()?.tool_authorization_tier;
     let mut core = engine.lock()?;
     check_course(&mut core, course_id)?;
@@ -457,13 +462,16 @@ pub(crate) fn proposal_decide(
                         &p,
                     )?;
                     drop(core);
+                    drop(_authorization);
                     return settle_decision(engine, &p);
                 }
             }
             drop(core);
+            drop(_authorization);
             return Err(course_write_unknown(engine, &p.session_id, &ledger));
         }
         drop(core);
+        drop(_authorization);
         return settle_decision(engine, &p);
     }
     if accept && tier_rank(&tier) < 2 {
@@ -477,6 +485,7 @@ pub(crate) fn proposal_decide(
         );
         crate::course_write_transaction::durable_json(&path, &p)?;
         drop(core);
+        drop(_authorization);
         return settle_decision(engine, &p);
     }
     let scope = ToolScope {
@@ -524,6 +533,7 @@ pub(crate) fn proposal_decide(
             let error = outcome.err().unwrap_or_else(out_of_scope);
             if p.status == "unknown" {
                 drop(core);
+                drop(_authorization);
                 return Err(course_write_unknown(engine, &p.session_id, &ledger));
             }
             return Err(error);
@@ -538,9 +548,11 @@ pub(crate) fn proposal_decide(
     })();
     if completion.is_err() {
         drop(core);
+        drop(_authorization);
         return Err(course_write_unknown(engine, &p.session_id, &ledger));
     }
     drop(core);
+    drop(_authorization);
     settle_decision(engine, &p)
 }
 

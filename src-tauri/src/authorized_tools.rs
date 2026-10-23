@@ -1205,6 +1205,73 @@ mod tests {
     }
 
     #[test]
+    fn proposal_publication_serializes_with_both_preference_save_paths() {
+        use std::sync::{mpsc, TryLockError};
+        use std::time::{Duration, Instant};
+        for patch in [false, true] {
+            let (_dir, engine, scope, id, _) = course_fixture("write");
+            let before = engine.lock().unwrap().content.read(&id).unwrap();
+            let pending = super::execute(&engine, &scope, "serialized", "write", json!({"path":format!("documents/{id}.md"),"content":"Accepted before revocation","expectedVersion":before.version})).unwrap();
+            let course = pending["courseId"].as_str().unwrap().to_owned();
+            let proposal = pending["proposalId"].as_str().unwrap().to_owned();
+            // Stop publication at core access, then verify that the decision
+            // already owns the same boundary as both settings writers.
+            let core = engine.lock().unwrap();
+            let deciding = engine.clone(); let c = course.clone(); let p = proposal.clone();
+            let decision = std::thread::spawn(move || super::proposal_decide(&deciding, &c, &p, true));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let serialized = loop {
+                match crate::app::UI_PREFERENCE_WRITE.try_lock() {
+                    Err(TryLockError::WouldBlock) => break true,
+                    Err(_) => panic!("preference lock poisoned"),
+                    Ok(guard) => drop(guard),
+                }
+                if Instant::now() >= deadline { break false; }
+                std::thread::yield_now();
+            };
+            let saving = engine.clone(); let (tx, rx) = mpsc::channel();
+            let revoke = std::thread::spawn(move || {
+                let result = if patch {
+                    saving.patch_all_ui_preferences(None, None, None, None, None, Some("read".into()))
+                } else { saving.save_ui_preferences(UiPreferences::default()) };
+                tx.send(result).unwrap();
+            });
+            assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+            drop(core);
+            let receipt = decision.join().unwrap().unwrap();
+            rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap(); revoke.join().unwrap();
+            assert!(serialized, "publication must own the settings boundary before waiting for core");
+            assert_eq!(receipt["persisted"], true);
+            // Already committed results remain queryable at off/read, while a
+            // new pending publication is forbidden after revocation succeeds.
+            assert_eq!(super::proposal_decide(&engine, &course, &proposal, true).unwrap(), receipt);
+            engine.save_ui_preferences(UiPreferences { tool_authorization_tier: "write".into(), ..UiPreferences::default() }).unwrap();
+            let pending = super::execute(&engine, &scope, "after-revocation", "write", json!({"path":"next.txt","content":"Must remain pending"})).unwrap();
+            engine.patch_all_ui_preferences(None, None, None, None, None, Some(if patch { "read" } else { "off" }.into())).unwrap();
+            let next = pending["proposalId"].as_str().unwrap();
+            assert_eq!(super::proposal_decide(&engine, &course, next, true).unwrap_err().code, "TOOL_NOT_ALLOWED");
+            assert_eq!(super::proposal_decide(&engine, &course, next, false).unwrap()["status"], "rejected");
+        }
+    }
+
+    #[test]
+    fn recycled_document_proposal_remains_readable_and_rejectable() {
+        let (_dir, engine, scope, id, _) = course_fixture("write");
+        let before = engine.lock().unwrap().content.read(&id).unwrap();
+        let pending = super::execute(&engine, &scope, "recycled", "write", json!({"path":format!("documents/{id}.md"),"content":"AI body","expectedVersion":before.version})).unwrap();
+        let course = pending["courseId"].as_str().unwrap(); let proposal = pending["proposalId"].as_str().unwrap();
+        {
+            let mut core = engine.lock().unwrap();
+            let preview = crate::trash::preview(&mut core.content, &id).unwrap();
+            crate::trash::trash(&mut core.content, &id, &preview.version, "proposal-trash").unwrap();
+        }
+        assert_eq!(super::proposal_get(&engine, course, proposal).unwrap()["content"], "AI body");
+        assert!(super::proposal_decide(&engine, course, proposal, true).is_err());
+        assert_eq!(super::proposal_decide(&engine, course, proposal, false).unwrap()["status"], "rejected");
+        assert!(super::proposal_list(&engine, course).unwrap().as_array().unwrap().is_empty());
+    }
+
+    #[test]
     fn proposals_reject_keep_drafts_and_refuse_stale_or_revoked_acceptance() {
         let (_dir, engine, scope, id, _) = course_fixture("write");
         let before = engine.lock().unwrap().content.read(&id).unwrap();

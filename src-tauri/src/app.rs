@@ -74,7 +74,7 @@ fn default_assistant_width() -> u16 {
 fn default_sidebar_width() -> u16 {
     240
 }
-static UI_PREFERENCE_WRITE: Mutex<()> = Mutex::new(());
+pub(crate) static UI_PREFERENCE_WRITE: Mutex<()> = Mutex::new(());
 impl UiPreferences {
     fn validate(&self) -> Result<()> {
         if !(12..=24).contains(&self.font_size) {
