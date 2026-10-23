@@ -288,12 +288,15 @@ pub(crate) fn execute(
         created_at: timestamp(),
     };
     fs::create_dir_all(&receipts).map_err(io)?;
-    crate::app::atomic_json(&ledger_path, &entry)?;
+    if ledger_path.with_extension("pending").exists() {
+        crate::course_write_transaction::durable_json(&ledger_path, &entry)?;
+    } else {
+        crate::app::atomic_json(&ledger_path, &entry)?;
+    }
     Ok(result)
     })();
     outcome.map_err(|error| {
-        if name == "write" && ledger_path.with_extension("pending").exists()
-            && read_ledger(&ledger_path).is_err() {
+        if name == "write" && ledger_path.with_extension("pending").exists() {
             course_write_unknown(engine, &scope.session_id, &ledger_path)
         } else { error }
     })
@@ -309,6 +312,9 @@ fn course_write_unknown(engine: &crate::app::Engine, session_id: &str, ledger: &
         let pending: Value = serde_json::from_slice(&pending)?;
         let course = pending["courseId"].as_str().ok_or_else(invalid)?;
         let path = pending["path"].as_str().ok_or_else(invalid)?;
+        if !crate::types::valid_id(course) {
+            return Err(invalid());
+        }
         let operation = ledger
             .file_stem()
             .and_then(|s| s.to_str())
@@ -317,9 +323,32 @@ fn course_write_unknown(engine: &crate::app::Engine, session_id: &str, ledger: &
         let session = crate::sessions::get(&mut core.content, session_id)?;
         let owner = match session.course_id {
             Some(id) => Some(id),
-            None => crate::course_sessions::course(&core.content, &session.section_id)?,
+            None => match crate::course_sessions::course(&core.content, &session.section_id) {
+                Ok(owner) => owner,
+                Err(_)
+                    if crate::types::valid_id(&session.section_id)
+                        && pending["sessionId"] == session.id
+                        && pending["sectionId"] == session.section_id
+                        && path == format!("documents/{}.md", session.section_id)
+                        && !core.content.is_trashed(&session.section_id)
+                        && fs::symlink_metadata(core.content.root().join(format!(
+                            "courses/{course}/materials/documents/{}.md",
+                            session.section_id
+                        )))
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    Some(course.to_owned())
+                }
+                Err(error) => return Err(error),
+            },
         };
         if owner.as_deref() != Some(course) {
+            return Err(out_of_scope());
+        }
+        if core.content.is_trashed(session_id) || core.content.is_trashed(course) {
+            return Err(out_of_scope());
+        }
+        if core.content.read(course)?.metadata.kind != "course" {
             return Err(out_of_scope());
         }
         crate::material_git::check_path(path)?;
@@ -955,6 +984,227 @@ mod tests {
     }
 
     use std::sync::Arc;
+
+    #[test]
+    fn course_intent_directory_sync_failure_does_not_publish() {
+        let (dir, engine, scope, id, _) = course_fixture("write");
+        let original = engine.lock().unwrap().content.read(&id).unwrap();
+        let args = json!({"path":format!("documents/{id}.md"),"content":"model", "expectedVersion":original.version});
+        let (op, _) =
+            crate::learning_tools::operation_id(&engine, &scope, "sync-failure", "write", &args)
+                .unwrap();
+        let pending = dir.path().join(format!(
+            "state/workspaces/{}/receipts/{op}.pending",
+            scope.session_id
+        ));
+        crate::course_write_transaction::FAIL_RECEIPT_SYNC
+            .with(|f| *f.borrow_mut() = Some(pending.clone()));
+        let result = run(&engine, &scope, "sync-failure", "write", args);
+        crate::course_write_transaction::FAIL_RECEIPT_SYNC.with(|f| *f.borrow_mut() = None);
+        assert_eq!(result.unwrap_err().code, "NATIVE_TOOL_UNKNOWN");
+        assert!(pending.is_file());
+        let evidence: Value = serde_json::from_slice(&std::fs::read(&pending).unwrap()).unwrap();
+        assert_eq!(evidence["sessionId"], scope.session_id);
+        assert_eq!(evidence["sectionId"], scope.section_id);
+        let core = engine.lock().unwrap();
+        assert_eq!(core.content.read(&id).unwrap().content, original.content);
+        assert!(!core
+            .content
+            .root()
+            .join(crate::course_write_transaction::recovery_path(
+                &original.path,
+                &op
+            ))
+            .exists());
+    }
+
+    #[test]
+    fn course_completion_directory_sync_failure_is_unknown() {
+        let (dir, engine, scope, _, _) = course_fixture("write");
+        let args = json!({"path":"sync.txt","content":"model"});
+        let (op, _) =
+            crate::learning_tools::operation_id(&engine, &scope, "completion-sync", "write", &args)
+                .unwrap();
+        let ledger = dir.path().join(format!(
+            "state/workspaces/{}/receipts/{op}.json",
+            scope.session_id
+        ));
+        crate::course_write_transaction::FAIL_RECEIPT_SYNC
+            .with(|f| *f.borrow_mut() = Some(ledger.clone()));
+        let result = run(&engine, &scope, "completion-sync", "write", args);
+        crate::course_write_transaction::FAIL_RECEIPT_SYNC.with(|f| *f.borrow_mut() = None);
+        let error = result.unwrap_err();
+        assert_eq!(error.code, "NATIVE_TOOL_UNKNOWN");
+        assert_eq!(error.details.unwrap()["published.json"]["exists"], true);
+        assert!(ledger.is_file());
+    }
+
+    #[test]
+    fn unsupported_course_write_has_no_intent_or_publication() {
+        let (dir, engine, scope, _, _) = course_fixture("write");
+        let args = json!({"path":"unsupported.txt","content":"model"});
+        let (op, _) =
+            crate::learning_tools::operation_id(&engine, &scope, "unsupported", "write", &args)
+                .unwrap();
+        crate::course_write_transaction::FORCE_UNSUPPORTED.with(|f| f.set(true));
+        let result = run(&engine, &scope, "unsupported", "write", args);
+        crate::course_write_transaction::FORCE_UNSUPPORTED.with(|f| f.set(false));
+        assert_eq!(result.unwrap_err().code, "UNSUPPORTED_PLATFORM");
+        assert!(!dir
+            .path()
+            .join(format!(
+                "state/workspaces/{}/receipts/{op}.pending",
+                scope.session_id
+            ))
+            .exists());
+        let mut core = engine.lock().unwrap();
+        let course = crate::sessions::get(&mut core.content, &scope.session_id)
+            .unwrap()
+            .course_id
+            .unwrap();
+        assert!(!core
+            .content
+            .root()
+            .join(format!("courses/{course}/materials/unsupported.txt"))
+            .exists());
+    }
+
+    #[test]
+    fn legacy_missing_section_recovers_only_bound_pending_course() {
+        let (dir, engine, scope, id, sibling) = course_fixture("write");
+        let (course, original) = {
+            let mut core = engine.lock().unwrap();
+            let session = core.content.read(&scope.session_id).unwrap();
+            let course = session.metadata.extra["courseId"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            crate::course_project::ensure_project(&mut core.content, &course).unwrap();
+            let mut metadata = session.metadata.clone();
+            metadata.extra.remove("courseId");
+            metadata.extra.insert("sectionId".into(), json!(id));
+            let content = crate::content::serialize(&metadata, &session.body).unwrap();
+            std::fs::write(core.content.root().join(&session.path), &content).unwrap();
+            core.content.register(&session.path).unwrap();
+            (course, core.content.read(&id).unwrap())
+        };
+        let call = crate::model::ToolCall {
+            id: "legacy_missing".into(),
+            name: "write".into(),
+            args: json!({"path":format!("documents/{id}.md"),"content":"model","expectedVersion":original.version}),
+        };
+        let (op, _) =
+            crate::learning_tools::operation_id(&engine, &scope, &call.id, &call.name, &call.args)
+                .unwrap();
+        let ledger = dir.path().join(format!(
+            "state/workspaces/{}/receipts/{op}.json",
+            scope.session_id
+        ));
+        let pending = json!({"path":format!("documents/{id}.md"),"courseId":course,"sessionId":scope.session_id,"sectionId":id});
+        crate::course_write_transaction::durable_json(&ledger.with_extension("pending"), &pending)
+            .unwrap();
+        let core = engine.lock().unwrap();
+        let recovery = core
+            .content
+            .root()
+            .join(crate::course_write_transaction::recovery_path(
+                &original.path,
+                &op,
+            ));
+        std::fs::create_dir_all(&recovery).unwrap();
+        std::fs::rename(
+            core.content.root().join(&original.path),
+            recovery.join("old"),
+        )
+        .unwrap();
+        drop(core);
+        let error = super::recover(&engine, &scope.session_id, &scope.run_id, &call).unwrap_err();
+        assert_eq!(error.details.unwrap()["old"]["exists"], true);
+        assert!(!engine
+            .lock()
+            .unwrap()
+            .content
+            .root()
+            .join(&original.path)
+            .exists());
+        for (key, value) in [("sessionId", "different"), ("sectionId", sibling.as_str())] {
+            let mut mismatch = pending.clone();
+            mismatch[key] = json!(value);
+            crate::course_write_transaction::durable_json(
+                &ledger.with_extension("pending"),
+                &mismatch,
+            )
+            .unwrap();
+            assert!(
+                super::course_write_unknown(&engine, &scope.session_id, &ledger)
+                    .details
+                    .is_none()
+            );
+        }
+        crate::course_write_transaction::durable_json(&ledger.with_extension("pending"), &pending)
+            .unwrap();
+        let core = engine.lock().unwrap();
+        let session = core.content.read(&scope.session_id).unwrap();
+        let mut metadata = session.metadata.clone();
+        let other = crate::course_sessions::course(&core.content, &sibling)
+            .unwrap()
+            .unwrap();
+        metadata.extra.insert("courseId".into(), json!(other));
+        std::fs::write(
+            core.content.root().join(&session.path),
+            crate::content::serialize(&metadata, &session.body).unwrap(),
+        )
+        .unwrap();
+        drop(core);
+        assert!(
+            super::course_write_unknown(&engine, &scope.session_id, &ledger)
+                .details
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn retained_recovery_directories_do_not_consume_material_quota() {
+        let (_dir, engine, scope, id, _) = course_fixture("write");
+        let mut core = engine.lock().unwrap();
+        let course = crate::sessions::get(&mut core.content, &scope.session_id)
+            .unwrap()
+            .course_id
+            .unwrap();
+        crate::course_project::ensure_project(&mut core.content, &course).unwrap();
+        let root = crate::course_project::course_project_root(core.content.root(), &course)
+            .unwrap()
+            .join("materials");
+        for index in 0..4100 {
+            std::fs::create_dir(root.join(format!(".learning-write-test{index}"))).unwrap();
+        }
+        let retained = root.join(".learning-write-test0/old");
+        std::fs::write(&retained, b"retained").unwrap();
+        crate::material_git::FrozenMaterials::capture_project(&core.content, &course).unwrap();
+        assert_eq!(std::fs::read(&retained).unwrap(), b"retained");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                root.join(format!("documents/{id}.md")),
+                root.join(".learning-write-link"),
+            )
+            .unwrap();
+            assert!(
+                crate::material_git::FrozenMaterials::capture_project(&core.content, &course)
+                    .is_err()
+            );
+            std::fs::remove_file(root.join(".learning-write-link")).unwrap();
+        }
+        for index in 0..4097 {
+            std::fs::write(root.join(format!("normal{index}.txt")), b"x").unwrap();
+        }
+        assert_eq!(
+            crate::material_git::FrozenMaterials::capture_project(&core.content, &course)
+                .unwrap_err()
+                .code,
+            "LIMIT_EXCEEDED"
+        );
+    }
 
     #[test]
     fn course_write_edits_body_with_version_and_keeps_identity_and_receipt() {

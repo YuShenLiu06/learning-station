@@ -3,6 +3,49 @@
 use crate::types::{CoreError, Result};
 use std::path::{Path, PathBuf};
 
+/// Fail before recording an intent on platforms without the publication backend.
+pub(crate) fn ensure_supported() -> Result<()> {
+    #[cfg(test)]
+    if FORCE_UNSUPPORTED.with(|value| value.get()) {
+        return supported(false);
+    }
+    supported(cfg!(any(target_os = "macos", target_os = "linux")))
+}
+fn supported(available: bool) -> Result<()> {
+    if available {
+        Ok(())
+    } else {
+        Err(CoreError::new(
+            "UNSUPPORTED_PLATFORM",
+            "此平台尚未提供可恢复的课程写入。",
+        ))
+    }
+}
+
+/// Scoped to course-tool intent and completion receipts. Persist every directory
+/// edge, including ancestors created by a previous interrupted attempt.
+pub(crate) fn durable_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| CoreError::io("missing receipt parent"))?;
+    std::fs::create_dir_all(parent)?;
+    for directory in parent.ancestors() {
+        std::fs::File::open(directory)?.sync_all()?;
+    }
+    crate::app::atomic_json(path, value)?;
+    #[cfg(test)]
+    if FAIL_RECEIPT_SYNC.with(|fail| fail.borrow().as_deref() == Some(path)) {
+        return Err(CoreError::io("synthetic receipt directory sync failure"));
+    }
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FORCE_UNSUPPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static FAIL_RECEIPT_SYNC: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
 pub(crate) fn recovery_path(relative: &str, operation: &str) -> PathBuf {
     Path::new(relative)
         .parent()

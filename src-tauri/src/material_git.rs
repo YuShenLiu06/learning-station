@@ -98,6 +98,7 @@ impl FrozenMaterials {
             };
             let mut pending = vec![root.join("materials")];
             let mut seen = 0;
+            let mut scanned = 0;
             let mut remaining = 64 * 1024 * 1024usize;
             while let Some(directory) = pending.pop() {
                 let metadata = fs::symlink_metadata(&directory)?;
@@ -110,8 +111,9 @@ impl FrozenMaterials {
                 }
                 let mut paths = Vec::new();
                 for entry in fs::read_dir(directory)? {
-                    seen += 1;
-                    if seen > 4096 {
+                    scanned += 1;
+                    // Recovery directories are retained, but total filesystem work stays bounded.
+                    if scanned > 65536 {
                         return Err(limit());
                     }
                     paths.push(entry?.path());
@@ -128,6 +130,16 @@ impl FrozenMaterials {
                         .file_name()
                         .and_then(|s| s.to_str())
                         .ok_or_else(scope)?;
+                    if metadata.is_dir()
+                        && name.strip_prefix(".learning-write-")
+                            .is_some_and(crate::types::valid_id)
+                    {
+                        continue;
+                    }
+                    seen += 1;
+                    if seen > 4096 {
+                        return Err(limit());
+                    }
                     let relative = path
                         .strip_prefix(root.join("materials"))
                         .map_err(|_| scope())?
@@ -1059,7 +1071,7 @@ fn git_error() -> CoreError {
 fn limit() -> CoreError {
     CoreError::new(
         "LIMIT_EXCEEDED",
-        "材料检查点超过4096文件或64MiB，未生成快照。",
+        "材料检查点超过4096条目或64MiB，或目录扫描超过65536条目，未生成快照。",
     )
 }
 

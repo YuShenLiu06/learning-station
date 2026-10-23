@@ -106,9 +106,9 @@ Focus 的 `metadataOnlySourceIds` 由 Rust 冻结 Context 生成并限制在本�
 
 ### 冲突副本与中断恢复
 
-macOS/Linux 课程 AI 写入（普通材料和业务笔记）共用 dirfd 发布事务。直接依赖既已锁版的 rustix 1.1.5 `fs` API；从 `/` 开始逐级 `O_DIRECTORY|O_NOFOLLOW` 打开授权目录，以已打开父目录对象执行所有文件创建和 rename，不在发布时重新解析用户路径。其他平台明确不支持此发布路径，没有不安全降级；不引入沙盒或把 advisory lock 当隔离。
+macOS/Linux 课程 AI 写入（普通材料和业务笔记）共用 dirfd 发布事务。直接依赖既已锁版的 rustix 1.1.5 `fs` API；从 `/` 开始逐级 `O_DIRECTORY|O_NOFOLLOW` 打开授权目录，以已打开父目录对象执行所有文件创建和 rename，不在发布时重新解析用户路径。其他平台在保存写入意图前明确拒绝此发布路径，没有不安全降级；不引入沙盒或把 advisory lock 当隔离。
 
-每次写入在目标父目录保留 `.learning-write-<原操作ID>/`：`manifest.json` 为持久意图，`new` 为独立的新稿副本，覆盖时 `old` 是原子移入的实际旧对象。先同步新稿/意图和目录，再以 NOREPLACE 移入旧对象，核对实际旧稿是否仍等于基线；匹配才用 NOREPLACE 发布另一份新稿，第三方文件占位时不覆盖。发布版本取自待发布字节，业务元数据仍由 ContentStore 规范化。成功后也保留副本，不自动清理。
+每次写入在目标父目录保留 `.learning-write-<原操作ID>/`：`manifest.json` 为持久意图，`new` 为独立的新稿副本，覆盖时 `old` 是原子移入的实际旧对象。先同步新稿/意图和目录，再以 NOREPLACE 移入旧对象，核对实际旧稿是否仍等于基线；匹配才用 NOREPLACE 发布另一份新稿，第三方文件占位时不覆盖。发布版本取自待发布字节，业务元数据仍由 ContentStore 规范化。成功后也保留副本，不自动清理。受管恢复目录经过符号链接与范围检查后不占用 4096 个材料条目配额；总目录扫描仍限制为 65536 个条目。会话 pending 与完成回执同步文件及父目录（含新建祖先目录）后才进入下一阶段；pending 目录同步失败不发布正文。旧会话的小节在移入 old 后暂时缺失时，仅使用已持久化且与当前 sessionId/sectionId 匹配的课程归属证据核对该原操作，当前显式课程变更仍拒绝访问。
 
 版本在最后窗口改变、发布或回执失败时保留旧/新稿；若目标仍为空，尽力用 NOREPLACE 恢复旧稿副本，绝不覆盖第三份。`NATIVE_TOOL_UNKNOWN.details` 返回相对于资料库的 `recoveryPath` 和只读状态（存在性、长度、哈希）；原操作恢复只核对 `target/old/new/manifest/published`，不重做写入。中断可能短暂留下空目标；状态无法读取时明确 unverified。没有自动恢复按钮，用户可在资料库下打开 `recoveryPath`，先把 old/new 复制到资料库外比较保管；确认目标缺失时再将选定完整稿恢复至 manifest 所列原文件名。目标已存在时先保留第三份并比较，不直接覆盖；业务 Markdown 须保留完整元数据头，勿把恢复副本当新笔记导入造成重复 ID。
 

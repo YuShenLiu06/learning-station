@@ -146,6 +146,7 @@ pub(super) fn course_write(
     let Some(course) = course(&mut core, scope)? else {
         return Ok(None);
     };
+    crate::course_write_transaction::ensure_supported()?;
     let pending = ledger.with_extension("pending");
     if pending.exists() {
         return Err(CoreError::new(
@@ -215,10 +216,11 @@ pub(super) fn course_write(
     // The 2 MiB scratch-workspace quota must not count the user's whole course.
     // Durable intent closes the write→receipt interruption gap. Unknown writes
     // are never replayed; recovery reads the original completed ledger only.
-    fs::create_dir_all(ledger.parent().ok_or_else(invalid)?).map_err(io)?;
-    crate::app::atomic_json(
+    let session = crate::sessions::get(&mut core.content, &scope.session_id)?;
+    crate::course_write_transaction::durable_json(
         &pending,
-        &json!({"path":args.path,"courseId":course,"expectedVersion":args.expected_version}),
+        &json!({"path":args.path,"courseId":course,"expectedVersion":args.expected_version,
+            "sessionId":session.id,"sectionId":session.section_id}),
     )?;
     let version = if let Some(doc) = doc {
         core.content
