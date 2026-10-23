@@ -173,6 +173,17 @@ impl FrozenMaterials {
                     if !metadata.is_file() {
                         return Err(scope());
                     }
+                    // Large unrelated files must not prevent the rest of the course
+                    // from being snapshotted. Keep the bounded read below for files
+                    // that grow after this metadata check; never load them unbounded.
+                    if metadata.len() > 5 * 1024 * 1024 {
+                        frozen.excluded_files.push(ExcludedFile {
+                            asset_id: String::new(),
+                            file_name: relative,
+                            reason: "capacity_exceeded".into(),
+                        });
+                        continue;
+                    }
                     let bytes = crate::assets::bounded_read(&path, 5 * 1024 * 1024)?;
                     if relative.starts_with("documents/") && crate::content::is_markdown_path(&path)
                     {

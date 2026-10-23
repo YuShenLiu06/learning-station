@@ -569,3 +569,30 @@ fn trash_visibility_requires_a_fresh_ledger_and_hides_copied_managed_ids() {
 
 #[path = "nested_course_git_tests.rs"]
 mod nested;
+
+#[test]
+fn oversized_non_text_materials_do_not_block_valid_text_snapshot_and_focus() {
+    let f = Fixture::new();
+    let first = f.commit(None);
+    let large_paths = ["archive.zip", "book.pdf", "video.mp4", "arbitrary.custom"];
+    for path in large_paths {
+        let mut file = fs::File::create(f.root.join("materials").join(path)).unwrap();
+        file.write_all(&[0xff, 0, 0xfe]).unwrap();
+        file.set_len(5 * 1024 * 1024 + 1).unwrap();
+    }
+    let html = b"<!doctype html><title>valid</title>";
+    fs::write(f.root.join("materials/demo.html"), html).unwrap();
+    fs::write(f.root.join("materials/notes.custom"), b"valid arbitrary suffix").unwrap();
+    let next = f.commit(Some(&first.checkpoint_commit_oid));
+    for path in large_paths {
+        assert!(next.excluded_files.iter().any(|entry|
+            entry.file_name == path && entry.reason == "capacity_exceeded"));
+        assert!(f.git.read("course_a", &next.checkpoint_commit_oid, path).is_err());
+        assert_eq!(fs::metadata(f.root.join("materials").join(path)).unwrap().len(), 5 * 1024 * 1024 + 1);
+    }
+    assert_eq!(f.read(&next, CHILD), f.child.content.as_bytes());
+    assert_eq!(f.read(&next, "demo.html"), html);
+    assert_eq!(f.read(&next, "notes.custom"), b"valid arbitrary suffix");
+    let focused = f.diff(&first, &next, Some("demo.html"));
+    assert!(focused.changes.iter().any(|change| change.path == "demo.html"));
+}
