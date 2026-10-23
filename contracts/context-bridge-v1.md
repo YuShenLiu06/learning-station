@@ -89,3 +89,7 @@ JSON 模式使用同一视图范围：本轮为已定位注册片段，完整为
 有效 `focus` 注册仅有 0 或 1 项，携带当前位置和本次 Changes/diff。全文使用独立 `materials` 注册，始终带来源路径，不重复声明当前 Focus。旧 Focus 若有 Pi 实际接收回执，将其材料/diff与课程变化降级为明确历史材料，保留原轮身份、完整 hash 链、偏移和接收回执；未送达候选直接排除。原始持久记录保留。无 Focus 的新轮不回填旧焦点；相同正文不同文件按稳定身份分别保留材料基准。压缩丢失基准仍经原机制补齐本轮正文。
 
 验证覆盖锁版 Pi 与 localhost 实际 payload、接收回执及隔离合成会话；不代表原生桌面或真实在线模型已经验收。
+
+## 练习引用来源清单
+
+ContextBridge 每个用户轮注册 `exercise_sources`，将同轮 `Context.manifest` 的 `sourceId/path/version` 显式提供给模型；普通聊天的 `generate_exercises` 与专用 practice 共用此清单。路径仅用于识别材料，`sourceIds` 必须填写稳定 ID。清单不包含课程可读目录或历史授权集合，不声明额外正文已读取；空清单也明确提供。旧轮清单沿 turn 生命周期排除，重试及压缩恢复使用原冻结快照。Rust 仍按原冻结 manifest 严格校验，不从文件名或路径猜测 ID，不将未知来源变成可自动修正的授权错误。

@@ -1,5 +1,5 @@
 // Single application-supplement boundary. Pi still owns messages, tools and compaction.
-const order = ['current_time','references','focus','materials','exploration'];
+const order = ['current_time','references','exercise_sources','focus','materials','exploration'];
 export const renderBridgePart=(description,value)=>typeof value==='string'?`${description}\n${value}`:JSON.stringify({description,...value});
 export function decodeBridgeInput(input) {
   if (!Array.isArray(input.bridge)) return input; // Existing private request fixtures/older callers.
@@ -10,7 +10,7 @@ export function decodeBridgeInput(input) {
     if(seen.has(part.key)&&seen.get(part.key)!==fingerprint)throw Object.assign(new Error('CONTEXT_CONFLICT'),{code:'CONTEXT_CONFLICT'});
     seen.set(part.key,fingerprint);values[part.key]=part.value;
   }
-  return { ...input, question: values.question, focus: values.focus, nativeMaterials: values.materials ?? [], nativeReferences: values.references ?? '', currentTime: values.current_time, exploration: values.exploration };
+  return { ...input, question: values.question, focus: values.focus, nativeMaterials: values.materials ?? [], nativeReferences: values.references ?? '', currentTime: values.current_time, exerciseSources: values.exercise_sources, exploration: values.exploration };
 }
 export class ContextBridge {
   constructor(manager, identity) { this.manager=manager; this.identity=identity; this.pending=[]; this.removed=new Set(); }

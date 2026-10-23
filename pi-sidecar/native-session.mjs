@@ -171,6 +171,7 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
       retireTurnContext(manager,bridge);
       const clock=envelope.currentTime??(timeContext?{referenceTime:timeContext.referenceTime,timeZone:timeContext.timeZone}:undefined);
       if(clock)bridge.message('current_time','本轮冻结时间与时区','learning-station-turn','referenceTime: '+clock.referenceTime+(clock.timeZone?'\ntimeZone: '+clock.timeZone:''));
+      if(envelope.exerciseSources)bridge.message('exercise_sources','本轮练习可引用来源（sourceIds 仅填写下列 sourceId，不得填写文件路径；清单不代表额外正文已读取）','learning-station-turn',envelope.exerciseSources);
       if(envelope.nativeReferences)bridge.message('references','用户本轮明确提供的引用及必要补充','learning-station-turn',envelope.nativeReferences);
       const inventory=await registerMaterialContext({manager,spec,loadChanges,envelope,bridge,containsSecret,apiKey,NativeSessionError});
       // The exploration entry marks the session origin: register on the opening
