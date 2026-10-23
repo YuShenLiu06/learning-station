@@ -134,9 +134,10 @@ pub(super) fn course_write(
     scope: &ToolScope,
     args: &WriteArgs,
     ledger: &Path,
+    call_id: &str,
 ) -> Result<Option<Value>> {
     let mut core = engine.lock()?;
-    course_write_locked(&mut core, scope, args, ledger, false)
+    course_write_locked(&mut core, scope, args, ledger, Some(call_id))
 }
 
 fn course_write_locked(
@@ -144,7 +145,7 @@ fn course_write_locked(
     scope: &ToolScope,
     args: &WriteArgs,
     ledger: &Path,
-    accepted: bool,
+    call_id: Option<&str>,
 ) -> Result<Option<Value>> {
     let Some(course) = course(core, scope)? else {
         return Ok(None);
@@ -203,7 +204,7 @@ fn course_write_locked(
         .file_stem()
         .and_then(|name| name.to_str())
         .ok_or_else(invalid)?;
-    if !accepted {
+    if let Some(call_id) = call_id {
         return stage(
             core,
             scope,
@@ -214,6 +215,7 @@ fn course_write_locked(
                 .map(|(body, _)| body.as_str())
                 .unwrap_or(""),
             operation,
+            call_id,
         )
         .map(Some);
     }
@@ -264,6 +266,8 @@ struct Proposal {
     session_id: String,
     section_id: String,
     run_id: String,
+    #[serde(default)]
+    call_id: Option<String>,
     allowed_ids: Vec<String>,
     path: String,
     expected_version: Option<String>,
@@ -284,7 +288,12 @@ fn proposal_path(core: &Core, course: &str, id: &str) -> Result<PathBuf> {
         .join(format!("{id}.json")))
 }
 fn read_proposal(core: &Core, course: &str, id: &str) -> Result<Proposal> {
-    let path = proposal_path(core, course, id)?;
+    let active = proposal_path(core, course, id)?;
+    let path = if active.exists() {
+        active
+    } else {
+        archive_path(core, course, id)?
+    };
     let mut p: Proposal = serde_json::from_slice(&crate::assets::bounded_read(&path, 256 * 1024)?)?;
     if p.id != id || p.course_id != course {
         return Err(out_of_scope());
@@ -300,23 +309,7 @@ fn read_proposal(core: &Core, course: &str, id: &str) -> Result<Proposal> {
             .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
         if no_intent {
             if let Ok(entry) = read_ledger(&ledger) {
-                let mut args =
-                    json!({"path":p.path,"content":p.content,"expectedVersion":p.expected_version});
-                let with_version = hash(&serde_json::to_string(&args)?);
-                if p.expected_version.is_none() {
-                    args.as_object_mut().unwrap().remove("expectedVersion");
-                }
-                let without_version = hash(&serde_json::to_string(&args)?);
-                if entry.name == "write"
-                    && (entry.arguments_hash == with_version
-                        || entry.arguments_hash == without_version)
-                    && entry.result["persisted"] == false
-                    && entry.result["status"] == "pending"
-                    && entry.result["proposalId"] == p.id
-                    && entry.result["courseId"] == p.course_id
-                    && entry.result["sessionId"] == p.session_id
-                    && entry.result["path"] == p.path
-                {
+                if matches_pending_ledger(&p, &entry)? {
                     p.status = "pending".into();
                 }
             }
@@ -341,20 +334,17 @@ fn stage(
     args: &WriteArgs,
     original: &str,
     id: &str,
+    call_id: &str,
 ) -> Result<Value> {
     let path = proposal_path(core, course, id)?;
-    if path.exists() {
+    if path.exists() || archive_path(core, course, id)?.exists() {
         return Ok(proposal_receipt(&read_proposal(core, course, id)?));
     }
     let directory = path.parent().ok_or_else(invalid)?;
     fs::create_dir_all(directory).map_err(io)?;
-    for item in fs::read_dir(directory).map_err(io)? {
-        let item = item.map_err(io)?;
-        let other: Proposal =
-            serde_json::from_slice(&crate::assets::bounded_read(&item.path(), 256 * 1024)?)?;
-        if other.path == args.path
-            && matches!(other.status.as_str(), "pending" | "accepting" | "unknown")
-        {
+    let active = active_proposals(core, course)?;
+    for other in active {
+        if other.path == args.path {
             return Err(CoreError::new(
                 "CONFLICT",
                 "该文件已有待审阅建议，请先接受或拒绝；正文未修改。",
@@ -367,6 +357,7 @@ fn stage(
         session_id: scope.session_id.clone(),
         section_id: scope.section_id.clone(),
         run_id: scope.run_id.clone(),
+        call_id: Some(call_id.into()),
         allowed_ids: scope.allowed_ids.clone(),
         path: args.path.clone(),
         expected_version: args.expected_version.clone(),
@@ -382,31 +373,16 @@ fn proposal_receipt(p: &Proposal) -> Value {
     p.receipt.clone().unwrap_or_else(|| json!({"persisted":false,"proposalPersisted":true,"proposalId":p.id,"courseId":p.course_id,"sessionId":p.session_id,"path":p.path,"status":p.status,"message":"建议已保留，正文未修改；等待用户决定，不得依赖建议内容继续执行。"}))
 }
 
-/// Lightweight polling: no proposal body is read until its file stamp changes.
+/// Poll unresolved proposals only; terminal legacy records migrate to archive.
 pub(crate) fn proposal_list(engine: &crate::app::Engine, course: &str) -> Result<Value> {
     let mut core = engine.lock()?;
     check_course(&mut core, course)?;
-    let dir = core.state_dir.join("edit-proposals").join(course);
-    let entries = match fs::read_dir(dir) {
-        Ok(v) => v,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(json!([])),
-        Err(e) => return Err(io(e)),
-    };
     let mut result = Vec::new();
-    for item in entries {
-        let item = item.map_err(io)?;
-        let id = item
-            .path()
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_owned();
-        let meta = item.metadata().map_err(io)?;
-        if crate::types::valid_id(&id) {
-            result.push(
-                json!({"id":id,"stamp":format!("{:?}-{}",meta.modified().map_err(io)?,meta.len())}),
-            );
-        }
+    for p in active_proposals(&core, course)? {
+        let meta = fs::metadata(proposal_path(&core, course, &p.id)?).map_err(io)?;
+        result.push(
+            json!({"id":p.id,"stamp":format!("{:?}-{}",meta.modified().map_err(io)?,meta.len())}),
+        );
     }
     Ok(json!(result))
 }
@@ -445,10 +421,7 @@ pub(crate) fn proposal_decide(
     id: &str,
     accept: bool,
 ) -> Result<Value> {
-    // Acceptance does not grant write permission. Reject remains available after revocation.
-    if accept && tier_rank(&engine.ui_preferences()?.tool_authorization_tier) < 2 {
-        return Err(not_allowed());
-    }
+    let tier = engine.ui_preferences()?.tool_authorization_tier;
     let mut core = engine.lock()?;
     check_course(&mut core, course_id)?;
     let mut p = read_proposal(&core, course_id, id)?;
@@ -465,13 +438,20 @@ pub(crate) fn proposal_decide(
                         &proposal_path(&core, course_id, id)?,
                         &p,
                     )?;
-                    return Ok(proposal_receipt(&p));
+                    archive_proposal(&core, &p)?;
+                    drop(core);
+                    return settle_decision(engine, &p);
                 }
             }
             drop(core);
             return Err(course_write_unknown(engine, &p.session_id, &ledger));
         }
-        return Ok(proposal_receipt(&p));
+        archive_proposal(&core, &p)?;
+        drop(core);
+        return settle_decision(engine, &p);
+    }
+    if accept && tier_rank(&tier) < 2 {
+        return Err(not_allowed());
     }
     let path = proposal_path(&core, course_id, id)?;
     if !accept {
@@ -480,7 +460,9 @@ pub(crate) fn proposal_decide(
             json!({"persisted":false,"status":"rejected","proposalId":id,"courseId":course_id,"path":p.path,"message":"用户已拒绝建议，正文未修改。"}),
         );
         crate::course_write_transaction::durable_json(&path, &p)?;
-        return Ok(proposal_receipt(&p));
+        archive_proposal(&core, &p)?;
+        drop(core);
+        return settle_decision(engine, &p);
     }
     let scope = ToolScope {
         session_id: p.session_id.clone(),
@@ -499,9 +481,19 @@ pub(crate) fn proposal_decide(
     let ledger = workspace_root(&core.state_dir, &p.session_id)
         .join("receipts")
         .join(format!("{id}.json"));
+    // No publication is allowed without the exact initial operation receipt.
+    let entry = read_ledger(&ledger).map_err(|_| {
+        CoreError::new(
+            "NATIVE_TOOL_UNKNOWN",
+            "原建议回执缺失或损坏；正文未修改，可拒绝建议后重新请求。",
+        )
+    })?;
+    if !matches_pending_ledger(&p, &entry)? {
+        return Err(CoreError::new("CONFLICT", "原建议回执不匹配；正文未修改。"));
+    }
     p.status = "accepting".into();
     crate::course_write_transaction::durable_json(&path, &p)?;
-    match course_write_locked(&mut core, &scope, &args, &ledger, true) {
+    match course_write_locked(&mut core, &scope, &args, &ledger, None) {
         Ok(Some(receipt)) => {
             p.status = "accepted".into();
             p.receipt = Some(receipt);
@@ -533,5 +525,151 @@ pub(crate) fn proposal_decide(
         drop(core);
         return Err(course_write_unknown(engine, &p.session_id, &ledger));
     }
-    Ok(proposal_receipt(&p))
+    archive_proposal(&core, &p)?;
+    drop(core);
+    settle_decision(engine, &p)
+}
+
+fn matches_pending_ledger(p: &Proposal, entry: &LedgerEntry) -> Result<bool> {
+    let mut args = json!({"path":p.path,"content":p.content,"expectedVersion":p.expected_version});
+    let with_version = hash(&serde_json::to_string(&args)?);
+    if p.expected_version.is_none() {
+        args.as_object_mut().unwrap().remove("expectedVersion");
+    }
+    let without_version = hash(&serde_json::to_string(&args)?);
+    Ok(entry.name == "write"
+        && (entry.arguments_hash == with_version || entry.arguments_hash == without_version)
+        && entry.result["persisted"] == false
+        && entry.result["status"] == "pending"
+        && entry.result["proposalId"] == p.id
+        && entry.result["courseId"] == p.course_id
+        && entry.result["sessionId"] == p.session_id
+        && entry.result["path"] == p.path)
+}
+fn archive_path(core: &Core, course: &str, id: &str) -> Result<PathBuf> {
+    let path = proposal_path(core, course, id)?;
+    Ok(path
+        .parent()
+        .ok_or_else(invalid)?
+        .join("archive")
+        .join(path.file_name().ok_or_else(invalid)?))
+}
+fn archive_proposal(core: &Core, p: &Proposal) -> Result<()> {
+    let path = proposal_path(core, &p.course_id, &p.id)?;
+    if !path.exists() {
+        return Ok(());
+    }
+    let archive = archive_path(core, &p.course_id, &p.id)?;
+    crate::course_write_transaction::durable_json(&archive, p)?;
+    fs::remove_file(&path).map_err(io)?;
+    fs::File::open(path.parent().ok_or_else(invalid)?)
+        .map_err(io)?
+        .sync_all()
+        .map_err(io)
+}
+// Legacy flat files are migrated on first encounter. Subsequent polls and
+// collision checks visit unresolved proposals only, never the archive tree.
+fn active_proposals(core: &Core, course: &str) -> Result<Vec<Proposal>> {
+    let directory = core.state_dir.join("edit-proposals").join(course);
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(io(e)),
+    };
+    let mut active = vec![];
+    for item in entries {
+        let item = item.map_err(io)?;
+        let name = item.file_name();
+        let Some(id) = name.to_str().and_then(|name| name.strip_suffix(".json")) else {
+            continue;
+        };
+        if !crate::types::valid_id(id) {
+            continue;
+        }
+        let p = read_proposal(core, course, id)?;
+        if matches!(p.status.as_str(), "accepted" | "rejected") {
+            archive_proposal(core, &p)?;
+        } else {
+            active.push(p);
+        }
+    }
+    Ok(active)
+}
+fn settle_decision(engine: &crate::app::Engine, p: &Proposal) -> Result<Value> {
+    let receipt = proposal_receipt(p);
+    let scope = ToolScope {
+        session_id: p.session_id.clone(),
+        section_id: p.section_id.clone(),
+        run_id: p.run_id.clone(),
+        allowed_ids: p.allowed_ids.clone(),
+    };
+    let mut calls = p.call_id.iter().cloned().collect::<Vec<_>>();
+    if calls.is_empty() {
+        // Old proposals predate callId. The native dispatch journal is written
+        // before invoking the handler, including when its future is cancelled.
+        // Match original session, run, exact args and stable operation identity;
+        // never infer identity from the currently selected conversation.
+        let directory = engine
+            .lock()?
+            .state_dir
+            .join("pi-native")
+            .join(hash(&p.session_id));
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => Some(entries),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(io(e)),
+        };
+        if let Some(entries) = entries {
+            for item in entries {
+                let item = item.map_err(io)?;
+                let name = item.file_name();
+                if !name
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("tool-") && name.ends_with(".json"))
+                {
+                    continue;
+                }
+                let record: Value = serde_json::from_slice(&crate::assets::bounded_read(
+                    &item.path(),
+                    128 * 1024,
+                )?)?;
+                if record["version"] != 1
+                    || record["runId"] != p.run_id
+                    || record["name"] != "write"
+                {
+                    continue;
+                }
+                let Some(call) = record["callId"].as_str() else {
+                    continue;
+                };
+                let expected_name = format!(
+                    "tool-{}.json",
+                    hash(&serde_json::to_string(&json!([p.run_id, call]))?)
+                );
+                if name != std::ffi::OsStr::new(&expected_name) {
+                    continue;
+                }
+                let mut args =
+                    json!({"path":p.path,"content":p.content,"expectedVersion":p.expected_version});
+                for omit_null in [false, true] {
+                    if omit_null && p.expected_version.is_none() {
+                        args.as_object_mut().unwrap().remove("expectedVersion");
+                    }
+                    if record["argsHash"] == hash(&serde_json::to_string(&args)?)
+                        && crate::learning_tools::operation_id(
+                            engine, &scope, call, "write", &args,
+                        )?
+                        .0 == p.id
+                    {
+                        calls.push(call.into());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    for call in calls {
+        crate::generation::settle_proposal_activity(engine, &scope, &call, &receipt)?;
+    }
+    Ok(receipt)
 }

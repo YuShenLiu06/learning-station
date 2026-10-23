@@ -279,7 +279,7 @@ pub(crate) fn execute(
     let outcome = (|| {
     let mut result = match name {
         "read" => execute_read(engine, scope, decode::<ReadArgs>(args)?),
-        "write" => execute_write(engine, &state_dir, scope, decode::<WriteArgs>(args)?, &ledger_path),
+        "write" => execute_write(engine, &state_dir, scope, decode::<WriteArgs>(args)?, &ledger_path, call_id),
         "bash" => execute_bash(&state_dir, scope, decode::<BashArgs>(args)?),
         _ => return Err(not_allowed()),
     }?;
@@ -485,11 +485,12 @@ fn execute_write(
     scope: &ToolScope,
     args: WriteArgs,
     ledger_path: &Path,
+    call_id: &str,
 ) -> Result<Value> {
     if args.content.chars().count() > MAX_CONTENT_CHARS {
         return Err(invalid());
     }
-    if let Some(result) = course_write(engine, scope, &args, ledger_path)? {
+    if let Some(result) = course_write(engine, scope, &args, ledger_path, call_id)? {
         return Ok(result);
     }
     if !valid_relative_path(&args.path) { return Err(invalid()); }
@@ -1053,12 +1054,100 @@ mod tests {
         let course = pending["courseId"].as_str().unwrap(); let proposal = pending["proposalId"].as_str().unwrap();
         let receipt = super::proposal_decide(&engine, course, proposal, true).unwrap();
         let path = dir.path().join(format!("state/edit-proposals/{course}/{proposal}.json"));
-        let mut data: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let archived = path.parent().unwrap().join("archive").join(path.file_name().unwrap());
+        let mut data: Value = serde_json::from_slice(&std::fs::read(&archived).unwrap()).unwrap();
         data["status"] = json!("accepting"); data["receipt"] = Value::Null;
         crate::course_write_transaction::durable_json(&path, &data).unwrap();
+        engine.save_ui_preferences(UiPreferences::default()).unwrap();
         assert_eq!(super::proposal_result(&engine, pending.clone()).unwrap(), receipt);
         assert_eq!(super::proposal_decide(&engine, course, proposal, true).unwrap(), receipt);
         assert_eq!(super::proposal_get(&engine, course, proposal).unwrap()["status"], "accepted");
+    }
+
+    #[test]
+    fn proposal_missing_or_mismatched_initial_ledger_never_publishes() {
+        let (dir, engine, scope, id, _) = course_fixture("write");
+        let before = engine.lock().unwrap().content.read(&id).unwrap();
+        let pending = super::execute(&engine, &scope, "missing-ledger", "write", json!({"path":format!("documents/{id}.md"),"content":"Unsafe publication","expectedVersion":before.version})).unwrap();
+        let course = pending["courseId"].as_str().unwrap();
+        let proposal = pending["proposalId"].as_str().unwrap();
+        let ledger = dir.path().join(format!("state/workspaces/{}/receipts/{proposal}.json", scope.session_id));
+        let mut entry: Value = serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
+        std::fs::remove_file(&ledger).unwrap();
+        assert_eq!(super::proposal_decide(&engine, course, proposal, true).unwrap_err().code, "NATIVE_TOOL_UNKNOWN");
+        assert_eq!(engine.lock().unwrap().content.read(&id).unwrap().content, before.content);
+        assert!(!ledger.with_extension("pending").exists());
+        entry["argumentsHash"] = json!("mismatched");
+        crate::course_write_transaction::durable_json(&ledger, &entry).unwrap();
+        assert_eq!(super::proposal_decide(&engine, course, proposal, true).unwrap_err().code, "CONFLICT");
+        assert_eq!(engine.lock().unwrap().content.read(&id).unwrap().content, before.content);
+        assert_eq!(super::proposal_decide(&engine, course, proposal, false).unwrap()["status"], "rejected");
+    }
+
+    #[test]
+    fn proposal_rejection_after_restart_settles_original_session_and_run() {
+        let (dir, engine, scope, id, _) = course_fixture("write");
+        let before = engine.lock().unwrap().content.read(&id).unwrap();
+        let pending = super::execute(&engine, &scope, "cancelled-call", "write", json!({"path":format!("documents/{id}.md"),"content":"Cancelled draft","expectedVersion":before.version})).unwrap();
+        let course = pending["courseId"].as_str().unwrap();
+        let proposal = pending["proposalId"].as_str().unwrap();
+        // Emulate a pre-upgrade proposal and the journal persisted before a
+        // native handler was cancelled while awaiting the user's decision.
+        let path = dir.path().join(format!("state/edit-proposals/{course}/{proposal}.json"));
+        let mut data: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        data.as_object_mut().unwrap().remove("callId");
+        crate::course_write_transaction::durable_json(&path, &data).unwrap();
+        let native = dir.path().join("state/pi-native").join(crate::types::hash(&scope.session_id));
+        std::fs::create_dir_all(&native).unwrap();
+        let name = format!("tool-{}.json", crate::types::hash(&serde_json::to_string(&json!([scope.run_id, "cancelled-call"])).unwrap()));
+        let args = json!({"path":format!("documents/{id}.md"),"content":"Cancelled draft","expectedVersion":before.version});
+        crate::native_session::atomic(&native.join(name), &json!({"version":1,"runId":scope.run_id,"callId":"cancelled-call","name":"write","argsHash":crate::types::hash(&serde_json::to_string(&args).unwrap()),"reply":null})).unwrap();
+        let activity_id = format!("tool_{}", &crate::types::hash(&format!("{}\ncancelled-call", scope.run_id))[..32]);
+        let activity: crate::generation::ToolActivity = serde_json::from_value(json!({"id":activity_id,"toolCallId":activity_id,"runId":scope.run_id,"sessionId":scope.session_id,"name":"write","status":"running","title":"受控写入","summary":"AI 修改待确认，建议已保留，正文未修改。","startedAt":"2026-10-23T00:00:00Z","updatedAt":"2026-10-23T00:00:00Z","persisted":false,"object":null,"errorCode":null})).unwrap();
+        let mut run = crate::generation::get(&engine, &scope.run_id).unwrap();
+        run.status = "cancelled".into();
+        run.tool_calls.push(activity);
+        crate::app::atomic_json(&dir.path().join(format!("state/runs/{}.json", scope.run_id)), &run).unwrap();
+        let other = crate::course_sessions::create(&mut engine.lock().unwrap(), course, "different-active-session").unwrap();
+        let reopened = Engine::new(dir.path().join("library"), dir.path().join("state")).unwrap();
+        super::proposal_decide(&reopened, course, proposal, false).unwrap();
+        let again = Engine::new(dir.path().join("library"), dir.path().join("state")).unwrap();
+        let run = crate::generation::get(&again, &scope.run_id).unwrap();
+        assert_eq!(run.tool_calls.len(), 1);
+        assert_eq!(run.tool_calls[0].status, "succeeded");
+        assert_eq!(run.tool_calls[0].id, activity_id);
+        assert_eq!(run.status, "cancelled");
+        assert!(!run.tool_calls[0].persisted);
+        assert_eq!(run.tool_calls[0].session_id, scope.session_id);
+        let mut core = again.lock().unwrap();
+        let original = crate::sessions::get(&mut core.content, &scope.session_id).unwrap();
+        assert!(original.entries.iter().any(|entry| entry.data.as_ref().is_some_and(|data| data["toolActivity"]["summary"] == "用户已拒绝建议，正文未修改。")));
+        assert!(crate::sessions::get(&mut core.content, &other.id).unwrap().entries.is_empty());
+        drop(core);
+        assert!(super::proposal_list(&again, course).unwrap().as_array().unwrap().is_empty());
+        assert_eq!(super::proposal_get(&again, course, proposal).unwrap()["status"], "rejected");
+        assert_eq!(super::proposal_result(&again, pending).unwrap()["status"], "rejected");
+    }
+
+    #[test]
+    fn proposal_poll_migrates_legacy_terminal_files_and_ignores_archive_contents() {
+        let (dir, engine, scope, _, _) = course_fixture("write");
+        let pending = super::execute(&engine, &scope, "legacy", "write", json!({"path":"legacy.txt","content":"draft"})).unwrap();
+        let course = pending["courseId"].as_str().unwrap(); let id = pending["proposalId"].as_str().unwrap();
+        let path = dir.path().join(format!("state/edit-proposals/{course}/{id}.json"));
+        let mut data: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        data["status"] = json!("rejected");
+        data.as_object_mut().unwrap().remove("callId");
+        crate::course_write_transaction::durable_json(&path, &data).unwrap();
+        assert!(super::proposal_list(&engine, course).unwrap().as_array().unwrap().is_empty());
+        let archive = path.parent().unwrap().join("archive");
+        assert!(!path.exists());
+        assert!(archive.join(format!("{id}.json")).exists());
+        // Malformed history cannot slow down or break active polling/staging.
+        std::fs::write(archive.join("historical.json"), "invalid history").unwrap();
+        assert!(super::proposal_list(&engine, course).unwrap().as_array().unwrap().is_empty());
+        assert_eq!(super::proposal_get(&engine, course, id).unwrap()["status"], "rejected");
+        assert_eq!(super::execute(&engine, &scope, "fresh", "write", json!({"path":"legacy.txt","content":"new"})).unwrap()["status"], "pending");
     }
 
     #[test]
@@ -1397,30 +1486,18 @@ mod tests {
     }
 
     #[test]
-    fn course_write_reports_unknown_when_completion_receipt_cannot_be_saved() {
+    fn course_write_refuses_unreadable_initial_receipt_before_publication() {
         let (dir, engine, scope, _, _) = course_fixture("write");
-        let args = json!({"path":"result.txt","content":"already persisted"});
+        let args = json!({"path":"result.txt","content":"must not publish"});
         let (request, _) = crate::learning_tools::operation_id(&engine,&scope,"receipt-failure","write",&args).unwrap();
         let ledger = dir.path().join(format!("state/workspaces/{}/receipts/{request}.json",scope.session_id));
-        // A directory at the final ledger path deterministically fails atomic
-        // receipt replacement after the actual course material has been saved.
-        let proposal = super::execute(&engine, &scope, "receipt-failure", "write", args.clone()).unwrap();
+        let proposal = super::execute(&engine, &scope, "receipt-failure", "write", args).unwrap();
         std::fs::remove_file(&ledger).unwrap();
         std::fs::create_dir_all(&ledger).unwrap();
         assert_eq!(super::proposal_decide(&engine, proposal["courseId"].as_str().unwrap(), proposal["proposalId"].as_str().unwrap(), true).unwrap_err().code,"NATIVE_TOOL_UNKNOWN");
-        let read = run(&engine,&scope,"read-persisted","read",json!({"path":"result.txt"})).unwrap();
-        assert_eq!(read["content"],"already persisted");
-        assert!(ledger.with_extension("pending").is_file());
-        let call=crate::model::ToolCall{id:"receipt-failure".into(),name:"write".into(),args:args.clone()};
-        let recovery=super::recover(&engine,&scope.session_id,&scope.run_id,&call).unwrap_err();
-        assert_eq!(recovery.code,"NATIVE_TOOL_UNKNOWN");
-        assert!(recovery.message.contains(".learning-write-"));
-        let detail=recovery.details.unwrap();
-        assert_eq!(detail["new"]["exists"],true);
-        assert_eq!(detail["published.json"]["exists"],true);
-        assert!(detail["recoveryPath"].as_str().unwrap().contains(".learning-write-"));
-
-        assert_eq!(run(&engine,&scope,"receipt-failure","write",args).unwrap_err().code,"NATIVE_TOOL_UNKNOWN");
+        assert!(!ledger.with_extension("pending").exists());
+        assert!(!dir.path().join(format!("library/courses/{}/materials/result.txt", proposal["courseId"].as_str().unwrap())).exists());
+        assert_eq!(super::proposal_get(&engine, proposal["courseId"].as_str().unwrap(), proposal["proposalId"].as_str().unwrap()).unwrap()["status"], "pending");
     }
 
     #[test]

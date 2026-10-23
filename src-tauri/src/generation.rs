@@ -1648,25 +1648,62 @@ fn finish_tool_activity(
         }
     }
 }
-fn publish_tool_activity(engine: &Engine, activity: &ToolActivity, sink: &Sink) -> Result<()> {
+pub(crate) fn settle_proposal_activity(
+    engine: &Engine,
+    scope: &crate::learning_tools::ToolScope,
+    call_id: &str,
+    receipt: &Value,
+) -> Result<()> {
+    let mut activity = new_tool_activity(scope, call_id, "write")?;
+    if let Some(previous) = get(engine, &scope.run_id)?
+        .tool_calls
+        .iter()
+        .find(|previous| previous.id == activity.id)
     {
-        let mut core = engine.lock()?;
-        sessions::append(
-            &mut core.content,
-            &activity.session_id,
-            Entry {
-                id: String::new(),
-                kind: "note".into(),
-                content: format!("{}：{}", activity.title, activity.summary),
-                created_at: String::new(),
-                selection: None,
-                related_ids: vec![],
-                data: Some(json!({"origin":"pi-tool-activity","toolActivity":activity})),
-            },
-            None,
-            &format!("{}-{}", activity.id, activity.status),
-        )?;
+        activity.started_at = previous.started_at.clone();
     }
+    finish_tool_activity(&mut activity, scope, &Ok(receipt.clone()));
+    let sink: Sink = Arc::new(|_| {});
+    publish_tool_activity(engine, &activity, &sink)
+}
+
+fn publish_tool_activity(engine: &Engine, activity: &ToolActivity, sink: &Sink) -> Result<()> {
+    // A decision IPC and the waiting handler may both settle the same call.
+    // Reuse the first persisted activity (including timestamps) for idempotency.
+    let mut core = engine.lock()?;
+    let saved = sessions::get(&mut core.content, &activity.session_id)?
+        .entries
+        .into_iter()
+        .filter_map(|entry| {
+            entry.data.and_then(|data| {
+                serde_json::from_value::<ToolActivity>(data["toolActivity"].clone()).ok()
+            })
+        })
+        .find(|previous| previous.id == activity.id && previous.status == activity.status);
+    let activity = match saved.as_ref() {
+        Some(previous)
+            if previous.summary == activity.summary && previous.persisted == activity.persisted =>
+        {
+            previous
+        }
+        _ => activity,
+    };
+    sessions::append(
+        &mut core.content,
+        &activity.session_id,
+        Entry {
+            id: String::new(),
+            kind: "note".into(),
+            content: format!("{}：{}", activity.title, activity.summary),
+            created_at: String::new(),
+            selection: None,
+            related_ids: vec![],
+            data: Some(json!({"origin":"pi-tool-activity","toolActivity":activity})),
+        },
+        None,
+        &format!("{}-{}", activity.id, activity.status),
+    )?;
+    drop(core);
     let mut runs = engine
         .runs
         .lock()
@@ -1687,6 +1724,26 @@ fn publish_tool_activity(engine: &Engine, activity: &ToolActivity, sink: &Sink) 
         let mut update = event(&managed.run, None);
         update.tool = Some(activity.clone());
         (sink)(update);
+    } else {
+        // A decision may arrive after cancellation or after an app restart.
+        // Keep the original run's durable summary in sync as well as its session.
+        let path = run_path(engine, &activity.run_id)?;
+        let mut run: Run =
+            serde_json::from_slice(&crate::assets::bounded_read(&path, 8 * 1024 * 1024)?)?;
+        if run.session_id != activity.session_id {
+            return Err(CoreError::new("CONFLICT", "工具活动与原会话不匹配。"));
+        }
+        if let Some(previous) = run
+            .tool_calls
+            .iter_mut()
+            .find(|item| item.tool_call_id == activity.tool_call_id)
+        {
+            *previous = activity.clone();
+        } else {
+            run.tool_calls.push(activity.clone());
+        }
+        run.updated_at = timestamp();
+        persist(engine, &run)?;
     }
     Ok(())
 }
