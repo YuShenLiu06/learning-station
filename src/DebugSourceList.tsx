@@ -2,18 +2,19 @@ import { useState } from 'react';
 import { ChevronRight, Copy } from 'lucide-react';
 import { DebugJsonView } from './DebugJsonView';
 import { DebugContextContent } from './DebugContextContent';
-import { isCurrentQuestion, currentContextSources, completeContextSources, sourceLabel, sourceValue, sourceRole, sourceRound } from './requestDebug';
+import { isCurrentQuestion, orderedSources, currentContextSources, completeContextSources, sourceLabel, sourceValue, sourceRole, sourceRound } from './requestDebug';
 import type { DebugRecord, DebugSource } from './requestDebug';
-function SourceRow({record,source,index,reading}: {record:DebugRecord;source:DebugSource;index:number;reading?:boolean}) {
+function SourceRow({record,source,index,reading,withFragments}: {record:DebugRecord;source:DebugSource;index:number;reading?:boolean;withFragments?:boolean}) {
   const [copied,setCopied]=useState('');
   const raw=sourceValue(record,source);
+  const fragments=withFragments?orderedSources(record).filter(fragment=>source.path.every((part,index)=>fragment.path[index]===part)):[];
   const inlineDescription=typeof raw==='string'&&!!source.description&&raw.startsWith(source.description+'\n');
   const path=source.path.join(' / ')+(source.start!==undefined?' ['+source.start+','+source.end+')':'');
   async function copy() {try{await navigator.clipboard.writeText(path+(source.sourcePath?'\n'+source.sourcePath:''));setCopied('路径已复制');}catch{setCopied('复制失败，可选中路径复制。');}}
   const initialOpen=reading&&(isCurrentQuestion(record,source)||['focus','changes'].includes(source.registrationKey??'')&&sourceRound(record,source)==='本轮'||source.name==='learning-station-material'&&sourceRound(record,source)==='轮次未定位');
   return <details className={reading?'debug-context-card':'debug-source-row'} open={initialOpen?true:undefined} data-source-key={source.registrationKey}>
     <summary><span className="debug-item-number">{String(index+1).padStart(2,'0')}</span><span className="debug-card-title"><span className={'debug-source-badge '+source.origin}>{sourceLabel(source)}</span><strong>{source.registrationKey??source.name}</strong><span className="debug-source-badge">{sourceRole(record,source)} · {sourceRound(record,source)}</span>{source.origin==='bridge'&&!source.registrationKey&&<span className="debug-source-badge unregistered">未注册</span>}<span className="debug-source-path">{path}</span></span><ChevronRight className="debug-chevron" size={14}/></summary>
-    <div className="debug-context-body">{source.description&&!inlineDescription&&<p className="debug-source-description">{source.description}</p>}<DebugContextContent record={record} source={source} reading={reading}/><div className="debug-source-location">{source.sourcePath&&<code>{source.sourcePath}</code>}{source.runId&&<span>run · {source.runId}</span>}{source.userEntryId&&<span>userEntry · {source.userEntryId}</span>}<button className="quiet-button" onClick={()=>{void copy();}} aria-label={'复制来源路径 '+String(index+1)}><Copy size={12}/>复制路径</button>{copied&&<span role="status">{copied}</span>}</div></div>
+    <div className="debug-context-body">{source.description&&!inlineDescription&&<p className="debug-source-description">{source.description}</p>}<DebugContextContent record={record} source={source} reading={reading}/>{withFragments&&<details className="debug-source-fragments" aria-label={'来源定位 · '+source.path.join('/')}><summary>来源定位 · {fragments.length} 个片段 <ChevronRight className="debug-chevron" size={13}/></summary>{fragments.length?fragments.map((fragment,position)=><SourceRow key={position} record={record} source={fragment} index={position}/>):<p className="debug-notice">此项未记录来源定位，正文仍按完整请求保留。</p>}</details>}<div className="debug-source-location">{source.sourcePath&&<code>{source.sourcePath}</code>}{source.runId&&<span>run · {source.runId}</span>}{source.userEntryId&&<span>userEntry · {source.userEntryId}</span>}<button className="quiet-button" onClick={()=>{void copy();}} aria-label={'复制来源路径 '+String(index+1)}><Copy size={12}/>复制路径</button>{copied&&<span role="status">{copied}</span>}</div></div>
   </details>;
 }
 export function DebugReading({record}: {record:DebugRecord}) {
@@ -25,7 +26,7 @@ export function DebugReading({record}: {record:DebugRecord}) {
 export function DebugSourceList({record}: {record:DebugRecord}) {
   const sources=completeContextSources(record);
   if(!record.complete)return <p className="debug-notice">请求体不完整：{record.omitted}。无法恢复完整上下文。</p>;
-  return <div className="debug-source-layout"><SnapshotDetails record={record}/><div>{sources.length?sources.map((source,index)=><SourceRow key={index} record={record} source={source} index={index}/>):<p className="debug-notice">本请求未记录可识别的 system/messages，请查看原始请求。</p>}
+  return <div className="debug-source-layout"><SnapshotDetails record={record}/><div>{sources.length?sources.map((source,index)=><SourceRow key={index} record={record} source={source} index={index} withFragments/>):<p className="debug-notice">本请求未记录可识别的 system/messages，请查看原始请求。</p>}
     <details className="debug-tools"><summary>工具定义 · tools <ChevronRight className="debug-chevron" size={14}/></summary><DebugJsonView value={(record.body as {tools?:unknown})?.tools??[]} label="工具定义JSON"/></details></div>
   </div>;
 }
