@@ -38,7 +38,7 @@ cwd 与 Node 目录读取参数都不是强隔离：真实锁版 read/Bash 可�
 
 ## 模型及资源
 
-固定显式 ModelRuntime、内存凭据、`modelsPath=null`、禁止模型目录网络刷新。旧会话资源加载器返回空外部扩展/模板/全局指导/Agents文件，应用仅传既有学习指导；课程项目按上节复用原生文本资源。基础工具表为空，精确开放应用任务策略允许的工具；普通聊天与探索（兼容 question/explain）共用完整学习工具集合与每轮6次预算，始终包含 create_review_card/create_error，不以 Skill 加载作为开关。Rust 的策略构建与校验复用同一白名单，Pi 独立校验并注册相同集合；重开会话按当前策略重建工具表。制卡仅保存本地卡片，不能据此宣称同步 Anki；`edit/grep/find/ls/powershell`均不注册。`read/write/bash`仅在本机设置的工具授权档位（off/read/write/bash，默认off，仅question/explain模式）开启后受控注册，随toolPolicy.authorization由Rust下发；参数与结果仍由Rust校验，read只读本轮manifest已授权来源或会话工作区文件，write只写会话工作区（路径/配额/符号链接受限），bash只在会话工作区以受限环境执行（固定PATH、无HOME、超时与输出有上限），write/bash以持久回执台账幂等，恢复只读台账不重执行。Node权限模式不允许创建子进程（bash由Rust进程执行，不经Node）。
+固定显式 ModelRuntime、内存凭据、`modelsPath=null`、禁止模型目录网络刷新。旧会话资源加载器返回空外部扩展/模板/全局指导/Agents文件，应用仅传既有学习指导；课程项目按上节复用原生文本资源。基础工具表为空，精确开放应用任务策略允许的工具；普通聊天与探索（兼容 question/explain）共用完整学习工具集合与每轮6次预算，始终包含 create_review_card/create_error，不以 Skill 加载作为开关。Rust 的策略构建与校验复用同一白名单，Pi 独立校验并注册相同集合；重开会话按当前策略重建工具表。制卡仅保存本地卡片，不能据此宣称同步 Anki；`edit/grep/find/ls/powershell`均不注册。`read/write/bash`仅在本机设置的工具授权档位（off/read/write/bash，默认off，仅question/explain模式）开启后受控注册，随toolPolicy.authorization由Rust下发；参数与结果仍由Rust校验，read只读本轮manifest已授权来源或会话工作区文件，write在课程内写当前课程materials（路径/配额/符号链接受限），无课程时保持会话工作区，bash只在会话工作区以受限环境执行（固定PATH、无HOME、超时与输出有上限），write/bash以持久回执台账幂等，恢复只读台账不重执行。Node权限模式不允许创建子进程（bash由Rust进程执行，不经Node）。
 
 `list_learning_skills`/`load_learning_skill`是仅question/explain/practice模式注册的只读工具，不挂任何授权档位：它们只读随包 `skills/` 固定允许清单（三个稳定id），复用主动快照同一路径校验（根内canonicalize、拒符号链接、16KiB、frontmatter合法），目录仅返回id/名称/描述不含正文，正文经工具结果通道返回且受工具结果预算约束，超出按SKILL_INVALID单工具拒绝。清单外或含路径成分的 id 分别以 TOOL_SCOPE／INVALID_TOOL_INPUT 拒绝，均不触盘。同run重复load同一指导只返回简短提示（含sha256）；该指导已随模式或工具注册注入时返回"已在指导中"，不重复正文；去重台账按run维度挂Rust，新run或该run压缩完成后可重新取正文。ready事件的learningSkills版本回执语义不变，仍只认主动注入快照，按需加载不进入该回执。
 
@@ -93,3 +93,11 @@ read的持久回执只证明原读取，重放或恢复前（包括Node已有原
 本轮 metadata 携带 [Focus v1](focus-v1.md) 的冻结对象，含课程、焦点文档、原来源文档、视图及固定 Git OID。它与本次 nativeMaterials 来自同次冻结；重试沿原 Focus，Pi 仍独占消息/压缩管理。本层不建立材料接收基准。
 
 Focus 的 `metadataOnlySourceIds` 由 Rust 冻结 Context 生成并限制在本轮授权来源内。Pi 排除这些来源此前的自动材料投影，保留普通历史与用户主动引用；后续恢复文本时重新载入真实完整基准。Git binary 判定仅控制自动投影，不替代 read 工具的类型与授权校验。
+
+## 课程工作区写入（#64）
+
+`read.path` / `write.path` 对课程会话以当前课程 `materials/` 为根，拒绝绝对路径、上级路径、隐藏路径和符号链接组件。`documents/<id>.md` 只允许本轮授权的笔记类来源，read返回正文及业务version；write.content只替换正文，保留稳定ID、归属、类型、来源及其他元数据。创建业务笔记仍使用既有学习服务。附件目录和课程/练习元数据不开放raw写入。
+
+普通材料文件可在根下新建，进入既有课程Git变化清单，后续可按path读取；不冒充侧栏业务笔记。支持现有材料类型校验，raw Markdown不得携带有效业务frontmatter。覆盖必须传read返回的`expectedVersion`，新建省略；缺版本覆盖、旧版本、跨课或未授权来源均拒绝。旧无课程请求继续使用原会话工作区。Bash目录不随此次write路由改变。
+
+回执仍在私有session账本中，完成回执重放不检查当前内容也不重写文件。课程写入前持久化intent；有intent而缺完成回执视为unknown，不盲目重放。Git沿既有versioning接口记录材料，不在模型参数中接受仓库或绝对路径。普通路径读返回实时材料版本，sourceId读取继续遵循原冻结manifest契约。

@@ -200,6 +200,8 @@ struct ReadArgs {
 struct WriteArgs {
     path: String,
     content: String,
+    #[serde(default)]
+    expected_version: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -273,7 +275,7 @@ pub(crate) fn execute(
     }
     let mut result = match name {
         "read" => execute_read(engine, scope, decode::<ReadArgs>(args)?),
-        "write" => execute_write(&state_dir, scope, decode::<WriteArgs>(args)?),
+        "write" => execute_write(engine, &state_dir, scope, decode::<WriteArgs>(args)?, &ledger_path),
         "bash" => execute_bash(&state_dir, scope, decode::<BashArgs>(args)?),
         _ => return Err(not_allowed()),
     }?;
@@ -306,7 +308,7 @@ pub(crate) fn validate_read_replay(
     let unchanged = if args.get("sourceId").is_some() {
         current["sourceId"] == receipt["sourceId"] && current["version"] == receipt["version"]
     } else {
-        ["sessionId", "path", "bytes", "content", "truncated"].iter().all(|key| current[key] == receipt[key])
+        ["sessionId", "path", "version", "bytes", "content", "truncated"].iter().all(|key| current[key] == receipt[key])
     };
     if !unchanged {
         return Err(CoreError::new("CONFLICT", "原读取回执与本轮资料版本不一致，请保留原记录后重新提问。"));
@@ -387,6 +389,7 @@ fn execute_read(engine: &crate::app::Engine, scope: &ToolScope, args: ReadArgs) 
         if !valid_relative_path(path) {
             return Err(invalid());
         }
+        if let Some(result) = course_read(engine, scope, path)? { return Ok(result); }
         let files_root = ensure_workspace_files(engine, scope)?;
         let target = resolve_existing(&files_root, path)?;
         let bytes = fs::read(&target).map_err(io)?;
@@ -396,13 +399,22 @@ fn execute_read(engine: &crate::app::Engine, scope: &ToolScope, args: ReadArgs) 
     }
 }
 
+#[path = "course_workspace.rs"]
+mod course_workspace;
+use course_workspace::{course_read, course_write};
+
 fn execute_write(
+    engine: &crate::app::Engine,
     state_dir: &Path,
     scope: &ToolScope,
     args: WriteArgs,
+    ledger_path: &Path,
 ) -> Result<Value> {
     if !valid_relative_path(&args.path) || args.content.chars().count() > MAX_CONTENT_CHARS {
         return Err(invalid());
+    }
+    if let Some(result) = course_write(engine, scope, &args, ledger_path)? {
+        return Ok(result);
     }
     let files_root = ensure_workspace_files_at(state_dir, &scope.session_id)?;
     let target = resolve_for_write(&files_root, &args.path)?;
@@ -899,6 +911,75 @@ mod tests {
     }
 
     use std::sync::Arc;
+
+    #[test]
+    fn course_write_edits_body_with_version_and_keeps_identity_and_receipt() {
+        let (_dir, engine, scope, id, sibling) = course_fixture("write");
+        let path = format!("documents/{id}.md");
+        let read = run(&engine, &scope, "read-body", "read", json!({"path":path})).unwrap();
+        assert!(!read["content"].as_str().unwrap().starts_with("---"));
+        let original = engine.lock().unwrap().content.read(&id).unwrap();
+        // A normal course may already contain a multi-megabyte attachment.
+        // It must not consume the old per-session scratch quota.
+        let material_root = engine.lock().unwrap().content.root().join(&original.path).parent().unwrap().parent().unwrap().to_path_buf();
+        std::fs::write(material_root.join("large.txt"), vec![b'x'; 3 * 1024 * 1024]).unwrap();
+        let args = json!({"path":path,"content":"Updated course body","expectedVersion":read["version"]});
+        let saved = run(&engine, &scope, "edit-body", "write", args.clone()).unwrap();
+        assert_eq!(saved["persisted"], true);
+        let updated = engine.lock().unwrap().content.read(&id).unwrap();
+        assert_eq!(updated.body.trim(), "Updated course body");
+        assert_eq!(updated.metadata.id, original.metadata.id);
+        assert_eq!(updated.metadata.extra["parentId"], original.metadata.extra["parentId"]);
+        assert_ne!(updated.version, original.version);
+        assert_eq!(run(&engine, &scope, "stale-body", "write", args.clone()).unwrap_err().code, "CONFLICT");
+        assert_eq!(run(&engine, &scope, "edit-body", "write", args).unwrap()["replayed"], true);
+        assert_eq!(run(&engine, &scope, "missing-version", "write", json!({"path":path,"content":"overwrite"})).unwrap_err().code, "CONFLICT");
+        assert_eq!(run(&engine, &scope, "cross-course", "write", json!({"path":format!("documents/{sibling}.md"),"content":"x"})).unwrap_err().code, "TOOL_SCOPE");
+        assert_eq!(run(&engine, &scope, "create-record", "write", json!({"path":"documents/forged.md","content":"x"})).unwrap_err().code, "TOOL_SCOPE");
+    }
+
+    #[test]
+    fn course_files_are_readable_versioned_and_unknown_write_never_repeats() {
+        let (dir, engine, scope, _, _) = course_fixture("write");
+        let args = json!({"path":"notes/summary.md","content":"New course material"});
+        let saved = run(&engine, &scope, "new-file", "write", args.clone()).unwrap();
+        let course = saved["courseId"].as_str().unwrap();
+        let host = dir.path().join(format!("library/courses/{course}/materials/notes/summary.md"));
+        assert_eq!(std::fs::read_to_string(&host).unwrap(), "New course material");
+        assert!(!dir.path().join(format!("state/workspaces/{}/files/notes/summary.md",scope.session_id)).exists());
+        let read = run(&engine, &scope, "read-file", "read", json!({"path":"notes/summary.md"})).unwrap();
+        assert_eq!(read["version"], saved["version"]);
+        assert_eq!(read["content"], "New course material");
+        let changes = crate::versioning::all_stat(&mut engine.lock().unwrap(), course, None).unwrap();
+        assert!(changes.iter().any(|change| change.path == "notes/summary.md"));
+        let new_args = json!({"path":"notes/summary.md","content":"Second content","expectedVersion":read["version"]});
+        run(&engine, &scope, "update-file", "write", new_args).unwrap();
+        assert_eq!(run(&engine, &scope, "new-file", "write", args.clone()).unwrap()["replayed"],true);
+        assert_eq!(std::fs::read_to_string(&host).unwrap(), "Second content");
+        // Model retry with the exact original operation cannot execute after
+        // receipt loss, even if the original destination is now absent.
+        let (request_id, _) = crate::learning_tools::operation_id(&engine,&scope,"new-file","write",&args).unwrap();
+        std::fs::remove_file(dir.path().join(format!("state/workspaces/{}/receipts/{request_id}.json",scope.session_id))).unwrap();
+        std::fs::remove_file(&host).unwrap();
+        assert_eq!(run(&engine, &scope, "new-file", "write", args).unwrap_err().code,"NATIVE_TOOL_UNKNOWN");
+        assert!(!host.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn course_paths_reject_symlinks_reserved_paths_and_absolute_paths() {
+        let (dir, engine, scope, _, _) = course_fixture("write");
+        let saved = run(&engine,&scope,"seed","write",json!({"path":"seed.txt","content":"seed"})).unwrap();
+        let root = dir.path().join(format!("library/courses/{}/materials",saved["courseId"].as_str().unwrap()));
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside,root.join("escape")).unwrap();
+        for path in ["escape/new/deep.txt", "../outside.txt", "/tmp/outside.txt", ".git/config", "assets/new.txt"] {
+            assert!(run(&engine,&scope,"invalid-path","write",json!({"path":path,"content":"x"})).is_err(),"{path}");
+        }
+        assert!(!outside.join("new").exists());
+        assert!(!root.join("assets/new.txt").exists());
+    }
 
     #[test]
     fn tier_off_rejects_authorized_tools_without_creating_a_workspace() {

@@ -1547,7 +1547,8 @@ fn validate_tool_call(call: &ToolCall) -> Result<()> {
                 }
             }
             "write" => {
-                if a.keys().any(|k| !["path", "content"].contains(&k.as_str())) {
+                if a.get("expectedVersion").is_some_and(|v| v.as_str().is_none_or(|s| s.is_empty() || s.len() > 128)) { return Err(protocol()); }
+                if a.keys().any(|k| !["path", "content", "expectedVersion"].contains(&k.as_str())) {
                     return Err(protocol());
                 }
                 match (text("path"), text("content")) {

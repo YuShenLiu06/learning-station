@@ -373,10 +373,10 @@ test('authorization tiers add read/write/bash only to question and explain polic
 });
 
 test('workspace tool arguments are shape-validated at the plugin boundary', () => {
-  for (const [name, args] of [['read', { sourceId: 'knowledge_1' }], ['read', { path: 'notes/a.md' }], ['write', { path: 'a.md', content: 'x' }], ['bash', { command: 'printf hi' }], ['bash', { command: 'printf hi', timeoutMs: 1500 }]]) {
+  for (const [name, args] of [['read', { sourceId: 'knowledge_1' }], ['read', { path: 'notes/a.md' }], ['write', { path: 'a.md', content: 'x' }], ['write', { path: 'a.md', content: 'x', expectedVersion: 'version-1' }], ['bash', { command: 'printf hi' }], ['bash', { command: 'printf hi', timeoutMs: 1500 }]]) {
     assert.deepEqual(validateCall('shape-ok', name, args), args);
   }
-  for (const [name, args] of [['read', {}], ['read', { sourceId: 'a', path: 'b' }], ['read', { sourceId: 'ok', extra: 1 }], ['write', { path: 'a.md' }], ['write', { path: '', content: 'x' }], ['bash', { command: '   ' }], ['bash', { command: 'echo', timeoutMs: 100 }], ['bash', { command: 'echo', timeoutMs: 99000 }], ['bash', { command: 'echo', extra: 1 }]]) {
+  for (const [name, args] of [['read', {}], ['read', { sourceId: 'a', path: 'b' }], ['read', { sourceId: 'ok', extra: 1 }], ['write', { path: 'a.md' }], ['write', { path: '', content: 'x' }], ['write', { path: 'a.md', content: 'x', expectedVersion: 1 }], ['write', { path: 'a.md', content: 'x', expectedVersion: '' }], ['bash', { command: '   ' }], ['bash', { command: 'echo', timeoutMs: 100 }], ['bash', { command: 'echo', timeoutMs: 99000 }], ['bash', { command: 'echo', extra: 1 }]]) {
     assert.throws(() => validateCall('shape-bad', name, args), (error) => error.code === 'TOOL_PROTOCOL', `${name} ${JSON.stringify(args)} must be rejected`);
   }
 });
