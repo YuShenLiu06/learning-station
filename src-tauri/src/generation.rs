@@ -2420,7 +2420,6 @@ mod history_audit_tests {
         let question = task_tool_policy("question", "off");
         let explain = task_tool_policy("explain", "off");
         assert_eq!(question.allowed_tools, explain.allowed_tools);
-        assert_eq!(question.max_calls, explain.max_calls);
         for name in ["create_review_card", "create_error", "load_learning_skill"] {
             assert!(question.allowed_tools.contains(&name.into()));
         }

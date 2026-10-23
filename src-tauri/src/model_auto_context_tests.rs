@@ -237,7 +237,6 @@ async fn context_bridge_real_pi_wire_replays_legacy_full_once_per_tool_loop_and_
             ToolPolicy {
                 mode: "question".into(),
                 allowed_tools: vec!["query_related_knowledge".into()],
-                max_calls: 2,
                 authorization: "off".into(),
             },
             crate::learning_skills::capture("question", &["query_related_knowledge".into()])

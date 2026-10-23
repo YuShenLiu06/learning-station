@@ -265,7 +265,6 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
             ToolPolicy {
                 mode: "question".into(),
                 allowed_tools: vec![],
-                max_calls: 0,
                 authorization: "off".into(),
             },
             skills.clone(),

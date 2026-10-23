@@ -173,14 +173,6 @@ impl FrozenMaterials {
                     if !metadata.is_file() {
                         return Err(scope());
                     }
-                    if !crate::assets::material_file_allowed(name) {
-                        frozen.excluded_files.push(ExcludedFile {
-                            asset_id: String::new(),
-                            file_name: relative,
-                            reason: "unsupported_type".into(),
-                        });
-                        continue;
-                    }
                     let bytes = crate::assets::bounded_read(&path, 5 * 1024 * 1024)?;
                     if relative.starts_with("documents/") && crate::content::is_markdown_path(&path)
                     {
@@ -193,8 +185,16 @@ impl FrozenMaterials {
                         {
                             continue;
                         }
-                    } else {
+                    } else if !relative.starts_with("assets/") && std::str::from_utf8(&bytes).is_ok_and(|text| !text.chars().any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))) {
+                        validate_material_text(&bytes)?;
+                    } else if crate::assets::material_file_allowed(name) {
                         crate::assets::inspect(name, &bytes)?;
+                    } else {
+                        frozen.excluded_files.push(ExcludedFile {
+                            asset_id: String::new(), file_name: relative,
+                            reason: "unsupported_type".into(),
+                        });
+                        continue;
                     }
                     remaining = remaining.checked_sub(bytes.len()).ok_or_else(limit)?;
                     frozen.entries.insert(relative, bytes);
@@ -1083,3 +1083,15 @@ mod course_tests;
 
 #[cfg(test)]
 pub(crate) use tests::retry_busy;
+
+/// Raw course text storage is independent of attachment preview types.
+pub(crate) fn validate_material_text(bytes: &[u8]) -> Result<&str> {
+    let text = std::str::from_utf8(bytes).map_err(|_| CoreError::new("UNSUPPORTED_TYPE", "该文件不是UTF-8文本，不能通过文本工具读取或覆盖。"))?;
+    if text.chars().any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t')) {
+        return Err(CoreError::new("UNSUPPORTED_TYPE", "文本含二进制控制字符，未读取或写入。"));
+    }
+    if bytes.len() > 1024 * 1024 {
+        return Err(CoreError::new("TOOL_SIZE_LIMIT", "单份课程文本不得超过1MiB。"));
+    }
+    Ok(text)
+}

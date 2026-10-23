@@ -45,7 +45,7 @@ test('real Pi provider sends every tool turn and labels continuation; no extra m
     res.end(n===1?`data: ${JSON.stringify({choices:[{index:0,delta:{tool_calls:[{index:0,id:'fixture-call',type:'function',function:{name:'query_related_knowledge',arguments:'{"query":"fixture"}'}}]},finish_reason:'tool_calls'}]})}\n\ndata: [DONE]\n\n`:sse('OK'));
   });
   try{
-    const events=[];const request={protocol:1,debugProtocol:true,operation:'generate',apiKey:secret,settings:{provider:'custom',protocol:'openai-completions',baseUrl:server.url,model:'fixture'},messages:[{role:'user',content:'fixture question'}],learningTools:true,toolPolicy:{mode:'explain',authorization:'off',allowedTools:['query_related_knowledge'],maxCalls:6}};
+    const events=[];const request={protocol:1,debugProtocol:true,operation:'generate',apiKey:secret,settings:{provider:'custom',protocol:'openai-completions',baseUrl:server.url,model:'fixture'},messages:[{role:'user',content:'fixture question'}],learningTools:true,toolPolicy:{mode:'explain',authorization:'off',allowedTools:['query_related_knowledge']}};
     const result=await runLearningAgent(request,async e=>events.push(e),{requestTool:async call=>call.type==='debug_probe'?{result:{epoch:1}}:{result:{items:[]}}});
     assert.equal(result.output,'OK');assert.equal(server.packets.length,2);
     const records=events.filter(e=>e.type==='debug_request');assert.equal(records.length,2);

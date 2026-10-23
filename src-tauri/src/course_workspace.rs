@@ -103,20 +103,13 @@ pub(super) fn course_read(
     let Some(course) = course(&mut core, scope)? else {
         return Ok(None);
     };
-    let target = target(&core, &course, path)?;
+    target(&core, &course, path)?;
     let doc = document(&core, scope, &course, path)?;
     let (text, version) = if let Some(doc) = doc {
         (doc.body, doc.version)
     } else {
         let (bytes, version) = crate::versioning::read_versioned(&mut core, &course, path)?;
-        crate::assets::inspect(
-            target
-                .file_name()
-                .and_then(|s| s.to_str())
-                .ok_or_else(invalid)?,
-            &bytes,
-        )?;
-        let text = String::from_utf8(bytes).map_err(|_| invalid())?;
+        let text = crate::material_git::validate_material_text(&bytes)?.to_owned();
         (text, version)
     };
     Ok(Some(read_result(scope, &course, path, &text, &version)?))
@@ -167,14 +160,14 @@ pub(super) fn course_write(
         Some((doc.body.clone(), doc.version.clone()))
     } else if existing.is_some() {
         let (bytes, version) = crate::versioning::read_versioned(&mut core, &course, &args.path)?;
-        Some((String::from_utf8(bytes).map_err(|_| invalid())?, version))
+        Some((crate::material_git::validate_material_text(&bytes)?.to_owned(), version))
     } else {
         None
     };
     if let Some((body, version)) = &baseline {
         if read_result(scope, &course, &args.path, body, version)?["truncated"] == true {
             return Err(CoreError::new(
-                "TOOL_LIMIT",
+                "TOOL_SIZE_LIMIT",
                 "原文件超出完整读取范围，不能用前缀覆盖；请在编辑器中修改，原文件保留。",
             ));
         }
@@ -190,13 +183,7 @@ pub(super) fn course_write(
         if crate::content::parse(&args.content).is_ok() {
             return Err(out_of_scope());
         }
-        crate::assets::inspect(
-            target
-                .file_name()
-                .and_then(|s| s.to_str())
-                .ok_or_else(invalid)?,
-            args.content.as_bytes(),
-        )?;
+        crate::material_git::validate_material_text(args.content.as_bytes())?;
         args.content.clone()
     };
     let operation = ledger

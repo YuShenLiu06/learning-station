@@ -1267,6 +1267,28 @@ mod tests {
     }
 
     #[test]
+    fn course_text_write_accepts_html_and_arbitrary_suffixes_and_keeps_versions() {
+        let (dir, engine, scope, _, _) = course_fixture("write");
+        for (i, path) in ["demo/red-black-tree-demo.html", "demo/source.unlisted", "demo/README"].iter().enumerate() {
+            let original = "<!doctype html><title>原文</title>";
+            let args = json!({"path":path,"content":original});
+            let saved = run(&engine, &scope, &format!("suffix-create-{i}"), "write", args.clone()).unwrap();
+            assert_eq!(saved["persisted"], true);
+            let changes = crate::versioning::all_stat(&mut engine.lock().unwrap(), saved["courseId"].as_str().unwrap(), None).unwrap();
+            assert!(changes.iter().any(|change| change.path == *path));
+            let read = run(&engine, &scope, &format!("suffix-read-{i}"), "read", json!({"path":path})).unwrap();
+            assert_eq!(read["content"], original);
+            assert_eq!(read["version"], saved["version"]);
+            let update = json!({"path":path,"content":"updated UTF-8 正文","expectedVersion":read["version"]});
+            run(&engine, &scope, &format!("suffix-update-{i}"), "write", update).unwrap();
+            assert_eq!(run(&engine, &scope, &format!("suffix-stale-{i}"), "write", json!({"path":path,"content":"stale","expectedVersion":read["version"]})).unwrap_err().code, "CONFLICT");
+            assert_eq!(run(&engine, &scope, &format!("suffix-create-{i}"), "write", args).unwrap()["replayed"], true);
+            let host = dir.path().join(format!("library/courses/{}/materials/{path}", saved["courseId"].as_str().unwrap()));
+            assert_eq!(std::fs::read_to_string(host).unwrap(), "updated UTF-8 正文");
+        }
+    }
+
+    #[test]
     fn course_write_reports_unknown_when_completion_receipt_cannot_be_saved() {
         let (dir, engine, scope, _, _) = course_fixture("write");
         let args = json!({"path":"result.txt","content":"already persisted"});
@@ -1320,7 +1342,7 @@ mod tests {
             assert_eq!(read["truncated"],true);
             let args=json!({"path":path,"content":"prefix","expectedVersion":read["version"]});
             let (request,_) = crate::learning_tools::operation_id(&engine,&scope,"truncate-write","write",&args).unwrap();
-            assert_eq!(run(&engine,&scope,"truncate-write","write",args).unwrap_err().code,"TOOL_LIMIT");
+            assert_eq!(run(&engine,&scope,"truncate-write","write",args).unwrap_err().code,"TOOL_SIZE_LIMIT");
             assert_eq!(std::fs::read(root.join(&path)).unwrap(),before);
             assert!(!dir.path().join(format!("state/workspaces/{}/receipts/{request}.pending",scope.session_id)).exists());
         }

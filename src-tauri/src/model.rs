@@ -23,7 +23,6 @@ use tokio::{
 const MAX_OUTPUT: usize = 1024 * 1024;
 const MAX_LINE: usize = 6 * MAX_OUTPUT + 4096;
 const MAX_CONFIG: u64 = 16 * 1024;
-const MAX_TOOL_CALLS: usize = 8;
 const MAX_TOOL_BYTES: usize = 32 * 1024;
 const ALL_TOOLS: &[&str] = &[
     "record_question",
@@ -238,7 +237,6 @@ pub type ToolHandler =
 pub struct ToolPolicy {
     pub mode: String,
     pub allowed_tools: Vec<String>,
-    pub max_calls: usize,
     /// User-selected authorization tier carried from local preferences; the
     /// model side never supplies or raises it.
     #[serde(default = "default_authorization")]
@@ -266,36 +264,27 @@ impl ToolPolicy {
             } else {
                 vec![]
             },
-            max_calls: if enabled { 8 } else { 0 },
             authorization: "off".into(),
         }
     }
 }
 // question/explain are compatibility labels for the same interactive task.
 // Keep task construction and validation on one Rust allowlist.
-fn task_tools(mode: &str) -> Result<(&'static [&'static str], usize)> {
+fn task_tools(mode: &str) -> Result<&'static [&'static str]> {
     Ok(match mode {
-        "question" | "explain" => (ALL_TOOLS, 6),
-        "practice" => (
-            &[
-                "query_related_knowledge",
-                "list_learning_skills",
-                "load_learning_skill",
-            ],
-            2,
-        ),
-        "review" => (&["query_related_knowledge"], 2),
-        "feedback" | "grading" => (&[], 0),
-        "legacy" => (&ALL_TOOLS[..3], 8),
+        "question" | "explain" => ALL_TOOLS,
+        "practice" => &["query_related_knowledge", "list_learning_skills", "load_learning_skill"],
+        "review" => &["query_related_knowledge"],
+        "feedback" | "grading" => &[],
+        "legacy" => &ALL_TOOLS[..3],
         _ => return Err(sidecar_error("TOOL_PROTOCOL")),
     })
 }
 pub(crate) fn task_tool_policy(mode: &str, authorization: &str) -> ToolPolicy {
-    let (names, max_calls) = task_tools(mode).unwrap_or((&[], 0));
+    let names = task_tools(mode).unwrap_or(&[]);
     let mut policy = ToolPolicy {
         mode: mode.into(),
         allowed_tools: names.iter().map(|name| (*name).into()).collect(),
-        max_calls,
         authorization: authorization.into(),
     };
     if matches!(mode, "question" | "explain") {
@@ -308,19 +297,17 @@ pub(crate) fn task_tool_policy(mode: &str, authorization: &str) -> ToolPolicy {
     policy
 }
 fn validate_tool_policy(policy: &ToolPolicy, has_handler: bool) -> Result<()> {
-    let (allowed, maximum) = task_tools(&policy.mode)?;
+    let allowed = task_tools(&policy.mode)?;
     let authorized = authorization_tools(&policy.authorization)?;
     // Tier tools ride on top of the interactive exploration modes only.
     let tier_applies = matches!(policy.mode.as_str(), "question" | "explain");
     let unique: std::collections::BTreeSet<_> = policy.allowed_tools.iter().collect();
-    if policy.max_calls > maximum
-        || policy.max_calls > MAX_TOOL_CALLS
-        || unique.len() != policy.allowed_tools.len()
+    if unique.len() != policy.allowed_tools.len()
         || policy.allowed_tools.iter().any(|name| {
             !allowed.contains(&name.as_str())
                 && !(tier_applies && authorized.contains(&name.as_str()))
         })
-        || (!policy.allowed_tools.is_empty() && (policy.max_calls == 0 || !has_handler))
+        || (!policy.allowed_tools.is_empty() && !has_handler)
     {
         return Err(sidecar_error("TOOL_PROTOCOL"));
     }
@@ -1133,8 +1120,6 @@ async fn run_sidecar(
         let mut settled = false;
         let mut final_content = None;
         let mut had_response = false;
-        let mut tool_attempts = 0usize;
-        let mut material_change_requests = 0usize;
         let mut output_validations = 0usize;
         let mut tool_cache: std::collections::BTreeMap<String, (String, Value)> =
             std::collections::BTreeMap::new();
@@ -1249,8 +1234,6 @@ async fn run_sidecar(
                         on_delta(text);
                     }
                     Some("material_changes") if ready && !settled => {
-                        material_change_requests += 1;
-                        if material_change_requests > 8 { return Err(sidecar_error("TOOL_LIMIT")); }
                         let handler=request_context.material_changes.as_ref().ok_or_else(||sidecar_error("TOOLS_DISABLED"))?;
                         let id=event["id"].as_str().filter(|s|crate::types::valid_id(s)).ok_or_else(||sidecar_error("TOOL_PROTOCOL"))?;
                         let previous=match &event["baseCommitOid"] {Value::Null=>None,Value::String(oid)=>Some(oid.clone()),_=>return Err(sidecar_error("TOOL_PROTOCOL"))};
@@ -1270,7 +1253,6 @@ async fn run_sidecar(
                     Some("tool_recover") if !settled => {
                         let native=request_context.native_session.as_ref().ok_or_else(||sidecar_error("TOOLS_DISABLED"))?;
                         let recovery=request_context.tool_recovery.as_ref().ok_or_else(||sidecar_error("NATIVE_TOOL_UNKNOWN"))?;
-                        tool_attempts+=1;if tool_attempts>MAX_TOOL_CALLS{return Err(sidecar_error("TOOL_LIMIT"));}
                         let original=event["recoveryRunId"].as_str().ok_or_else(||sidecar_error("TOOL_PROTOCOL"))?;
                         if !crate::types::valid_id(original){return Err(sidecar_error("TOOL_PROTOCOL"));}
                         let call=ToolCall{id:event["id"].as_str().unwrap_or_default().into(),name:event["name"].as_str().unwrap_or_default().into(),args:event["args"].clone()};
@@ -1293,7 +1275,7 @@ async fn run_sidecar(
                     }
                     Some("validate_output") if ready && !settled && policy.mode == "practice" => {
                         output_validations += 1;
-                        if output_validations > 3 { return Err(sidecar_error("TOOL_LIMIT")); }
+                        if output_validations > 3 { return Err(sidecar_error("OUTPUT_VALIDATION_LIMIT")); }
                         let validator = request_context.output_validator.as_ref().ok_or_else(|| sidecar_error("TOOLS_DISABLED"))?;
                         let id = event["id"].as_str().filter(|s| crate::types::valid_id(s)).ok_or_else(|| sidecar_error("TOOL_PROTOCOL"))?;
                         let content = event["content"].as_str().filter(|s| s.len() <= 256*1024).ok_or_else(|| sidecar_error("OUTPUT_LIMIT"))?;
@@ -1320,10 +1302,6 @@ async fn run_sidecar(
                             .as_ref()
                             .ok_or_else(|| sidecar_error("TOOLS_DISABLED"))?;
                         had_response = true;
-                        tool_attempts += 1;
-                        if tool_attempts > policy.max_calls || tool_attempts > MAX_TOOL_CALLS {
-                            return Err(sidecar_error("TOOL_LIMIT"));
-                        }
                         let call = ToolCall {
                             id: event
                                 .get("id")
@@ -1379,7 +1357,7 @@ async fn run_sidecar(
                                 .len()
                                 > MAX_TOOL_BYTES
                             {
-                                return Err(sidecar_error("TOOL_LIMIT"));
+                                return Err(sidecar_error("TOOL_SIZE_LIMIT"));
                             }
                             tool_cache.insert(call.id.clone(), (identity, reply.clone()));
                             reply
@@ -1465,6 +1443,9 @@ async fn run_sidecar(
     result
 }
 fn validate_tool_call(call: &ToolCall) -> Result<()> {
+    if serde_json::to_vec(&call.args)?.len() > MAX_TOOL_BYTES {
+        return Err(sidecar_error("TOOL_SIZE_LIMIT"));
+    }
     if call.id.is_empty() || call.id.chars().count() > 256 || call.id.chars().any(char::is_control)
     {
         return Err(sidecar_error("TOOL_PROTOCOL"));
@@ -1510,7 +1491,6 @@ fn validate_tool_call(call: &ToolCall) -> Result<()> {
             || a.get("exercises")
                 .and_then(Value::as_array)
                 .is_none_or(|a| a.is_empty() || a.len() > 5)
-            || serde_json::to_vec(&call.args)?.len() > MAX_TOOL_BYTES
         {
             return Err(sidecar_error("TOOL_PROTOCOL"));
         }
@@ -1523,9 +1503,6 @@ fn validate_tool_call(call: &ToolCall) -> Result<()> {
             .args
             .as_object()
             .ok_or_else(|| sidecar_error("TOOL_PROTOCOL"))?;
-        if serde_json::to_vec(&call.args)?.len() > MAX_TOOL_BYTES {
-            return Err(sidecar_error("TOOL_LIMIT"));
-        }
         let text = |key: &str| a.get(key).and_then(Value::as_str);
         let protocol = || sidecar_error("TOOL_PROTOCOL");
         match call.name.as_str() {
@@ -1619,13 +1596,6 @@ fn validate_tool_call(call: &ToolCall) -> Result<()> {
         .args
         .as_object()
         .ok_or_else(|| sidecar_error("TOOL_PROTOCOL"))?;
-    if serde_json::to_vec(&call.args)
-        .map_err(|_| sidecar_error("TOOL_PROTOCOL"))?
-        .len()
-        > MAX_TOOL_BYTES
-    {
-        return Err(sidecar_error("TOOL_LIMIT"));
-    }
     for (key, value) in args {
         let (_, limit) = fields
             .iter()
@@ -1901,7 +1871,8 @@ fn sidecar_error(code: &str) -> CoreError {
             "OUTPUT_LIMIT",
             "模型输出超过限制，已停止；已收到的内容已保留。",
         ),
-        "TOOL_LIMIT" => ("TOOL_LIMIT", "学习工具调用超过本次预算，已停止。"),
+        "OUTPUT_VALIDATION_LIMIT" => ("OUTPUT_VALIDATION_LIMIT", "练习输出校验修正次数已用尽。"),
+        "TOOL_SIZE_LIMIT" => ("TOOL_SIZE_LIMIT", "学习工具参数或结果超过容量限制。"),
         "LIMIT_EXCEEDED" => ("LIMIT_EXCEEDED", "完整材料变化及必要正文超过发送容量；未截断，原问题与版本保留。"),
         "CONTEXT_CONFLICT" => ("CONTEXT_CONFLICT", "聚焦正文与固定材料类型不一致，正文未发送；请保留原问题并重新核对聚焦材料。"),
         "TIME_CONTEXT_INVALID" => ("TIME_CONTEXT_INVALID","请求时间或时区无效，未发送模型请求。"),
@@ -2558,7 +2529,6 @@ mod tests {
             ToolPolicy {
                 mode: "question".into(),
                 allowed_tools: allowed.clone(),
-                max_calls: 4,
                 authorization: "write".into(),
             },
             crate::learning_skills::capture("question", &allowed).unwrap(),
@@ -2682,7 +2652,13 @@ mod tests {
                         {"index":2,"id":"actual-knowledge-1","type":"function","function":{"name":"query_related_knowledge","arguments":serde_json::to_string(&json!({"query":"Since"})).unwrap()}},
                         {"index":3,"id":"actual-card-1","type":"function","function":{"name":"create_review_card","arguments":serde_json::to_string(&json!({"front":"What does since mark?","back":"A starting point.","tags":["since"]})).unwrap()}},
                         {"index":4,"id":"actual-note-1","type":"function","function":{"name":"create_note","arguments":serde_json::to_string(&json!({"content":"Since gives a starting point; for gives a duration.","selection":"since Monday"})).unwrap()}},
-                        {"index":5,"id":"actual-todo-1","type":"function","function":{"name":"create_todo","arguments":serde_json::to_string(&json!({"title":"复习 since 与 for","dueAt":"2000-01-01T08:00:00+08:00"})).unwrap()}}
+                        {"index":5,"id":"actual-todo-1","type":"function","function":{"name":"create_todo","arguments":serde_json::to_string(&json!({"title":"复习 since 与 for","dueAt":"2000-01-01T08:00:00+08:00"})).unwrap()}},
+                        {"index":6,"id":"extra-query-6","type":"function","function":{"name":"query_related_knowledge","arguments":serde_json::to_string(&json!({"query":"Since 6"})).unwrap()}},
+                        {"index":7,"id":"extra-query-7","type":"function","function":{"name":"query_related_knowledge","arguments":serde_json::to_string(&json!({"query":"Since 7"})).unwrap()}},
+                        {"index":8,"id":"extra-query-8","type":"function","function":{"name":"query_related_knowledge","arguments":serde_json::to_string(&json!({"query":"Since 8"})).unwrap()}},
+                        {"index":9,"id":"extra-query-9","type":"function","function":{"name":"query_related_knowledge","arguments":serde_json::to_string(&json!({"query":"Since 9"})).unwrap()}},
+                        {"index":10,"id":"extra-query-10","type":"function","function":{"name":"query_related_knowledge","arguments":serde_json::to_string(&json!({"query":"Since 10"})).unwrap()}},
+                        {"index":11,"id":"extra-query-11","type":"function","function":{"name":"query_related_knowledge","arguments":serde_json::to_string(&json!({"query":"Since 11"})).unwrap()}}
                     ]},"finish_reason":null}]});
                     format!("data: {first}\n\ndata: {call}\n\ndata: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n")
                 } else {
@@ -2692,7 +2668,7 @@ mod tests {
                         .iter()
                         .filter(|message| message["role"] == "tool")
                         .collect();
-                    assert_eq!(result_messages.len(), 6);
+                    assert_eq!(result_messages.len(), 12);
                     let receipts: Vec<Value> = result_messages
                         .iter()
                         .map(|message| {
@@ -2783,7 +2759,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             |delta| partial.push_str(delta),
             Some(handler.clone()),
-            ToolPolicy { mode:"explain".into(), allowed_tools: ALL_TOOLS.iter().map(|name| (*name).into()).collect(), max_calls:6, authorization:"off".into() },
+            ToolPolicy { mode:"explain".into(), allowed_tools: ALL_TOOLS.iter().map(|name| (*name).into()).collect(), authorization:"off".into() },
             crate::learning_skills::capture("explain", &ALL_TOOLS.iter().map(|name| (*name).into()).collect::<Vec<String>>()).unwrap(),
             None,
         )
@@ -2871,10 +2847,10 @@ mod tests {
         );
     }
     #[test]
-    fn mode_tool_policy_rejects_cross_mode_tools_and_excess_budget() {
-        for (mode, allowed, maximum) in [
-            ("question", ALL_TOOLS.to_vec(), 6),
-            ("explain", ALL_TOOLS.to_vec(), 6),
+    fn mode_tool_policy_rejects_cross_mode_tools_and_missing_handler() {
+        for (mode, allowed) in [
+            ("question", ALL_TOOLS.to_vec()),
+            ("explain", ALL_TOOLS.to_vec()),
             (
                 "practice",
                 vec![
@@ -2882,27 +2858,25 @@ mod tests {
                     "list_learning_skills",
                     "load_learning_skill",
                 ],
-                2,
             ),
-            ("review", vec!["query_related_knowledge"], 2),
-            ("feedback", vec![], 0),
-            ("grading", vec![], 0),
+            ("review", vec!["query_related_knowledge"]),
+            ("feedback", vec![]),
+            ("grading", vec![]),
         ] {
-            let mut policy = ToolPolicy {
+            let policy = ToolPolicy {
                 mode: mode.into(),
                 allowed_tools: allowed.into_iter().map(str::to_owned).collect(),
-                max_calls: maximum,
                 authorization: "off".into(),
             };
             assert!(validate_tool_policy(&policy, true).is_ok());
-            policy.max_calls += 1;
-            assert!(validate_tool_policy(&policy, true).is_err());
+            if !policy.allowed_tools.is_empty() {
+                assert!(validate_tool_policy(&policy, false).is_err());
+            }
         }
         assert!(validate_tool_policy(
             &ToolPolicy {
                 mode: "practice".into(),
                 allowed_tools: vec!["create_review_card".into()],
-                max_calls: 2,
                 authorization: "off".into()
             },
             true
@@ -2914,7 +2888,6 @@ mod tests {
         let policy = |mode: &str, tools: &[&str], authorization: &str| ToolPolicy {
             mode: mode.into(),
             allowed_tools: tools.iter().map(|name| (*name).to_owned()).collect(),
-            max_calls: 4,
             authorization: authorization.into(),
         };
         assert!(validate_tool_policy(&policy("question", &["read"], "read"), true).is_ok());
@@ -3027,7 +3000,7 @@ mod tests {
             name: "record_question".into(),
             args: json!({"question":"中".repeat(8000),"selection":"文".repeat(4000)}),
         };
-        assert_eq!(validate_tool_call(&large).unwrap_err().code, "TOOL_LIMIT");
+        assert_eq!(validate_tool_call(&large).unwrap_err().code, "TOOL_SIZE_LIMIT");
     }
     #[tokio::test]
     async fn tool_handler_is_not_invoked_when_production_usage_is_blocked() {

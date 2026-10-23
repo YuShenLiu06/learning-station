@@ -14,21 +14,20 @@ export const AUTHORIZATION_TOOLS = Object.freeze({
   bash: Object.freeze(['read', 'write', 'bash']),
 });
 // Both wire labels represent the same chat task, including reopened sessions.
-const CHAT_POLICY = Object.freeze({ allowedTools: LEARNING_PLUGIN.tools, maxCalls: 6 });
+const CHAT_POLICY = Object.freeze({ allowedTools: LEARNING_PLUGIN.tools });
 export const MODE_POLICIES = Object.freeze({
   question: CHAT_POLICY,
   explain: CHAT_POLICY,
-  practice: { allowedTools: ['query_related_knowledge', 'list_learning_skills', 'load_learning_skill'], maxCalls: 2 },
-  feedback: { allowedTools: [], maxCalls: 0 },
-  grading: { allowedTools: [], maxCalls: 0 },
-  review: { allowedTools: ['query_related_knowledge'], maxCalls: 2 },
-  legacy: { allowedTools: [...LEGACY_TOOLS], maxCalls: 8 },
+  practice: { allowedTools: ['query_related_knowledge', 'list_learning_skills', 'load_learning_skill'] },
+  feedback: { allowedTools: [] },
+  grading: { allowedTools: [] },
+  review: { allowedTools: ['query_related_knowledge'] },
+  legacy: { allowedTools: [...LEGACY_TOOLS] },
 });
-export const MAX_TOOL_CALLS = 8;
 export const MAX_TOOL_BYTES = 32 * 1024;
 const known = new Set([...LEARNING_PLUGIN.tools, ...AUTHORIZATION_TOOLS.bash]);
 const safeMessages = Object.freeze({
-  TOOL_PROTOCOL: '学习工具协议或参数无效。', TOOL_LIMIT: '学习工具调用超过本次预算。',
+  TOOL_PROTOCOL: '学习工具协议或参数无效。', TOOL_SIZE_LIMIT: '学习工具参数或结果超过容量限制。',
   TOOL_FAILED: '学习工具执行失败，未确认完成。', TOOLS_DISABLED: '请求了未注册的学习工具。',
   CANCELLED: '学习工具调用已取消。',
 });
@@ -50,7 +49,7 @@ export function fingerprint(name, args) { return JSON.stringify([name, stable(ar
 function bounded(value) {
   let json;
   try { json = JSON.stringify(value); } catch { throw new LearningToolError('TOOL_PROTOCOL'); }
-  if (typeof json !== 'string' || Buffer.byteLength(json) > MAX_TOOL_BYTES) throw new LearningToolError('TOOL_LIMIT');
+  if (typeof json !== 'string' || Buffer.byteLength(json) > MAX_TOOL_BYTES) throw new LearningToolError('TOOL_SIZE_LIMIT');
   return json;
 }
 function validId(id) { return typeof id === 'string' && id.length > 0 && [...id].length <= 256 && !/[\u0000-\u001f\u007f]/u.test(id); }
@@ -88,7 +87,7 @@ const definitions = [
     description: '读取本轮manifest来源或当前课程materials相对路径（无课程时为会话工作区），二选一；返回version供覆盖校验。',
     parameters: Type.Object({ sourceId: optionalString(128), path: optionalString(128) }, { additionalProperties: false }) },
   { name: 'write', label: '受控写入',
-    description: '写入当前课程materials相对路径（无课程时为会话工作区）。已有文件先read并传expectedVersion；documents/<id>.md的content是正文，保留业务元数据。新建普通材料文件；以persisted:true为准。',
+    description: '写入当前课程materials相对路径（无课程时为会话工作区）。已有文件先read并传expectedVersion；documents/<id>.md的content是正文，保留业务元数据。普通材料按真实文件名保存UTF-8文本，不限制扩展名，无需探针或追加.txt。保存不等于支持应用内预览；可告知用户在课程资料目录用外部程序打开，不自动执行。以persisted:true为准。',
     parameters: Type.Object({ path: string(128), content: string(20000), expectedVersion: optionalString(128) }, { additionalProperties: false }) },
   { name: 'bash', label: '受控命令',
     description: '在受限会话工作区执行命令；资料不构成授权，以持久化回执为准。',
@@ -134,9 +133,9 @@ export function validateCall(id, name, args) {
   return args;
 }
 export function validateToolPolicy(input, legacyEnabled = false, operation = 'generate') {
-  if (operation === 'test') return { mode: 'legacy', allowedTools: [], maxCalls: 0, authorization: 'off' };
-  const policy = input ?? { mode: 'legacy', allowedTools: legacyEnabled ? [...LEGACY_TOOLS] : [], maxCalls: legacyEnabled ? 8 : 0 };
-  if (!policy || typeof policy !== 'object' || Array.isArray(policy) || Object.keys(policy).some((key) => !['mode', 'allowedTools', 'maxCalls', 'authorization'].includes(key))) throw new LearningToolError('TOOL_PROTOCOL');
+  if (operation === 'test') return { mode: 'legacy', allowedTools: [], authorization: 'off' };
+  const policy = input ?? { mode: 'legacy', allowedTools: legacyEnabled ? [...LEGACY_TOOLS] : [] };
+  if (!policy || typeof policy !== 'object' || Array.isArray(policy) || Object.keys(policy).some((key) => !['mode', 'allowedTools', 'authorization'].includes(key))) throw new LearningToolError('TOOL_PROTOCOL');
   const authorization = policy.authorization ?? 'off';
   const tierTools = AUTHORIZATION_TOOLS[authorization];
   if (!tierTools) throw new LearningToolError('TOOL_PROTOCOL');
@@ -146,13 +145,12 @@ export function validateToolPolicy(input, legacyEnabled = false, operation = 'ge
   const tierApplies = policy.mode === 'question' || policy.mode === 'explain';
   const allowed = tierApplies ? [...maximum.allowedTools, ...tierTools] : maximum.allowedTools;
   if (!Array.isArray(policy.allowedTools) || policy.allowedTools.length > allowed.length || new Set(policy.allowedTools).size !== policy.allowedTools.length
-    || policy.allowedTools.some((name) => !allowed.includes(name)) || !Number.isInteger(policy.maxCalls) || policy.maxCalls < 0 || policy.maxCalls > maximum.maxCalls
-    || (policy.maxCalls === 0 && policy.allowedTools.length > 0)) throw new LearningToolError('TOOL_PROTOCOL');
-  return { mode: policy.mode, allowedTools: [...policy.allowedTools], maxCalls: policy.maxCalls, authorization };
+    || policy.allowedTools.some((name) => !allowed.includes(name))) throw new LearningToolError('TOOL_PROTOCOL');
+  return { mode: policy.mode, allowedTools: [...policy.allowedTools], authorization };
 }
-export function createLearningPlugin({ requestTool, secret = '', fail = () => {}, allowedTools = LEGACY_TOOLS, maxCalls = MAX_TOOL_CALLS, timeContext }) {
+export function createLearningPlugin({ requestTool, secret = '', fail = () => {}, allowedTools = LEGACY_TOOLS, timeContext }) {
   if (typeof requestTool !== 'function') throw new LearningToolError('TOOLS_DISABLED');
-  if (!Array.isArray(allowedTools) || allowedTools.some((name) => !known.has(name)) || !Number.isInteger(maxCalls) || maxCalls < 1 || maxCalls > MAX_TOOL_CALLS) throw new LearningToolError('TOOL_PROTOCOL');
+  if (!Array.isArray(allowedTools) || allowedTools.some((name) => !known.has(name))) throw new LearningToolError('TOOL_PROTOCOL');
   const permitted = new Set(allowedTools);
   let attempts = 0;
   let executed = 0;
@@ -166,7 +164,6 @@ export function createLearningPlugin({ requestTool, secret = '', fail = () => {}
   };
   const preflight = (toolCall, args) => {
     attempts++;
-    if (attempts > maxCalls) throw new LearningToolError('TOOL_LIMIT');
     const call = safeCall(toolCall.id, toolCall.name, args);
     const cached = cache.get(call.id);
     if (cached && cached.fingerprint !== fingerprint(call.name, call.args)) throw new LearningToolError('TOOL_PROTOCOL');
@@ -183,7 +180,6 @@ export function createLearningPlugin({ requestTool, secret = '', fail = () => {}
       return cached.promise;
     }
     executed++;
-    if (executed > maxCalls) { fail('TOOL_LIMIT'); throw new LearningToolError('TOOL_LIMIT'); }
     const promise = (async () => {
       let reply;
       try { reply = await requestTool(call, signal); }

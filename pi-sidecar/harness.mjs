@@ -41,7 +41,7 @@ export const SAFE_MESSAGES = Object.freeze({
   OUTPUT_LIMIT: '模型输出超过限制，已停止；已收到的内容已保留。',
   LIMIT_EXCEEDED: '完整材料变化及必要正文超过发送容量；未截断，原问题与版本保留。',
   CONTEXT_CONFLICT: '聚焦正文与固定材料类型不一致，正文未发送；请保留原问题并重新核对聚焦材料。',
-  TOOL_LIMIT: '学习工具调用超过本次预算，已停止。',
+  TOOL_SIZE_LIMIT: '学习工具参数或结果超过容量限制。',
   TOOL_PROTOCOL: '学习工具协议或参数无效，已停止。',
   TOOL_FAILED: '学习工具执行失败，未确认完成。',
   TOOLS_DISABLED: '模型请求了未启用的工具，已停止本次生成。',
@@ -281,7 +281,7 @@ export async function runLearningAgent(request, emit, { signal, streamFn: fixtur
   const toolsEnabled = policy.allowedTools.length > 0 && request.learningTools === true && request.operation === 'generate' && typeof requestTool === 'function';
   if (policy.allowedTools.length > 0 && !toolsEnabled) throw new SafeError('TOOLS_DISABLED');
   const permitted = new Set(policy.allowedTools);
-  const plugin = toolsEnabled ? createLearningPlugin({ requestTool:(...args)=>native?native.requestTool(...args):requestTool(...args), secret: request.apiKey, fail, allowedTools: policy.allowedTools, maxCalls: policy.maxCalls, timeContext }) : undefined;
+  const plugin = toolsEnabled ? createLearningPlugin({ requestTool:(...args)=>native?native.requestTool(...args):requestTool(...args), secret: request.apiKey, fail, allowedTools: policy.allowedTools, timeContext }) : undefined;
   const filtered = new SecretFilter(request.apiKey);
   let output = '';
   let rawOutput = '';
@@ -290,7 +290,6 @@ export async function runLearningAgent(request, emit, { signal, streamFn: fixtur
   let finalText = '';
   let completedAssistant;
   let sawAgentEnd = false;
-  let modelToolCalls = 0;
   const sendText = async (text) => {
     if (Buffer.byteLength(output) + Buffer.byteLength(text) > MAX_OUTPUT) { fail('OUTPUT_LIMIT'); return; }
     output += text;
@@ -367,8 +366,6 @@ export async function runLearningAgent(request, emit, { signal, streamFn: fixtur
     if (event.type === 'message_end' && event.message.role === 'assistant') {
       completedAssistant = event.message;
       const calls = event.message.content.filter((part) => part.type === 'toolCall');
-      modelToolCalls += calls.length;
-      if (modelToolCalls > policy.maxCalls) fail('TOOL_LIMIT');
       for (const call of calls) {
         if (!plugin || !permitted.has(call.name)) { fail('TOOLS_DISABLED'); break; }
         try { plugin.validate(call); } catch (error) {
