@@ -182,11 +182,12 @@ async fn context_bridge_real_pi_wire_replays_legacy_full_once_per_tool_loop_and_
         assert!(json.get("manifest").is_none());
         assert!(json.get("turnState").is_none());
         assert!(parts[0]["value"]["referenceTime"].as_str().is_some());
+        let materials = &parts.iter().find(|part| part["key"] == "materials").unwrap()["value"];
         if round == 3 {
-            failed_projection = parts[2]["value"].to_string();
+            failed_projection = materials.to_string();
         }
         if round == 4 {
-            assert_eq!(parts[2]["value"].to_string(), failed_projection);
+            assert_eq!(materials.to_string(), failed_projection);
         }
         projections.push(json.clone());
         let legacy = crate::generation::messages_with_intent(&request, &ctx, &s, None);
