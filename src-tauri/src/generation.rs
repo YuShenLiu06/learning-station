@@ -1685,7 +1685,7 @@ fn publish_tool_activity(engine: &Engine, activity: &ToolActivity, sink: &Sink) 
     // A decision IPC and the waiting handler may both settle the same call.
     // Reuse the first persisted activity (including timestamps) for idempotency.
     let mut core = engine.lock()?;
-    let saved = sessions::get(&mut core.content, &activity.session_id)?
+    let saved = sessions::get_persisted(&mut core.content, &activity.session_id)?
         .entries
         .into_iter()
         .filter_map(|entry| {
@@ -1718,6 +1718,12 @@ fn publish_tool_activity(engine: &Engine, activity: &ToolActivity, sink: &Sink) 
         &format!("{}-{}", activity.id, activity.status),
     )?;
     drop(core);
+    // The durable entry retains its original digest; only the run/event view
+    // receives the attribution recovered for display after a successful replay.
+    let mut projected = activity.clone();
+    projected.user_entry_id = attributed.user_entry_id.clone();
+    projected.sequence = attributed.sequence;
+    let activity = &projected;
     let mut runs = engine
         .runs
         .lock()
@@ -1920,6 +1926,45 @@ mod lifecycle_tests {
             "NOT_CONFIGURED"
         );
     }
+    #[test]
+    fn legacy_activity_replay_preserves_original_digest_for_running_and_terminal() {
+        for terminal in [false, true] {
+            let (temp, engine, session) = setup();
+            let saved = sessions::append(&mut engine.lock().unwrap().content, &session.id,
+                Entry { id: String::new(), kind: "user".into(), content: "fixture".into(),
+                    created_at: String::new(), selection: None, related_ids: vec![], data: None },
+                None, "legacy-question").unwrap();
+            let user = saved.entries.iter().find(|entry| entry.kind == "user").unwrap().id.clone();
+            let scope = crate::learning_tools::ToolScope { session_id: session.id.clone(), section_id: session.section_id.clone(), run_id: "run_lifecycle".into(), allowed_ids: vec![] };
+            let mut activity = new_tool_activity(&scope, "legacy-call", "write").unwrap();
+            let receipt = json!({"persisted":true,"sessionId":session.id});
+            if terminal { finish_tool_activity(&mut activity, &scope, &Ok(receipt.clone())); }
+            assert!(activity.user_entry_id.is_none() && activity.sequence.is_none());
+            let request = format!("{}-{}", activity.id, activity.status);
+            let original = Entry { id: String::new(), kind: "note".into(), content: format!("{}：{}", activity.title, activity.summary), created_at: String::new(), selection: None, related_ids: vec![], data: Some(json!({"origin":"pi-tool-activity","toolActivity":activity})) };
+            let saved = sessions::append(&mut engine.lock().unwrap().content, &session.id, original.clone(), None, &request).unwrap();
+            let entry = saved.entries.iter().find(|entry| entry.kind == "note").unwrap();
+            let doc = engine.lock().unwrap().content.read(&entry.id).unwrap();
+            let path = temp.path().join("library").join(doc.path);
+            let original_bytes = fs::read(&path).unwrap();
+            let mut current = run(&session.id); current.user_entry_id = Some(user.clone()); current.tool_calls = vec![activity.clone()];
+            persist(&engine, &current).unwrap();
+            drop(engine);
+            let reopened = Engine::new(temp.path().join("library"), temp.path().join("state")).unwrap();
+            let projected = sessions::get(&mut reopened.lock().unwrap().content, &session.id).unwrap();
+            assert_eq!(projected.entries.iter().find(|entry| entry.kind == "note").unwrap().data.as_ref().unwrap()["toolActivity"]["userEntryId"], user);
+            let sink: Sink = Arc::new(|_| {});
+            for _ in 0..2 {
+                if terminal { settle_proposal_activity(&reopened, &scope, "legacy-call", &receipt).unwrap(); }
+                else { publish_tool_activity(&reopened, &activity, &sink).unwrap(); }
+            }
+            assert_eq!(fs::read(&path).unwrap(), original_bytes);
+            assert_eq!(get(&reopened, &scope.run_id).unwrap().tool_calls.len(), 1);
+            let mut different = original; different.content.push_str("different");
+            assert_eq!(sessions::append(&mut reopened.lock().unwrap().content, &session.id, different, None, &request).unwrap_err().code, "CONFLICT");
+        }
+    }
+
     #[test]
     fn real_todo_receipt_drives_safe_durable_tool_card_and_reopens_without_duplicates() {
         let (temp, engine, session) = setup();

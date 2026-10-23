@@ -119,7 +119,7 @@ Tauri devUrl约定 `http://127.0.0.1:1420`，release嵌入 `dist/`。命令snake
 
 ToolActivity=`{id,toolCallId,runId,sessionId,userEntryId?,sequence?,name,status:running|succeeded|failed,title,summary,startedAt,updatedAt,persisted,object?,errorCode?}`。id/toolCallId由Core对run+模型opaque ID哈希，不返回rawargs或内部路径。object=`{kind:todo|learning-entry|review-card,id,sessionId,sectionId}`；仅真实保存回执提供。查询成功persisted=false，不能显示“已保存”。
 
-userEntryId 由 Rust 从准确 Run 绑定写入，不能来自模型参数。旧活动缺此字段时，读取会话仅从该 runId 的原运行文件核实 id/sessionId/userEntryId 并检查问题仍在该会话；只补返回投影、不改旧文件，不按时间或相邻正文推断。前端把活动放在对应问题后，重试沿同一问题归属；缺绑定但有同 runId 回复时贴该回复。sequence 由原 Run.toolCalls 的顺序确定，同轮卡片按其排列；无法核实归属的旧回执保留在原活动记录位置，标注所属问题未确认。最近 30 条裁剪不会把早期工具堆到末尾。
+userEntryId 由 Rust 从准确 Run 绑定写入，不能来自模型参数。旧活动缺此字段时，读取会话仅从该 runId 的原运行文件核实 id/sessionId/userEntryId 并检查问题仍在该会话；只补返回投影、不改旧文件，不按时间或相邻正文推断。旧回执同状态重放使用原始持久化数据核对原 requestDigest，通过后仅在 Run/事件显示投影补充归属；不以新增显示字段重写或放宽旧幂等摘要。前端把活动放在对应问题后，重试沿同一问题归属；缺绑定但有同 runId 回复时贴该回复。sequence 由原 Run.toolCalls 的顺序确定，同轮卡片按其排列；无法核实归属的旧回执保留在原活动记录位置，标注所属问题未确认。最近 30 条裁剪不会把早期工具堆到末尾。
 
 工具开始/回执后更新`get_run.toolCalls`并发`generation.tool`事件。历史复用Session.entries：kind=note，data=`{origin:"pi-tool-activity",toolActivity}`；按toolCallId取最新快照，不当普通学习正文、不回灌模型历史。历史只有running而无终态显示结果未确认，不自动重跑；打开仅按稳定ID调用已有待办/学习记录/复习接口。
 

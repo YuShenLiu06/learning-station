@@ -1184,6 +1184,54 @@ mod tests {
     }
 
     #[test]
+    fn upgraded_terminal_activity_replay_archives_without_changing_legacy_digest() {
+        for accept in [false, true] {
+            let (dir, engine, scope, id, _) = course_fixture("write");
+            let before = engine.lock().unwrap().content.read(&id).unwrap();
+            let pending = super::execute(&engine, &scope, "legacy-settled", "write", json!({"path":format!("documents/{id}.md"),"content":"Saved once","expectedVersion":before.version})).unwrap();
+            let course = pending["courseId"].as_str().unwrap();
+            let proposal = pending["proposalId"].as_str().unwrap();
+            let receipt = super::proposal_decide(&engine, course, proposal, accept).unwrap();
+            // Build the old-release checkpoint: its terminal receipt is already
+            // durable, but the process stopped before moving the flat proposal.
+            let (entry_path, legacy_bytes) = {
+                let mut core = engine.lock().unwrap();
+                let session = crate::sessions::get_persisted(&mut core.content, &scope.session_id).unwrap();
+                let entry = session.entries.iter().find(|entry| entry.data.as_ref().is_some_and(|data| data["toolActivity"]["status"] == "succeeded")).unwrap();
+                let mut doc = core.content.read(&entry.id).unwrap();
+                let mut data = entry.data.clone().unwrap();
+                let activity = data["toolActivity"].as_object_mut().unwrap();
+                activity.remove("userEntryId"); activity.remove("sequence");
+                let digest = crate::types::hash(&serde_json::to_string(&json!({"kind":entry.kind,"content":entry.content,"selection":entry.selection,"relatedIds":entry.related_ids,"data":data})).unwrap());
+                doc.metadata.extra.insert("data".into(), data);
+                doc.metadata.extra.insert("requestDigest".into(), json!(digest));
+                let path = core.content.root().join(&doc.path);
+                let bytes = crate::content::serialize(&doc.metadata, &doc.body).unwrap().into_bytes();
+                std::fs::write(&path, &bytes).unwrap();
+                (path, bytes)
+            };
+            let run_path = dir.path().join(format!("state/runs/{}.json", scope.run_id));
+            let mut run: Value = serde_json::from_slice(&std::fs::read(&run_path).unwrap()).unwrap();
+            for activity in run["toolCalls"].as_array_mut().unwrap() {
+                activity.as_object_mut().unwrap().remove("userEntryId");
+                activity.as_object_mut().unwrap().remove("sequence");
+            }
+            std::fs::write(&run_path, serde_json::to_vec(&run).unwrap()).unwrap();
+            let path = dir.path().join(format!("state/edit-proposals/{course}/{proposal}.json"));
+            let archive = path.parent().unwrap().join("archive").join(path.file_name().unwrap());
+            std::fs::rename(&archive, &path).unwrap();
+            drop(engine);
+            let reopened = Engine::new(dir.path().join("library"), dir.path().join("state")).unwrap();
+            assert!(super::proposal_list(&reopened, course).unwrap().as_array().unwrap().is_empty());
+            assert!(!path.exists() && archive.exists());
+            assert_eq!(super::proposal_result(&reopened, pending).unwrap(), receipt);
+            assert_eq!(std::fs::read(&entry_path).unwrap(), legacy_bytes);
+            assert_eq!(crate::generation::get(&reopened, &scope.run_id).unwrap().tool_calls.len(), 1);
+            assert_eq!(reopened.lock().unwrap().content.read(&id).unwrap().body.trim(), if accept { "Saved once" } else { before.body.trim() });
+        }
+    }
+
+    #[test]
     fn proposal_poll_migrates_legacy_terminal_files_and_ignores_archive_contents() {
         let (dir, engine, scope, _, _) = course_fixture("write");
         let pending = super::execute(&engine, &scope, "legacy", "write", json!({"path":"legacy.txt","content":"draft"})).unwrap();

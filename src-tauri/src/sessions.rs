@@ -204,6 +204,14 @@ fn attribute_legacy_tool_activities(state_dir: &Path, session_id: &str, entries:
 }
 
 pub fn get(store: &mut ContentStore, id: &str) -> Result<Session> {
+    let mut session = get_persisted(store, id)?;
+    attribute_legacy_tool_activities(store.state_dir(), id, &mut session.entries);
+    Ok(session)
+}
+
+// Idempotent writers must compare/replay the exact persisted bytes, not the
+// read-only display projection (which may fill fields absent in old receipts).
+pub(crate) fn get_persisted(store: &mut ContentStore, id: &str) -> Result<Session> {
     if !valid_id(id) {
         return Err(CoreError::new("INVALID_INPUT", "会话编号无效。"));
     }
@@ -327,7 +335,6 @@ pub fn get(store: &mut ContentStore, id: &str) -> Result<Session> {
         }
     }
     entries.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
-    attribute_legacy_tool_activities(store.state_dir(), id, &mut entries);
     let created = doc
         .metadata
         .extra
