@@ -177,7 +177,7 @@ async fn context_bridge_real_pi_wire_replays_legacy_full_once_per_tool_loop_and_
         let json: Value = serde_json::from_str(sent).unwrap();
         assert!(json.get("learningHistory").is_none());
         let parts = json["bridge"].as_array().unwrap();
-        assert_eq!(parts.iter().map(|p|p["key"].as_str().unwrap()).collect::<Vec<_>>(), vec!["current_time", "references", "materials", "question"]);
+        assert_eq!(parts.iter().map(|p|p["key"].as_str().unwrap()).collect::<Vec<_>>(), vec!["current_time", "references", "exercise_sources", "materials", "question"]);
         assert_eq!(json["contextBridgeManifest"], frozen.manifest);
         assert!(json.get("manifest").is_none());
         assert!(json.get("turnState").is_none());
