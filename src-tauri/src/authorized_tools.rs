@@ -1018,6 +1018,34 @@ mod tests {
     }
 
     #[test]
+    fn proposal_pre_intent_crash_recovers_only_exact_pending_evidence() {
+        let (dir, engine, scope, id, _) = course_fixture("write");
+        let before = engine.lock().unwrap().content.read(&id).unwrap();
+        let pending = super::execute(&engine, &scope, "crash-before-intent", "write", json!({"path":format!("documents/{id}.md"),"content":"Not published","expectedVersion":before.version})).unwrap();
+        let course = pending["courseId"].as_str().unwrap(); let proposal = pending["proposalId"].as_str().unwrap();
+        let path = dir.path().join(format!("state/edit-proposals/{course}/{proposal}.json"));
+        let mut data: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        data["status"] = json!("accepting");
+        crate::course_write_transaction::durable_json(&path, &data).unwrap();
+        let reopened = Engine::new(dir.path().join("library"), dir.path().join("state")).unwrap();
+        assert_eq!(super::proposal_get(&reopened, course, proposal).unwrap()["status"], "pending");
+        let ledger = dir.path().join(format!("state/workspaces/{}/receipts/{proposal}.json", scope.session_id));
+        // Any durable intent keeps an uncertain publication locked.
+        std::fs::write(ledger.with_extension("pending"), "{}").unwrap();
+        assert_eq!(super::proposal_get(&reopened, course, proposal).unwrap()["status"], "accepting");
+        assert_eq!(super::proposal_decide(&reopened, course, proposal, false).unwrap_err().code, "NATIVE_TOOL_UNKNOWN");
+        std::fs::remove_file(ledger.with_extension("pending")).unwrap();
+        let original_ledger = std::fs::read(&ledger).unwrap();
+        let mut entry: Value = serde_json::from_slice(&original_ledger).unwrap();
+        entry["argumentsHash"] = json!("different");
+        crate::course_write_transaction::durable_json(&ledger, &entry).unwrap();
+        assert_eq!(super::proposal_get(&reopened, course, proposal).unwrap()["status"], "accepting");
+        std::fs::write(&ledger, original_ledger).unwrap();
+        assert_eq!(super::proposal_decide(&reopened, course, proposal, false).unwrap()["status"], "rejected");
+        assert_eq!(reopened.lock().unwrap().content.read(&id).unwrap().body, before.body);
+    }
+
+    #[test]
     fn proposal_completion_ledger_recovers_interrupted_status_without_republish() {
         let (dir, engine, scope, id, _) = course_fixture("write");
         let before = engine.lock().unwrap().content.read(&id).unwrap();

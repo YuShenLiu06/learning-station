@@ -909,7 +909,7 @@ export function App() {
       {bootError && <div className="connection-banner" role="status"><CircleHelp size={16} /><span>{bootError}</span><button onClick={() => { void load(); }}>重新连接</button></div>}
       {notifications && <div className="notice-popover"><div className="popover-heading">学习通知<button className="icon-button" aria-label="关闭通知" onClick={() => setNotifications(false)}><X size={15} /></button></div>{boot.notices.length ? boot.notices.map(notice => <article key={notice.id}><strong>{notice.title}</strong><p>{notice.body || '学习待办已到期。'}</p>{!notice.read && <button className="quiet-button" onClick={async () => { try { await call('notice_read', { id: notice.id }); setBoot(old => ({ ...old, notices: old.notices.map(item => item.id === notice.id ? { ...item, read: true } : item) })); } catch (error) { notify(errorText(error)); } }}>标为已读</button>}</article>) : <div className="subtle-empty">还没有通知。到期的学习待办会出现在这里。</div>}</div>}
 
-      {nativeAvailable && nodes.some(node => node.id === courseId && node.kind === 'course') && <EditReview courseId={courseId} documentId={activeId} isDirty={id => { const d = docsRef.current[id]; return !!d && (d.body !== d.savedBody || d.saving || d.draftLoaded === false); }} onAccepted={async id => {
+      {nativeAvailable && nodes.some(node => node.id === courseId && node.kind === 'course') && <EditReview courseId={courseId} documentId={activeId} isLoaded={id => docsRef.current[id]?.draftLoaded === true} isDirty={id => { const d = docsRef.current[id]; return !!d && (d.body !== d.savedBody || d.saving || d.draftLoaded === false); }} onAccepted={async id => {
         const section = await call<Section>('section_open', { id });
         const local = docsRef.current[id];
         if (!local) return;

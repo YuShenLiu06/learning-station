@@ -170,7 +170,10 @@ fn course_write_locked(
         Some((doc.body.clone(), doc.version.clone()))
     } else if existing.is_some() {
         let (bytes, version) = crate::versioning::read_versioned(core, &course, &args.path)?;
-        Some((crate::material_git::validate_material_text(&bytes)?.to_owned(), version))
+        Some((
+            crate::material_git::validate_material_text(&bytes)?.to_owned(),
+            version,
+        ))
     } else {
         None
     };
@@ -282,9 +285,42 @@ fn proposal_path(core: &Core, course: &str, id: &str) -> Result<PathBuf> {
 }
 fn read_proposal(core: &Core, course: &str, id: &str) -> Result<Proposal> {
     let path = proposal_path(core, course, id)?;
-    let p: Proposal = serde_json::from_slice(&crate::assets::bounded_read(&path, 256 * 1024)?)?;
+    let mut p: Proposal = serde_json::from_slice(&crate::assets::bounded_read(&path, 256 * 1024)?)?;
     if p.id != id || p.course_id != course {
         return Err(out_of_scope());
+    }
+    // A crash before durable write intent cannot have published anything. Only
+    // reopen this window with the exact original pending operation evidence;
+    // missing/mismatched ledgers and any intent remain unknown.
+    if p.status == "accepting" {
+        let ledger = workspace_root(&core.state_dir, &p.session_id)
+            .join("receipts")
+            .join(format!("{id}.json"));
+        let no_intent = fs::symlink_metadata(ledger.with_extension("pending"))
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+        if no_intent {
+            if let Ok(entry) = read_ledger(&ledger) {
+                let mut args =
+                    json!({"path":p.path,"content":p.content,"expectedVersion":p.expected_version});
+                let with_version = hash(&serde_json::to_string(&args)?);
+                if p.expected_version.is_none() {
+                    args.as_object_mut().unwrap().remove("expectedVersion");
+                }
+                let without_version = hash(&serde_json::to_string(&args)?);
+                if entry.name == "write"
+                    && (entry.arguments_hash == with_version
+                        || entry.arguments_hash == without_version)
+                    && entry.result["persisted"] == false
+                    && entry.result["status"] == "pending"
+                    && entry.result["proposalId"] == p.id
+                    && entry.result["courseId"] == p.course_id
+                    && entry.result["sessionId"] == p.session_id
+                    && entry.result["path"] == p.path
+                {
+                    p.status = "pending".into();
+                }
+            }
+        }
     }
     Ok(p)
 }

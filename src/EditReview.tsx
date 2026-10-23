@@ -5,7 +5,7 @@ import { editDiff } from './editDiff';
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 
 type Proposal = { id: string; courseId: string; path: string; original: string; content: string; status: string; expectedVersion?: string };
-type Props = { courseId: string; documentId: string; isDirty: (id: string) => boolean; onAccepted: (id: string) => Promise<void> };
+type Props = { courseId: string; documentId: string; isDirty: (id: string) => boolean; isLoaded: (id: string) => boolean; onAccepted: (id: string) => Promise<void> };
 const documentId = (path: string) => /^documents\/([^/]+)\.md$/u.exec(path)?.[1] || '';
 
 export function EditReview(props: Props) {
@@ -56,6 +56,16 @@ export function EditReview(props: Props) {
     if (accept && latest.current.isDirty(id)) { setError('当前文件有未保存编辑。草稿和建议均已保留，请先处理草稿。'); return; }
     setBusy(true); setError('');
     try {
+      if (accept && id && !latest.current.isLoaded(id)) {
+        // An unopened document may still have a durable draft from a previous
+        // launch. A failed read is never evidence of a clean editor.
+        const [section, draft] = await Promise.all([
+          call<{ body: string }>('section_open', { id }),
+          call<{ data: { body?: string } } | null>('draft_get', { key: `section:${id}` }),
+        ]);
+        if (draft?.data.body !== undefined && draft.data.body !== section.body) throw new Error('该文件有未保存的本机草稿。请先打开并处理草稿；建议和正文均保留。');
+      }
+      if (accept && latest.current.isDirty(id)) throw new Error('当前文件有未保存编辑。请先处理草稿；建议和正文均保留。');
       const receipt = await call<{ persisted: boolean; status?: string }>('decide_edit_proposal', { courseId: proposal.courseId, id: proposal.id, accept });
       if (receipt.persisted) {
         if (id) await latest.current.onAccepted(id);
