@@ -724,6 +724,23 @@ mod tests {
         );
     }
     #[test]
+    fn file_paths_and_history_only_ids_never_become_exercise_sources() {
+        let manifest = vec![ManifestItem {
+            id: "section_ex".into(),
+            path: "courses/course_one/materials/documents/section_ex.md".into(),
+            version: "frozen_version".into(), included_chars: 20,
+        }];
+        for id in ["materials/documents/section_ex.md", "courses/course_one/materials/documents/section_ex.md", "../documents/section_ex.md", "history_only", "invented"] {
+            let mut data = raw();
+            data["exercises"][0]["sourceIds"] = json!([id]);
+            let error = validate(data, &manifest, "run_sources").unwrap_err();
+            assert_eq!(error.code, "INVALID_MODEL_OUTPUT");
+            assert_eq!(error.details.unwrap()["recoverable"], false);
+        }
+        assert!(validate(raw(), &manifest, "run_sources").is_ok());
+    }
+
+    #[test]
     fn strict_structure_rejects_unknown_fields_lengths_and_untrusted_sources_before_write() {
         let (_directory, mut store, session, source) = fixture();
         for change in 0..9 {

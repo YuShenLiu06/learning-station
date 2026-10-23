@@ -17,7 +17,7 @@ description: 根据给定材料和自然语言目标设计跨学科练习，按�
 
 - 工具入参 JSON：在 question/explain 等模式经 generate_exercises 工具保存练习时作为参数提交，按工具 schema 校验；顶层只有 requirements（本轮用户要求）、summary、exercises 三项。
 - 最终输出 JSON：practice 模式直接输出的练习产物，交由 Rust 校验后保存；顶层只有 exercises、summary 两项，没有 requirements，也不要写 id、answerMatch 等程序生成字段（校验通过后由程序补齐）。
-- 样例中的 sourceIds（src_demo_material、src_demo_note）仅为示意；实际取值只能来自本轮授权引用清单（context manifest）中的稳定 ID，不得重复、不得虚构，AI 回复里的编号不算来源。
+- 样例中的 sourceIds（src_demo_material、src_demo_note）仅为示意；实际取值只能来自本轮授权引用清单（context manifest）中的稳定 ID（使用“本轮练习可引用来源”的 sourceId，文件路径不是 sourceId），不得重复、不得虚构，AI 回复里的编号不算来源。
 
 ### 样例一：exact（客观题）
 

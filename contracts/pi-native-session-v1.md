@@ -127,3 +127,7 @@ ToolPolicy 只携带 mode、allowedTools、authorization，不再携带 maxCalls
 课程 `write` 的 #71 审阅状态：`proposalPersisted=true` 仅证明修改建议已保留，`persisted=false,status=pending` 不代表正文写入。生成 handler 等待用户决定；接受返回真实写入回执，拒绝返回 `persisted=false,status=rejected`。停止/超时保留提案，恢复时 pending 为未决错误，不作为完成回执注入 Pi；不自动接受或延长模型预算。无课程 scratch write/Bash 不纳入此文本审阅承诺。
 
 #71 接受前要求初始 ledger 完整且身份匹配，缺失/损坏不发布但可拒绝后重请。`accepting`/`unknown` 查询已执行结果不依赖当前 write 授权，不能借核对重放发布。接受/拒绝均结算原 session+run 工具活动，不要求原生成仍运行；终结提案归档后继续按原 ID 恢复，未决列表不返回历史终结项（旧平铺终结项首次遇到迁移）。该流程不引入新的工具数量上限。
+
+## 练习引用来源清单
+
+ContextBridge 每个用户轮注册 `exercise_sources`，将同轮 `Context.manifest` 的 `sourceId/path/version` 显式提供给模型；普通聊天的 `generate_exercises` 与专用 practice 共用此清单。路径仅用于识别材料，`sourceIds` 必须填写稳定 ID。清单不包含课程可读目录或历史授权集合，不声明额外正文已读取；空清单也明确提供。旧轮清单沿 turn 生命周期排除，重试及压缩恢复使用原冻结快照。Rust 仍按原冻结 manifest 严格校验，不从文件名或路径猜测 ID，不将未知来源变成可自动修正的授权错误。

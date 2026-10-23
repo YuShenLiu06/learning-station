@@ -22,9 +22,9 @@ test('A → B → A → no Focus: actual payload retires references and keeps on
   });
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
   const body='两份不同文件的相同正文',hash=createHash('sha256').update(body).digest('hex');
-  const run=async(id,runId='run_'+round)=>{
+  const run=async(id,runId='run_'+round,includeSources=true)=>{
     const focus=id?{courseId:'course',documentId:id,sourceDocumentId:id,path:`documents/${id}.md`,type:'markdown',documentVersion:hash,commitHash:'',materialTreeOid:'',paragraphs:[]}:undefined;
-    await runLearningAgent({protocol:1,operation:'generate',apiKey:'synthetic-focus-key',settings:{provider:'custom',protocol:'openai-completions',baseUrl:`http://127.0.0.1:${server.address().port}/v1`,model:'fixture'},learningTools:true,learningSkills:[],toolPolicy:{mode:'question',authorization:'off',allowedTools:[...LEARNING_PLUGIN.tools]},debugProtocol:true,nativeSession:{directory,learningSessionId:'focus',runId,userEntryId:'user_'+round,authorizedSourceIds:['A','B'],protectHistory:false,legacyRecords:[]},messages:[{role:'user',content:JSON.stringify({question:'问题 '+round,focus,nativeReferences:round===0?'ONCE_ONLY_CITATION':'',nativeMaterials:id?[{id,path:focus.path,text:body,textHash:hash,version:hash,range:{startChar:0,endChar:[...body].length,complete:true,totalBytes:Buffer.byteLength(body)}}]:[],contextBridgeManifest:{version:1,entries:[]}})}]},e=>{if(e.type==='debug_request')captures.push(e);},{requestTool:async call=>{
+    await runLearningAgent({protocol:1,operation:'generate',apiKey:'synthetic-focus-key',settings:{provider:'custom',protocol:'openai-completions',baseUrl:`http://127.0.0.1:${server.address().port}/v1`,model:'fixture'},learningTools:true,learningSkills:[],toolPolicy:{mode:'question',authorization:'off',allowedTools:[...LEARNING_PLUGIN.tools]},debugProtocol:true,nativeSession:{directory,learningSessionId:'focus',runId,userEntryId:'user_'+round,authorizedSourceIds:['A','B'],protectHistory:false,legacyRecords:[]},messages:[{role:'user',content:JSON.stringify({question:'问题 '+round,focus,exerciseSources:includeSources?{sources:id?[{sourceId:id,path:focus.path,version:hash}]:[]}:undefined,nativeReferences:round===0?'ONCE_ONLY_CITATION':'',nativeMaterials:id?[{id,path:focus.path,text:body,textHash:hash,version:hash,range:{startChar:0,endChar:[...body].length,complete:true,totalBytes:Buffer.byteLength(body)}}]:[],contextBridgeManifest:{version:1,entries:[]}})}]},e=>{if(e.type==='debug_request')captures.push(e);},{requestTool:async call=>{
       if(call.type==='session_sync')return {result:{synced:true}};
       if(call.type==='debug_probe')return {result:{epoch:1}};
       if(call.name==='list_learning_skills')return {result:{skills:[]}};
@@ -38,6 +38,10 @@ test('A → B → A → no Focus: actual payload retires references and keeps on
         const values=packet.messages.map(text),focus=values.filter(v=>v.startsWith('【Focus：当前文件】'));
         assert.equal(focus.length,id?1:0);
         if(id)assert(focus[0].includes(`documents/${id}.md`));
+        const sources=values.filter(v=>v.includes('本轮练习可引用来源'));
+        assert.equal(sources.length,1,'exactly one current-turn citation manifest survives tool continuations/reopen');
+        assert.deepEqual(JSON.parse(sources[0]).sources,id?[{sourceId:id,path:`documents/${id}.md`,version:hash}]:[]);
+        assert(!sources[0].includes(id==='A'?'"sourceId":"B"':'"sourceId":"A"'),'history authorization must not broaden citation manifest');
         assert.equal(values.filter(v=>v.includes('ONCE_ONLY_CITATION')).length,round===0?1:0);
         for(let previous=0;previous<round;previous++)assert(values.includes('问题 '+previous),'legitimate native question history retained');
       }
@@ -57,7 +61,14 @@ test('A → B → A → no Focus: actual payload retires references and keeps on
     const values=packets.at(-1).messages.map(text);
     assert.equal(values.filter(v=>v.startsWith('【Focus：当前文件】')).length,1);
     assert(values.some(v=>v.includes(body)),'lost baseline reloads without a second Focus');
+    assert.deepEqual(JSON.parse(values.find(v=>v.includes('本轮练习可引用来源'))).sources,[{sourceId:'B',path:'documents/B.md',version:hash}],'compaction restores the frozen citation manifest');
     assert(manager.getEntries().some(e=>e.type==='custom_message'&&e.content.includes('ONCE_ONLY_CITATION')),'durable original reference is preserved');
+    round=5;await run('A','old_without_sources',false);
+    assert(!packets.at(-1).messages.map(text).some(v=>v.includes('本轮练习可引用来源')));
+    await run('A','retry_old_with_sources');
+    const retried=packets.at(-1).messages.map(text);
+    assert.equal(retried.filter(v=>v==='问题 5').length,1,'retry never duplicates the saved user entry');
+    assert.deepEqual(JSON.parse(retried.find(v=>v.includes('本轮练习可引用来源'))).sources,[{sourceId:'A',path:'documents/A.md',version:hash}],'an old accepted user entry still receives the new mapping on retry');
   } finally {server.closeAllConnections();await new Promise(resolve=>server.close(resolve));fs.rmSync(directory,{recursive:true,force:true});}
 });
 

@@ -72,6 +72,13 @@ impl ContextBridge {
         let mut store = Self::default();
         store.add(&crate::time_context::bridge_part(&time))?;
         store.add(&crate::context::bridge_part(&references))?;
+        // The debug inventory and Pi's history authorization are not model-visible
+        // citation authority. Expose exactly the manifest used by both validators.
+        store.add(&PromptPart {
+            key: "exercise_sources",
+            description: "本轮练习可引用来源（sourceIds 仅填写下列 sourceId，不得填写文件路径；清单不代表额外正文已读取）",
+            value: json!({"sources": ctx.manifest.iter().map(|m| json!({"sourceId":m.id,"path":m.path,"version":m.version})).collect::<Vec<_>>()}),
+        })?;
         if let Some(focus) = &request.focus {
             let mut part = crate::focus::bridge_part(focus);
             // Citation locators already use body Unicode-character coordinates.
@@ -201,13 +208,13 @@ mod tests {
             .create_section("合成旧材料", "🙂原句", vec![], vec![])
             .unwrap();
         let (session, _) = c.start_session(&source.id, false).unwrap();
-        for locator in [Value::Null, json!({"startChar":1,"endChar":3})] {
+        for (mode, locator) in [("question", Value::Null), ("practice", Value::Null), ("question", json!({"startChar":1,"endChar":3}))] {
             let input = serde_json::from_value(json!({"documentId":source.id,"expectedVersion":source.version,"selection":"原句","locator":locator})).unwrap();
             let mut ctx = crate::context::load(&c.content, &source.id, None).unwrap();
             crate::context::inject(&c.content, &mut ctx, &[input]).unwrap();
             let projection =
                 ContextBridge::snapshot(&c.state_dir, &c.content, &session, &ctx).unwrap();
-            let request = serde_json::from_value(json!({"sessionId":session.id,"mode":"question","prompt":"解释原句","selection":"","requestId":"legacy_locator_fixture","injections":[{"documentId":source.id,"expectedVersion":source.version,"selection":"原句","locator":locator}]})).unwrap();
+            let request = serde_json::from_value(json!({"sessionId":session.id,"mode":mode,"prompt":"解释原句","selection":"","requestId":"legacy_locator_fixture","injections":[{"documentId":source.id,"expectedVersion":source.version,"selection":"原句","locator":locator}]})).unwrap();
             let frozen = ContextBridge::freeze(
                 &request,
                 &ctx,
@@ -217,6 +224,9 @@ mod tests {
                 TimeContext::capture(),
             )
             .unwrap();
+            let envelope: Value = serde_json::from_str(frozen.messages[0]["content"].as_str().unwrap()).unwrap();
+            let sources = envelope["bridge"].as_array().unwrap().iter().find(|p| p["key"] == "exercise_sources").unwrap();
+            assert_eq!(sources["value"]["sources"], json!(ctx.manifest.iter().map(|m| json!({"sourceId":m.id,"path":m.path,"version":m.version})).collect::<Vec<_>>()));
             let item = frozen.manifest["entries"]
                 .as_array()
                 .unwrap()

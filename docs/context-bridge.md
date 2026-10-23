@@ -157,3 +157,7 @@ Pi system.sections 取得，绑定到该次最终 Request 的字段/片段；不
 接受前必须匹配初始工具 ledger；缺失或损坏时不发布，允许拒绝后重新请求。`accepting` / `unknown` 的结果核对不要求当前仍有 write 档位，核对不会重新执行发布。若能证明初始 pending ledger 身份一致且持久写入意图不存在，可恢复为待决定；存在意图或证据不一致仍保持未知。
 
 用户决定会结算原 session/run 的工具活动，即使生成已经停止或应用重启。终结提案归档但保留按 ID 的恢复入口，列表只返回未决建议；旧平铺目录中的终结文件首次遇到时迁移。此生命周期不新增工具数量预算。
+
+## 练习引用来源清单
+
+ContextBridge 每个用户轮注册 `exercise_sources`，将同轮 `Context.manifest` 的 `sourceId/path/version` 显式提供给模型；普通聊天的 `generate_exercises` 与专用 practice 共用此清单。路径仅用于识别材料，`sourceIds` 必须填写稳定 ID。清单不包含课程可读目录或历史授权集合，不声明额外正文已读取；空清单也明确提供。旧轮清单沿 turn 生命周期排除，重试及压缩恢复使用原冻结快照。Rust 仍按原冻结 manifest 严格校验，不从文件名或路径猜测 ID，不将未知来源变成可自动修正的授权错误。
