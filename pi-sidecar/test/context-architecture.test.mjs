@@ -61,7 +61,7 @@ test('final SDK wire allows only registered supplements in declared order and on
       const capture=captures[round];assert.deepEqual(capture.body,packet);
       const application=capture.sources.filter(s=>s.origin==='bridge');
       assert(application.every(s=>s.registrationKey&&s.description&&s.runId));
-      const keys=application.map(s=>s.registrationKey),priority=['current_time','references','focus'];
+      const keys=application.map(s=>s.registrationKey),priority=['current_time','references','focus','materials'];
       assert(keys.every(key=>priority.includes(key)),'no undeclared application key');
       for(const source of capture.sources.filter(s=>s.origin==='unknown')){const role=source.path[0]==='messages'?packet.messages[source.path[1]].role:'system';if(['assistant','tool'].includes(role))continue;let value=packet;for(const at of source.path)value=value[at];if(source.start!==undefined)value=value.slice(source.start,source.end);assert.equal(value.trim(),'','no unregistered application text at the final wire boundary');}
       for(const userEntryId of new Set(application.map(s=>s.userEntryId))){
@@ -71,10 +71,10 @@ test('final SDK wire allows only registered supplements in declared order and on
         if(questionSource)assert(turn.every(s=>s.path[1]<questionSource.path[1]),'each historical supplement precedes its own native question');
       }
       assert.equal(application.filter(s=>s.registrationKey==='current_time'&&s.userEntryId===`user_${round}`).length,1);
-      assert.equal(texts.filter(text=>text.includes('EXACT_QUOTE')).length,round===3?0:1,'the original quotation remains in its historical turn until Pi compacts it');
+      assert.equal(texts.filter(text=>text.includes('EXACT_QUOTE')).length,round===0?1:0,'one-shot quotation is excluded from later user turns');
       if(round===0)assert(texts.some(v=>v.endsWith(quote)),'reference preserves real newlines and literal backslash-n');
       const values=application.map(s=>{let value=packet;for(const at of s.path)value=value[at];return value;});
-      const material=values.filter(v=>v.startsWith('以下为当前用户正在看的内容'));
+      const material=values.filter(v=>v.startsWith('以下为已提供的材料正文'));
       if(round===0||round===3)assert.equal(material.length,1);
       if(round===1)assert(values.filter(v=>v.startsWith('【Focus：')).some(v=>v.includes(`-${first}\n+${second}\n`)),'native focus diff is inside the merged Focus part');
       if(round===2)assert.equal(material.length,1,'unchanged preserves the initial body without appending a full');

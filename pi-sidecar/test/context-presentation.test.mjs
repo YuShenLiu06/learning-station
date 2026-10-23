@@ -63,9 +63,9 @@ test('actual SDK HTTP follows the readable Focus/Changes contract with native Gi
     for(const forbidden of ['INTERNAL_SOURCE_ID','documentId','sourceDocumentId','materialTreeOid','checkpointCommitOid','fixedVersion','textHash','materialRole','projectionVersion','learning_rules','完整正文或真实 Git 差量','OTHER_BODY_MUST_NOT_SEND'])assert(!wire.includes(forbidden),forbidden);
     assert(!wire.includes(hash(body)),'custom body hash stays internal');
     assert.equal(messages.filter(m=>m.role==='user'&&text(m)==='相同问题').length,i>=7?i-6:i+1,'repeated text is a distinct native question');
-    const full=currentTexts.filter(v=>v.startsWith('以下为当前用户正在看的内容'));
+    const full=currentTexts.filter(v=>v.startsWith('以下为已提供的材料正文'));
     const changes=location;
-    if(i===0||i===7){assert.equal(full.length,1);assert(full[0].startsWith('以下为当前用户正在看的内容（固定 Git 版本；'+(i===0?'首次正文基准':'正文基准已丢失，重新载入')+'）'));assert(full[0].endsWith(body));assert(changes.includes('首次建立课程材料基准'));assert.equal(statCalls[0].base,null);assert(!changes.includes('diff --git'));}
+    if(i===0||i===7){assert.equal(full.length,1);assert(full[0].startsWith('以下为已提供的材料正文（固定 Git 版本；'+(i===0?'首次正文基准':'正文基准已丢失，重新载入')+'）'));assert(full[0].endsWith(body));assert(changes.includes('首次建立课程材料基准'));assert.equal(statCalls[0].base,null);assert(!changes.includes('diff --git'));}
     else assert.equal(full.length,0,'valid historical body is retained without another full');
     if([1,3,4,8].includes(i)){assert(!changes.includes(changesSection)&&!changes.includes('diff --git'),'unchanged course/body adds no stat or patch inside Focus');}
     if([2,5,6].includes(i)){assert(changes.includes(changesSection));assert(changes.includes(statCalls[0].stat),'native stat bytes reach HTTP unchanged');if(i!==5){assert(changes.endsWith(statCalls[0].patch));assert(changes.indexOf(statCalls[0].stat)<changes.indexOf('当前聚焦文件的完整 Git diff'));assert(statCalls[0].stat.includes('focus.md'));}else assert(!changes.includes('diff --git'),'other file has only stat');}

@@ -54,7 +54,7 @@ test('actual multi-turn HTTP wire keeps each bridge with its native question, in
     if(value.startsWith('本轮冻结时间与时区\nreferenceTime: '))return `time:${value.split('\n')[1].slice(-3,-1)}`;
     if(parsed?.type==='automatic_material_projection')return `focus:${parsed.frames[0].text}`;
     if(parsed?.scenario)return 'exploration';
-    if(value.startsWith('以下为当前用户正在看的内容'))return 'focus:'+value.split('\n').slice(2).join('\n');
+    if(value.startsWith('以下为已提供的材料正文'))return 'focus:'+value.split('\n').slice(2).join('\n');
     if(value.startsWith('【Exploration：'))return 'exploration';
     if(value.startsWith('用户本轮明确提供的引用及必要补充\n'))return 'user:'+value.split('\n').slice(1).join('\n');
     if(m.role==='assistant'&&m.tool_calls?.length)return 'assistant:tools';
@@ -67,9 +67,10 @@ test('actual multi-turn HTTP wire keeps each bridge with its native question, in
   try {
     for(stage=0;stage<4;stage++){
       const start=packets.length;await run(stage);
+      for(let j=history.length-1;j>=0;j--)if(history[j].startsWith('time:')||history[j].startsWith('user:QUOTE_'))history.splice(j,1);
       const actual=packets[start].messages.filter(m=>m.role!=='system').map(label);
       if(process.env.LS_CONTEXT_WIRE_EVIDENCE){fs.mkdirSync(process.env.LS_CONTEXT_WIRE_EVIDENCE,{recursive:true});fs.writeFileSync(path.join(process.env.LS_CONTEXT_WIRE_EVIDENCE,'chronology-wire.json'),JSON.stringify(packets,null,2));}
-      assert.deepEqual(actual,[...history,...turn(stage)],`round ${stage}: historical bridge must remain before its own question`);
+      assert.deepEqual(actual,[...history,...turn(stage)],`round ${stage}: only current transient context remains; material and native history stay anchored`);
       history.push(...turn(stage));
       if(stage===1){
         const continuation=packets[start+1].messages.filter(m=>m.role!=='system').map(label);

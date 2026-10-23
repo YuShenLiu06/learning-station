@@ -1,7 +1,7 @@
 // Application binding around the pinned public Pi SDK. Credentials and tools remain explicit.
 import fs from 'node:fs';
 import {ContextBridge,decodeBridgeInput} from './context-bridge.mjs';
-import {registerMaterialContext} from './material-context.mjs';
+import {registerMaterialContext,retireTurnContext} from './material-context.mjs';
 import path from 'node:path';
 import {createHash, randomUUID} from 'node:crypto';
 import {createAssistantMessageEventStream} from '@earendil-works/pi-ai/utils/event-stream';
@@ -165,14 +165,9 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
       const envelope=decodeBridgeInput(input);
       if(containsSecret(envelope,apiKey))throw new NativeSessionError('AUTH');
       currentTurn=input;
-      // Replacing the same saved question is idempotent; earlier questions keep
-      // their own frozen context in Pi history. Safety/compaction edits still apply.
-      for(const entry of manager.buildSessionProjection().entries){
-        const source=entry.sourceEntry;
-        if(!entry.messages.length||source.type!=='custom_message'||source.details?.userEntryId!==spec.userEntryId)continue;
-        if(['learning-station-turn','learning-station-focus'].includes(source.customType)
-          ||source.customType==='learning-station-changes'&&!manager.getEntries().some(r=>r.type==='custom'&&r.customType==='learning-station-changes-request'&&r.data?.changesEntryId===source.id))bridge.exclude(source.id);
-      }
+      // User sends, not HTTP tool continuations, own transient bridge context.
+      // Preserve durable material receipts while retiring earlier turn declarations.
+      retireTurnContext(manager,bridge);
       const clock=envelope.currentTime??(timeContext?{referenceTime:timeContext.referenceTime,timeZone:timeContext.timeZone}:undefined);
       if(clock)bridge.message('current_time','本轮冻结时间与时区','learning-station-turn','referenceTime: '+clock.referenceTime+(clock.timeZone?'\ntimeZone: '+clock.timeZone:''));
       if(envelope.nativeReferences)bridge.message('references','用户本轮明确提供的引用及必要补充','learning-station-turn',envelope.nativeReferences);
