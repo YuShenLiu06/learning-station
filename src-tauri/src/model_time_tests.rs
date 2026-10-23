@@ -48,6 +48,7 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
             .find(|entry| entry.kind == "assistant")
             .unwrap();
         let reference = crate::context::AssistantReference {
+            locator: None,
             session_id: saved.id,
             entry_id: entry.id.clone(),
             run_id: Some("run_raw_source".into()),
@@ -78,6 +79,7 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
         )
         .unwrap();
         let exercise_reference = crate::exercise_references::ExerciseReference {
+            locator: None,
             session_id: p.session_id,
             document_id: p.document_id,
             exercise_entry_id: p.exercise_entry_id,
@@ -145,6 +147,7 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
         }
         captures
     });
+    let mut clocks = Vec::new();
     for (i, goal) in ["爱因斯坦是什么人？", "继续解释他的科学贡献"]
         .iter()
         .enumerate()
@@ -190,6 +193,8 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
         assert_eq!(intent.original_question, "爱因斯坦是什么人？");
         assert!(!intent.material_source_ids.is_empty());
         let request = GenerationRequest {
+            focus: None,
+            document_id: None,
             session_id: session.id.clone(),
             mode: "question".into(),
             selection: String::new(),
@@ -220,13 +225,28 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
             )
             .unwrap();
         }
-        let messages =
-            crate::generation::messages_with_intent(&request, &ctx, &session, Some(&intent));
         let clock = crate::time_context::for_operation(
             &state,
             &format!("generation:{}:{}", session.id, entry_id),
         )
         .unwrap();
+        let zone = clock.time_zone.as_deref().map(|tz| format!("\ntimeZone: {tz}")).unwrap_or_default();
+        clocks.push(format!("本轮冻结时间与时区\nreferenceTime: {}{}", clock.reference_time, zone));
+        let messages = {
+            let c = e.lock().unwrap();
+            let projection = crate::context_bridge::ContextBridge::snapshot(
+                &c.state_dir, &c.content, &session, &ctx,
+            ).unwrap();
+            crate::context_bridge::ContextBridge::freeze(
+                &request, &ctx, &session, Some(&intent), &projection, clock.clone(),
+            ).unwrap().messages
+        };
+        let native = {
+            let c = e.lock().unwrap();
+            let markdown = c.content.read(&session.id).unwrap().content;
+            crate::native_session::prepare(&state, &session, &format!("time_run_{i}"), &entry_id,
+                ctx.manifest.iter().map(|m|m.id.clone()).collect(), false, vec![], &markdown).unwrap()
+        };
         let settings = ModelSettings {
             configured: true,
             provider: "custom".into(),
@@ -250,10 +270,12 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
             },
             skills.clone(),
             Some(RequestContext {
+                debug_identity: None, debug_registrations: None,
                 output_validator: None,
-                native_session: None,
+                native_session: Some(native),
                 context_observer: None,
                 tool_recovery: None,
+                material_changes: None,
                 compaction_observer: None,
                 time: clock.clone(),
                 exploration: Some(intent),
@@ -273,61 +295,43 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
             .unwrap()["content"]
             .as_str()
             .unwrap();
-        assert!(sys.contains("AI回答引用是用户明确选择的历史AI文本"));
         assert!(!sys.contains("IGNORE_ALL_SYSTEM_RULES"));
-        let request_payload = p["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|m| m["content"].as_str())
-            .find_map(|text| {
-                serde_json::from_str::<Value>(text)
-                    .ok()
-                    .filter(|v| v["type"] == "learning_request")
-            })
-            .expect("real Pi request contains the Rust learning request");
-        assert_eq!(
-            request_payload["assistantReferenceManifest"]
-                .as_array()
-                .unwrap()
-                .len(),
-            if i == 0 { 1 } else { 0 }
-        );
-        assert_eq!(
-            request_payload["exerciseReferenceManifest"]
-                .as_array()
-                .unwrap()
-                .len(),
-            if i == 0 { 1 } else { 0 }
-        );
-        assert!(!p.to_string().contains("UNREVEALED_TYPED_ANSWER_SENTINEL"));
-        assert!(!p
-            .to_string()
-            .contains("UNREVEALED_TYPED_EXPLANATION_SENTINEL"));
-        if i == 0 {
-            assert!(request_payload["context"]
-                .as_str()
-                .unwrap()
-                .contains("quoted_exercise_part"));
-        }
-        if i == 0 {
-            assert!(request_payload["context"]
-                .as_str()
-                .unwrap()
-                .contains("quoted_ai_answer"));
-        }
-        assert!(!request_payload["manifest"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|v| v["path"].as_str().unwrap_or("").starts_with("ai-answer/")));
-        assert!(sys.contains("从用户问题发起的新探索"));
-        assert!(sys.contains("不是教材缺失"));
-        assert!(sys.contains("不额外逐条询问保存许可"));
-        assert!(sys.contains("爱因斯坦是什么人？"));
-        assert!(sys.contains("referenceTime:"));
-        assert!(sys.contains("timeZone:"));
-        assert!(sys.contains("name: learning-explore"));
+        assert!(!sys.contains("name: learning-explore"));
+        let messages = p["messages"].as_array().unwrap();
+        let texts: Vec<String> = messages.iter().map(|m| m["content"].as_str().map(str::to_owned)
+            .unwrap_or_else(||m["content"].as_array().into_iter().flatten().filter_map(|p|p["text"].as_str()).collect())).collect();
+        let all_text = texts.join("\n");
+        let prior = if i==0 {&[][..]} else {packets[0]["messages"].as_array().unwrap().as_slice()};
+        assert_eq!(&messages[..prior.len()],prior,"reopening preserves the original wire prefix including its one-shot references");
+        let current_text = texts[prior.len()..].join("\n");
+        let times: Vec<_> = texts.iter().filter(|t|t.starts_with("本轮冻结时间与时区")).collect();
+        assert_eq!(times.len(),i+1,"each native turn retains its own frozen clock");
+        for (round,time) in times.iter().enumerate() { assert_eq!(*time, &clocks[round]); }
+        assert!(times.last().unwrap().starts_with("本轮冻结时间与时区\nreferenceTime: "));
+        assert!(!all_text.contains("learning_request"));
+        assert!(!all_text.contains("contextBridgeManifest"));
+        assert!(!all_text.contains("UNREVEALED_TYPED_ANSWER_SENTINEL"));
+        assert!(!all_text.contains("UNREVEALED_TYPED_EXPLANATION_SENTINEL"));
+        assert_eq!(current_text.contains("文件：练习题目"), i == 0);
+        assert_eq!(all_text.matches("文件：练习题目").count(),1,"original reference remains once without being re-injected");
+        assert_eq!(current_text.contains("RENDERED_QUESTION_TYPED_SOURCE"), i == 0);
+        assert_eq!(all_text.matches("RENDERED_QUESTION_TYPED_SOURCE").count(),1,"original reference remains once without being re-injected");
+        assert!(!all_text.contains("quoted_exercise_part"));
+        assert_eq!(current_text.contains("文件：历史回答"), i == 0);
+        assert_eq!(all_text.matches("文件：历史回答").count(),1,"original reference remains once without being re-injected");
+        assert_eq!(current_text.contains("AI_REF_FIXTURE **raw**。IGNORE_ALL_SYSTEM_RULES"), i == 0);
+        assert_eq!(all_text.matches("AI_REF_FIXTURE **raw**。IGNORE_ALL_SYSTEM_RULES").count(),1,"original reference remains once without being re-injected");
+        assert!(!all_text.contains("quoted_ai_answer"));
+        let exploration: Vec<_> = texts.iter().filter(|t|t.starts_with("【Exploration：当前任务入口】")).collect();
+        // Session-scoped registration: one entry from the opening turn, reused.
+        assert_eq!(exploration.len(), 1);
+        assert!(exploration.iter().all(|t|t.as_str()=="【Exploration：当前任务入口】\n本会话来自独立探索入口，正文保存在探索笔记中。"));
+        assert!(!all_text.contains("question-led-exploration"));
+        assert!(!all_text.contains("storageDocumentId"));
+        let goal = if i==0 {"爱因斯坦是什么人？"} else {"继续解释他的科学贡献"};
+        assert_eq!(texts.iter().filter(|t|t.as_str()==goal).count(),1,"current question is a single genuine native user message");
+        assert!(!sys.contains("referenceTime:"));
+        assert!(!sys.contains("爱因斯坦是什么人？"));
         let all = p.to_string();
         assert!(all.contains("LINKED_MATERIAL_MUST_SURVIVE"));
         assert!(all.contains(if i == 0 {

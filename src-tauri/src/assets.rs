@@ -65,8 +65,8 @@ impl Drop for LockedRoot {
 }
 
 /// Imports bytes provided by the caller, never a caller-selected system path.
-/// Metadata is the last atomic no-clobber commit marker. A partial/corrupt asset
-/// is left untouched and reported as invalid rather than silently overwritten.
+/// Both body and receipt are synced in a private staging directory before its
+/// atomic publication under the asset lock. Existing assets are never rewritten.
 pub fn import(
     store: &ContentStore,
     course_id: &str,
@@ -96,55 +96,89 @@ pub fn import(
         asset,
     };
     let _process = OPERATIONS.lock().map_err(|_| busy())?;
-    let root = lock_root(store, true)?.ok_or_else(invalid_state)?;
+    let (storage, project) = crate::course_project::asset_storage(store, course_id)?;
+    let root = lock_root(&storage, true)?.ok_or_else(invalid_state)?;
     // The ID is global even though storage and authorization are course-scoped.
     // Checking only directory existence discloses no other course's contents.
     reject_other_course_request(&root.path, course_id, &id)?;
+    for summary in store
+        .summaries()
+        .into_iter()
+        .filter(|s| s.kind == "course" && s.id != course_id)
+    {
+        let (other, _) = crate::course_project::asset_storage(store, &summary.id)?;
+        if fs::symlink_metadata(other.join("assets").join(&summary.id).join(&id)).is_ok() {
+            return Err(conflict());
+        }
+    }
     let course =
-        checked_directory(store.root(), &["assets", course_id], true)?.ok_or_else(invalid_state)?;
+        checked_directory(&storage, &["assets", course_id], true)?.ok_or_else(invalid_state)?;
     let path = course.join(&id);
     if fs::symlink_metadata(&path).is_ok() {
-        return existing_receipt(store.root(), course_id, &id, &record);
+        return existing_receipt(&storage, course_id, &id, &record, project);
     }
-    let existing = list_course(store.root(), course_id)?;
+    let existing = list_course(&storage, course_id, project)?;
     let total: u64 = existing.iter().map(|asset| asset.size).sum();
     if existing.len() >= MAX_ASSETS || total + bytes.len() as u64 > MAX_COURSE_BYTES {
         return Err(limit("每门课程最多保存100份资料，总大小不得超过25MiB。"));
     }
-    match create_private_directory(&path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            return existing_receipt(store.root(), course_id, &id, &record);
-        }
-        Err(error) => return Err(CoreError::io(error)),
-    }
-    checked_directory(store.root(), &["assets", course_id, &id], false)?
-        .ok_or_else(invalid_state)?;
-    write_noclobber(&path, &format!("content.{extension}"), bytes)?;
-    write_noclobber(
-        &path,
-        "metadata.json",
-        &serde_json::to_vec(&record).map_err(|_| invalid_state())?,
-    )?;
-    sync_directory(&course)?;
+    let name = if project {
+        editable_name(file_name)
+    } else {
+        format!("content.{extension}")
+    };
+    publish_asset(&course, &id, |staged| {
+        write_noclobber(staged, &name, bytes)?;
+        write_noclobber(
+            staged,
+            if project {
+                ".asset.json"
+            } else {
+                "metadata.json"
+            },
+            &serde_json::to_vec(&record).map_err(|_| invalid_state())?,
+        )
+    })?;
     Ok(record.asset)
 }
 
 pub fn list(store: &ContentStore, course_id: &str) -> Result<Vec<Asset>> {
     validate_course(store, course_id)?;
     let _process = OPERATIONS.lock().map_err(|_| busy())?;
-    let Some(_root) = lock_root(store, false)? else {
+    let (storage, project) = crate::course_project::asset_storage(store, course_id)?;
+    let Some(_root) = lock_root(&storage, false)? else {
         return Ok(vec![]);
     };
-    list_course(store.root(), course_id)
+    list_course(&storage, course_id, project)
+}
+
+/// Full, validated inert bytes for a checkpoint; never the truncated preview.
+pub(crate) fn checkpoint_bytes(
+    store: &ContentStore,
+    course_id: &str,
+) -> Result<Vec<(Asset, Vec<u8>)>> {
+    validate_course(store, course_id)?;
+    let _process = OPERATIONS.lock().map_err(|_| busy())?;
+    let (storage, project) = crate::course_project::asset_storage(store, course_id)?;
+    let Some(_root) = lock_root(&storage, false)? else {
+        return Ok(vec![]);
+    };
+    list_course(&storage, course_id, project)?
+        .iter()
+        .map(|asset| {
+            load_asset(&storage, course_id, &asset.id, project)
+                .map(|(record, bytes)| (record.asset, bytes))
+        })
+        .collect()
 }
 
 pub fn read(store: &ContentStore, course_id: &str, asset_id: &str) -> Result<AssetPreview> {
     validate_course(store, course_id)?;
     validate_asset_id(asset_id)?;
     let _process = OPERATIONS.lock().map_err(|_| busy())?;
-    let _root = lock_root(store, false)?.ok_or_else(not_found)?;
-    let (record, bytes) = load_asset(store.root(), course_id, asset_id)?;
+    let (storage, project) = crate::course_project::asset_storage(store, course_id)?;
+    let _root = lock_root(&storage, false)?.ok_or_else(not_found)?;
+    let (record, bytes) = load_asset(&storage, course_id, asset_id, project)?;
     let is_image = record.asset.mime.starts_with("image/");
     let (text, data_url, truncated) = if is_image {
         (
@@ -246,7 +280,14 @@ fn mime_for(extension: &str) -> Option<(&'static str, bool)> {
     })
 }
 
-fn inspect(file_name: &str, bytes: &[u8]) -> Result<(String, &'static str)> {
+pub(crate) fn material_file_allowed(name: &str) -> bool {
+    extension(name)
+        .ok()
+        .and_then(|ext| mime_for(&ext))
+        .is_some()
+}
+
+pub(crate) fn inspect(file_name: &str, bytes: &[u8]) -> Result<(String, &'static str)> {
     let extension = extension(file_name)?;
     let (mime, image) = mime_for(&extension).ok_or_else(|| {
         CoreError::new(
@@ -307,6 +348,25 @@ fn inspect(file_name: &str, bytes: &[u8]) -> Result<(String, &'static str)> {
     Ok((extension, mime))
 }
 
+pub(crate) fn editable_name(name: &str) -> String {
+    let encoded = name.replace('%', "%25").replace(':', "%3A");
+    if encoded.eq_ignore_ascii_case(".asset.json") || encoded.len() > 255 {
+        // The caller has already validated the allowlisted extension. Keep the
+        // original name in the receipt, and retain hidden-name exclusion.
+        let extension = name
+            .rsplit('.')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        format!(
+            "{}content.{extension}",
+            if name.starts_with('.') { "." } else { "" }
+        )
+    } else {
+        encoded
+    }
+}
+
 fn payload_hash(asset: &Asset) -> Result<String> {
     let bytes = serde_json::to_vec(&(
         &asset.course_id,
@@ -324,17 +384,19 @@ fn existing_receipt(
     course_id: &str,
     id: &str,
     requested: &StoredAsset,
+    project: bool,
 ) -> Result<Asset> {
-    let (existing, _) = load_asset(root, course_id, id)?;
+    let (existing, _) = load_asset(root, course_id, id, project)?;
     if existing.request_id != requested.request_id
         || existing.payload_hash != requested.payload_hash
     {
         return Err(conflict());
     }
-    Ok(existing.asset)
+    sync_directory(&root.join("assets").join(course_id))?;
+    Ok(requested.asset.clone())
 }
 
-fn list_course(root: &Path, course_id: &str) -> Result<Vec<Asset>> {
+fn list_course(root: &Path, course_id: &str, project: bool) -> Result<Vec<Asset>> {
     let Some(course) = checked_directory(root, &["assets", course_id], false)? else {
         return Ok(vec![]);
     };
@@ -346,11 +408,18 @@ fn list_course(root: &Path, course_id: &str) -> Result<Vec<Asset>> {
             .file_name()
             .into_string()
             .map_err(|_| invalid_state())?;
+        if id.starts_with(".import-") {
+            let metadata = fs::symlink_metadata(entry.path()).map_err(CoreError::io)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(unsafe_path());
+            }
+            continue; // A crash may leave unpublished staging; never expose or delete it.
+        }
         validate_asset_id(&id)?;
         if assets.len() >= MAX_ASSETS {
             return Err(limit("课程资料超过100份，未读取或写入更多内容。"));
         }
-        let (record, _) = load_asset(root, course_id, &id)?;
+        let (record, _) = load_asset(root, course_id, &id, project)?;
         total += record.asset.size;
         if total > MAX_COURSE_BYTES {
             return Err(limit("课程资料总大小超过25MiB。"));
@@ -361,12 +430,22 @@ fn list_course(root: &Path, course_id: &str) -> Result<Vec<Asset>> {
     Ok(assets)
 }
 
-fn load_asset(root: &Path, course_id: &str, id: &str) -> Result<(StoredAsset, Vec<u8>)> {
+fn load_asset(
+    root: &Path,
+    course_id: &str,
+    id: &str,
+    project: bool,
+) -> Result<(StoredAsset, Vec<u8>)> {
     validate_asset_id(id)?;
     let directory =
         checked_directory(root, &["assets", course_id, id], false)?.ok_or_else(not_found)?;
-    let metadata = bounded_read(&directory.join("metadata.json"), MAX_METADATA)?;
-    let record: StoredAsset = serde_json::from_slice(&metadata).map_err(|_| invalid_state())?;
+    let receipt = if project {
+        ".asset.json"
+    } else {
+        "metadata.json"
+    };
+    let metadata = bounded_read(&directory.join(receipt), MAX_METADATA)?;
+    let mut record: StoredAsset = serde_json::from_slice(&metadata).map_err(|_| invalid_state())?;
     if record.version != 1
         || !crate::types::valid_id(&record.request_id)
         || record.asset.id != id
@@ -390,11 +469,15 @@ fn load_asset(root: &Path, course_id: &str, id: &str) -> Result<(StoredAsset, Ve
     {
         return Err(invalid_state());
     }
-    let content_name = format!("content.{ext}");
+    let content_name = if project {
+        editable_name(&record.asset.file_name)
+    } else {
+        format!("content.{ext}")
+    };
     let mut entries = 0;
     for entry in fs::read_dir(&directory).map_err(CoreError::io)? {
         let name = entry.map_err(CoreError::io)?.file_name();
-        if name != "metadata.json" && name != content_name.as_str() {
+        if name != receipt && name != content_name.as_str() {
             return Err(invalid_state());
         }
         entries += 1;
@@ -409,10 +492,16 @@ fn load_asset(root: &Path, course_id: &str, id: &str) -> Result<(StoredAsset, Ve
         &directory.join(content_name),
         if image { MAX_IMAGE } else { MAX_TEXT },
     )?;
-    if bytes.len() as u64 != record.asset.size || digest(&bytes) != record.asset.sha256 {
+    if !project
+        && (bytes.len() as u64 != record.asset.size || digest(&bytes) != record.asset.sha256)
+    {
         return Err(invalid_state());
     }
     inspect(&record.asset.file_name, &bytes)?;
+    if project {
+        record.asset.size = bytes.len() as u64;
+        record.asset.sha256 = digest(&bytes);
+    }
     Ok((record, bytes))
 }
 
@@ -445,8 +534,8 @@ fn reject_other_course_request(root: &Path, course_id: &str, id: &str) -> Result
     Ok(())
 }
 
-fn lock_root(store: &ContentStore, create: bool) -> Result<Option<LockedRoot>> {
-    let Some(root) = checked_directory(store.root(), &["assets"], create)? else {
+fn lock_root(root: &Path, create: bool) -> Result<Option<LockedRoot>> {
+    let Some(root) = checked_directory(root, &["assets"], create)? else {
         return Ok(None);
     };
     let path = root.join(LOCK_NAME);
@@ -545,7 +634,7 @@ fn same_file(a: &Metadata, b: &Metadata) -> bool {
     }
 }
 
-fn bounded_read(path: &Path, maximum: usize) -> Result<Vec<u8>> {
+pub(crate) fn bounded_read(path: &Path, maximum: usize) -> Result<Vec<u8>> {
     let file = checked_file(path, maximum)?;
     let mut bytes = Vec::new();
     file.take((maximum + 1) as u64)
@@ -565,6 +654,30 @@ fn create_private_directory(path: &Path) -> std::io::Result<()> {
         builder.mode(0o700);
     }
     builder.create(path)
+}
+
+// The caller holds both application and on-disk asset locks. Publishing the
+// same-filesystem directory keeps readers from observing only one of its files.
+fn publish_asset(course: &Path, id: &str, write: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
+    let staged = tempfile::Builder::new()
+        .prefix(".import-")
+        .tempdir_in(course)
+        .map_err(CoreError::io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(staged.path(), fs::Permissions::from_mode(0o700))
+            .map_err(CoreError::io)?;
+    }
+    write(staged.path())?;
+    let destination = course.join(id);
+    match fs::symlink_metadata(&destination) {
+        Ok(_) => return Err(conflict()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(CoreError::io(error)),
+    }
+    fs::rename(staged.path(), &destination).map_err(CoreError::io)?;
+    sync_directory(course)
 }
 
 fn write_noclobber(directory: &Path, name: &str, bytes: &[u8]) -> Result<()> {
@@ -692,6 +805,35 @@ mod tests {
         )
         .unwrap();
         (directory, store, course.id, section.id, other.id)
+    }
+
+    #[test]
+    fn failed_staging_and_crash_leftovers_do_not_publish_or_block_assets() {
+        let (_dir, store, course, _, _) = fixture();
+        let seed = import(&store, &course, "seed.txt", b"seed", "staging_seed").unwrap();
+        let directory = store.root().join("assets").join(&course);
+        let id = format!("asset_{}", &digest(b"staging_failed")[..32]);
+        let error = publish_asset(&directory, &id, |staged| {
+            write_noclobber(staged, "content.txt", b"uncommitted")?;
+            Err(CoreError::new("IO", "synthetic receipt write failure"))
+        })
+        .unwrap_err();
+        assert_eq!(error.code, "IO");
+        assert!(!directory.join(&id).exists());
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        let pending = directory.join(".import-crashed");
+        fs::create_dir(&pending).unwrap();
+        fs::write(pending.join("content.txt"), b"unpublished").unwrap();
+        assert_eq!(list(&store, &course).unwrap(), vec![seed]);
+        let next = import(&store, &course, "next.txt", b"next", "staging_next").unwrap();
+        assert_eq!(list(&store, &course).unwrap().len(), 2);
+        let error = publish_asset(&directory, &next.id, |_| Ok(())).unwrap_err();
+        assert_eq!(error.code, "CONFLICT");
+        assert_eq!(
+            read(&store, &course, &next.id).unwrap().text.as_deref(),
+            Some("next")
+        );
+        assert!(pending.is_dir()); // Unknown crash data is retained, not silently removed.
     }
 
     #[test]
@@ -1241,7 +1383,7 @@ mod lock_lifecycle_tests {
             let mut child = None;
             let outcome =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
-                    let root = lock_root(&store, true)?.unwrap();
+                    let root = lock_root(store.root(), true)?.unwrap();
                     child = Some(InheritedFile::hold(&root._lock));
                     match exit {
                         "error" => Err(invalid_state()),
@@ -1254,11 +1396,11 @@ mod lock_lifecycle_tests {
                 "unwind" => assert!(outcome.is_err()),
                 _ => outcome.unwrap().unwrap(),
             }
-            let next = lock_root(&store, false).unwrap().unwrap();
+            let next = lock_root(store.root(), false).unwrap().unwrap();
             child.take().unwrap().finish();
             // Closing an inherited descriptor of the old owner must not unlock
             // the next owner, which uses a different open-file-description.
-            assert_eq!(lock_root(&store, false).err().unwrap().code, "BUSY");
+            assert_eq!(lock_root(store.root(), false).err().unwrap().code, "BUSY");
             drop(next);
         }
     }
@@ -1271,11 +1413,11 @@ mod lock_lifecycle_tests {
             directory.path().join("state"),
         )
         .unwrap();
-        let owner = lock_root(&store, true).unwrap().unwrap();
+        let owner = lock_root(store.root(), true).unwrap().unwrap();
         for _ in 0..2 {
-            assert_eq!(lock_root(&store, false).err().unwrap().code, "BUSY");
+            assert_eq!(lock_root(store.root(), false).err().unwrap().code, "BUSY");
         }
         drop(owner);
-        assert!(lock_root(&store, false).unwrap().is_some());
+        assert!(lock_root(store.root(), false).unwrap().is_some());
     }
 }

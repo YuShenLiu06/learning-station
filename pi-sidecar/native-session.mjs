@@ -1,11 +1,13 @@
-// Application binding around the pinned public Pi SDK. No global loader, auth file or CLI.
+// Application binding around the pinned public Pi SDK. Credentials and tools remain explicit.
 import fs from 'node:fs';
+import {ContextBridge,decodeBridgeInput} from './context-bridge.mjs';
+import {registerMaterialContext} from './material-context.mjs';
 import path from 'node:path';
 import {createHash, randomUUID} from 'node:crypto';
 import {createAssistantMessageEventStream} from '@earendil-works/pi-ai/utils/event-stream';
 import {Agent} from '@earendil-works/pi-agent-core';
 import {InMemoryCredentialStore} from '@earendil-works/pi-ai';
-import {AgentSession, SessionManager, SettingsManager, ModelRuntime, createExtensionRuntime, convertToLlm} from '@earendil-works/pi-coding-agent';
+import {AgentSession, SessionManager, SettingsManager, ModelRuntime, DefaultResourceLoader, getAgentDir, createExtensionRuntime, convertToLlm} from '@earendil-works/pi-coding-agent';
 const stable = v=>Array.isArray(v)?v.map(stable):v&&typeof v==='object'?Object.fromEntries(Object.keys(v).sort().map(k=>[k,stable(v[k])])):v;
 const sha = value => createHash('sha256').update(value).digest('hex');
 const redact=(v,key)=>typeof v==='string'?v.replaceAll(key,'[REDACTED]'):Array.isArray(v)?v.map(x=>redact(x,key)):v&&typeof v==='object'?Object.fromEntries(Object.entries(v).map(([k,x])=>[k,redact(x,key)])):v;
@@ -23,9 +25,9 @@ function atomic(file,value){
 }
 function sync(file){const fd=fs.openSync(file,'r');try{if(!process.permission)fs.fsyncSync(fd);}finally{fs.closeSync(fd);}}
 function text(message){return typeof message.content==='string'?message.content:(message.content??[]).filter(p=>p.type==='text').map(p=>p.text).join('');}
-function safeStream(original,secret,checkpoint){return (model,context,options)=>{
+function safeStream(original,secret,checkpoint,beforeRequest){return (model,context,options)=>{
   const stream=createAssistantMessageEventStream();
-  (async()=>{try{await checkpoint();const cleanContext={...context,messages:context.messages.map(m=>m.role==='system'?{...m,...(m.sections?{sections:{...m.sections,cwd:'学习站受控学习空间（没有通用文件或命令权限）'}}:{}),...(typeof m.content==='string'?{content:m.content.replace(/<cwd>[\s\S]*?<\/cwd>/gu,'<cwd>学习站受控学习空间（没有通用文件或命令权限）</cwd>')}:{})}:m)};for await(const event of await original(model,cleanContext,options))stream.push(redact(event,secret));stream.end();}
+  (async()=>{try{await checkpoint();const cleanContext={...context,messages:context.messages.map(m=>m.role==='system'?{...m,...(m.sections?{sections:{...m.sections,cwd:'当前课程'}}:{}),...(typeof m.content==='string'?{content:m.content.replace(/<cwd>[\s\S]*?<\/cwd>/gu,'<cwd>当前课程</cwd>')}:{})}:m)};let received=false;for await(const event of await original(model,cleanContext,options)){if(!received&&(event.type==='text_delta'||event.type==='toolcall_start'||event.type==='done')){beforeRequest?.(context);await checkpoint();received=true;}stream.push(redact(event,secret));}stream.end();}
   catch{const error={role:'assistant',content:[],api:model.api,provider:model.provider,model:model.id,usage:{input:0,output:0,cacheRead:0,cacheWrite:0,totalTokens:0,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}},stopReason:'error',errorMessage:'Controlled stream failed',timestamp:Date.now()};stream.push({type:'error',reason:'error',error});stream.end();}})();
   return stream;
 };}
@@ -36,6 +38,8 @@ export function sealedResources(systemPrompt){
 function validateInner(spec){
   if(!spec||!path.isAbsolute(spec.directory)||!/^[A-Za-z0-9_-]{1,200}$/u.test(spec.learningSessionId)||!/^[A-Za-z0-9_-]{1,200}$/u.test(spec.runId)||typeof spec.userEntryId!=='string'||!Array.isArray(spec.authorizedSourceIds))throw new NativeSessionError();
   if(fs.realpathSync(spec.directory)!==spec.directory||!fs.lstatSync(spec.directory).isDirectory())throw new NativeSessionError();
+  if(spec.projectRoot!==undefined&&(!path.isAbsolute(spec.projectRoot)||fs.realpathSync(spec.projectRoot)!==spec.projectRoot||!fs.lstatSync(spec.projectRoot).isDirectory()))throw new NativeSessionError();
+  if(spec.agentDir!==undefined&&!path.isAbsolute(spec.agentDir))throw new NativeSessionError();
   const binding=JSON.parse(read(path.join(spec.directory,'binding.json'),16384));
   if(binding.version!==1||binding.learningSessionId!==spec.learningSessionId||binding.transcript!=='transcript.jsonl')throw new NativeSessionError();
   const file=path.join(spec.directory,binding.transcript);
@@ -51,8 +55,9 @@ function validateInner(spec){
 }
 function validate(spec){try{return validateInner(spec);}catch(error){throw error instanceof NativeSessionError?error:new NativeSessionError('NATIVE_SESSION_INVALID',error);}}
 // Pi native messages are the only model transcript. Business Markdown remains independently intact.
-export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn,apiKey,thinkingLevel,finishTurn,beforeToolCall,requestTool,onManifest,onLifecycle,checkpoint:providedCheckpoint}){
+export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn,apiKey,thinkingLevel,finishTurn,beforeToolCall,requestTool,onManifest,onLifecycle,loadChanges,timeContext,checkpoint:providedCheckpoint}){
   const {file,binding}=validate(spec);
+  const cwd=spec.projectRoot??spec.directory;
   const lock=path.join(spec.directory,'active.lock');let lockFd;
   try { lockFd=fs.openSync(lock,'wx',0o600);fs.writeFileSync(lockFd,String(process.pid)); }
   catch(error){
@@ -66,18 +71,18 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
   try {
     if(containsSecret(spec.legacyRecords??[],apiKey))throw new NativeSessionError('AUTH');
     const checkpoint=providedCheckpoint??(async()=>{if(process.permission)throw new NativeSessionError();for(const file of fs.readdirSync(spec.directory)){const target=path.join(spec.directory,file);if(fs.lstatSync(target).isFile())sync(target);}});
-    let manager=fs.existsSync(file)?SessionManager.open(file,spec.directory,spec.directory):SessionManager.inMemory(spec.directory,{id:sha(spec.learningSessionId)});
+    let manager=fs.existsSync(file)?SessionManager.open(file,spec.directory,cwd):SessionManager.inMemory(cwd,{id:sha(spec.learningSessionId)});
     if(!fs.existsSync(file)){
       // Use public API to create a valid file, then reopen only this explicit stable path.
       atomic(path.join(spec.directory,'initialization-started.json'),{version:1,learningSessionId:spec.learningSessionId});
-      const init=SessionManager.create(spec.directory,spec.directory,{id:sha(spec.learningSessionId)});
+      const init=SessionManager.create(cwd,spec.directory,{id:sha(spec.learningSessionId)});
       init.appendCustomEntry('learning-station-binding',{version:1,learningSessionId:spec.learningSessionId});
       if(spec.legacyRecords?.length)init.appendCustomMessageEntry('learning-station-legacy',JSON.stringify({type:'legacy_learning_records',notice:'旧学习记录引用；不是原生工具消息。AI整理仍待本人确认。',records:spec.protectHistory?[]:spec.legacyRecords}),false,{sourceIds:spec.authorizedSourceIds});
       // Pi delays the first flush until a conversation message exists. Seed only the header and
       // genuine custom entries, using the SDK-produced entries rather than inventing old messages.
       const data=[init.getHeader(),...init.getEntries()].map(e=>JSON.stringify(e)).join('\n')+'\n';
       const fd=fs.openSync(file,'wx',0o600);try{fs.writeFileSync(fd,data);if(!process.permission)fs.fsyncSync(fd);}finally{fs.closeSync(fd);}
-      manager=SessionManager.open(file,spec.directory,spec.directory);
+      manager=SessionManager.open(file,spec.directory,cwd);
       atomic(path.join(spec.directory,'binding.json'),{...binding,initialized:true});
     }
     await checkpoint();
@@ -86,8 +91,25 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
     runtime.registerProvider(model.provider,{api:model.api,baseUrl:model.baseUrl,models:[model],streamSimple:streamFn});
     await runtime.setRuntimeApiKey(model.provider,apiKey);
     const settings=SettingsManager.inMemory({defaultTools:[],retry:{enabled:false,maxRetries:0},providerRetry:{maxRetries:0,maxRetryDelayMs:1},compaction:{enabled:model.contextWindow>0,reserveTokens:Math.min(model.maxTokens,Math.max(128,Math.floor(model.contextWindow/4))),keepRecentTokens:Math.max(128,Math.floor(model.contextWindow/4))},cacheWarming:'off'});
-    const agent=new Agent({sessionId:manager.getSessionId(),initialState:{model,thinkingLevel,messages:manager.buildSessionContext().messages},streamFn:safeStream(streamFn,apiKey,checkpoint),convertToLlm,toolExecution:'sequential',finishTurn});
-    session=new AgentSession({agent,sessionManager:manager,settingsManager:settings,cwd:spec.directory,resourceLoader:sealedResources(systemPrompt),modelRuntime:runtime,baseToolsOverride:{},customTools:tools,initialActiveToolNames:tools.map(t=>t.name),allowedToolNames:tools.map(t=>t.name),usesDefaultTools:false});
+    // Pi owns project discovery, ancestor context files and skill parsing. Keep the
+    // existing explicit extension/tool policy; text resources do not grant tools.
+    // Pi treats an empty custom prompt as its default coding tutorial. Whitespace
+    // explicitly opts out while preserving its project AGENTS/skill discovery.
+    const piSystemPrompt=systemPrompt||' ';
+    const resourceLoader=spec.projectRoot?new DefaultResourceLoader({cwd,agentDir:spec.agentDir??getAgentDir(),settingsManager:settings,systemPromptOverride:()=>piSystemPrompt,noExtensions:true}):sealedResources(piSystemPrompt);
+    await resourceLoader.reload();
+    const markChangesRequest=context=>{
+      for(const e of manager.buildSessionProjection().entries){const source=e.sourceEntry;
+        if(!e.messages.length||source.type!=='custom_message'||!(source.customType==='learning-station-material'||source.details?.materialFrames)||!context.messages.some(m=>text(m)===source.content))continue;
+        if(!manager.getEntries().some(r=>r.type==='custom'&&r.customType==='learning-station-material-request'&&r.data?.entryId===source.id))manager.appendCustomEntry('learning-station-material-request',{nativeSessionId:manager.getSessionId(),entryId:source.id});
+      }
+      for(const e of manager.buildSessionProjection().entries){const source=e.sourceEntry;
+        if(!e.messages.length||source.type!=='custom_message'||!source.details?.courseId||!source.details?.checkpointCommitOid||source.details?.runId!==spec.runId||!context.messages.some(m=>text(m)===source.content))continue;
+        if(!manager.getEntries().some(r=>r.type==='custom'&&r.customType==='learning-station-changes-request'&&r.data?.changesEntryId===source.id))manager.appendCustomEntry('learning-station-changes-request',{nativeSessionId:manager.getSessionId(),runId:spec.runId,userEntryId:spec.userEntryId,changesEntryId:source.id});
+      }
+    };
+    const agent=new Agent({sessionId:manager.getSessionId(),initialState:{model,thinkingLevel,messages:manager.buildSessionContext().messages},streamFn:safeStream(streamFn,apiKey,checkpoint,markChangesRequest),convertToLlm,toolExecution:'sequential',finishTurn});
+    session=new AgentSession({agent,sessionManager:manager,settingsManager:settings,cwd,resourceLoader,modelRuntime:runtime,baseToolsOverride:{},customTools:tools,initialActiveToolNames:tools.map(t=>t.name),allowedToolNames:tools.map(t=>t.name),usesDefaultTools:false});
     // AgentSession owns its hooks; application preflight remains an additional restrictive layer.
     const nativeBefore=agent.beforeToolCall;agent.beforeToolCall=async(c,s)=>await beforeToolCall?.(c,s)??await nativeBefore?.(c,s);
     agent.finishTurn=finishTurn;
@@ -113,10 +135,11 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
       if(!owner)throw new NativeSessionError('NATIVE_TOOL_UNKNOWN');
       const receipt=path.join(spec.directory,'tool-'+sha(JSON.stringify([owner.runId,call.id]))+'.json');
       let reply=fs.existsSync(receipt)?JSON.parse(read(receipt,65536)):null;
-      if(!reply?.reply){
+      if(call.name==='read'||!reply?.reply){
         if(typeof requestTool!=='function')throw new NativeSessionError('NATIVE_TOOL_UNKNOWN');
         const recovered=await requestTool({type:'tool_recover',recoveryRunId:owner.runId,id:call.id,name:call.name,args:call.arguments});
-        if(!recovered?.result?.persisted)throw new NativeSessionError('NATIVE_TOOL_UNKNOWN');
+        const deniedRead=call.name==='read'&&['TOOL_SCOPE','CONFLICT','TOOL_NOT_ALLOWED','TRASHED','NOT_FOUND'].includes(recovered?.error?.code);
+        if(!(call.name==='read'?recovered?.result||deniedRead:recovered?.result?.persisted))throw new NativeSessionError('NATIVE_TOOL_UNKNOWN');
         reply={callId:call.id,name:call.name,argsHash:sha(JSON.stringify(stable(call.arguments))),reply:recovered};
       }
       if(reply.callId!==call.id||reply.name!==call.name||reply.argsHash!==sha(JSON.stringify(stable(call.arguments)))||!reply.reply)throw new NativeSessionError('NATIVE_TOOL_UNKNOWN');
@@ -124,50 +147,54 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
       manager.appendMessage({role:'toolResult',toolCallId:call.id,toolName:call.name,content:[{type:'text',text:JSON.stringify(value)}],isError:!!reply.reply.error,timestamp:Date.now()});
     }
     // A changed scope must not hide an unresolved write and bypass its receipt.
-    if(revoked||spec.protectHistory){
+    if(revoked||spec.protectHistory&&(!spec.historyBoundaryKey||previousBinding?.historyBoundaryKey!==spec.historyBoundaryKey)){
       const boundary=manager.appendCustomMessageEntry('learning-station-permission-boundary','资料授权已变化；此前模型上下文已排除，仅使用本轮授权资料。',false,{});
       manager.appendCompaction('应用权限边界：此前内容未重新授权，不作为本轮依据。',boundary,0,{reason:'authorization-change'},true);
     }
-    manager.appendCustomEntry('learning-station-scope',{sourceIds:spec.authorizedSourceIds});
+    manager.appendCustomEntry('learning-station-scope',{sourceIds:spec.authorizedSourceIds,historyBoundaryKey:spec.historyBoundaryKey});
     agent.state.messages=manager.buildSessionContext().messages;
-    // Old per-turn references are not silently injected into later requests.
-    for(const entry of manager.buildSessionProjection().entries){if(entry.sourceEntry.type==='custom_message'&&entry.sourceEntry.customType==='learning-station-turn'&&entry.messages.length)manager.appendContextEdit(entry.sourceEntry.id,null);}
+    // Older application projections carried raw internal metadata and no registry identity.
+    // Retire only those custom projections; Pi keeps the actual user/tool/assistant history.
+    for(const entry of manager.buildSessionProjection().entries)if(entry.messages.length&&entry.sourceEntry.type==='custom_message'&&['learning-station-material','learning-station-changes','learning-station-turn'].includes(entry.sourceEntry.customType)&&!entry.sourceEntry.details?.bridgeKey)manager.appendContextEdit(entry.sourceEntry.id,null);
     agent.state.messages=manager.buildSessionContext().messages;
-    let currentSources=[];let currentTurn;
-    const applyContext=async envelope=>{
+    const bridge=new ContextBridge(manager,{runId:spec.runId,userEntryId:spec.userEntryId});
+    const nativeTransform=agent.transformContext;
+    agent.transformContext=async(messages,signal)=>bridge.ordered(await nativeTransform?.(messages,signal)??messages);
+    let currentTurn,pendingProjection=Promise.resolve();
+    const projectContext=async input=>{
+      const envelope=decodeBridgeInput(input);
       if(containsSecret(envelope,apiKey))throw new NativeSessionError('AUTH');
-      currentSources=envelope.nativeMaterials??[];currentTurn=envelope;
-      const inventory=structuredClone(envelope.contextBridgeManifest??{version:1,entries:[]});
-      inventory.entries=inventory.entries.filter(e=>e.kind!=='history');
-      for(const source of currentSources){
-        if(typeof source.text!=='string'||sha(source.text)!==source.textHash||!spec.authorizedSourceIds.includes(source.id))throw new NativeSessionError();
-        const active=manager.buildSessionProjection().entries.filter(e=>e.messages.length&&e.sourceEntry.type==='custom_message'&&e.sourceEntry.customType==='learning-station-material'&&e.sourceEntry.details?.sourceId===source.id);
-        let activeHash;let chainReady=false;
-        for(const entry of active){
-          let value;try{value=JSON.parse(text(entry.messages[0]));}catch{chainReady=false;break;}
-          for(const frame of value.frames??[]){if(frame.kind==='full'){chainReady=sha(frame.text)===frame.textHash;activeHash=frame.textHash;}
-          else if(frame.kind==='diff'){chainReady=chainReady&&frame.baseHash===activeHash;activeHash=frame.textHash;}else chainReady=false;}
-        }
-        const last=chainReady?active.at(-1)?.sourceEntry.details:undefined;
-        let status=manager.getEntries().some(e=>e.type==='custom_message'&&e.customType==='learning-station-material'&&e.details?.sourceId===source.id)?'reloaded':'added',frames=[{kind:'full',version:source.version,textHash:source.textHash,text:source.text}];
-        if(chainReady&&source.range?.complete&&last?.textHash===source.textHash){status='retained';frames=[];}
-        else if(source.range?.complete&&last&&active.length<8){const at=source.frames?.findIndex(f=>f.textHash===last.textHash)??-1;if(at>=0&&source.frames.length>at+1){frames=source.frames.slice(at+1);status='updated';}}
-        if(frames.length){
-          if(frames[0].kind==='full')for(const entry of active)manager.appendContextEdit(entry.sourceEntry.id,null);
-          manager.appendCustomMessageEntry('learning-station-material',JSON.stringify({type:'automatic_material_projection',id:source.id,version:source.version,range:source.range,frames}),false,{sourceId:source.id,textHash:source.textHash,version:source.version,range:source.range});
-        }
-        const item=inventory.entries.find(e=>e.sourceId===source.id&&e.kind==='material');if(item){item.status=status;item.reason=status==='retained'?'native_projection_contains_baseline':status==='updated'?'native_projection_verified_diff':'native_baseline_reload';}
+      currentTurn=input;
+      // Replacing the same saved question is idempotent; earlier questions keep
+      // their own frozen context in Pi history. Safety/compaction edits still apply.
+      for(const entry of manager.buildSessionProjection().entries){
+        const source=entry.sourceEntry;
+        if(!entry.messages.length||source.type!=='custom_message'||source.details?.userEntryId!==spec.userEntryId)continue;
+        if(['learning-station-turn','learning-station-focus'].includes(source.customType)
+          ||source.customType==='learning-station-changes'&&!manager.getEntries().some(r=>r.type==='custom'&&r.customType==='learning-station-changes-request'&&r.data?.changesEntryId===source.id))bridge.exclude(source.id);
       }
-      for(const entry of manager.buildSessionProjection().entries){if(entry.sourceEntry.type==='custom_message'&&entry.sourceEntry.customType==='learning-station-turn'&&entry.messages.length)manager.appendContextEdit(entry.sourceEntry.id,null);}
-      const projectedMaterial=manager.buildSessionProjection().entries.filter(e=>e.messages.length&&e.sourceEntry.type==='custom_message'&&e.sourceEntry.customType==='learning-station-material').flatMap(e=>e.messages.map(text)).join('\n')+(envelope.nativeReferences??'');
-      inventory.projectedChars=[...projectedMaterial].length;inventory.projectedBytes=Buffer.byteLength(projectedMaterial);
-      const turn={...envelope};delete turn.nativeMaterials;delete turn.learningHistory;delete turn.historyManifest;delete turn.context;delete turn.question;
-      turn.context=envelope.nativeReferences??'';delete turn.nativeReferences;turn.contextBridgeManifest=inventory;
-      manager.appendCustomMessageEntry('learning-station-turn',JSON.stringify(turn),false,{runId:spec.runId});
+      const clock=envelope.currentTime??(timeContext?{referenceTime:timeContext.referenceTime,timeZone:timeContext.timeZone}:undefined);
+      if(clock)bridge.message('current_time','本轮冻结时间与时区','learning-station-turn','referenceTime: '+clock.referenceTime+(clock.timeZone?'\ntimeZone: '+clock.timeZone:''));
+      if(envelope.nativeReferences)bridge.message('references','用户本轮明确提供的引用及必要补充','learning-station-turn',envelope.nativeReferences);
+      const inventory=await registerMaterialContext({manager,spec,loadChanges,envelope,bridge,containsSecret,apiKey,NativeSessionError});
+      // The exploration entry marks the session origin: register on the opening
+      // turn only (or again if compaction removed it), never per submission.
+      if(envelope.exploration&&!bridge.registered('exploration'))bridge.message('exploration','【Exploration：当前任务入口】','learning-station-turn','本会话来自独立探索入口，正文保存在探索笔记中。');
+      bridge.commit();
+      const projected=manager.buildSessionProjection().entries.filter(e=>e.messages.length&&e.sourceEntry.details?.bridgeKey).flatMap(e=>e.messages.map(text)).join('\n');
+      inventory.projectedChars=[...projected].length;inventory.projectedBytes=Buffer.byteLength(projected);
       agent.state.messages=manager.buildSessionContext().messages;
       await onManifest?.(inventory);
     };
-    let pendingProjection=Promise.resolve();
+    const applyContext=input=>{
+      // Capture before the first asynchronous provider/receipt. A later UI edit
+      // cannot change this turn or the snapshot reused after Pi compaction.
+      const frozen=structuredClone(input);
+      const projection=pendingProjection.then(()=>projectContext(frozen));
+      pendingProjection=projection;
+      void projection.catch(()=>{});
+      return projection;
+    };
     const nativePrepare=agent.prepareRequest;
     agent.prepareRequest=async (...args)=>{await pendingProjection;return nativePrepare?.(...args);};
     const unsub=session.subscribe(event=>{
@@ -186,27 +213,36 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
       if(event.type==='message_end'&&event.message.role==='user'&&!record.userNativeId){
         const entry=manager.getEntries().filter(e=>e.type==='message'&&e.message.role==='user').at(-1);
         if(!entry)throw new NativeSessionError();
-        record.userNativeId=entry.id;manager.appendCustomEntry('learning-station-user',{userEntryId:spec.userEntryId,nativeId:entry.id});persist(record);
+        record.userNativeId=entry.id;manager.appendCustomEntry('learning-station-user',{userEntryId:spec.userEntryId,runId:spec.runId,nativeId:entry.id,inputHash:record.inputHash});persist(record);
       }
       if(event.type==='message_end')await checkpoint();
     });
-    return {session,agent,manager,applyContext,record,
+    const userIdentity=nativeId=>{const owner=manager.getEntries().find(e=>e.type==='custom'&&e.customType==='learning-station-user'&&e.data?.nativeId===nativeId)?.data;return owner?{userEntryId:owner.userEntryId,...(owner.runId?{runId:owner.runId}:{})}:{};};
+    return {session,agent,manager,applyContext,record,debugRegistrations:()=>bridge.registrations(),
+      debugSources:()=>manager.buildSessionProjection().entries.flatMap(entry=>entry.messages.map(message=>({
+        value:text(convertToLlm([message])[0]??message),origin:message.role==='custom'?(['learning-station-material','learning-station-turn','learning-station-changes','learning-station-focus'].includes(message.customType)?'bridge':'unknown'):({user:'user',assistant:'model',toolResult:'tool',compactionSummary:'pi',branchSummary:'pi'}[message.role]??'unknown'),
+        ...(entry.sourceEntry.details?.bridgeKey?{registrationKey:entry.sourceEntry.details.bridgeKey,description:entry.sourceEntry.details.bridgeDescription,runId:entry.sourceEntry.details.runId,userEntryId:entry.sourceEntry.details.userEntryId}:message.role==='user'?{registrationKey:'question',description:'Pi 原生用户输入',...userIdentity(entry.sourceEntry.id)}:{}),
+        name:message.customType??message.role,sourcePath:`native/${entry.sourceEntry.id}/${message.customType??message.role}`,
+      }))),
       async requestTool(call,signal){manager.appendCustomEntry('learning-station-tool',{runId:spec.runId,callId:call.id,argsHash:sha(JSON.stringify(stable(call.args)))});sync(file);await checkpoint();return requestTool(call,signal);},
       async prompt(question){
+        await pendingProjection;
         if(question.includes(apiKey))throw new NativeSessionError('AUTH');
+        const inputHash=sha(question);if(record.inputHash&&record.inputHash!==inputHash)throw new NativeSessionError();record.inputHash=inputHash;
         if(record.status==='complete')return {cached:record.finalContent};
         persist(record);
         // Preserve a previously accepted user once, including after a failed run.
         const prior=manager.getEntries().find(e=>e.type==='custom'&&e.customType==='learning-station-user'&&e.data?.userEntryId===spec.userEntryId);
-        if(prior){const entry=manager.getEntry(prior.data.nativeId);if(!entry||entry.type!=='message'||entry.message.role!=='user'||text(entry.message)!==question)throw new NativeSessionError();
+        if(prior){const entry=manager.getEntry(prior.data.nativeId);if(!entry||entry.type!=='message'||entry.message.role!=='user'||(prior.data.inputHash?prior.data.inputHash!==inputHash:text(entry.message)!==question))throw new NativeSessionError();
           // Compaction or a permission boundary may have removed the original from
           // the effective projection. Restore only this exact saved question as
           // retry context, never the revoked material or another user utterance.
-          const visible=manager.buildSessionProjection().entries.some(e=>e.sourceEntry.id===entry.id&&e.messages.some(m=>m.role==='user'&&text(m)===question));
-          const retry=visible?'继续处理上一条已保存用户问题；不得重新执行已完成工具。':`继续处理这条已保存用户问题：\n\n${question}\n\n不得重新执行已完成工具。`;
+          const accepted=text(entry.message);
+          const visible=manager.buildSessionProjection().entries.some(e=>e.sourceEntry.id===entry.id&&e.messages.some(m=>m.role==='user'&&text(m)===accepted));
+          const retry=visible?'继续处理上一条已保存用户问题；不得重新执行已完成工具。':`继续处理这条已保存用户问题：\n\n${accepted}\n\n不得重新执行已完成工具。`;
           await session.sendCustomMessage({customType:'learning-station-retry',content:retry,display:false,details:{userEntryId:spec.userEntryId}},{triggerTurn:true});
         }else{
-          await session.prompt(question,{expandPromptTemplates:false,source:'rpc'});
+          await session.prompt(question,{expandPromptTemplates:!!spec.projectRoot,source:'rpc'});
 
         }
         await agent.waitForIdle();await pendingProjection;return {};

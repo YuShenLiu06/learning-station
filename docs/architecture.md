@@ -3,6 +3,7 @@
 | 部分 | 权威数据与职责 |
 | --- | --- |
 | content/library_tree/context | Markdown 稳定 ID、逻辑层级、显式关联、受限上下文与实际版本快照 |
+| file_metadata/versioning | 底层纯数据接口："当前"只在 nowfile()；init/commit、版本 hash、stat、diff、固定版本读唯一出口；Focus 拼接、read 工具与变化视图消费（[文件元数据与版本](file-metadata-and-versioning.md)） |
 | exploration/trash | 固定目录普通笔记与稳定首问；加锁回收账本，保留原文件及原 ID，变更原文时整批阻止恢复 |
 | sessions/exercises/review | 学习记录、结构练习及子文档、按作答匹配反馈、本人错因、复习回执与精确集合 CSV |
 | assets | 课程资料白名单、配额、完整性校验和受控本机预览；不执行代码 |
