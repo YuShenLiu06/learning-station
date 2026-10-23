@@ -995,21 +995,50 @@ pub fn attachment_path(asset_id: &str, file_name: &str) -> Result<String> {
     Ok(path)
 }
 
+#[cfg(test)]
+thread_local! {
+    static EXCLUSION_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 // Shared by capture and authorized writes, so writes cannot publish files
 // which the next checkpoint intentionally excludes.
 fn path_exclusion(path: &Path, name: &str, directory: bool) -> Option<&'static str> {
+    #[cfg(test)]
+    EXCLUSION_PROBES.with(|count| count.set(count.get() + 1));
     exclusion_reason(name).or_else(|| {
         (directory && (matches!(name.to_ascii_lowercase().as_str(), "node_modules" | "target" | "dist" | "vendor" | "cache")
-            || path.join(".git").exists()
-            || path.join("objects").is_dir() && path.join("HEAD").exists()))
+            || fs::symlink_metadata(path.join(".git")).is_ok()
+            || fs::symlink_metadata(path.join("objects"))
+                .is_ok_and(|meta| meta.is_dir() || meta.file_type().is_symlink())
+                && fs::symlink_metadata(path.join("HEAD")).is_ok()))
         .then_some("source_or_cache_directory")
     })
 }
 
 pub(crate) fn validate_material_write_path(root: &Path, relative: &str) -> Result<()> {
     check_path(relative)?;
-    let mut path = root.to_path_buf();
     let parts: Vec<_> = relative.split('/').collect();
+    // Check the trusted course root and every existing component before any
+    // exclusion probe: even metadata probes through a link reveal outside state.
+    // Missing components are valid for new files; no directories are created here.
+    let mut path = root.to_path_buf();
+    for part in std::iter::once(None).chain(parts.iter().map(Some)) {
+        if let Some(name) = part {
+            path.push(name);
+        }
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(CoreError::new(
+                    "TOOL_SCOPE",
+                    "受控工具只能访问当前会话工作区和本轮已授权来源。",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let mut path = root.to_path_buf();
     for (index, name) in parts.iter().enumerate() {
         path.push(name);
         if path_exclusion(&path, name, index + 1 < parts.len()).is_some() { return Err(scope()); }
