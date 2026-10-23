@@ -170,3 +170,5 @@ label select{display:block;background:#fff;border:1px solid #dce5ce;border-radiu
 .debug-json .cm-search label { display: inline-flex; align-items: center; gap: 4px; width: auto; margin: 0; font-size: 12px; }
 .debug-json .cm-search input[type="checkbox"] { width: auto; margin: 0; }
 .debug-json .cm-search button { padding: 4px 7px; border: 1px solid var(--line); background: var(--paper); border-radius: 4px; font-size: 12px; }
+
+.edit-review{flex-shrink:0;background:#f7f3e9;border-bottom:1px solid #ddd5c5;padding:10px 24px;font-size:12px;max-height:48vh;overflow:auto}.edit-review-bar,.edit-review-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.edit-review-bar select{max-width:100%;min-width:0}.edit-review p{margin:8px 0;overflow-wrap:anywhere}.edit-review-actions button{border:1px solid #bfb9a8;border-radius:5px;padding:6px 10px}.edit-diff{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.6 ui-monospace,monospace;margin:8px 0;tab-size:2}.edit-diff span{display:block;white-space:pre-wrap}.diff-removed{background:#f9e4df;color:#812e22}.diff-added{background:#e4efdd;color:#285b30}

@@ -718,7 +718,11 @@ fn learning_tool_handler(
         let scope = scope.clone();
         let sink = sink.clone();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
+            let wait_engine = engine.clone();
+            let wait_scope = scope.clone();
+            let wait_sink = sink.clone();
+            let wait_call = call.clone();
+            let mut result = tokio::task::spawn_blocking(move || {
                 let mut activity = new_tool_activity(&scope, &call.id, &call.name)?;
                 publish_tool_activity(&engine, &activity, &sink)?;
                 // Workspace tools enforce their own tier, confinement and receipts.
@@ -742,7 +746,19 @@ fn learning_tool_handler(
                 result
             })
             .await
-            .map_err(|_| CoreError::new("INTERNAL", "学习工具执行中断，已提交记录仍保留。"))?
+            .map_err(|_| CoreError::new("INTERNAL", "学习工具执行中断，已提交记录仍保留。"))??;
+            // No pending result reaches Pi: cancellation drops this wait, while
+            // the durable proposal remains available after restart.
+            if result["status"] == "pending" && result["proposalId"].is_string() {
+                while result["status"] == "pending" {
+                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                    result = crate::authorized_tools::proposal_result(&wait_engine, result)?;
+                }
+                let mut activity = new_tool_activity(&wait_scope, &wait_call.id, &wait_call.name)?;
+                finish_tool_activity(&mut activity, &wait_scope, &Ok(result.clone()));
+                let _ = publish_tool_activity(&wait_engine, &activity, &wait_sink);
+            }
+            Ok(result)
         })
     })
 }
@@ -1545,6 +1561,11 @@ fn finish_tool_activity(
 ) {
     activity.updated_at = timestamp();
     if let Ok(value) = result {
+        if activity.name == "write" && value["proposalId"].is_string() && value["persisted"] == false {
+            activity.status = if value["status"] == "pending" { "running" } else { "succeeded" }.into();
+            activity.summary = if value["status"] == "pending" { "AI 修改待确认，建议已保留，正文未修改。" } else { "用户已拒绝建议，正文未修改。" }.into();
+            return;
+        }
         if activity.name == "query_related_knowledge" {
             activity.status = "succeeded".into();
             activity.summary = "已完成授权材料查询，未创建新内容。".into();
@@ -1570,7 +1591,7 @@ fn finish_tool_activity(
             activity.status = "succeeded".into();
             activity.persisted = true;
             activity.summary = if activity.name == "write" {
-                "已写入会话工作区并保存回执。"
+                "已写入文件并保存回执。"
             } else {
                 "已在会话工作区执行并保存回执。"
             }

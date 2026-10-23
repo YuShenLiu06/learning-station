@@ -136,7 +136,17 @@ pub(super) fn course_write(
     ledger: &Path,
 ) -> Result<Option<Value>> {
     let mut core = engine.lock()?;
-    let Some(course) = course(&mut core, scope)? else {
+    course_write_locked(&mut core, scope, args, ledger, false)
+}
+
+fn course_write_locked(
+    core: &mut Core,
+    scope: &ToolScope,
+    args: &WriteArgs,
+    ledger: &Path,
+    accepted: bool,
+) -> Result<Option<Value>> {
+    let Some(course) = course(core, scope)? else {
         return Ok(None);
     };
     crate::course_write_transaction::ensure_supported()?;
@@ -159,7 +169,7 @@ pub(super) fn course_write(
     let baseline = if let Some(doc) = &doc {
         Some((doc.body.clone(), doc.version.clone()))
     } else if existing.is_some() {
-        let (bytes, version) = crate::versioning::read_versioned(&mut core, &course, &args.path)?;
+        let (bytes, version) = crate::versioning::read_versioned(core, &course, &args.path)?;
         Some((crate::material_git::validate_material_text(&bytes)?.to_owned(), version))
     } else {
         None
@@ -190,9 +200,23 @@ pub(super) fn course_write(
         .file_stem()
         .and_then(|name| name.to_str())
         .ok_or_else(invalid)?;
+    if !accepted {
+        return stage(
+            core,
+            scope,
+            &course,
+            args,
+            baseline
+                .as_ref()
+                .map(|(body, _)| body.as_str())
+                .unwrap_or(""),
+            operation,
+        )
+        .map(Some);
+    }
     let published_version = if doc.is_none() {
         Some(crate::versioning::write_version(
-            &mut core,
+            core,
             &course,
             content.as_bytes(),
         )?)
@@ -227,4 +251,251 @@ pub(super) fn course_write(
         json!({"persisted":true,"sessionId":scope.session_id,"courseId":course,
         "path":args.path,"version":version,"bytes":content.len(),"overwritten":existing.is_some()}),
     ))
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Proposal {
+    id: String,
+    course_id: String,
+    session_id: String,
+    section_id: String,
+    run_id: String,
+    allowed_ids: Vec<String>,
+    path: String,
+    expected_version: Option<String>,
+    original: String,
+    content: String,
+    status: String,
+    receipt: Option<Value>,
+}
+
+fn proposal_path(core: &Core, course: &str, id: &str) -> Result<PathBuf> {
+    if !crate::types::valid_id(course) || !crate::types::valid_id(id) {
+        return Err(invalid());
+    }
+    Ok(core
+        .state_dir
+        .join("edit-proposals")
+        .join(course)
+        .join(format!("{id}.json")))
+}
+fn read_proposal(core: &Core, course: &str, id: &str) -> Result<Proposal> {
+    let path = proposal_path(core, course, id)?;
+    let p: Proposal = serde_json::from_slice(&crate::assets::bounded_read(&path, 256 * 1024)?)?;
+    if p.id != id || p.course_id != course {
+        return Err(out_of_scope());
+    }
+    Ok(p)
+}
+fn check_course(core: &mut Core, id: &str) -> Result<()> {
+    core.content.refresh()?;
+    if !crate::types::valid_id(id)
+        || core.content.is_trashed(id)
+        || core.content.read(id)?.metadata.kind != "course"
+    {
+        return Err(out_of_scope());
+    }
+    Ok(())
+}
+fn stage(
+    core: &mut Core,
+    scope: &ToolScope,
+    course: &str,
+    args: &WriteArgs,
+    original: &str,
+    id: &str,
+) -> Result<Value> {
+    let path = proposal_path(core, course, id)?;
+    if path.exists() {
+        return Ok(proposal_receipt(&read_proposal(core, course, id)?));
+    }
+    let directory = path.parent().ok_or_else(invalid)?;
+    fs::create_dir_all(directory).map_err(io)?;
+    for item in fs::read_dir(directory).map_err(io)? {
+        let item = item.map_err(io)?;
+        let other: Proposal =
+            serde_json::from_slice(&crate::assets::bounded_read(&item.path(), 256 * 1024)?)?;
+        if other.path == args.path
+            && matches!(other.status.as_str(), "pending" | "accepting" | "unknown")
+        {
+            return Err(CoreError::new(
+                "CONFLICT",
+                "该文件已有待审阅建议，请先接受或拒绝；正文未修改。",
+            ));
+        }
+    }
+    let p = Proposal {
+        id: id.into(),
+        course_id: course.into(),
+        session_id: scope.session_id.clone(),
+        section_id: scope.section_id.clone(),
+        run_id: scope.run_id.clone(),
+        allowed_ids: scope.allowed_ids.clone(),
+        path: args.path.clone(),
+        expected_version: args.expected_version.clone(),
+        original: original.into(),
+        content: args.content.clone(),
+        status: "pending".into(),
+        receipt: None,
+    };
+    crate::course_write_transaction::durable_json(&path, &p)?;
+    Ok(proposal_receipt(&p))
+}
+fn proposal_receipt(p: &Proposal) -> Value {
+    p.receipt.clone().unwrap_or_else(|| json!({"persisted":false,"proposalPersisted":true,"proposalId":p.id,"courseId":p.course_id,"sessionId":p.session_id,"path":p.path,"status":p.status,"message":"建议已保留，正文未修改；等待用户决定，不得依赖建议内容继续执行。"}))
+}
+
+/// Lightweight polling: no proposal body is read until its file stamp changes.
+pub(crate) fn proposal_list(engine: &crate::app::Engine, course: &str) -> Result<Value> {
+    let mut core = engine.lock()?;
+    check_course(&mut core, course)?;
+    let dir = core.state_dir.join("edit-proposals").join(course);
+    let entries = match fs::read_dir(dir) {
+        Ok(v) => v,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(json!([])),
+        Err(e) => return Err(io(e)),
+    };
+    let mut result = Vec::new();
+    for item in entries {
+        let item = item.map_err(io)?;
+        let id = item
+            .path()
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_owned();
+        let meta = item.metadata().map_err(io)?;
+        if crate::types::valid_id(&id) {
+            result.push(
+                json!({"id":id,"stamp":format!("{:?}-{}",meta.modified().map_err(io)?,meta.len())}),
+            );
+        }
+    }
+    Ok(json!(result))
+}
+pub(crate) fn proposal_get(engine: &crate::app::Engine, course: &str, id: &str) -> Result<Value> {
+    let mut core = engine.lock()?;
+    check_course(&mut core, course)?;
+    let p = read_proposal(&core, course, id)?;
+    Ok(
+        json!({"id":p.id,"courseId":p.course_id,"path":p.path,"original":p.original,"content":p.content,"status":p.status,"expectedVersion":p.expected_version}),
+    )
+}
+pub(crate) fn proposal_result(engine: &crate::app::Engine, result: Value) -> Result<Value> {
+    let Some(id) = result["proposalId"].as_str() else {
+        return Ok(result);
+    };
+    let course = result["courseId"].as_str().ok_or_else(invalid)?;
+    let core = engine.lock()?;
+    let p = read_proposal(&core, course, id)?;
+    if matches!(p.status.as_str(), "accepting" | "unknown") {
+        let ledger = workspace_root(&core.state_dir, &p.session_id)
+            .join("receipts")
+            .join(format!("{}.json", p.id));
+        if let Ok(entry) = read_ledger(&ledger) {
+            if entry.result["persisted"] == true {
+                return Ok(entry.result);
+            }
+        }
+        drop(core);
+        return Err(course_write_unknown(engine, &p.session_id, &ledger));
+    }
+    Ok(proposal_receipt(&p))
+}
+pub(crate) fn proposal_decide(
+    engine: &crate::app::Engine,
+    course_id: &str,
+    id: &str,
+    accept: bool,
+) -> Result<Value> {
+    // Acceptance does not grant write permission. Reject remains available after revocation.
+    if accept && tier_rank(&engine.ui_preferences()?.tool_authorization_tier) < 2 {
+        return Err(not_allowed());
+    }
+    let mut core = engine.lock()?;
+    check_course(&mut core, course_id)?;
+    let mut p = read_proposal(&core, course_id, id)?;
+    if p.status != "pending" {
+        if matches!(p.status.as_str(), "accepting" | "unknown") {
+            let ledger = workspace_root(&core.state_dir, &p.session_id)
+                .join("receipts")
+                .join(format!("{id}.json"));
+            if let Ok(entry) = read_ledger(&ledger) {
+                if entry.result["persisted"] == true {
+                    p.status = "accepted".into();
+                    p.receipt = Some(entry.result);
+                    crate::course_write_transaction::durable_json(
+                        &proposal_path(&core, course_id, id)?,
+                        &p,
+                    )?;
+                    return Ok(proposal_receipt(&p));
+                }
+            }
+            drop(core);
+            return Err(course_write_unknown(engine, &p.session_id, &ledger));
+        }
+        return Ok(proposal_receipt(&p));
+    }
+    let path = proposal_path(&core, course_id, id)?;
+    if !accept {
+        p.status = "rejected".into();
+        p.receipt = Some(
+            json!({"persisted":false,"status":"rejected","proposalId":id,"courseId":course_id,"path":p.path,"message":"用户已拒绝建议，正文未修改。"}),
+        );
+        crate::course_write_transaction::durable_json(&path, &p)?;
+        return Ok(proposal_receipt(&p));
+    }
+    let scope = ToolScope {
+        session_id: p.session_id.clone(),
+        section_id: p.section_id.clone(),
+        run_id: p.run_id.clone(),
+        allowed_ids: p.allowed_ids.clone(),
+    };
+    if course(&mut core, &scope)?.as_deref() != Some(course_id) {
+        return Err(out_of_scope());
+    }
+    let args = WriteArgs {
+        path: p.path.clone(),
+        content: p.content.clone(),
+        expected_version: p.expected_version.clone(),
+    };
+    let ledger = workspace_root(&core.state_dir, &p.session_id)
+        .join("receipts")
+        .join(format!("{id}.json"));
+    p.status = "accepting".into();
+    crate::course_write_transaction::durable_json(&path, &p)?;
+    match course_write_locked(&mut core, &scope, &args, &ledger, true) {
+        Ok(Some(receipt)) => {
+            p.status = "accepted".into();
+            p.receipt = Some(receipt);
+        }
+        outcome => {
+            p.status = if ledger.with_extension("pending").exists() {
+                "unknown"
+            } else {
+                "pending"
+            }
+            .into();
+            crate::course_write_transaction::durable_json(&path, &p)?;
+            let error = outcome.err().unwrap_or_else(out_of_scope);
+            if p.status == "unknown" {
+                drop(core);
+                return Err(course_write_unknown(engine, &p.session_id, &ledger));
+            }
+            return Err(error);
+        }
+    }
+    // Completion ledger survives interruption before proposal status sync.
+    let completion = (|| -> Result<()> {
+        let mut entry = read_ledger(&ledger)?;
+        entry.result = proposal_receipt(&p);
+        crate::course_write_transaction::durable_json(&ledger, &entry)?;
+        crate::course_write_transaction::durable_json(&path, &p)
+    })();
+    if completion.is_err() {
+        drop(core);
+        return Err(course_write_unknown(engine, &p.session_id, &ledger));
+    }
+    Ok(proposal_receipt(&p))
 }

@@ -256,3 +256,16 @@ test('invalid body projection fails explicitly without advancing a baseline or s
  const s=spec();let requests=0;const n=await openNativeSession(s,options(fixture(()=>requests++)));
  try {await assert.rejects(n.applyContext({...envelope,nativeMaterials:[{...envelope.nativeMaterials[0],projectionError:'CONTEXT_CONFLICT'}]}),e=>e.code==='CONTEXT_CONFLICT');assert.equal(requests,0);assert.equal(materialEntries(n).length,0);}finally{n.close();}
 });
+
+test('interrupted edit remains unknown while pending, then rejected proposal pairs on reopen without writing', async () => {
+ const s=spec();let n=await openNativeSession(s,options());
+ n.manager.appendMessage({role:'assistant',content:[{type:'toolCall',id:'pending_edit',name:'write',arguments:{path:'lesson.md',content:'proposal'}}],api:model.api,provider:model.provider,model:model.id,usage:{input:0,output:0},stopReason:'toolUse',timestamp:Date.now()});
+ n.manager.appendCustomEntry('learning-station-tool',{runId:s.runId,callId:'pending_edit'});n.close();
+ let requests=0;
+ await assert.rejects(openNativeSession({...s,runId:'pending_reopen'},{...options(),requestTool:async call=>{assert.equal(call.type,'tool_recover');requests++;return {result:{persisted:false,proposalId:'proposal_fixture',status:'pending'}};}}),e=>e.code==='NATIVE_TOOL_UNKNOWN');
+ let observed;
+ n=await openNativeSession({...s,runId:'rejected_reopen',userEntryId:'continue_user'},{...options(fixture(c=>observed=c)),requestTool:async call=>{assert.equal(call.type,'tool_recover');requests++;return {result:{persisted:false,proposalId:'proposal_fixture',status:'rejected'}};}});
+ await n.applyContext(envelope);await n.prompt('Continue after refusing edit');n.close();
+ assert.equal(requests,2);
+ assert(observed.messages.some(m=>m.role==='toolResult'&&m.toolCallId==='pending_edit'&&JSON.stringify(m.content).includes('rejected')));
+});

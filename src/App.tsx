@@ -1,3 +1,4 @@
+import { EditReview } from './EditReview';
 import { captureFocus } from './focus';
 import { locateCitation } from './citation';
 import { renderedCitation, renderedCitationRange } from './renderedCitation';
@@ -907,6 +908,16 @@ export function App() {
       {boot.treeWarnings?.length ? <details className="tree-warnings"><summary>学习目录有 {boot.treeWarnings.length} 项提示</summary>{boot.treeWarnings.map((warning,index)=><p key={index}>{warning}</p>)}</details> : null}
       {bootError && <div className="connection-banner" role="status"><CircleHelp size={16} /><span>{bootError}</span><button onClick={() => { void load(); }}>重新连接</button></div>}
       {notifications && <div className="notice-popover"><div className="popover-heading">学习通知<button className="icon-button" aria-label="关闭通知" onClick={() => setNotifications(false)}><X size={15} /></button></div>{boot.notices.length ? boot.notices.map(notice => <article key={notice.id}><strong>{notice.title}</strong><p>{notice.body || '学习待办已到期。'}</p>{!notice.read && <button className="quiet-button" onClick={async () => { try { await call('notice_read', { id: notice.id }); setBoot(old => ({ ...old, notices: old.notices.map(item => item.id === notice.id ? { ...item, read: true } : item) })); } catch (error) { notify(errorText(error)); } }}>标为已读</button>}</article>) : <div className="subtle-empty">还没有通知。到期的学习待办会出现在这里。</div>}</div>}
+
+      {nativeAvailable && nodes.some(node => node.id === courseId && node.kind === 'course') && <EditReview courseId={courseId} documentId={activeId} isDirty={id => { const d = docsRef.current[id]; return !!d && (d.body !== d.savedBody || d.saving || d.draftLoaded === false); }} onAccepted={async id => {
+        const section = await call<Section>('section_open', { id });
+        const local = docsRef.current[id];
+        if (!local) return;
+        const changed = local.body !== local.savedBody;
+        const next = changed ? { ...local, conflict: true, error: '正文已接受 AI 修改；期间新增的编辑保留，请对照正文。' } : { ...local, section, body: section.body, savedBody: section.body, conflict: false, error: undefined };
+        docsRef.current = { ...docsRef.current, [id]: next };
+        setDocs(old => ({ ...old, [id]: next }));
+      }}/>}
 
       <div className="lesson-view" hidden={view !== 'lesson'}>
         {opening && !current ? <div className="center-state"><LoaderCircle className="spin" size={25} /><p>正在打开小节…</p></div> : current ? <>

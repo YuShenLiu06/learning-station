@@ -529,6 +529,18 @@ async fn load_session_context(
 async fn get_ui_preferences(state: State<'_, Arc<Engine>>) -> Result<UiPreferences> {
     work(state.inner().clone(), |e| e.ui_preferences()).await
 }
+#[tauri::command]
+async fn edit_proposals(state: State<'_, Arc<Engine>>, course_id: String) -> Result<Value> {
+    work(state.inner().clone(), move |e| crate::authorized_tools::proposal_list(e, &course_id)).await
+}
+#[tauri::command]
+async fn edit_proposal(state: State<'_, Arc<Engine>>, course_id: String, id: String) -> Result<Value> {
+    work(state.inner().clone(), move |e| crate::authorized_tools::proposal_get(e, &course_id, &id)).await
+}
+#[tauri::command]
+async fn decide_edit_proposal(state: State<'_, Arc<Engine>>, course_id: String, id: String, accept: bool) -> Result<Value> {
+    work(state.inner().clone(), move |e| crate::authorized_tools::proposal_decide(e, &course_id, &id, accept)).await
+}
 // Read-only: durable write/bash receipt summaries of one session workspace.
 // No arguments, command text or file contents ever leave the ledger.
 #[tauri::command]
@@ -1079,6 +1091,9 @@ pub fn run() {
             get_ui_preferences,
             save_ui_preferences,
             list_tool_receipts,
+            edit_proposals,
+            edit_proposal,
+            decide_edit_proposal,
             get_session,
             append_entry,
             load_context,

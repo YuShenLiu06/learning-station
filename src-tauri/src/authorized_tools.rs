@@ -95,7 +95,10 @@ pub(crate) fn recover(
         };
         validate_read_replay(engine, &read_scope, &call.args, &entry.result)?;
     }
-    let mut result = entry.result;
+    let mut result = proposal_result(engine, entry.result)?;
+    if result["status"] == "pending" {
+        return Err(CoreError::new("NATIVE_TOOL_UNKNOWN", "建议仍待用户决定，正文未修改；请先审阅后核对原请求。"));
+    }
     result["recovered"] = json!(true);
     Ok(result)
 }
@@ -269,7 +272,7 @@ pub(crate) fn execute(
         if name == "read" {
             validate_read_replay(engine, scope, &args, &entry.result)?;
         }
-        let mut result = entry.result;
+        let mut result = proposal_result(engine, entry.result)?;
         result["replayed"] = json!(true);
         return Ok(result);
     }
@@ -474,6 +477,7 @@ fn execute_read(engine: &crate::app::Engine, scope: &ToolScope, args: ReadArgs) 
 #[path = "course_workspace.rs"]
 mod course_workspace;
 use course_workspace::{course_read, course_write};
+pub(crate) use course_workspace::{proposal_list, proposal_get, proposal_decide, proposal_result};
 
 fn execute_write(
     engine: &crate::app::Engine,
@@ -980,7 +984,83 @@ mod tests {
     fn run(
         engine: &Arc<Engine>,
         scope: &ToolScope, call: &str, name: &str, args: Value,) -> Result<Value, CoreError> {
-        crate::authorized_tools::execute(engine, scope, call, name, args)
+        // Existing #64 tests exercise the final publication transaction after
+        // explicit acceptance; proposal lifecycle is tested separately below.
+        let result = crate::authorized_tools::execute(engine, scope, call, name, args)?;
+        if result["status"] == "pending" {
+            super::proposal_decide(engine, result["courseId"].as_str().unwrap(), result["proposalId"].as_str().unwrap(), true)
+        } else { Ok(result) }
+    }
+
+    #[test]
+    fn proposals_preserve_original_serialize_and_recover_decisions() {
+        let (dir, engine, scope, id, _) = course_fixture("write");
+        let before = engine.lock().unwrap().content.read(&id).unwrap();
+        let args = json!({"path":format!("documents/{id}.md"),"content":"Accepted body","expectedVersion":before.version});
+        let pending = super::execute(&engine, &scope, "proposal", "write", args.clone()).unwrap();
+        let course = pending["courseId"].as_str().unwrap();
+        let proposal = pending["proposalId"].as_str().unwrap();
+        assert_eq!(pending["persisted"], false);
+        assert_eq!(engine.lock().unwrap().content.read(&id).unwrap().content, before.content);
+        assert_eq!(super::proposal_list(&engine, course).unwrap().as_array().unwrap().len(), 1);
+        assert_eq!(super::proposal_get(&engine, course, proposal).unwrap()["original"], before.body);
+        let mut changed = args.clone(); changed["content"] = json!("Second");
+        assert_eq!(super::execute(&engine, &scope, "second", "write", changed).unwrap_err().code, "CONFLICT");
+        let reopened = Engine::new(dir.path().join("library"), dir.path().join("state")).unwrap();
+        assert_eq!(super::proposal_get(&reopened, course, proposal).unwrap()["status"], "pending");
+        let receipt = super::proposal_decide(&engine, course, proposal, true).unwrap();
+        assert_eq!(receipt["persisted"], true);
+        assert_eq!(super::proposal_decide(&engine, course, proposal, true).unwrap(), receipt);
+        assert_eq!(super::proposal_result(&engine, pending.clone()).unwrap(), receipt);
+        assert_eq!(engine.lock().unwrap().content.read(&id).unwrap().body.trim(), "Accepted body");
+        let replay = super::execute(&engine, &scope, "proposal", "write", args).unwrap();
+        assert_eq!(replay["persisted"], true);
+    }
+
+    #[test]
+    fn proposal_completion_ledger_recovers_interrupted_status_without_republish() {
+        let (dir, engine, scope, id, _) = course_fixture("write");
+        let before = engine.lock().unwrap().content.read(&id).unwrap();
+        let pending = super::execute(&engine, &scope, "crash-status", "write", json!({"path":format!("documents/{id}.md"),"content":"Accepted once","expectedVersion":before.version})).unwrap();
+        let course = pending["courseId"].as_str().unwrap(); let proposal = pending["proposalId"].as_str().unwrap();
+        let receipt = super::proposal_decide(&engine, course, proposal, true).unwrap();
+        let path = dir.path().join(format!("state/edit-proposals/{course}/{proposal}.json"));
+        let mut data: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        data["status"] = json!("accepting"); data["receipt"] = Value::Null;
+        crate::course_write_transaction::durable_json(&path, &data).unwrap();
+        assert_eq!(super::proposal_result(&engine, pending).unwrap(), receipt);
+        assert_eq!(super::proposal_decide(&engine, course, proposal, true).unwrap(), receipt);
+        assert_eq!(super::proposal_get(&engine, course, proposal).unwrap()["status"], "accepted");
+    }
+
+    #[test]
+    fn proposals_reject_keep_drafts_and_refuse_stale_or_revoked_acceptance() {
+        let (_dir, engine, scope, id, _) = course_fixture("write");
+        let before = engine.lock().unwrap().content.read(&id).unwrap();
+        let args = json!({"path":format!("documents/{id}.md"),"content":"AI body","expectedVersion":before.version});
+        let p = super::execute(&engine, &scope, "proposal", "write", args).unwrap();
+        let course = p["courseId"].as_str().unwrap(); let proposal = p["proposalId"].as_str().unwrap();
+        let latest = engine.lock().unwrap().content.read(&id).unwrap();
+        let manual = crate::content::serialize(&latest.metadata, "External body").unwrap();
+        std::fs::write(engine.lock().unwrap().content.root().join(&latest.path), manual).unwrap();
+        assert_eq!(super::proposal_decide(&engine, course, proposal, true).unwrap_err().code, "CONFLICT");
+        assert_eq!(super::proposal_get(&engine, course, proposal).unwrap()["content"], "AI body");
+        engine.save_ui_preferences(UiPreferences::default()).unwrap();
+        assert_eq!(super::proposal_decide(&engine, course, proposal, true).unwrap_err().code, "TOOL_NOT_ALLOWED");
+        let rejected = super::proposal_decide(&engine, course, proposal, false).unwrap();
+        assert_eq!(rejected["status"], "rejected");
+        assert_eq!(super::proposal_decide(&engine, course, proposal, false).unwrap(), rejected);
+        assert_eq!(engine.lock().unwrap().content.read(&id).unwrap().body.trim(), "External body");
+    }
+
+    #[test]
+    #[ignore = "creates an isolated native GUI fixture only when explicitly requested"]
+    fn create_edit_review_gui_fixture() {
+        let (dir, engine, scope, id, _) = course_fixture("write");
+        let before = engine.lock().unwrap().content.read(&id).unwrap();
+        let p = super::execute(&engine, &scope, "gui-proposal", "write", json!({"path":format!("documents/{id}.md"),"content":"# AI 修改预览\n\n这是待确认的学习笔记。\n\n```rust\nlet learning = true;\n```\n\n公式 $a^2+b^2=c^2$ 和 [链接](https://example.com)。","expectedVersion":before.version})).unwrap();
+        let root = dir.keep();
+        println!("EDIT_REVIEW_FIXTURE root={} document={} proposal={}", root.display(), id, p);
     }
 
     use std::sync::Arc;
@@ -1296,8 +1376,10 @@ mod tests {
         let ledger = dir.path().join(format!("state/workspaces/{}/receipts/{request}.json",scope.session_id));
         // A directory at the final ledger path deterministically fails atomic
         // receipt replacement after the actual course material has been saved.
+        let proposal = super::execute(&engine, &scope, "receipt-failure", "write", args.clone()).unwrap();
+        std::fs::remove_file(&ledger).unwrap();
         std::fs::create_dir_all(&ledger).unwrap();
-        assert_eq!(run(&engine,&scope,"receipt-failure","write",args.clone()).unwrap_err().code,"NATIVE_TOOL_UNKNOWN");
+        assert_eq!(super::proposal_decide(&engine, proposal["courseId"].as_str().unwrap(), proposal["proposalId"].as_str().unwrap(), true).unwrap_err().code,"NATIVE_TOOL_UNKNOWN");
         let read = run(&engine,&scope,"read-persisted","read",json!({"path":"result.txt"})).unwrap();
         assert_eq!(read["content"],"already persisted");
         assert!(ledger.with_extension("pending").is_file());
@@ -2041,7 +2123,8 @@ mod m2_independent_review {
         assert!(r.is_ok(),"authorized source read must follow frozen focus, not session creation anchor");
         e.save_ui_preferences(UiPreferences{tool_authorization_tier:"write".into(),..UiPreferences::default()}).unwrap();
         let written=super::execute(&e,&scope,"write-second-note","write",json!({"path":"answer.txt","content":"synthetic B"})).unwrap();
-        assert_eq!(written["persisted"],true);
+        assert_eq!(written["persisted"],false);
+        assert_eq!(super::proposal_decide(&e,written["courseId"].as_str().unwrap(),written["proposalId"].as_str().unwrap(),true).unwrap()["persisted"],true);
         assert_eq!(super::execute(&e,&scope,"write-second-note","write",json!({"path":"answer.txt","content":"synthetic B"})).unwrap()["replayed"],true);
         assert!(super::execute(&e,&scope,"write-escape-note","write",json!({"path":"../escape","content":"x"})).is_err());
         e.save_ui_preferences(UiPreferences{tool_authorization_tier:"bash".into(),..UiPreferences::default()}).unwrap();
