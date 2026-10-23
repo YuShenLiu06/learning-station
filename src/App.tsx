@@ -290,7 +290,11 @@ export function App() {
     courseId: nativeAvailable && nodes.some(node => node.id === courseId && node.kind === 'course') ? courseId : '', documentId: activeId,
     isLoaded: id => docsRef.current[id]?.draftLoaded === true,
     isDirty: id => { const d = docsRef.current[id]; return !!d && (d.body !== d.savedBody || d.saving || d.draftLoaded === false); },
-    notify, onOpen: id => { setEditing(false); if (id !== activeIdRef.current) void openSection(id); },
+    notify, onOpen: async id => {
+      const section = await call<Section>('section_open', { id });
+      if (id !== activeIdRef.current) await openSection(id, section);
+      setEditing(false);
+    },
     onAccepted: async id => {
         const section = await call<Section>('section_open', { id });
         const local = docsRef.current[id];
@@ -999,7 +1003,7 @@ export function App() {
 
     {trashNode && <Dialog title="移至可恢复回收区" description="先核对整棵目录和会话范围，再确认；不会永久删除文件。" onClose={()=>setTrashNode(null)}><TrashConfirmation node={trashNode} prepare={()=>prepareTrash(trashNode.id)} onDone={receipt=>{void afterTrash(receipt);}}/></Dialog>}
     {creatingNode && <Dialog title="新建学习内容" description="课程、目录、正文都保存在本机；之后可以整理到其他目录。" onClose={()=>setCreatingNode(null)}><CreateNodeForm nodes={nodes} defaultKind={creatingNode} parentId={isContainer ? activeId : current?.section.parentId || undefined} onCreated={section=>{void acceptCreated(section);}}/></Dialog>}
-    {editReview.raw && editReview.proposal && <Dialog title={proposalFileName(editReview.proposal.path)} description="对照原文审阅，接受后才保存此文件。" onClose={editReview.closeRaw}><div className="raw-edit-review"><EditReviewContent review={editReview}/></div><EditReviewDock review={editReview}/></Dialog>}
+    {editReview.raw && editReview.proposal && <Dialog title={proposalFileName(editReview.proposal.path)} description={editReview.readOnly ? "文件暂未打开。这里仅对照保留的原文和建议，可拒绝本次建议；正文和草稿均保留。" : "对照原文审阅，接受后才保存此文件。"} onClose={editReview.closeRaw}><div className="raw-edit-review"><EditReviewContent review={editReview}/></div><EditReviewDock review={editReview}/></Dialog>}
     {linkingMaterials && current && <Dialog title="关联本页的材料" description="保存成功后才会改变实际来源；提问、选区与学习记录仍属于当前笔记。" onClose={()=>setLinkingMaterials(false)}><LinkedMaterials section={current.section} nodes={nodes} onSave={links=>saveLinks(current.section.id,links)}/></Dialog>}
     {movingNode && current && <Dialog title="整理到其他目录" description="只改变持久目录归属，稳定编号与学习记录保持关联。" onClose={()=>setMovingNode(false)}><MoveNodeForm node={current.section} nodes={nodes} onMoved={section=>{setMovingNode(false);setDocs(old=>({...old,[section.id]:{...old[section.id],section,savedBody:section.body}}));void refreshTree();}}/></Dialog>}
     {(assetLoading || assetPreview) && <Dialog title={assetPreview?.asset.fileName || '正在读取本机资料'} description="课程资料只读预览，不执行代码、不载入远程内容。" onClose={()=>{assetSequence.current++;setAssetLoading(false);setAssetPreview(null);}}>{assetLoading ? <p className="context-loading"><LoaderCircle size={15} className="spin"/>正在读取本课程资料…</p> : assetPreview && <><AssetPreviewContent preview={assetPreview}/>{session.courseId && <button className="quiet-button" onClick={()=>{setFocusedAsset(assetPreview);setAssetPreview(null);requestAnimationFrame(()=>questionRef.current?.focus());}}>就这份资料提问</button>}</>}</Dialog>}
