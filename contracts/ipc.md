@@ -153,3 +153,11 @@ userEntryId 由 Rust 从准确 Run 绑定写入，不能来自模型参数。旧
 仅用户打开练习“编辑 Markdown”视图的冻结 Focus 为该练习增加读取授权；做题视图不授完整答案读取权、不自动发送正文。工具 `read` 的 `documents/<exerciseDocumentId>.md` 返回 `{exercises:[...]}` JSON 字符串及文档版本。`write.content` 顶层只允许 `exercises`；保留id表示原题/修改，新增省略id，删除从数组省略。原id必须属于该题集，来源限原题集持久化manifest。修改与新增由Rust生成新题id，未改题保留稳定id。
 
 每次接受先验证当前版本及1至5题限制，追加不可变exercise修订entry，再通过既有保留旧稿事务更新页面指向。原entry、作答及评分不重写；新题不继承旧题作答。`originalExerciseEntryId` 保留原映射，`exerciseEntryId` 指当前修订，`exerciseEditOperation` 供原操作核对。未知结果不重放；数量限制/版本冲突仍保留该题待决。未保存Markdown草稿、受影响题未提交作答或错因会阻止接受；拒绝不丢输入。直接编辑Markdown只改变展示，不改变评分题集。
+
+### 普通 Markdown 逐处审阅
+
+`edit_proposal` 对待处理的普通文本提案返回 `textReview:{version,hunks:[{id,prefix,before,after,status}],tail}`。Rust 以完整空行段落、列表/表格和代码围栏生成 canonical hunks，保留 UTF-8、CRLF 与末尾换行；超过比较预算时保守合并为一处。UI 不再独立计算可决定范围，只展示同源分块；已决定处显示实际保留正文，剩余处可定位、高亮。
+
+`decide_text_proposal({courseId,id,hunkId,accept})` 不接受客户端正文，返回 `{persisted,status,complete,version}`。每次接受以当前已保存版本执行既有事务；每处有独立、绑定确切参数的操作和回执。重复决定返回原回执，未知结果仅核对原操作，不自动重放或改成拒绝；有未知处时其他处不能继续决定。拒绝不写正文也不备份草稿。整页操作复用逐处接口，第一处失败即停；已经接受的正文不因后续拒绝而撤回。
+
+原工具参数与提案身份保持不变；部分完成回执含 `partialPersisted`、接受/拒绝/剩余数量，最终回执含 `hunkDecisions`、实际保存版本和接受/拒绝数量，不声明全部建议已保存。旧 pending 提案惰性迁移；旧 unknown/accepting 继续原恢复协议，不生成新写入。无差异旧提案仍可通过原整页接口处理。练习的整题决定协议不变。

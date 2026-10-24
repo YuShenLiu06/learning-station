@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
-import { ArrowDown, ArrowUp, FileText } from 'lucide-react';
+import { ArrowDown, ArrowUp, FileText, MoreHorizontal } from 'lucide-react';
 import { marked } from 'marked';
 import { call, nativeAvailable } from './api';
 import { diffParts } from './editDiff';
@@ -12,7 +12,8 @@ import { sanitizeMarkdown } from './sanitize';
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 export type ReviewQuestion = { id: string; question: string; format: string; answers: string[]; explanation?: string; tags?: string[]; sourceIds?: string[]; rubric?: { criteria: {id:string;label:string;description:string;maxPoints:number}[] } };
 export type QuestionChange = { id: string; before?: ReviewQuestion; after?: ReviewQuestion; status: string };
-export type EditProposal = { exercise?: { documentId: string; version: string; changes: QuestionChange[] }; id: string; courseId: string; path: string; original: string; content: string; status: string; expectedVersion?: string };
+export type TextHunk = { id: string; prefix: string; before: string; after: string; status: string };
+export type EditProposal = { textReview?: { version?: string; hunks: TextHunk[]; tail: string }; exercise?: { documentId: string; version: string; changes: QuestionChange[] }; id: string; courseId: string; path: string; original: string; content: string; status: string; expectedVersion?: string };
 type Props = { courseId: string; documentId: string; isDirty: (id: string) => boolean; isLoaded: (id: string) => boolean; onAccepted: (id: string) => Promise<void>; onOpen: (id: string) => void | boolean | Promise<void | boolean>; notify: (message: string) => void };
 export const proposalDocumentId = (path: string) => /^documents\/([^/]+)\.md$/u.exec(path)?.[1] || '';
 export const proposalFileName = (path: string) => path.split('/').at(-1) || '文本文件';
@@ -43,6 +44,7 @@ export function useEditReview(props: Props) {
   const latest = useRef(props); latest.current = props;
   // A late poll must not put a just-decided proposal back into the document.
   const settled = useRef(new Set<string>());
+  const decisions = useRef(0);
   useEffect(() => {
     setItems([]); setSelectedRaw(''); setSelectedId(''); setError(''); settled.current.clear(); locateSequence.current++;
     if (!nativeAvailable || !props.courseId) return;
@@ -50,6 +52,7 @@ export function useEditReview(props: Props) {
     const cache = new Map<string, { stamp: string; proposal: EditProposal }>();
     let timer: ReturnType<typeof setTimeout>;
     async function poll() {
+      const before = decisions.current;
       try {
         const list = await call<{ id: string; stamp: string }[]>('edit_proposals', { courseId: props.courseId });
         for (const item of list) {
@@ -58,7 +61,7 @@ export function useEditReview(props: Props) {
             cache.set(item.id, { stamp: item.stamp, proposal });
           }
         }
-        if (!stopped) setItems(list.map(item => cache.get(item.id)!.proposal).filter(p => !settled.current.has(p.id) && ['pending', 'unknown', 'accepting'].includes(p.status)));
+        if (!stopped && before === decisions.current) setItems(list.map(item => cache.get(item.id)!.proposal).filter(p => !settled.current.has(p.id) && ['pending', 'unknown', 'accepting'].includes(p.status)));
       } catch (e) { if (!stopped) setError(errorText(e)); }
       finally { if (!stopped) timer = setTimeout(() => { void poll(); }, 1000); }
     }
@@ -70,7 +73,7 @@ export function useEditReview(props: Props) {
   const documentItems = items.filter(p => proposalDocumentId(p.path) === props.documentId);
   const proposal = raw || documentItems.find(p => p.id === selectedId) || documentItems[0];
   const blocks = useMemo(() => {
-    if (!proposal || proposal.exercise) return [];
+    if (!proposal || proposal.exercise || proposal.textReview) return [];
     // Keep code fences, lists and tables intact; never split their Markdown
     // delimiters across independently rendered fragments.
     const tokenize = (text: string) => marked.lexer(text).map(token => token.raw);
@@ -86,11 +89,16 @@ export function useEditReview(props: Props) {
       return { ...block, source: block.kind !== 'same' && (needsReviewSource(block.text) || indistinguishable) };
     });
   }, [proposal]);
-  const hunks = blocks.flatMap((block, i) => block.kind !== 'same' && (i === 0 || blocks[i - 1].kind === 'same') ? [i] : []);
+  const textHunks = proposal?.textReview?.hunks.filter(h => ['pending', 'accepting'].includes(h.status));
+  const hunks = textHunks ? textHunks.map((_, i) => i) : blocks.flatMap((block, i) => block.kind !== 'same' && (i === 0 || blocks[i - 1].kind === 'same') ? [i] : []);
   useEffect(() => { setHunk(0); setError(''); }, [proposal?.id]);
+  const currentHunk = Math.min(hunk, Math.max(0, hunks.length - 1));
+  useEffect(() => {
+    if (proposal?.textReview) diffRoot.current?.querySelectorAll<HTMLElement>('[data-review-hunk]')[currentHunk]?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }, [proposal?.textReview, currentHunk]);
   function navigate(delta: number) {
     if (!hunks.length) return;
-    const index = (hunk + delta + hunks.length) % hunks.length;
+    const index = (currentHunk + delta + hunks.length) % hunks.length;
     setHunk(index);
     diffRoot.current?.querySelectorAll<HTMLElement>('[data-review-hunk]')[index]?.scrollIntoView({ block: 'center', behavior: 'smooth' });
   }
@@ -142,6 +150,32 @@ export function useEditReview(props: Props) {
     } catch (e) { setError(errorText(e)); }
     finally { setBusy(false); }
   }
+  async function decideText(accept: boolean, all = false) {
+    if (!proposal?.textReview || busy || accept && readOnly && textHunks?.[currentHunk]?.status !== 'accepting') return;
+    const selected = proposal;
+    const pending = selected.textReview!.hunks.filter(h => ['pending', 'accepting'].includes(h.status));
+    const targets = all ? pending : pending.slice(currentHunk, currentHunk + 1);
+    const id = proposalDocumentId(selected.path);
+    setBusy(true); setError(''); decisions.current++;
+    try {
+      for (const target of targets) {
+        if (accept && target.status === 'pending' && latest.current.isDirty(id)) throw new Error('还有未保存的编辑。请先处理草稿，建议和原文均已保留。');
+        if (accept && target.status === 'pending' && id && !latest.current.isLoaded(id)) throw new Error('请先打开文件并处理草稿，再接受修改。');
+        const receipt = await call<{ persisted: boolean; status: string; complete: boolean }>('decide_text_proposal', { courseId: selected.courseId, id: selected.id, hunkId: target.id, accept });
+        if (!receipt.persisted && receipt.status !== 'rejected') throw new Error('结果尚未确认，请核对原建议，勿重复写入。');
+        if (receipt.persisted && id) await latest.current.onAccepted(id);
+        if (receipt.complete) { settled.current.add(selected.id); setItems(old => old.filter(p => p.id !== selected.id)); setSelectedRaw(''); }
+        else {
+          const updated = await call<EditProposal>('edit_proposal', { courseId: selected.courseId, id: selected.id });
+          if (['accepted', 'rejected'].includes(updated.status)) { settled.current.add(selected.id); setItems(old => old.filter(p => p.id !== selected.id)); }
+          else setItems(old => old.map(p => p.id === selected.id ? updated : p));
+        }
+        latest.current.notify(receipt.persisted ? '此处修改已保存。' : '已拒绝此处修改，已保存的内容保留。');
+      }
+      setHunk(currentHunk >= pending.length - targets.length ? 0 : currentHunk);
+    } catch (e) { setError(errorText(e)); }
+    finally { decisions.current++; setBusy(false); }
+  }
   async function decideQuestion(questionId: string, accept: boolean) {
     if (!proposal?.exercise || busy || readOnly && accept) return;
     const selected = proposal;
@@ -158,7 +192,7 @@ export function useEditReview(props: Props) {
     } catch (e) { setError(errorText(e)); }
     finally { setBusy(false); }
   }
-  return { items, proposal, decideQuestion, raw: !!raw, readOnly, blocks, hunks, hunk, diffRoot, dirty, busy, error, navigate, locate, decide, closeRaw: () => setSelectedRaw(''), dismissError: () => setError('') };
+  return { items, proposal, decideText, textHunks, decideQuestion, raw: !!raw, readOnly, blocks, hunks, hunk: currentHunk, diffRoot, dirty, busy, error, navigate, locate, decide, closeRaw: () => setSelectedRaw(''), dismissError: () => setError('') };
 }
 export type EditReviewState = ReturnType<typeof useEditReview>;
 
@@ -167,6 +201,21 @@ export function EditReviewContent({ review, onAsset, hideTitle }: { review: Edit
   if (review.proposal.exercise) return <ExerciseReview review={review}/>;
   return <div ref={review.diffRoot} className={`inline-edit-review${hideTitle ? ' hide-redundant-title' : ''}`} aria-label="正文修改差异">
     {review.dirty && <p className="review-draft-warning" role="status">还有未保存的编辑。以下对照 AI 读取的原文；你的草稿仍在编辑器中，请先处理后再接受。</p>}
+    {review.proposal.textReview && <>
+      {review.proposal.textReview.hunks.map(change => {
+        const pending = ['pending', 'accepting'].includes(change.status);
+        const active = review.textHunks?.[review.hunk]?.id === change.id;
+        const source = needsReviewSource(change.before) || needsReviewSource(change.after) || sanitizeMarkdown(change.before) === sanitizeMarkdown(change.after);
+        return <div key={change.id}>
+          <Markdown text={change.prefix} referenceText={review.proposal!.original} courseId={review.proposal!.courseId} onAsset={onAsset}/>
+          {pending ? <section className={`review-hunk${active ? ' current' : ''}`} data-review-hunk={change.id} aria-label={active ? '当前修改' : '待处理修改'} aria-current={active ? 'true' : undefined}>
+            {active && <span className="review-change-label">当前修改</span>}
+            {([{kind:'removed',text:change.before},{kind:'added',text:change.after}] as const).filter(b=>b.text).map(block=><div key={block.kind} className={`review-change review-${block.kind}`}><span className="review-change-sign">{block.kind==='removed'?'−':'+'}</span><div><span className="review-change-label">{block.kind==='removed'?'原文':'建议'}</span>{source?<pre className="review-source" aria-label="准确源码"><code>{block.text}</code></pre>:<Markdown text={block.text} referenceText={block.kind==='removed'?review.proposal!.original:review.proposal!.content} courseId={review.proposal!.courseId} onAsset={onAsset}/>}</div></div>)}
+          </section> : <Markdown text={change.status==='accepted'?change.after:change.before} referenceText={change.status==='accepted'?review.proposal!.content:review.proposal!.original} courseId={review.proposal!.courseId} onAsset={onAsset}/>}
+        </div>;
+      })}
+      <Markdown text={review.proposal.textReview.tail} referenceText={review.proposal.original} courseId={review.proposal.courseId} onAsset={onAsset}/>
+    </>}
     {review.blocks.map((block, index) => block.kind === 'same'
       ? <Markdown key={index} text={block.text} referenceText={review.proposal!.original} courseId={review.proposal!.courseId} onAsset={onAsset}/>
       : <div key={index} className={`review-change review-${block.kind}`} data-review-hunk={review.hunks.includes(index) ? '' : undefined}>
@@ -182,12 +231,20 @@ export function EditReviewDock({ review, editing, onRead }: { review: EditReview
     <section className="review-dock" aria-label="练习修改审阅"><div className="review-dock-copy"><strong>审阅练习修改</strong><small>{review.busy ? '正在保存此题…' : `${review.proposal.exercise.changes.filter(c => ['pending','accepting'].includes(c.status)).length} 题待处理 · 题干、答案与解析一起保存`}</small></div>{editing && <button className="review-secondary" onClick={onRead}>查看题目差异</button>}</section>
   </div>;
   const unknown = review.proposal.status !== 'pending';
+  const checking = review.textHunks?.[review.hunk]?.status === 'accepting';
   return <div className="review-dock-wrap">
     {(review.error || unknown) && <p className="review-recovery" role="alert">{review.error || '写入结果需要核对，旧稿和新稿均保留。'}{review.error && <button onClick={review.dismissError}>关闭提示</button>}</p>}
     <section className="review-dock" aria-label="本文件修改审阅">
       <div className="review-dock-copy"><strong>{unknown ? '核对这页修改' : '审阅这页修改'}</strong><small>{review.busy ? '正在核对保存结果…' : review.readOnly ? '文件未打开，可查看保留内容或拒绝建议' : review.dirty ? '先处理未保存的编辑' : '接受后保存正文'}</small></div>
       <div className="review-navigation"><button aria-label="上一处修改" disabled={!review.hunks.length || editing} onClick={() => review.navigate(-1)}><ArrowUp size={15}/></button><span>{review.hunks.length ? `${review.hunk + 1} / ${review.hunks.length}` : '无差异'}</span><button aria-label="下一处修改" disabled={!review.hunks.length || editing} onClick={() => review.navigate(1)}><ArrowDown size={15}/></button></div>
-      <div className="review-dock-actions">{editing && <button className="review-secondary" onClick={onRead}>查看差异</button>}{unknown ? <button className="review-primary" disabled={review.busy} onClick={() => { void review.decide(true); }}>核对写入结果</button> : <><button className="review-secondary" disabled={review.busy} onClick={() => { void review.decide(false); }}>拒绝</button>{!review.readOnly && <button className="review-primary" disabled={review.busy || review.dirty} onClick={() => { void review.decide(true); }}>接受{review.hunks.length ? `这 ${review.hunks.length} 处` : '修改'}</button>}</>}</div>
+      <div className="review-dock-actions">{editing && <button className="review-secondary" onClick={onRead}>查看差异</button>}{review.proposal.textReview ? <>
+        <button className="review-secondary" disabled={review.busy || !review.hunks.length || checking} onClick={()=>{void review.decideText(false);}}>拒绝此处</button>
+        {(!review.readOnly || checking) && <button className="review-primary" disabled={review.busy || !review.hunks.length || review.dirty && !checking} onClick={()=>{void review.decideText(true);}}>{checking?'核对写入结果':'接受此处'}</button>}
+        <details className="review-more"><summary aria-label="更多审阅操作"><MoreHorizontal size={18}/></summary><div>
+          <button disabled={review.busy || !review.hunks.length || checking} onClick={()=>{void review.decideText(false,true);}}>拒绝剩余修改</button>
+          {!review.readOnly && <button disabled={review.busy || review.dirty || !review.hunks.length || checking} onClick={()=>{void review.decideText(true,true);}}>接受剩余修改</button>}
+        </div></details>
+      </> : unknown ? <button className="review-primary" disabled={review.busy} onClick={() => { void review.decide(true); }}>核对写入结果</button> : <><button className="review-secondary" disabled={review.busy} onClick={() => { void review.decide(false); }}>拒绝</button>{!review.readOnly && <button className="review-primary" disabled={review.busy || review.dirty} onClick={() => { void review.decide(true); }}>接受{review.hunks.length ? `这 ${review.hunks.length} 处` : '修改'}</button>}</>}</div>
     </section>
   </div>;
 }

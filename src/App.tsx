@@ -310,9 +310,9 @@ export function App() {
         const next = changed ? { ...local, conflict: true, error: '正文已接受 AI 修改；期间新增的编辑保留，请对照正文。' } : { ...local, section, body: section.body, savedBody: section.body, conflict: false, error: undefined };
         docsRef.current = { ...docsRef.current, [id]: next };
         setDocs(old => ({ ...old, [id]: next }));
+        if (!changed && local.draftLoaded !== false) await call('draft_save', { key:`section:${id}`, data:{ body:section.body, question:questionDrafts.current[id] || '' } });
         if (section.kind === 'exercise') {
           if (!changed) setEditedIds(old => new Set([...old].filter(value => value !== id)));
-          if (!changed && local.draftLoaded !== false) await call('draft_save', { key:`section:${id}`, data:{ body:section.body, question:questionDrafts.current[id] || '' } });
           updateTargetSession(await call<LearningSession>('session_refresh', { sectionId:id, sessionId:section.originSessionId }));
         }
     },

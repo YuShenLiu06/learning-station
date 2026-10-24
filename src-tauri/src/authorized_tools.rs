@@ -508,7 +508,7 @@ fn execute_read(engine: &crate::app::Engine, scope: &ToolScope, args: ReadArgs) 
 #[path = "course_workspace.rs"]
 mod course_workspace;
 use course_workspace::{course_read, course_write};
-pub(crate) use course_workspace::{proposal_list, proposal_get, proposal_decide, proposal_result, exercise_proposal_decide};
+pub(crate) use course_workspace::{proposal_list, proposal_get, proposal_decide, proposal_result, exercise_proposal_decide, text_proposal_decide};
 
 fn execute_write(
     engine: &crate::app::Engine,
@@ -1023,6 +1023,8 @@ mod tests {
             super::proposal_decide(engine, result["courseId"].as_str().unwrap(), result["proposalId"].as_str().unwrap(), true)
         } else { Ok(result) }
     }
+
+    include!("partial_review_tests.rs");
 
     fn exercise_review_fixture() -> (tempfile::TempDir, Arc<Engine>, ToolScope, String, Value) {
         let (dir, engine, mut scope, source, _) = course_fixture("write");
