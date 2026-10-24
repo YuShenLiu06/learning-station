@@ -169,6 +169,10 @@ fn an_entry_hidden_in_a_separate_exercise_record_is_also_a_restore_dependency() 
     let exercise = ex(&mut c, &session.id, &source.id, "entry-dependency-exercise");
     let entry = exercise.document.metadata.extra["exerciseEntryId"].as_str().unwrap();
     let view = exercises::materialize_legacy(&mut c.content, &session.id, entry).unwrap();
+    // Explicit legacy materialization owns a separate movable view. Returning the
+    // native page here silently changes the dependency graph under test.
+    assert_ne!(view.id, exercise.document.id);
+    assert_eq!(exercises::materialize_legacy(&mut c.content, &session.id, entry).unwrap().id, view.id);
     library_tree::move_node(&mut c.content, &view.id, Some(&other.id), 0, &view.version).unwrap();
     let entry_receipt = recycle(&mut c, &view.id, "entry-dependency-trash-view");
     let source_receipt = recycle(&mut c, &source.id, "entry-dependency-trash-source");

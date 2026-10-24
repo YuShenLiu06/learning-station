@@ -631,13 +631,6 @@ pub fn materialize_legacy(
         if origin(store, &document)?.session_id != session_id { return Err(conflict()); }
         return Ok(document);
     }
-    if let Some(suffix) = exercise_entry_id.strip_prefix("entry_") {
-        let native_id = format!("exdoc_{suffix}");
-        if let Ok(document) = store.read(&native_id) {
-            if origin(store, &document)?.session_id != session_id { return Err(conflict()); }
-            return Ok(document);
-        }
-    }
     validate_stored(
         &data,
         &stored_manifest(&data, &session.context_manifest)?,
