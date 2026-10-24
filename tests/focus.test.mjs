@@ -94,6 +94,7 @@ test('actual React/native path keeps the original Focus through page switch, can
   await wait(()=>document.querySelectorAll('.course-sidebar-panel .review-file-link').length===2);
   assert.match(document.querySelector('[aria-label="文件变更审批"]').textContent,/文件变更审批 · 2/);
   assert.equal(document.querySelectorAll('.assistant-panel .review-file-link').length,0);
+  for(const row of document.querySelectorAll('.review-file-link')){assert.ok(row.classList.contains('tree-row'));assert.ok(row.querySelector('.tree-title'));assert.match(row.getAttribute('aria-label'),/修改待确认/);assert.equal(row.querySelector('small'),null);assert.equal(row.querySelectorAll('svg').length,1);}
   const groupToggle=document.querySelector('[aria-label="文件变更审批"] .course-group-heading');
   await click(groupToggle);assert.equal(groupToggle.getAttribute('aria-expanded'),'false');
   assert.equal(groupToggle.nextElementSibling.hidden,true);await click(groupToggle);

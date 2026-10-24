@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowDown, ArrowUp, ArrowUpRight, FileText } from 'lucide-react';
+import type { CSSProperties } from 'react';
+import { ArrowDown, ArrowUp, FileText } from 'lucide-react';
 import { marked } from 'marked';
 import { call, nativeAvailable } from './api';
 import { diffParts } from './editDiff';
@@ -192,8 +193,12 @@ export function EditReviewDock({ review, editing, onRead }: { review: EditReview
 }
 export function EditReviewLinks({ review, title }: { review: EditReviewState; title: (p: EditProposal) => string }) {
   if (!review.items.length && !review.error) return null;
-  return <div className="review-file-links" aria-label="待审阅文件">
-    {review.items.map(p => <button className="review-file-link" key={p.id} disabled={review.busy} aria-current={review.proposal?.id === p.id ? true : undefined} onClick={() => review.locate(p)}><FileText size={17}/><span><strong>{title(p)}</strong><small>{p.status === 'pending' ? '修改待确认 · 查看正文差异' : '写入待核对 · 查看保留的内容'}</small></span><ArrowUpRight size={15}/></button>)}
+  return <div className="library-tree review-file-links" role="group" aria-label="待审阅文件">
+    {review.items.map(p => {
+      const label = title(p), status = p.status === 'pending' ? '修改待确认' : '写入待核对';
+      const selected = review.proposal?.id === p.id;
+      return <button className={`tree-row review-file-link ${selected ? 'active' : ''}`} style={{ '--tree-depth': 0 } as CSSProperties} key={p.id} disabled={review.busy} aria-current={selected ? true : undefined} aria-label={`${label} · ${status}`} title={`${label} · ${status}`} onClick={() => review.locate(p)}><span className="tree-chevron"/><FileText size={14}/><span className="tree-title">{label}</span></button>;
+    })}
     {review.error && <p className="inline-error" role="alert">文件变更审批：{review.error}<button onClick={review.dismissError}>关闭提示</button></p>}
   </div>;
 }
