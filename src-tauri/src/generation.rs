@@ -673,6 +673,9 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
             }
             Err(e) => Err(e),
         };
+        if result.is_err() {
+            let _ = settle_interrupted_tools(&engine, &id, &sink);
+        }
         let mut runs = engine.runs.lock().unwrap_or_else(|e| e.into_inner());
         let m = runs.get_mut(&id).unwrap();
         match result {
@@ -1567,8 +1570,14 @@ fn finish_tool_activity(
 ) {
     activity.updated_at = timestamp();
     if let Ok(value) = result {
+        if activity.name == "write" && value["status"] == "unchanged" && value["persisted"] == false
+            && value["sessionId"] == scope.session_id {
+            activity.status = "succeeded".into();
+            activity.summary = "内容未变化，未重复写入。".into();
+            return;
+        }
         if activity.name == "write" && value["proposalId"].is_string() && value["persisted"] == false {
-            activity.status = if value["status"] == "pending" { "running" } else { "succeeded" }.into();
+            activity.status = if value["status"] == "pending" { "waiting" } else { "succeeded" }.into();
             activity.summary = if value["status"] == "pending" { "AI 修改待确认，建议已保留，正文未修改。" } else { "用户已拒绝建议，正文未修改。" }.into();
             return;
         }
@@ -1654,6 +1663,19 @@ fn finish_tool_activity(
         }
     }
 }
+// A cancelled handler may leave blocking work in flight. Preserve uncertainty;
+// only its eventual durable receipt can confirm whether the write completed.
+fn settle_interrupted_tools(engine: &Engine, run_id: &str, sink: &Sink) -> Result<()> {
+    for mut activity in get(engine, run_id)?.tool_calls.into_iter().filter(|a| a.status == "running") {
+        activity.status = "unknown".into();
+        activity.summary = "生成已结束，工具结果尚未核实；请核对原回执，不要重复写入。".into();
+        activity.error_code = Some("NATIVE_TOOL_UNKNOWN".into());
+        activity.updated_at = timestamp();
+        publish_tool_activity(engine, &activity, sink)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn settle_proposal_activity(
     engine: &Engine,
     scope: &crate::learning_tools::ToolScope,
@@ -1685,6 +1707,12 @@ fn publish_tool_activity(engine: &Engine, activity: &ToolActivity, sink: &Sink) 
     // A decision IPC and the waiting handler may both settle the same call.
     // Reuse the first persisted activity (including timestamps) for idempotency.
     let mut core = engine.lock()?;
+    // Serialize against completion publication; timeout cleanup must not erase
+    // a receipt that arrived after its initial snapshot.
+    if activity.status == "unknown" && get(engine, &activity.run_id)?.tool_calls.iter()
+        .any(|previous| previous.id == activity.id && previous.status != "running") {
+        return Ok(());
+    }
     let saved = sessions::get_persisted(&mut core.content, &activity.session_id)?
         .entries
         .into_iter()
@@ -1735,6 +1763,9 @@ fn publish_tool_activity(engine: &Engine, activity: &ToolActivity, sink: &Sink) 
             .iter_mut()
             .find(|item| item.tool_call_id == activity.tool_call_id)
         {
+            if activity.status == "unknown" && previous.status != "running" {
+                return Ok(());
+            }
             *previous = activity.clone();
         } else {
             managed.run.tool_calls.push(activity.clone());
@@ -1818,6 +1849,37 @@ mod lifecycle_tests {
         };
         (temp, engine, session)
     }
+    #[test]
+    fn interrupted_tools_preserve_waiting_and_unknown_until_real_receipt() {
+        let (_temp, engine, session) = setup();
+        let run = run(&session.id);
+        let scope = crate::learning_tools::ToolScope { session_id:session.id.clone(), section_id:session.section_id.clone(), run_id:run.id.clone(), allowed_ids:vec![] };
+        engine.runs.lock().unwrap().insert(run.id.clone(), ManagedRun {run, cancel:Arc::new(AtomicBool::new(false))});
+        let sink: Sink = Arc::new(|_| {});
+        let mut pending = new_tool_activity(&scope, "pending", "write").unwrap();
+        publish_tool_activity(&engine, &pending, &sink).unwrap();
+        finish_tool_activity(&mut pending, &scope, &Ok(json!({"status":"pending","proposalId":"proposal","persisted":false})));
+        publish_tool_activity(&engine, &pending, &sink).unwrap();
+        assert_eq!(get(&engine,&scope.run_id).unwrap().tool_calls[0].status,"waiting");
+        let mut in_flight = new_tool_activity(&scope, "in-flight", "write").unwrap();
+        publish_tool_activity(&engine, &in_flight, &sink).unwrap();
+        settle_interrupted_tools(&engine, &scope.run_id, &sink).unwrap();
+        let snapshot = get(&engine,&scope.run_id).unwrap();
+        assert_eq!(snapshot.tool_calls[0].status,"waiting");
+        assert_eq!(snapshot.tool_calls[1].status,"unknown");
+        assert!(!snapshot.tool_calls[1].persisted);
+        let stale_unknown = snapshot.tool_calls[1].clone();
+        finish_tool_activity(&mut in_flight, &scope, &Ok(json!({"persisted":true,"sessionId":session.id})));
+        publish_tool_activity(&engine, &in_flight, &sink).unwrap();
+        publish_tool_activity(&engine, &stale_unknown, &sink).unwrap();
+        assert_eq!(get(&engine,&scope.run_id).unwrap().tool_calls[1].status,"succeeded");
+        settle_proposal_activity(&engine, &scope, "pending", &json!({"persisted":false,"status":"rejected","proposalId":"proposal"})).unwrap();
+        let mut core = engine.lock().unwrap();
+        let saved = sessions::get_persisted(&mut core.content,&session.id).unwrap();
+        assert!(saved.entries.iter().any(|entry| entry.data.as_ref().is_some_and(|d| d["toolActivity"]["status"] == "waiting")));
+        assert!(saved.entries.iter().any(|entry| entry.data.as_ref().is_some_and(|d| d["toolActivity"]["status"] == "unknown")));
+    }
+
     #[test]
     fn appended_question_is_reused_for_retries_without_duplicate_history() {
         let (_temp, engine, session) = setup();
