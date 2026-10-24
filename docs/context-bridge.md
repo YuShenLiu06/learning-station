@@ -161,3 +161,5 @@ Pi system.sections 取得，绑定到该次最终 Request 的字段/片段；不
 ## 练习引用来源清单
 
 ContextBridge 每个用户轮注册 `exercise_sources`，将同轮 `Context.manifest` 的 `sourceId/path/version` 显式提供给模型；普通聊天的 `generate_exercises` 与专用 practice 共用此清单。路径仅用于识别材料，`sourceIds` 必须填写稳定 ID。清单不包含课程可读目录或历史授权集合，不声明额外正文已读取；空清单也明确提供。旧轮清单沿 turn 生命周期排除，重试及压缩恢复使用原冻结快照。Rust 仍按原冻结 manifest 严格校验，不从文件名或路径猜测 ID，不将未知来源变成可自动修正的授权错误。
+
+练习“编辑 Markdown”视图允许本轮显式读取该题集的结构化版本以提出整题修改；冻结时仅增加该文档ID的读取范围，不自动投影答案。做题视图保持原隐藏答案边界。接受审阅追加不可变修订，具体协议见 [IPC练习审阅](../contracts/ipc.md)。

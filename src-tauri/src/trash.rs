@@ -314,7 +314,7 @@ fn collect(store: &mut ContentStore, id: &str) -> Result<(Preview, Vec<Snapshot>
         }
     }
     let mut entries = BTreeMap::new();
-    let origins: Vec<_> = documents
+    let mut origins: Vec<_> = documents
         .values()
         .filter(|doc| doc.metadata.kind == "exercise")
         .filter_map(|doc| {
@@ -361,6 +361,16 @@ fn collect(store: &mut ContentStore, id: &str) -> Result<(Preview, Vec<Snapshot>
             .is_some_and(|session| origin_sessions.contains(session))
         {
             entries.insert(document.id.clone(), document);
+        }
+    }
+    for doc in documents.values().filter(|d| d.metadata.kind == "exercise") {
+        if let (Some(session), Some(original)) = (doc.metadata.extra.get("originSessionId").and_then(Value::as_str), doc.metadata.extra.get("originalExerciseEntryId").and_then(Value::as_str)) {
+            origins.push((session.to_owned(), original.to_owned()));
+        }
+    }
+    for entry in entries.values() {
+        if entry.metadata.extra.get("data").and_then(|d|d.get("revisionDocumentId")).and_then(Value::as_str).is_some_and(|id|ids.contains(id)) {
+            if let Some(session) = entry.metadata.extra.get("sessionId").and_then(Value::as_str) { origins.push((session.to_owned(), entry.id.clone())); }
         }
     }
     collect_exercise_entries(store, &origins, &entries, &mut documents)?;
@@ -595,9 +605,11 @@ fn verify_restore_dependencies(documents: &[Document], ledger: &Ledger) -> Resul
             .filter(|id| valid_id(id)).ok_or_else(restore_conflict);
         let session = field("originSessionId")?;
         let entry = field("exerciseEntryId")?;
+        let original = document.metadata.extra.get("originalExerciseEntryId").and_then(Value::as_str).unwrap_or(entry);
         for (dependency, path) in [
             (session, format!("sessions/{session}/session.md")),
             (entry, format!("sessions/{session}/entries/{entry}.md")),
+            (original, format!("sessions/{session}/entries/{original}.md")),
         ] {
             if !remaining.ids.contains(dependency) && !remaining.paths.contains(&path) { continue; }
             let blocked = ledger.records.values().find(|record| record.receipt.status == "trashed"

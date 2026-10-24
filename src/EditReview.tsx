@@ -4,10 +4,14 @@ import { marked } from 'marked';
 import { call, nativeAvailable } from './api';
 import { diffParts } from './editDiff';
 import { Markdown } from './Markdown';
+import { flushExerciseDrafts } from './exerciseDraft';
+import { ExerciseReview } from './ExerciseReview';
 import { sanitizeMarkdown } from './sanitize';
 
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
-export type EditProposal = { id: string; courseId: string; path: string; original: string; content: string; status: string; expectedVersion?: string };
+export type ReviewQuestion = { id: string; question: string; format: string; answers: string[]; explanation?: string; tags?: string[]; sourceIds?: string[]; rubric?: { criteria: {id:string;label:string;description:string;maxPoints:number}[] } };
+export type QuestionChange = { id: string; before?: ReviewQuestion; after?: ReviewQuestion; status: string };
+export type EditProposal = { exercise?: { documentId: string; version: string; changes: QuestionChange[] }; id: string; courseId: string; path: string; original: string; content: string; status: string; expectedVersion?: string };
 type Props = { courseId: string; documentId: string; isDirty: (id: string) => boolean; isLoaded: (id: string) => boolean; onAccepted: (id: string) => Promise<void>; onOpen: (id: string) => void | Promise<void>; notify: (message: string) => void };
 export const proposalDocumentId = (path: string) => /^documents\/([^/]+)\.md$/u.exec(path)?.[1] || '';
 export const proposalFileName = (path: string) => path.split('/').at(-1) || '文本文件';
@@ -15,7 +19,7 @@ export const proposalFileName = (path: string) => path.split('/').at(-1) || '文
 // Some Markdown constructs lose essential source information in the reading
 // renderer (targets/definitions/HTML), or would create an embedded preview.
 // Changed versions of those constructs must remain inert, exact text.
-function needsReviewSource(text: string) {
+export function needsReviewSource(text: string) {
   let source = !sanitizeMarkdown(text).replace(/<[^>]*>/gu, '').trim();
   marked.walkTokens(marked.lexer(text), token => {
     if (['def', 'html', 'link', 'image'].includes(token.type)
@@ -61,7 +65,7 @@ export function useEditReview(props: Props) {
   const readOnly = !!raw && !!proposalDocumentId(raw.path);
   const proposal = raw || items.find(p => proposalDocumentId(p.path) === props.documentId);
   const blocks = useMemo(() => {
-    if (!proposal) return [];
+    if (!proposal || proposal.exercise) return [];
     // Keep code fences, lists and tables intact; never split their Markdown
     // delimiters across independently rendered fragments.
     const tokenize = (text: string) => marked.lexer(text).map(token => token.raw);
@@ -130,12 +134,29 @@ export function useEditReview(props: Props) {
     } catch (e) { setError(errorText(e)); }
     finally { setBusy(false); }
   }
-  return { items, proposal, raw: !!raw, readOnly, blocks, hunks, hunk, diffRoot, dirty, busy, error, navigate, locate, decide, closeRaw: () => setSelectedRaw(''), dismissError: () => setError('') };
+  async function decideQuestion(questionId: string, accept: boolean) {
+    if (!proposal?.exercise || busy || readOnly && accept) return;
+    const selected = proposal;
+    const id = selected.exercise!.documentId;
+    if (accept && latest.current.isDirty(id)) { setError('请先保存或放弃练习 Markdown 草稿，再接受修改。'); return; }
+    setBusy(true); setError('');
+    try {
+      await flushExerciseDrafts();
+      const receipt = await call<{ persisted: boolean; complete: boolean; status: string }>('decide_exercise_proposal', { courseId: selected.courseId, id: selected.id, questionId, accept });
+      if (receipt.persisted) await latest.current.onAccepted(id);
+      if (receipt.complete) { settled.current.add(selected.id); setItems(old => old.filter(p => p.id !== selected.id)); setSelectedRaw(''); }
+      else { const updated = await call<EditProposal>('edit_proposal', { courseId: selected.courseId, id: selected.id }); setItems(old => old.map(p => p.id === selected.id ? updated : p)); }
+      latest.current.notify(receipt.persisted ? '此题修改已保存，原题与历史作答保留。' : '已拒绝此题修改。');
+    } catch (e) { setError(errorText(e)); }
+    finally { setBusy(false); }
+  }
+  return { items, proposal, decideQuestion, raw: !!raw, readOnly, blocks, hunks, hunk, diffRoot, dirty, busy, error, navigate, locate, decide, closeRaw: () => setSelectedRaw(''), dismissError: () => setError('') };
 }
 export type EditReviewState = ReturnType<typeof useEditReview>;
 
 export function EditReviewContent({ review, onAsset, hideTitle }: { review: EditReviewState; hideTitle?: boolean; onAsset?: (courseId: string, assetId: string) => void }) {
   if (!review.proposal) return null;
+  if (review.proposal.exercise) return <ExerciseReview review={review}/>;
   return <div ref={review.diffRoot} className={`inline-edit-review${hideTitle ? ' hide-redundant-title' : ''}`} aria-label="正文修改差异">
     {review.dirty && <p className="review-draft-warning" role="status">还有未保存的编辑。以下对照 AI 读取的原文；你的草稿仍在编辑器中，请先处理后再接受。</p>}
     {review.blocks.map((block, index) => block.kind === 'same'
@@ -148,6 +169,10 @@ export function EditReviewContent({ review, onAsset, hideTitle }: { review: Edit
 }
 export function EditReviewDock({ review, editing, onRead }: { review: EditReviewState; editing?: boolean; onRead?: () => void }) {
   if (!review.proposal) return null;
+  if (review.proposal.exercise) return <div className="review-dock-wrap">
+    {review.error && <p className="review-recovery" role="alert">{review.error}<button onClick={review.dismissError}>关闭提示</button></p>}
+    <section className="review-dock" aria-label="练习修改审阅"><div className="review-dock-copy"><strong>审阅练习修改</strong><small>{review.busy ? '正在保存此题…' : `${review.proposal.exercise.changes.filter(c => ['pending','accepting'].includes(c.status)).length} 题待处理 · 题干、答案与解析一起保存`}</small></div>{editing && <button className="review-secondary" onClick={onRead}>查看题目差异</button>}</section>
+  </div>;
   const unknown = review.proposal.status !== 'pending';
   return <div className="review-dock-wrap">
     {(review.error || unknown) && <p className="review-recovery" role="alert">{review.error || '写入结果需要核对，旧稿和新稿均保留。'}{review.error && <button onClick={review.dismissError}>关闭提示</button>}</p>}

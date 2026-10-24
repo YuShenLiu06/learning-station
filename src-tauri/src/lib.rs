@@ -32,6 +32,7 @@ pub use desktop::run;
 pub mod assets;
 pub mod exercise_references;
 pub mod exercises;
+mod exercise_edits;
 pub mod library_tree;
 pub mod review;
 

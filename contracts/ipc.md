@@ -145,3 +145,11 @@ userEntryId 由 Rust 从准确 Run 绑定写入，不能来自模型参数。旧
 ### Focus 冻结
 
 `freeze_focus {request:{sessionId,input:{documentId,expectedBody,expectedVersion?,view,ranges,questionId?,assetId?},selection,injections,assistantReferences,exerciseReferences}}` 返回 [FocusSnapshot](focus-v1.md)。这是一次本机私有材料冻结，不发模型、不改变权限。`start_generation` 增可选 `focus`；既有调用兼容，带 Focus 的请求严格绑定原冻结记录。
+
+### 练习整题修改审阅
+
+`decide_exercise_proposal({courseId,id,questionId,accept})` 每次决定一整题，返回 `{persisted,status,complete,version}`；全部处理后原提案归档。`edit_proposal` 可带 `exercise:{documentId,version,changes:[{id,before?,after?,status,operation}]}`，题干中的选项、答案、解析、格式与量表不可拆分接受。未改题保持普通内容展示，UI不展示底层JSON。
+
+仅用户打开练习“编辑 Markdown”视图的冻结 Focus 为该练习增加读取授权；做题视图不授完整答案读取权、不自动发送正文。工具 `read` 的 `documents/<exerciseDocumentId>.md` 返回 `{exercises:[...]}` JSON 字符串及文档版本。`write.content` 顶层只允许 `exercises`；保留id表示原题/修改，新增省略id，删除从数组省略。原id必须属于该题集，来源限原题集持久化manifest。修改与新增由Rust生成新题id，未改题保留稳定id。
+
+每次接受先验证当前版本及1至5题限制，追加不可变exercise修订entry，再通过既有保留旧稿事务更新页面指向。原entry、作答及评分不重写；新题不继承旧题作答。`originalExerciseEntryId` 保留原映射，`exerciseEntryId` 指当前修订，`exerciseEditOperation` 供原操作核对。未知结果不重放；数量限制/版本冲突仍保留该题待决。未保存Markdown草稿、受影响题未提交作答或错因会阻止接受；拒绝不丢输入。直接编辑Markdown只改变展示，不改变评分题集。

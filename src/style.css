@@ -181,3 +181,12 @@ label select{display:block;background:#fff;border:1px solid #dce5ce;border-radiu
 .inline-edit-review.hide-redundant-title>.markdown:first-of-type h1:first-child{display:none}
 
 .review-source{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.7 ui-monospace,monospace;margin:4px 0;padding:8px 10px;background:#ffffff60;border-radius:4px}.review-source code{font:inherit}
+
+.exercise-review { max-width: 850px; margin: 0 auto; padding: 20px 28px 80px; }
+.exercise-review-question { margin-bottom: 30px; }
+.exercise-review-question > header { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+.exercise-review-question > header span { color: var(--muted); font-size: .8rem; }
+.exercise-review-version { min-width: 0; flex: 1; }
+.exercise-review-reference { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--line); }
+.exercise-review-reference > strong { font-size: .8rem; }
+.exercise-review-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
