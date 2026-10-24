@@ -62,3 +62,36 @@ test('exercise acceptance and rejection pass through the real native adapter to 
   assert.equal(calls.length,3);
  } finally {delete globalThis.exerciseNativeInvoke;await unlink(filename);}
 });
+
+test('an unloaded unrelated exercise draft blocks acceptance but never rejection', async () => {
+ const dom=new JSDOM('<div id="root"></div>',{url:'http://127.0.0.1/'});
+ Object.assign(globalThis,{window:dom.window,document:dom.window.document,IS_REACT_ACT_ENVIRONMENT:true,requestAnimationFrame:callback=>setTimeout(callback,0),cancelAnimationFrame:clearTimeout});
+ const filename=new URL(`./.exercise-draft-rejection-${process.pid}.mjs`,import.meta.url);
+ await build({stdin:{contents:`import React from 'react';import {useEditReview,EditReviewContent,EditReviewDock} from './src/EditReview';import {useExerciseDraft} from './src/exerciseDraft';export function Harness(props){const draft=useExerciseDraft('unrelated-question','');const review=useEditReview(props);return <><button onClick={()=>draft.setAnswer('保留的未提交答案')}>输入其他题草稿</button><output>{draft.answer}</output>{review.proposal?<EditReviewContent review={review}/>:<p>Normal exercises</p>}<EditReviewDock review={review}/></>}`,resolveDir:process.cwd(),loader:'tsx'},outfile:filename.pathname,bundle:true,packages:'external',platform:'node',format:'esm',jsx:'automatic',plugins:[{name:'draft-rejection-ipc',setup(b){
+  b.onResolve({filter:/^\.\/api$/},()=>({path:'ipc',namespace:'fixture'}));
+  b.onLoad({filter:/.*/,namespace:'fixture'},()=>({contents:'export const nativeAvailable=true;export const call=(...args)=>globalThis.draftRejectionCall(...args);'}));
+ }}]});
+ const React=await import('react');const {createRoot}=await import('react-dom/client');const {Harness}=await import(filename.href);const root=createRoot(document.getElementById('root'));
+ const before={id:'old',question:'原题',answers:['A'],format:'exact',explanation:'解析'};
+ const proposal={id:'p',courseId:'c',path:'documents/ex.md',original:JSON.stringify({exercises:[before]}),content:'private-json',status:'pending',exercise:{documentId:'ex',version:'v1',changes:[{id:'old',before,after:{...before,id:'new',question:'新题'},status:'pending'}]}};
+ const decisions=[];let draftWrites=0;
+ globalThis.draftRejectionCall=async(command,args)=>{
+  if(command==='draft_get')throw Error('其他题草稿尚未恢复');
+  if(command==='draft_save'){draftWrites++;throw Error('草稿不能覆盖');}
+  if(command==='edit_proposals')return[{id:'p',stamp:'1'}];
+  if(command==='edit_proposal')return proposal;
+  if(command==='decide_exercise_proposal'){decisions.push(args);return{persisted:false,status:'rejected',complete:true};}
+  throw Error(command);
+ };
+ try {
+  await React.act(async()=>{root.render(React.createElement(Harness,{courseId:'c',documentId:'ex',isDirty:()=>false,isLoaded:()=>true,onAccepted:async()=>{throw Error('拒绝不得刷新正文');},onOpen:async()=>{},notify:()=>{}}));await new Promise(r=>setTimeout(r,15));});
+  const button=text=>[...document.querySelectorAll('button')].find(b=>b.textContent===text);
+  await React.act(async()=>button('输入其他题草稿').click());
+  await React.act(async()=>button('接受此题修改').click());
+  assert.equal(decisions.length,0);assert.match(document.body.textContent,/草稿尚未读取成功/);
+  await React.act(async()=>button('拒绝此题修改').click());
+  assert.deepEqual(decisions,[{courseId:'c',id:'p',questionId:'old',accept:false}]);
+  assert.equal(draftWrites,0);assert.equal(document.querySelector('output').textContent,'保留的未提交答案');
+  assert.equal(document.querySelector('.review-dock'),null);assert.match(document.body.textContent,/Normal exercises/);
+ } finally {await React.act(async()=>root.unmount());dom.window.close();delete globalThis.draftRejectionCall;await unlink(filename);}
+});

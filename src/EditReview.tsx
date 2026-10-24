@@ -141,7 +141,7 @@ export function useEditReview(props: Props) {
     if (accept && latest.current.isDirty(id)) { setError('请先保存或放弃练习 Markdown 草稿，再接受修改。'); return; }
     setBusy(true); setError('');
     try {
-      await flushExerciseDrafts();
+      if (accept) await flushExerciseDrafts();
       const receipt = await call<{ persisted: boolean; complete: boolean; status: string }>('decide_exercise_proposal', { courseId: selected.courseId, id: selected.id, questionId, accept });
       if (receipt.persisted) await latest.current.onAccepted(id);
       if (receipt.complete) { settled.current.add(selected.id); setItems(old => old.filter(p => p.id !== selected.id)); setSelectedRaw(''); }
