@@ -11,7 +11,7 @@ static SKILL_DIR: OnceLock<PathBuf> = OnceLock::new();
 const MAX_SKILL_BYTES: u64 = 16 * 1024;
 /// The fixed bundled allowlist. On-demand listing/loading never discovers other
 /// directories; an id outside this list is an authorization rejection.
-pub const KNOWN_IDS: &[&str] = &["learning-explore", "learning-exercises", "learning-review"];
+pub const KNOWN_IDS: &[&str] = &["learning-explore", "learning-exercises", "learning-review", "learning-exercise-markdown"];
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -257,7 +257,7 @@ mod tests {
                 .iter()
                 .map(|item| item.id.as_str())
                 .collect::<Vec<_>>(),
-            ["learning-explore", "learning-exercises"]
+            ["learning-explore", "learning-exercises", "learning-exercise-markdown"]
         );
         assert!(catalog_from(Path::new("/not-a-skill-root")).is_empty());
     }

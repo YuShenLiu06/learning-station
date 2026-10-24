@@ -2347,6 +2347,14 @@ mod tests {
         assert!(content.starts_with("---\nname: learning-review\n"));
         assert_eq!(loaded["sha256"].as_str().unwrap(), hash(content));
         assert_eq!(loaded["skillId"], "learning-review");
+        let format = execute(
+            &engine, &scope, "exercise-format-load", "load_learning_skill",
+            json!({"skillId":"learning-exercise-markdown"}),
+        ).unwrap();
+        let body = format["content"].as_str().unwrap();
+        assert_eq!(format["skillId"], "learning-exercise-markdown");
+        assert_eq!(format["sha256"].as_str().unwrap(), hash(body));
+        assert_eq!(body, include_str!("../../skills/learning-exercise-markdown/SKILL.md"));
         // An id outside the fixed allowlist never reaches the disk.
         for (id, code) in [
             ("not-a-skill", "TOOL_SCOPE"),
