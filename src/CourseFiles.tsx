@@ -3,7 +3,7 @@ import { ChevronDown, ChevronRight, FileText, Folder, RefreshCw, X } from 'lucid
 import { call, nativeAvailable } from './api';
 import type { LibraryNode } from './types';
 type CourseFile = { id: string; path: string; name: string; directory: boolean; parentId?: string; documentId?: string };
-export function CourseFiles({ courseId, nodes, activeId, expandedIds, onExpanded, onOpen, filter, renderDocument, renderRemaining }: { courseId: string; nodes: LibraryNode[]; activeId: string; expandedIds: string[]; onExpanded: (ids: string[]) => void; onOpen: (id: string) => void; filter: string; renderDocument: (id: string) => React.ReactNode; renderRemaining: (displayed: string[]) => React.ReactNode }) {
+export function CourseFiles({ onRefreshNodes, courseId, nodes, activeId, expandedIds, onExpanded, onOpen, filter, renderDocument, renderRemaining }: { onRefreshNodes?: () => Promise<unknown>; courseId: string; nodes: LibraryNode[]; activeId: string; expandedIds: string[]; onExpanded: (ids: string[]) => void; onOpen: (id: string) => void; filter: string; renderDocument: (id: string) => React.ReactNode; renderRemaining: (displayed: string[]) => React.ReactNode }) {
   const [files, setFiles] = useState<CourseFile[]>([]); const [error, setError] = useState(''); const [loading, setLoading] = useState(false); const [revision, setRevision] = useState(0);
   const [selected, setSelected] = useState<CourseFile | null>(null); const opener = useRef<HTMLElement | null>(null);
   const close = () => { setSelected(null); opener.current?.focus(); };
@@ -11,7 +11,7 @@ export function CourseFiles({ courseId, nodes, activeId, expandedIds, onExpanded
     let live = true; setFiles([]); setSelected(null); setError('');
     if (!nativeAvailable) return;
     setLoading(true);
-    call<CourseFile[]>('list_course_files', { courseId }).then(value => { if (live) setFiles(value); }).catch(e => { if (live) setError(e.message || String(e)); }).finally(() => { if (live) setLoading(false); });
+    call<CourseFile[]>('list_course_files', { courseId }).then(async value => { if (!live) return; setFiles(value); if (value.some(file => file.documentId && !nodes.some(node => node.id === file.documentId))) await onRefreshNodes?.(); }).catch(e => { if (live) setError(e.message || String(e)); }).finally(() => { if (live) setLoading(false); });
     return () => { live = false; };
   }, [courseId, nodes, revision]);
   useEffect(() => { const refresh = () => setRevision(value => value + 1); window.addEventListener('focus', refresh); return () => window.removeEventListener('focus', refresh); }, []);
@@ -24,7 +24,7 @@ export function CourseFiles({ courseId, nodes, activeId, expandedIds, onExpanded
   function rows(parentId?: string, depth = 0): React.ReactNode {
     return files.filter(f => (f.parentId || undefined) === parentId && matches.has(f.id)).map(file => {
       const expanded = !!filter || expandedIds.includes(file.id); const doc = nodes.find(n => n.id === file.documentId);
-      if (file.documentId) return <div key={file.id} style={{ paddingLeft: depth * 12 }}>{renderDocument(file.documentId)}</div>;
+      if (file.documentId && doc) return <div key={file.id} style={{ paddingLeft: depth * 12 }}>{renderDocument(file.documentId)}</div>;
       return <div key={file.id}><button className={`tree-row ${file.documentId === activeId ? 'active' : ''}`} style={{ '--tree-depth': depth } as React.CSSProperties} aria-expanded={file.directory ? expanded : undefined} title={file.path} onClick={event => { if (file.directory) toggle(file.id); else if (file.documentId) onOpen(file.documentId); else { opener.current=event.currentTarget; setSelected(file); } }}><span className="tree-chevron">{file.directory ? expanded ? <ChevronDown size={12}/> : <ChevronRight size={12}/> : null}</span>{file.directory ? <Folder size={14}/> : <FileText size={14}/>}<span className="tree-title">{doc?.title || file.name}</span></button>{file.directory && expanded && rows(file.id, depth + 1)}</div>;
     });
   }
