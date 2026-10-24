@@ -572,7 +572,6 @@ async fn rust_node_pi_validates_final_json_and_corrects_before_any_persistence()
             ToolPolicy {
                 mode: "practice".into(),
                 allowed_tools: vec![],
-                max_calls: 0,
                 authorization: "off".into(),
             },
             crate::learning_skills::capture("practice", &[]).unwrap(),
@@ -749,7 +748,6 @@ async fn rust_node_pi_exercise_tool_receipt_corrects_invalid_output_in_same_nati
         ToolPolicy {
             mode: "question".into(),
             allowed_tools: vec!["generate_exercises".into()],
-            max_calls: 4,
             authorization: "off".into(),
         },
         crate::learning_skills::capture("question", &["generate_exercises".into()]).unwrap(),

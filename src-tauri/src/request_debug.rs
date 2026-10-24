@@ -4,6 +4,9 @@ use serde_json::{json, Value};
 use std::sync::{Mutex, OnceLock};
 const MAX_RECORDS: usize = 40;
 const MAX_BYTES: usize = 4 * 1024 * 1024;
+// Tests that toggle the process-wide capture switch must not clear each other's records.
+#[cfg(test)]
+pub(crate) static TEST_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
 #[derive(Default)]
 pub struct DebugState {
     enabled: bool,

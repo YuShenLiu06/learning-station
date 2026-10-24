@@ -12,6 +12,33 @@ export function receivedMaterialFrames(entry) {
   if(entry.details?.materialFrames)return entry.details.materialFrames.map(f=>frameValue(entry,f));
   return JSON.parse(entry.content).frames??[]; // Previously accepted native JSON projections.
 }
+// Retire transient focus semantics while preserving Pi-proven body/diff baselines.
+// Old transcripts used the focus registration for both location and body messages.
+export function retireTurnContext(manager, bridge) {
+  for(const entry of manager.buildSessionProjection().entries) {
+    const source=entry.sourceEntry;
+    if(!entry.messages.length||source.type!=='custom_message')continue;
+    const key=source.details?.bridgeKey;
+    if(source.customType==='learning-station-turn'&&key!=='exploration')bridge.exclude(source.id);
+    if(key!=='focus')continue;
+    bridge.exclude(source.id);
+    const receipts=manager.getEntries().filter(r=>r.type==='custom'&&(
+      r.customType==='learning-station-material-request'&&r.data?.entryId===source.id||
+      r.customType==='learning-station-changes-request'&&r.data?.changesEntryId===source.id));
+    if(!receipts.length)continue; // Unsent candidates are not a received baseline.
+    const newline=source.content.indexOf('\n');
+    const legacyJson=!source.details?.materialFrames&&source.content.startsWith('{');
+    const prefix='【已提供的材料与变化（历史）】'+(source.details?.path&&!source.content.slice(newline).startsWith('\n文件：')?'\n文件：'+source.details.path:'');
+    const content=legacyJson?source.content:prefix+source.content.slice(newline);
+    const shift=prefix.length-newline;
+    const details={...source.details,bridgeKey:'materials',bridgeDescription:prefix};
+    if(details.materialFrames)details.materialFrames=details.materialFrames.map(f=>({...f,start:f.start+shift,end:f.end+shift}));
+    const id=manager.appendCustomMessageEntry(source.details?.materialFrames||legacyJson?'learning-station-material':'learning-station-changes',content,false,details);
+    for(const receipt of receipts)manager.appendCustomEntry(receipt.customType,{...receipt.data,...(receipt.customType==='learning-station-material-request'?{entryId:id}:{changesEntryId:id})});
+  }
+  // Make retirements visible to baseline discovery before registering this turn.
+  bridge.commit();
+}
 function focusLocation(f,path) {
   let value='文件：'+path+'\n'+(f.commitHash?'版本：'+f.commitHash:'内容版本：'+f.documentVersion);
   if(f.exercise)value+='\n当前题目：第 '+f.exercise.number+' 题';
@@ -74,8 +101,8 @@ export async function registerMaterialContext({manager,spec,loadChanges,envelope
     if(unchanged)status='retained';
     else if(diff){patchSource=source;patchBaseline=last;status='updated';}
     else {
-      const description=source.range?.complete===false?'以下为已提供范围的正文（部分内容）':source.gitCommitOid?'以下为当前用户正在看的内容（固定 Git 版本；'+(ever?'正文基准已丢失，重新载入':'首次正文基准')+'）':'以下为当前用户正在看的内容';
-      const prefix=envelope.focus?'':('文件：'+(source.modelPath??source.path??'未记录路径')+'\n');
+      const description=source.range?.complete===false?'以下为已提供范围的正文（部分内容）':source.gitCommitOid?'以下为已提供的材料正文（固定 Git 版本；'+(ever?'正文基准已丢失，重新载入':'首次正文基准')+'）':'以下为已提供的材料正文';
+      const prefix='文件：'+(source.modelPath??source.path??'未记录路径')+'\n';
       const value=prefix+source.text,start=renderBridgePart(description,prefix).length;
       bodyMessages.push({description,value,details:{sourceId:source.id,path:source.path,textHash:source.textHash,version:source.version,range:source.range,...(source.gitCommitOid?{gitCommitOid:source.gitCommitOid,gitBlobOid:source.gitBlobOid}:{}),materialFrames:[{kind:'full',textHash:source.textHash,start,end:start+source.text.length}]}});
     }
@@ -102,7 +129,7 @@ export async function registerMaterialContext({manager,spec,loadChanges,envelope
     }
     bridge.message('focus',description,'learning-station-focus',value,details);
   }
-  for(const body of bodyMessages)bridge.message('focus',body.description,'learning-station-material',body.value,body.details);
+  for(const body of bodyMessages)bridge.message('materials',body.description,'learning-station-material',body.value,body.details);
   for(const item of inventory.entries)if(item.kind==='turn'&&(item.id==='focus'||item.id.startsWith('focus:'))&&currentSources.length){item.includedChars=0;item.reason='focus_location';}
   return inventory;
 }

@@ -102,6 +102,10 @@ pub struct ToolObject {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolActivity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_entry_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<usize>,
     pub id: String,
     pub tool_call_id: String,
     pub run_id: String,
@@ -669,6 +673,9 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
             }
             Err(e) => Err(e),
         };
+        if result.is_err() {
+            let _ = settle_interrupted_tools(&engine, &id, &sink);
+        }
         let mut runs = engine.runs.lock().unwrap_or_else(|e| e.into_inner());
         let m = runs.get_mut(&id).unwrap();
         match result {
@@ -718,7 +725,11 @@ fn learning_tool_handler(
         let scope = scope.clone();
         let sink = sink.clone();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
+            let wait_engine = engine.clone();
+            let wait_scope = scope.clone();
+            let wait_sink = sink.clone();
+            let wait_call = call.clone();
+            let mut result = tokio::task::spawn_blocking(move || {
                 let mut activity = new_tool_activity(&scope, &call.id, &call.name)?;
                 publish_tool_activity(&engine, &activity, &sink)?;
                 // Workspace tools enforce their own tier, confinement and receipts.
@@ -742,7 +753,19 @@ fn learning_tool_handler(
                 result
             })
             .await
-            .map_err(|_| CoreError::new("INTERNAL", "学习工具执行中断，已提交记录仍保留。"))?
+            .map_err(|_| CoreError::new("INTERNAL", "学习工具执行中断，已提交记录仍保留。"))??;
+            // No pending result reaches Pi: cancellation drops this wait, while
+            // the durable proposal remains available after restart.
+            if result["status"] == "pending" && result["proposalId"].is_string() {
+                while result["status"] == "pending" {
+                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                    result = crate::authorized_tools::proposal_result(&wait_engine, result)?;
+                }
+                let mut activity = new_tool_activity(&wait_scope, &wait_call.id, &wait_call.name)?;
+                finish_tool_activity(&mut activity, &wait_scope, &Ok(result.clone()));
+                let _ = publish_tool_activity(&wait_engine, &activity, &wait_sink);
+            }
+            Ok(result)
         })
     })
 }
@@ -1523,6 +1546,8 @@ fn new_tool_activity(
     );
     let stamp = timestamp();
     Ok(ToolActivity {
+        user_entry_id: None,
+        sequence: None,
         id: id.clone(),
         tool_call_id: id,
         run_id: scope.run_id.clone(),
@@ -1545,6 +1570,17 @@ fn finish_tool_activity(
 ) {
     activity.updated_at = timestamp();
     if let Ok(value) = result {
+        if activity.name == "write" && value["status"] == "unchanged" && value["persisted"] == false
+            && value["sessionId"] == scope.session_id {
+            activity.status = "succeeded".into();
+            activity.summary = "内容未变化，未重复写入。".into();
+            return;
+        }
+        if activity.name == "write" && value["proposalId"].is_string() && value["persisted"] == false {
+            activity.status = if value["status"] == "pending" { "waiting" } else { "succeeded" }.into();
+            activity.summary = if value["status"] == "pending" { "AI 修改待确认，建议已保留，正文未修改。" } else { "用户已拒绝建议，正文未修改。" }.into();
+            return;
+        }
         if activity.name == "query_related_knowledge" {
             activity.status = "succeeded".into();
             activity.summary = "已完成授权材料查询，未创建新内容。".into();
@@ -1570,7 +1606,7 @@ fn finish_tool_activity(
             activity.status = "succeeded".into();
             activity.persisted = true;
             activity.summary = if activity.name == "write" {
-                "已写入会话工作区并保存回执。"
+                "已写入文件并保存回执。"
             } else {
                 "已在会话工作区执行并保存回执。"
             }
@@ -1617,6 +1653,11 @@ fn finish_tool_activity(
     activity.error_code = Some("TOOL_FAILED".into());
     if let Err(error) = result {
         activity.error_code = Some(error.code.clone());
+        if activity.name == "write" {
+            if let Some(feedback) = crate::authorized_tools::write_conflict_feedback(error) {
+                activity.summary = feedback["message"].as_str().unwrap().into();
+            }
+        }
         if error.code == "INVALID_MODEL_OUTPUT"
             && error
                 .details
@@ -1627,25 +1668,108 @@ fn finish_tool_activity(
         }
     }
 }
-fn publish_tool_activity(engine: &Engine, activity: &ToolActivity, sink: &Sink) -> Result<()> {
-    {
-        let mut core = engine.lock()?;
-        sessions::append(
-            &mut core.content,
-            &activity.session_id,
-            Entry {
-                id: String::new(),
-                kind: "note".into(),
-                content: format!("{}：{}", activity.title, activity.summary),
-                created_at: String::new(),
-                selection: None,
-                related_ids: vec![],
-                data: Some(json!({"origin":"pi-tool-activity","toolActivity":activity})),
-            },
-            None,
-            &format!("{}-{}", activity.id, activity.status),
-        )?;
+// A cancelled handler may leave blocking work in flight. Preserve uncertainty;
+// only its eventual durable receipt can confirm whether the write completed.
+fn settle_interrupted_tools(engine: &Engine, run_id: &str, sink: &Sink) -> Result<()> {
+    for mut activity in get(engine, run_id)?.tool_calls.into_iter().filter(|a| a.status == "running") {
+        activity.status = "unknown".into();
+        activity.summary = "生成已结束，工具结果尚未核实；请核对原回执，不要重复写入。".into();
+        activity.error_code = Some("NATIVE_TOOL_UNKNOWN".into());
+        activity.updated_at = timestamp();
+        publish_tool_activity(engine, &activity, sink)?;
     }
+    Ok(())
+}
+
+pub(crate) fn settle_proposal_activity(
+    engine: &Engine,
+    scope: &crate::learning_tools::ToolScope,
+    call_id: &str,
+    receipt: &Value,
+) -> Result<()> {
+    let mut activity = new_tool_activity(scope, call_id, "write")?;
+    if let Some(previous) = get(engine, &scope.run_id)?
+        .tool_calls
+        .iter()
+        .find(|previous| previous.id == activity.id)
+    {
+        activity.started_at = previous.started_at.clone();
+    }
+    finish_tool_activity(&mut activity, scope, &Ok(receipt.clone()));
+    let sink: Sink = Arc::new(|_| {});
+    publish_tool_activity(engine, &activity, &sink)
+}
+
+#[cfg(test)]
+thread_local! {
+    static ACTIVITY_CORE_LOCKED: std::cell::RefCell<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
+}
+
+fn publish_tool_activity(engine: &Engine, activity: &ToolActivity, sink: &Sink) -> Result<()> {
+    let run = get(engine, &activity.run_id)?;
+    if run.id != activity.run_id || run.session_id != activity.session_id {
+        return Err(CoreError::new("CONFLICT", "工具活动与原会话不匹配。"));
+    }
+    let mut attributed = activity.clone();
+    attributed.sequence = Some(run.tool_calls.iter().position(|item| item.id == activity.id).unwrap_or(run.tool_calls.len()));
+    attributed.user_entry_id = run.user_entry_id;
+    let activity = &attributed;
+    // A decision IPC and the waiting handler may both settle the same call.
+    // Reuse the first persisted activity (including timestamps) for idempotency.
+    let mut core = engine.lock()?;
+    #[cfg(test)]
+    ACTIVITY_CORE_LOCKED.with(|hook| {
+        if let Some((locked, resume)) = hook.borrow_mut().take() {
+            locked.send(()).unwrap();
+            resume.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        }
+    });
+    // Inspect durable activities under core alone. Taking runs here would
+    // invert completion's runs -> core order and can deadlock on timeout.
+    let saved_activities = sessions::get_persisted(&mut core.content, &activity.session_id)?
+        .entries
+        .into_iter()
+        .filter_map(|entry| {
+            entry.data.and_then(|data| {
+                serde_json::from_value::<ToolActivity>(data["toolActivity"].clone()).ok()
+            })
+        }).collect::<Vec<_>>();
+    if activity.status == "unknown" && saved_activities.iter()
+        .any(|previous| previous.id == activity.id && previous.status != "running") {
+        return Ok(());
+    }
+    let saved = saved_activities.into_iter()
+        .find(|previous| previous.id == activity.id && previous.status == activity.status);
+    let activity = match saved.as_ref() {
+        Some(previous)
+            if previous.summary == activity.summary && previous.persisted == activity.persisted =>
+        {
+            previous
+        }
+        _ => activity,
+    };
+    sessions::append(
+        &mut core.content,
+        &activity.session_id,
+        Entry {
+            id: String::new(),
+            kind: "note".into(),
+            content: format!("{}：{}", activity.title, activity.summary),
+            created_at: String::new(),
+            selection: None,
+            related_ids: vec![],
+            data: Some(json!({"origin":"pi-tool-activity","toolActivity":activity})),
+        },
+        None,
+        &format!("{}-{}", activity.id, activity.status),
+    )?;
+    drop(core);
+    // The durable entry retains its original digest; only the run/event view
+    // receives the attribution recovered for display after a successful replay.
+    let mut projected = activity.clone();
+    projected.user_entry_id = attributed.user_entry_id.clone();
+    projected.sequence = attributed.sequence;
+    let activity = &projected;
     let mut runs = engine
         .runs
         .lock()
@@ -1657,6 +1781,9 @@ fn publish_tool_activity(engine: &Engine, activity: &ToolActivity, sink: &Sink) 
             .iter_mut()
             .find(|item| item.tool_call_id == activity.tool_call_id)
         {
+            if activity.status == "unknown" && previous.status != "running" {
+                return Ok(());
+            }
             *previous = activity.clone();
         } else {
             managed.run.tool_calls.push(activity.clone());
@@ -1666,6 +1793,26 @@ fn publish_tool_activity(engine: &Engine, activity: &ToolActivity, sink: &Sink) 
         let mut update = event(&managed.run, None);
         update.tool = Some(activity.clone());
         (sink)(update);
+    } else {
+        // A decision may arrive after cancellation or after an app restart.
+        // Keep the original run's durable summary in sync as well as its session.
+        let path = run_path(engine, &activity.run_id)?;
+        let mut run: Run =
+            serde_json::from_slice(&crate::assets::bounded_read(&path, 8 * 1024 * 1024)?)?;
+        if run.session_id != activity.session_id {
+            return Err(CoreError::new("CONFLICT", "工具活动与原会话不匹配。"));
+        }
+        if let Some(previous) = run
+            .tool_calls
+            .iter_mut()
+            .find(|item| item.tool_call_id == activity.tool_call_id)
+        {
+            *previous = activity.clone();
+        } else {
+            run.tool_calls.push(activity.clone());
+        }
+        run.updated_at = timestamp();
+        persist(engine, &run)?;
     }
     Ok(())
 }
@@ -1720,6 +1867,82 @@ mod lifecycle_tests {
         };
         (temp, engine, session)
     }
+    #[test]
+    fn timeout_activity_does_not_invert_completion_lock_order() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (_temp, engine, session) = setup();
+        let run = run(&session.id);
+        let scope = crate::learning_tools::ToolScope { session_id:session.id.clone(), section_id:session.section_id.clone(), run_id:run.id.clone(), allowed_ids:vec![] };
+        engine.runs.lock().unwrap().insert(run.id.clone(), ManagedRun {run, cancel:Arc::new(AtomicBool::new(false))});
+        let sink: Sink = Arc::new(|_| {});
+        let mut activity = new_tool_activity(&scope, "concurrent-timeout", "write").unwrap();
+        publish_tool_activity(&engine, &activity, &sink).unwrap();
+        activity.status = "unknown".into();
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker_engine = engine.clone();
+        let cleanup = std::thread::spawn(move || {
+            ACTIVITY_CORE_LOCKED.with(|hook| *hook.borrow_mut() = Some((locked_tx, resume_rx)));
+            let result = publish_tool_activity(&worker_engine, &activity, &sink);
+            done_tx.send(()).unwrap();
+            result
+        });
+        locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let completion_engine = engine.clone();
+        let (completion_tx, completion_rx) = mpsc::channel();
+        let completion = std::thread::spawn(move || {
+            // Match generation completion exactly: hold runs while persist
+            // obtains core through run_path. Cleanup already holds core.
+            let mut runs = completion_engine.runs.lock().unwrap();
+            let managed = runs.get_mut(&scope.run_id).unwrap();
+            managed.run.status = "failed".into();
+            resume_tx.send(()).unwrap();
+            let result = persist(&completion_engine, &managed.run);
+            completion_tx.send(()).unwrap();
+            result
+        });
+        completion_rx.recv_timeout(Duration::from_secs(5)).expect("completion must not deadlock with timeout cleanup");
+        done_rx.recv_timeout(Duration::from_secs(5)).expect("timeout cleanup must finish");
+        completion.join().unwrap().unwrap();
+        cleanup.join().unwrap().unwrap();
+        let saved = get(&engine,"run_lifecycle").unwrap();
+        assert_eq!(saved.status,"failed");
+        assert_eq!(saved.tool_calls[0].status,"unknown");
+    }
+
+    #[test]
+    fn interrupted_tools_preserve_waiting_and_unknown_until_real_receipt() {
+        let (_temp, engine, session) = setup();
+        let run = run(&session.id);
+        let scope = crate::learning_tools::ToolScope { session_id:session.id.clone(), section_id:session.section_id.clone(), run_id:run.id.clone(), allowed_ids:vec![] };
+        engine.runs.lock().unwrap().insert(run.id.clone(), ManagedRun {run, cancel:Arc::new(AtomicBool::new(false))});
+        let sink: Sink = Arc::new(|_| {});
+        let mut pending = new_tool_activity(&scope, "pending", "write").unwrap();
+        publish_tool_activity(&engine, &pending, &sink).unwrap();
+        finish_tool_activity(&mut pending, &scope, &Ok(json!({"status":"pending","proposalId":"proposal","persisted":false})));
+        publish_tool_activity(&engine, &pending, &sink).unwrap();
+        assert_eq!(get(&engine,&scope.run_id).unwrap().tool_calls[0].status,"waiting");
+        let mut in_flight = new_tool_activity(&scope, "in-flight", "write").unwrap();
+        publish_tool_activity(&engine, &in_flight, &sink).unwrap();
+        settle_interrupted_tools(&engine, &scope.run_id, &sink).unwrap();
+        let snapshot = get(&engine,&scope.run_id).unwrap();
+        assert_eq!(snapshot.tool_calls[0].status,"waiting");
+        assert_eq!(snapshot.tool_calls[1].status,"unknown");
+        assert!(!snapshot.tool_calls[1].persisted);
+        let stale_unknown = snapshot.tool_calls[1].clone();
+        finish_tool_activity(&mut in_flight, &scope, &Ok(json!({"persisted":true,"sessionId":session.id})));
+        publish_tool_activity(&engine, &in_flight, &sink).unwrap();
+        publish_tool_activity(&engine, &stale_unknown, &sink).unwrap();
+        assert_eq!(get(&engine,&scope.run_id).unwrap().tool_calls[1].status,"succeeded");
+        settle_proposal_activity(&engine, &scope, "pending", &json!({"persisted":false,"status":"rejected","proposalId":"proposal"})).unwrap();
+        let mut core = engine.lock().unwrap();
+        let saved = sessions::get_persisted(&mut core.content,&session.id).unwrap();
+        assert!(saved.entries.iter().any(|entry| entry.data.as_ref().is_some_and(|d| d["toolActivity"]["status"] == "waiting")));
+        assert!(saved.entries.iter().any(|entry| entry.data.as_ref().is_some_and(|d| d["toolActivity"]["status"] == "unknown")));
+    }
+
     #[test]
     fn appended_question_is_reused_for_retries_without_duplicate_history() {
         let (_temp, engine, session) = setup();
@@ -1829,10 +2052,57 @@ mod lifecycle_tests {
         );
     }
     #[test]
+    fn legacy_activity_replay_preserves_original_digest_for_running_and_terminal() {
+        for terminal in [false, true] {
+            let (temp, engine, session) = setup();
+            let saved = sessions::append(&mut engine.lock().unwrap().content, &session.id,
+                Entry { id: String::new(), kind: "user".into(), content: "fixture".into(),
+                    created_at: String::new(), selection: None, related_ids: vec![], data: None },
+                None, "legacy-question").unwrap();
+            let user = saved.entries.iter().find(|entry| entry.kind == "user").unwrap().id.clone();
+            let scope = crate::learning_tools::ToolScope { session_id: session.id.clone(), section_id: session.section_id.clone(), run_id: "run_lifecycle".into(), allowed_ids: vec![] };
+            let mut activity = new_tool_activity(&scope, "legacy-call", "write").unwrap();
+            let receipt = json!({"persisted":true,"sessionId":session.id});
+            if terminal { finish_tool_activity(&mut activity, &scope, &Ok(receipt.clone())); }
+            assert!(activity.user_entry_id.is_none() && activity.sequence.is_none());
+            let request = format!("{}-{}", activity.id, activity.status);
+            let original = Entry { id: String::new(), kind: "note".into(), content: format!("{}：{}", activity.title, activity.summary), created_at: String::new(), selection: None, related_ids: vec![], data: Some(json!({"origin":"pi-tool-activity","toolActivity":activity})) };
+            let saved = sessions::append(&mut engine.lock().unwrap().content, &session.id, original.clone(), None, &request).unwrap();
+            let entry = saved.entries.iter().find(|entry| entry.kind == "note").unwrap();
+            let doc = engine.lock().unwrap().content.read(&entry.id).unwrap();
+            let path = temp.path().join("library").join(doc.path);
+            let original_bytes = fs::read(&path).unwrap();
+            let mut current = run(&session.id); current.user_entry_id = Some(user.clone()); current.tool_calls = vec![activity.clone()];
+            persist(&engine, &current).unwrap();
+            drop(engine);
+            let reopened = Engine::new(temp.path().join("library"), temp.path().join("state")).unwrap();
+            let projected = sessions::get(&mut reopened.lock().unwrap().content, &session.id).unwrap();
+            assert_eq!(projected.entries.iter().find(|entry| entry.kind == "note").unwrap().data.as_ref().unwrap()["toolActivity"]["userEntryId"], user);
+            let sink: Sink = Arc::new(|_| {});
+            for _ in 0..2 {
+                if terminal { settle_proposal_activity(&reopened, &scope, "legacy-call", &receipt).unwrap(); }
+                else { publish_tool_activity(&reopened, &activity, &sink).unwrap(); }
+            }
+            assert_eq!(fs::read(&path).unwrap(), original_bytes);
+            assert_eq!(get(&reopened, &scope.run_id).unwrap().tool_calls.len(), 1);
+            let mut different = original; different.content.push_str("different");
+            assert_eq!(sessions::append(&mut reopened.lock().unwrap().content, &session.id, different, None, &request).unwrap_err().code, "CONFLICT");
+        }
+    }
+
+    #[test]
     fn real_todo_receipt_drives_safe_durable_tool_card_and_reopens_without_duplicates() {
         let (temp, engine, session) = setup();
         let mut current = run(&session.id);
         current.id = "run_lifecycle".into();
+        let saved_question = sessions::append(
+            &mut engine.lock().unwrap().content, &session.id,
+            Entry { id: String::new(), kind: "user".into(), content: "fixture question".into(),
+                created_at: String::new(), selection: None, related_ids: vec![], data: None },
+            None, "tool-question",
+        ).unwrap();
+        let user_id = saved_question.entries.iter().find(|entry| entry.kind == "user").unwrap().id.clone();
+        current.user_entry_id = Some(user_id.clone());
         engine.runs.lock().unwrap().insert(
             current.id.clone(),
             ManagedRun {
@@ -1871,6 +2141,9 @@ mod lifecycle_tests {
                 .len(),
             1
         );
+        let recorded = get(&engine, "run_lifecycle").unwrap();
+        assert_eq!(recorded.tool_calls[0].user_entry_id.as_deref(), Some(user_id.as_str()));
+        assert_eq!(recorded.tool_calls[0].sequence, Some(0));
         let serialized = serde_json::to_string(&*events.lock().unwrap()).unwrap();
         assert!(!serialized.contains("opaque-secret-id"));
         assert!(!serialized.contains("synthetic private title"));
@@ -2420,7 +2693,6 @@ mod history_audit_tests {
         let question = task_tool_policy("question", "off");
         let explain = task_tool_policy("explain", "off");
         assert_eq!(question.allowed_tools, explain.allowed_tools);
-        assert_eq!(question.max_calls, explain.max_calls);
         for name in ["create_review_card", "create_error", "load_learning_skill"] {
             assert!(question.allowed_tools.contains(&name.into()));
         }

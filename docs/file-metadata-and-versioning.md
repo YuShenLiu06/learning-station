@@ -51,6 +51,7 @@ FileAddr {
 | `all_stat(course, base?)` | 变更文件清单 | `course: CourseId`（取自 `addr.course`）；课程级变更统计，UI 变化视图与 Focus 部件的课程变化块消费，不物化 diff。 |
 | `file_diff(addr, base?)` | diff 或全文 | `addr: FileAddr`；`base = None`（首见、基准被压缩丢失或超预算）时允许返回全文。 |
 | `all_diff(course, base?)` | 全文件 diff | 全量补丁，受预算约束。 |
+| `read_versioned(course, path)` | `{ bytes, version }` | 普通课程材料工具读取：从同一次固定 checkpoint 取正文与 blob OID，避免外部编辑让正文与版本错配。 |
 | `read(addr, version)` | 固定版本内容 | `addr: FileAddr`；read 学习工具授权、回执与幂等校验的唯一固定版本入口。 |
 
 实现由接口屏蔽，仅两种：
@@ -79,3 +80,7 @@ versioning.all_stat(now.course, base)   // course 取自 FileAddr
 ## 同步要求
 
 接口行为变更同步本文、[ContextBridge](context-bridge.md) 与相关契约（contracts/focus-v1、contracts/material-changes-v1、contracts/context-bridge-v1），并按仓库纪律串行运行对应回归。
+
+课程工具发布新文件时，`write_version(course, bytes)` 经同一 Git 后端计算待发布字节的 blob OID，不能用发布后重新读取的第三方内容作为本次写入版本；后续冻结仍按既有 snapshot 流程捕获当前材料。
+
+课程工具覆盖现有文件时，从同一已打开、移入恢复目录并核对正文的旧对象保留 Unix 读写与执行权限位（不扩展为 owner、ACL 或扩展属性复制）；发布失败的尽力恢复同样保留权限。新建文件与独立恢复新稿保持仅所有者读写，第三方文件仍不可被恢复操作覆盖。

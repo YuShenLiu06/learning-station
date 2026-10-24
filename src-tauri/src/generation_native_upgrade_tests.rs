@@ -313,9 +313,12 @@ async fn native_exploration_context_reaches_first_and_reopened_provider_requests
             assert_eq!(exploration.len(), 1);
             assert!(exploration.iter().all(|t|t.as_str()=="【Exploration：当前任务入口】\n本会话来自独立探索入口，正文保存在探索笔记中。"));
             let material_path = format!("文件：courses/{}.md",launch.document.id);
-            let identified: Vec<_> = texts.iter().filter(|t|t.contains(&launch.document.id)).collect();
+            let citation_maps: Vec<Value> = texts.iter().filter(|t| t.contains("本轮练习可引用来源")).map(|t| serde_json::from_str(t).unwrap()).collect();
+            assert_eq!(citation_maps.len(), 1, "one current frozen citation map");
+            assert_eq!(citation_maps[0]["sources"], json!(runs[round].context_manifest.iter().map(|m| json!({"sourceId":m.id,"path":m.path,"version":m.version})).collect::<Vec<_>>()));
+            let identified: Vec<_> = texts.iter().filter(|t|t.contains(&launch.document.id) && !t.contains("本轮练习可引用来源")).collect();
             assert_eq!(identified.len(),1,"the legitimate frozen material path remains once in history");
-            assert!(identified[0].starts_with("以下为当前用户正在看的内容\n"));
+            assert!(identified[0].starts_with("以下为已提供的材料正文\n"));
             assert!(identified[0].lines().any(|line|line==material_path));
             assert_eq!(identified[0].matches(&launch.document.id).count(),1,"source identity is a real path, never bare exploration metadata");
             assert!(!system.contains(goals[0]));

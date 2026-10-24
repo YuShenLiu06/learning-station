@@ -98,6 +98,7 @@ impl FrozenMaterials {
             };
             let mut pending = vec![root.join("materials")];
             let mut seen = 0;
+            let mut scanned = 0;
             let mut remaining = 64 * 1024 * 1024usize;
             while let Some(directory) = pending.pop() {
                 let metadata = fs::symlink_metadata(&directory)?;
@@ -110,8 +111,9 @@ impl FrozenMaterials {
                 }
                 let mut paths = Vec::new();
                 for entry in fs::read_dir(directory)? {
-                    seen += 1;
-                    if seen > 4096 {
+                    scanned += 1;
+                    // Recovery directories are retained, but total filesystem work stays bounded.
+                    if scanned > 65536 {
                         return Err(limit());
                     }
                     paths.push(entry?.path());
@@ -128,6 +130,16 @@ impl FrozenMaterials {
                         .file_name()
                         .and_then(|s| s.to_str())
                         .ok_or_else(scope)?;
+                    if metadata.is_dir()
+                        && name.strip_prefix(".learning-write-")
+                            .is_some_and(crate::types::valid_id)
+                    {
+                        continue;
+                    }
+                    seen += 1;
+                    if seen > 4096 {
+                        return Err(limit());
+                    }
                     let relative = path
                         .strip_prefix(root.join("materials"))
                         .map_err(|_| scope())?
@@ -139,15 +151,7 @@ impl FrozenMaterials {
                     {
                         continue;
                     }
-                    let reason = exclusion_reason(name).or_else(|| {
-                        (metadata.is_dir()
-                            && (matches!(
-                                name,
-                                "node_modules" | "target" | "dist" | "vendor" | "cache"
-                            ) || path.join(".git").exists()
-                                || path.join("objects").is_dir() && path.join("HEAD").exists()))
-                        .then_some("source_or_cache_directory")
-                    });
+                    let reason = path_exclusion(&path, name, metadata.is_dir());
                     if let Some(reason) = reason {
                         let asset_id = if relative.starts_with(&format!("assets/{course_id}/")) {
                             relative.split('/').nth(2).unwrap_or("").to_owned()
@@ -169,11 +173,17 @@ impl FrozenMaterials {
                     if !metadata.is_file() {
                         return Err(scope());
                     }
-                    if !crate::assets::material_file_allowed(name) {
+                    // Large unrelated files must not prevent the rest of the course
+                    // from being snapshotted. Keep the bounded read below for files
+                    // that grow after this metadata check; never load them unbounded.
+                    if metadata.len() > 5 * 1024 * 1024 {
+                        let asset_id = crate::assets::registered_project_asset_id(
+                            &root.join("materials"), course_id, &relative,
+                        ).unwrap_or_default();
                         frozen.excluded_files.push(ExcludedFile {
-                            asset_id: String::new(),
+                            asset_id,
                             file_name: relative,
-                            reason: "unsupported_type".into(),
+                            reason: "capacity_exceeded".into(),
                         });
                         continue;
                     }
@@ -189,8 +199,16 @@ impl FrozenMaterials {
                         {
                             continue;
                         }
-                    } else {
+                    } else if !relative.starts_with("assets/") && std::str::from_utf8(&bytes).is_ok_and(|text| !text.chars().any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))) {
+                        validate_material_text(&bytes)?;
+                    } else if crate::assets::material_file_allowed(name) {
                         crate::assets::inspect(name, &bytes)?;
+                    } else {
+                        frozen.excluded_files.push(ExcludedFile {
+                            asset_id: String::new(), file_name: relative,
+                            reason: "unsupported_type".into(),
+                        });
+                        continue;
                     }
                     remaining = remaining.checked_sub(bytes.len()).ok_or_else(limit)?;
                     frozen.entries.insert(relative, bytes);
@@ -325,13 +343,6 @@ impl MaterialGit {
         if fs::symlink_metadata(root.join(".git")).is_ok() {
             return Self::open_course(library_root, course_id);
         }
-        for ancestor in root.parent().ok_or_else(scope)?.ancestors() {
-            if ancestor.join(".git").exists()
-                || ancestor.join("objects").is_dir() && ancestor.join("HEAD").exists()
-            {
-                return Err(scope());
-            }
-        }
         let bytes = crate::assets::bounded_read(
             &root.join(format!("materials/documents/{course_id}.md")),
             crate::content::MAX_DOCUMENT_BYTES as usize,
@@ -349,6 +360,11 @@ impl MaterialGit {
             course: Some(course_id.into()),
             writable: true,
         };
+        // A library may live inside a source checkout (including a linked
+        // worktree). git() always pins both --git-dir and --work-tree: ancestor
+        // discovery is neither needed nor allowed. Claim only an absent local
+        // .git; never let init reinitialize an unknown/concurrently created one.
+        fs::create_dir(repo.directory.join(".git"))?;
         repo.git(&["init", "--template=", "--object-format=sha1", "."], &[])?;
         let marker = repo.directory.join(".git/learning-materials-v2");
         let mut file = fs::OpenOptions::new()
@@ -594,6 +610,16 @@ impl MaterialGit {
             });
         }
         Ok(files)
+    }
+
+    pub(crate) fn blob_version(&self, bytes: &[u8]) -> Result<String> {
+        let output = self.git(&["hash-object", "--stdin"], bytes)?;
+        let version = String::from_utf8(output)
+            .map_err(|_| scope())?
+            .trim()
+            .to_owned();
+        check_oid(&version)?;
+        Ok(version)
     }
 
     /// Exact blob bytes, including binary or text beyond preview limits.
@@ -941,7 +967,7 @@ fn check_oid(oid: &str) -> Result<()> {
         Err(scope())
     }
 }
-fn check_path(path: &str) -> Result<()> {
+pub(crate) fn check_path(path: &str) -> Result<()> {
     if path.is_empty()
         || path.contains(['\\', ':'])
         || path.chars().any(char::is_control)
@@ -967,6 +993,57 @@ pub fn attachment_path(asset_id: &str, file_name: &str) -> Result<String> {
     let path = format!("attachments/{asset_id}/{encoded}");
     check_path(&path)?;
     Ok(path)
+}
+
+#[cfg(test)]
+thread_local! {
+    static EXCLUSION_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// Shared by capture and authorized writes, so writes cannot publish files
+// which the next checkpoint intentionally excludes.
+fn path_exclusion(path: &Path, name: &str, directory: bool) -> Option<&'static str> {
+    #[cfg(test)]
+    EXCLUSION_PROBES.with(|count| count.set(count.get() + 1));
+    exclusion_reason(name).or_else(|| {
+        (directory && (matches!(name.to_ascii_lowercase().as_str(), "node_modules" | "target" | "dist" | "vendor" | "cache")
+            || fs::symlink_metadata(path.join(".git")).is_ok()
+            || fs::symlink_metadata(path.join("objects"))
+                .is_ok_and(|meta| meta.is_dir() || meta.file_type().is_symlink())
+                && fs::symlink_metadata(path.join("HEAD")).is_ok()))
+        .then_some("source_or_cache_directory")
+    })
+}
+
+pub(crate) fn validate_material_write_path(root: &Path, relative: &str) -> Result<()> {
+    check_path(relative)?;
+    let parts: Vec<_> = relative.split('/').collect();
+    // Check the trusted course root and every existing component before any
+    // exclusion probe: even metadata probes through a link reveal outside state.
+    // Missing components are valid for new files; no directories are created here.
+    let mut path = root.to_path_buf();
+    for part in std::iter::once(None).chain(parts.iter().map(Some)) {
+        if let Some(name) = part {
+            path.push(name);
+        }
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(CoreError::new(
+                    "TOOL_SCOPE",
+                    "受控工具只能访问当前会话工作区和本轮已授权来源。",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let mut path = root.to_path_buf();
+    for (index, name) in parts.iter().enumerate() {
+        path.push(name);
+        if path_exclusion(&path, name, index + 1 < parts.len()).is_some() { return Err(scope()); }
+    }
+    Ok(())
 }
 
 fn exclusion_reason(name: &str) -> Option<&'static str> {
@@ -1035,7 +1112,7 @@ fn git_error() -> CoreError {
 fn limit() -> CoreError {
     CoreError::new(
         "LIMIT_EXCEEDED",
-        "材料检查点超过4096文件或64MiB，未生成快照。",
+        "材料检查点超过4096条目或64MiB，或目录扫描超过65536条目，未生成快照。",
     )
 }
 
@@ -1049,3 +1126,15 @@ mod course_tests;
 
 #[cfg(test)]
 pub(crate) use tests::retry_busy;
+
+/// Raw course text storage is independent of attachment preview types.
+pub(crate) fn validate_material_text(bytes: &[u8]) -> Result<&str> {
+    let text = std::str::from_utf8(bytes).map_err(|_| CoreError::new("UNSUPPORTED_TYPE", "该文件不是UTF-8文本，不能通过文本工具读取或覆盖。"))?;
+    if text.chars().any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t')) {
+        return Err(CoreError::new("UNSUPPORTED_TYPE", "文本含二进制控制字符，未读取或写入。"));
+    }
+    if bytes.len() > 1024 * 1024 {
+        return Err(CoreError::new("TOOL_SIZE_LIMIT", "单份课程文本不得超过1MiB。"));
+    }
+    Ok(text)
+}

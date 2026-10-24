@@ -439,3 +439,86 @@ fn material_symlinks_and_git_hooks_never_run() {
     f.diff(None, &first, Some(&f.child_path()));
     assert!(!marker.exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn material_write_symlinks_reject_before_any_exclusion_probe() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("materials");
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(root.join("legal/deep")).unwrap();
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("note.md"), "private original").unwrap();
+    symlink(&outside, root.join("legal/deep/link")).unwrap();
+    symlink(outside.join("note.md"), root.join("file.md")).unwrap();
+    symlink(outside.join("absent"), root.join("dangling")).unwrap();
+    symlink(&outside, dir.path().join("linked-root")).unwrap();
+
+    let mut errors = Vec::new();
+    // Previously a linked directory with .git or objects/HEAD returned
+    // MATERIAL_SCOPE, while the exact same link without them reached TOOL_SCOPE.
+    for markers in ["none", "git", "bare"] {
+        if markers == "git" {
+            fs::write(outside.join(".git"), "private marker").unwrap();
+        } else if markers == "bare" {
+            fs::remove_file(outside.join(".git")).unwrap();
+            fs::create_dir(outside.join("objects")).unwrap();
+            fs::write(outside.join("HEAD"), "private head").unwrap();
+        }
+        for path in ["legal/deep/link/new/note.md", "file.md", "dangling/note.md"] {
+            EXCLUSION_PROBES.with(|count| count.set(0));
+            let error = validate_material_write_path(&root, path).unwrap_err();
+            assert_eq!(error.code, "TOOL_SCOPE", "{markers}: {path}");
+            assert_eq!(EXCLUSION_PROBES.with(|count| count.get()), 0);
+            errors.push(serde_json::to_value(error).unwrap());
+        }
+        EXCLUSION_PROBES.with(|count| count.set(0));
+        let error = validate_material_write_path(&dir.path().join("linked-root"), "note.md")
+            .unwrap_err();
+        assert_eq!(error.code, "TOOL_SCOPE");
+        assert_eq!(EXCLUSION_PROBES.with(|count| count.get()), 0);
+        assert_eq!(fs::read_to_string(outside.join("note.md")).unwrap(), "private original");
+        assert!(!outside.join("new").exists());
+        assert!(!outside.join("absent").exists());
+    }
+    assert!(errors.windows(2).all(|pair| pair[0] == pair[1]));
+}
+
+#[test]
+fn material_write_validation_preserves_deep_new_paths_and_exclusions() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("materials");
+    fs::create_dir_all(root.join("legal/deep")).unwrap();
+    fs::write(root.join("legal/deep/note.md"), "original").unwrap();
+    for path in ["legal/deep/note.md", "legal/deep/new/note.md", "new/deep/note.md"] {
+        validate_material_write_path(&root, path).unwrap();
+    }
+    assert!(!root.join("new").exists());
+    assert!(!root.join("legal/deep/new").exists());
+    fs::create_dir_all(root.join("nested/.git")).unwrap();
+    fs::create_dir_all(root.join("bare/objects")).unwrap();
+    fs::write(root.join("bare/HEAD"), "ref: refs/heads/main").unwrap();
+    for path in ["nested/note.md", "bare/note.md", "target/note.md", "legal/secret.json"] {
+        assert_eq!(validate_material_write_path(&root, path).unwrap_err().code, "MATERIAL_SCOPE");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn material_write_git_markers_are_not_followed() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir(root.join("nested")).unwrap();
+    fs::create_dir(root.join("bare")).unwrap();
+    // Dangling marker links still exclude the directory. Following these links
+    // would instead report absence and silently admit both repository shapes.
+    symlink(root.join("absent"), root.join("nested/.git")).unwrap();
+    symlink(root.join("absent"), root.join("bare/objects")).unwrap();
+    symlink(root.join("absent"), root.join("bare/HEAD")).unwrap();
+    for path in ["nested/note.md", "bare/note.md"] {
+        assert_eq!(validate_material_write_path(root, path).unwrap_err().code, "MATERIAL_SCOPE");
+    }
+    assert!(!root.join("absent").exists());
+}

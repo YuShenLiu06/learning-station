@@ -177,16 +177,17 @@ async fn context_bridge_real_pi_wire_replays_legacy_full_once_per_tool_loop_and_
         let json: Value = serde_json::from_str(sent).unwrap();
         assert!(json.get("learningHistory").is_none());
         let parts = json["bridge"].as_array().unwrap();
-        assert_eq!(parts.iter().map(|p|p["key"].as_str().unwrap()).collect::<Vec<_>>(), vec!["current_time", "references", "materials", "question"]);
+        assert_eq!(parts.iter().map(|p|p["key"].as_str().unwrap()).collect::<Vec<_>>(), vec!["current_time", "references", "exercise_sources", "materials", "question"]);
         assert_eq!(json["contextBridgeManifest"], frozen.manifest);
         assert!(json.get("manifest").is_none());
         assert!(json.get("turnState").is_none());
         assert!(parts[0]["value"]["referenceTime"].as_str().is_some());
+        let materials = &parts.iter().find(|part| part["key"] == "materials").unwrap()["value"];
         if round == 3 {
-            failed_projection = parts[2]["value"].to_string();
+            failed_projection = materials.to_string();
         }
         if round == 4 {
-            assert_eq!(parts[2]["value"].to_string(), failed_projection);
+            assert_eq!(materials.to_string(), failed_projection);
         }
         projections.push(json.clone());
         let legacy = crate::generation::messages_with_intent(&request, &ctx, &s, None);
@@ -237,7 +238,6 @@ async fn context_bridge_real_pi_wire_replays_legacy_full_once_per_tool_loop_and_
             ToolPolicy {
                 mode: "question".into(),
                 allowed_tools: vec!["query_related_knowledge".into()],
-                max_calls: 2,
                 authorization: "off".into(),
             },
             crate::learning_skills::capture("question", &["query_related_knowledge".into()])
@@ -315,7 +315,7 @@ async fn context_bridge_real_pi_wire_replays_legacy_full_once_per_tool_loop_and_
         assert!(!t.contains("unifiedDiff"));
         assert!(!t.contains("readcache"));
     }
-    let legacy_full = |packet: &Value| packet["messages"].as_array().unwrap().iter().map(&message_text).filter(|t|t.starts_with("以下为当前用户正在看的内容\n")).collect::<Vec<_>>();
+    let legacy_full = |packet: &Value| packet["messages"].as_array().unwrap().iter().map(&message_text).filter(|t|t.starts_with("以下为已提供的材料正文\n")).collect::<Vec<_>>();
     for packet in &packets {
         let full = legacy_full(packet);
         assert!(!full.is_empty());
@@ -493,7 +493,7 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
     }
     for packet in &packets[..2] { let text=packet.to_string();assert!(!text.contains("B_NOT_YET_FOCUSED_BODY")&&!text.contains("B_FIXED_SECOND_BODY"));assert_eq!(text.matches("A_FIXED_FIRST_BODY").count(),1); }
     let texts = |packet: &Value| packet["messages"].as_array().unwrap().iter().map(&message_text).collect::<Vec<_>>();
-    assert!(texts(&packets[2]).iter().any(|t|t.starts_with("以下为当前用户正在看的内容（固定 Git 版本；首次正文基准）\n")&&t.ends_with("B_FIXED_SECOND_BODY\n+111")));
+    assert!(texts(&packets[2]).iter().any(|t|t.starts_with("以下为已提供的材料正文（固定 Git 版本；首次正文基准）\n")&&t.ends_with("B_FIXED_SECOND_BODY\n+111")));
     let patch = deliveries.iter().find(|(i,_)|*i==3).unwrap().1["focused"]["gitChange"]["unifiedDiff"].as_str().unwrap();
     let model_path = format!("materials/{}",focuses[3].path);
     assert!(patch.starts_with(&format!("diff --git a/{model_path} b/{model_path}\n")));
@@ -501,21 +501,26 @@ async fn course_git_fixed_objects_and_distinct_body_old_cross_the_actual_private
     for packet in &packets[3..5] { assert_eq!(texts(packet).join("\n").matches(patch).count(),1); }
     let previous = packets[3]["messages"].as_array().unwrap();
     let unchanged = packets[4]["messages"].as_array().unwrap();
-    assert_eq!(&unchanged[..previous.len()], previous.as_slice(), "unchanged Focus must preserve the exact earlier wire prefix, including historical time, references and locations");
-    let projections = |messages: &[Value]| messages.iter().map(&message_text).filter(|t|t.starts_with("以下为当前用户正在看的内容")||t.contains("当前聚焦文件的完整 Git diff（正文基准")).count();
+    for message in previous.iter().filter(|m| matches!(m["role"].as_str(), Some("assistant" | "tool")) || message_text(m).starts_with("Fixed Changes ")) {
+        assert!(unchanged.contains(message), "native conversation and tool history must remain unchanged");
+    }
+    let current: Vec<_> = unchanged.iter().map(&message_text).collect();
+    for prefix in ["【Focus：当前文件】", "本轮冻结时间与时区", "用户本轮明确提供的引用及必要补充"] {
+        assert_eq!(current.iter().filter(|t|t.starts_with(prefix)).count(),1,"only this user turn declares {prefix}");
+    }
+    let projections = |messages: &[Value]| messages.iter().map(&message_text).filter(|t|t.starts_with("以下为已提供的材料正文")||t.contains("当前聚焦文件的完整 Git diff（正文基准")).count();
     assert_eq!(projections(unchanged), projections(previous), "unchanged Focus must not append another body");
-    let suffix = &unchanged[previous.len()..];
-    assert_eq!(suffix.first().unwrap()["role"], "assistant", "previous answer remains after its original question");
-    assert!(suffix.iter().any(|m|m.to_string().contains("referenceTime")), "new turn appends its own clock instead of replacing the earlier one");
-    assert!(suffix.iter().map(&message_text).any(|t|t.contains("用户精确选区")&&t.contains("<引用开始>")), "new turn retains its own explicit citation");
-    assert!(suffix.last().unwrap().to_string().contains("Fixed Changes 4"));
+    assert!(unchanged.iter().any(|m|m["role"] == "assistant"), "previous answer remains in native history");
+    assert!(current.iter().any(|t|t.contains("用户精确选区")&&t.contains("<引用开始>")), "new turn retains its own explicit citation");
+    assert!(unchanged.last().unwrap().to_string().contains("Fixed Changes 4"));
     assert!(!packets[5].to_string().contains("B_FIXED_SECOND_BODY"));
     assert!(packets[5].to_string().contains("A_FIXED_CHANGED_GIT_BODY"));
     for (round,packet) in packets.iter().enumerate().skip(5) {
         let content = texts(packet);
-        let full: Vec<_> = content.iter().filter(|t|t.starts_with("以下为当前用户正在看的内容（固定 Git 版本；")).collect();
+        let full: Vec<_> = content.iter().filter(|t|t.starts_with("以下为已提供的材料正文（固定 Git 版本；")).collect();
         assert_eq!(full.len(),1,"new session or compaction must recover one complete body");
-        assert_eq!(full[0].split_once('\n').unwrap().1,"A_FIXED_CHANGED_GIT_BODY");
+        assert_eq!(full[0].lines().nth(1).unwrap(),format!("文件：materials/{}",focuses[round].path));
+        assert_eq!(full[0].splitn(3,'\n').nth(2).unwrap(),"A_FIXED_CHANGED_GIT_BODY");
         assert!(full[0].contains(if round==5 {"首次正文基准"} else {"正文基准已丢失，重新载入"}));
         assert!(!content.iter().any(|t|t.contains("当前聚焦文件的完整 Git diff（正文基准")));
     }

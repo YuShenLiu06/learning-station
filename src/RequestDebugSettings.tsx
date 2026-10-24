@@ -4,7 +4,7 @@ import { call } from './api';
 import { DebugJsonView } from './DebugJsonView';
 import { DebugReading, DebugSourceList } from './DebugSourceList';
 import { useDebugBridge } from './useDebugBridge';
-import { debugPhase, debugQuestion, emptyDebug, requestDiff } from './requestDebug';
+import { debugPhase, debugQuestion, emptyDebug, requestDiff, currentContextSnapshot } from './requestDebug';
 import type { DebugSnapshot } from './requestDebug';
 import './requestDebug.css';
 export function RequestDebugSettings() {
@@ -41,9 +41,9 @@ export function RequestDebugSettings() {
         {bridge.value&&!bridge.value.complete&&<p className="debug-notice">桥快照不完整，或存在未归属片段。导出会保留完整性说明，不补造缺失内容。</p>}
         {bridge.error&&<p role="alert" className="inline-error">{bridge.error}</p>}
         {bridge.saved&&<p role="status" className="debug-export-result">{bridge.saved}</p>}
-        <div className="debug-tabs" role="group" aria-label="请求视图">{([{id:'context',label:'上下文'},{id:'sources',label:'来源'},{id:'payload',label:'原始请求'},{id:'diff',label:'与上次差异'}] as const).map(item=><button key={item.id} aria-pressed={tab===item.id} onClick={()=>setTab(item.id)}>{item.label}</button>)}</div>
-        {tab==='context'?<><div className="debug-section-toolbar"><div><h4>本次发送的上下文</h4><p>桥内容与本轮问题按实际顺序显示；原生历史另见来源和原始请求。</p></div><div className="debug-mode-switch" role="group" aria-label="上下文显示方式"><button aria-pressed={mode==='reading'} onClick={()=>setMode('reading')}>阅读</button><button aria-pressed={mode==='json'} onClick={()=>setMode('json')}>JSON</button></div></div>{mode==='reading'?<DebugReading record={record}/>:bridge.value?<DebugJsonView value={bridge.value} label="ContextBridge解码JSON"/>:!bridge.error&&<p role="status">正在解码已捕获的桥内容…</p>}</>:
-          tab==='sources'?<><div className="debug-section-toolbar"><div><h4>最终实发来源</h4><p>标签来自实际记录；注册快照独立呈现，不将后续拼装冒充注册。</p></div></div><DebugSourceList record={record}/></>:
+        <div className="debug-tabs" role="group" aria-label="请求视图">{([{id:'context',label:'本轮新增上下文'},{id:'sources',label:'完整上下文'},{id:'payload',label:'原始请求'},{id:'diff',label:'与上次差异'}] as const).map(item=><button key={item.id} aria-pressed={tab===item.id} onClick={()=>setTab(item.id)}>{item.label}</button>)}</div>
+        {tab==='context'?<><div className="debug-section-toolbar"><div><h4>本轮新增上下文</h4><p>只列本轮实际新注册的桥部件。工具续跑沿用同一用户轮；历史、问题与工具消息见完整上下文。</p></div><div className="debug-mode-switch" role="group" aria-label="上下文显示方式"><button aria-pressed={mode==='reading'} onClick={()=>setMode('reading')}>阅读</button><button aria-pressed={mode==='json'} onClick={()=>setMode('json')}>JSON</button></div></div>{mode==='reading'?<DebugReading record={record}/>:<DebugJsonView value={{complete:record.complete,omitted:record.omitted,entries:currentContextSnapshot(record)}} label="本轮新增上下文JSON"/>}</>:
+          tab==='sources'?<><div className="debug-section-toolbar"><div><h4>完整上下文</h4><p>按实际请求顺序保留系统内容、历史消息、压缩摘要及工具调用与结果；未定位来源的消息也完整展示。</p></div><div className="debug-mode-switch" role="group" aria-label="完整上下文显示方式"><button aria-pressed={mode==='reading'} onClick={()=>setMode('reading')}>阅读</button><button aria-pressed={mode==='json'} onClick={()=>setMode('json')}>JSON</button></div></div>{mode==='reading'?<DebugSourceList record={record}/>:<DebugJsonView value={{complete:record.complete,omitted:record.omitted,body:record.body}} label="完整上下文JSON"/>}</>:
           tab==='payload'?<><div className="debug-section-toolbar"><div><h4>原始请求</h4><p>保留线上 JSON 转义；认证字段已脱敏。</p></div></div><DebugJsonView value={{url:record.url,method:record.method,headers:record.headers,body:record.body}} label="原始请求JSON"/></>:
           <><div className="debug-section-toolbar"><div><h4>与上次请求的差异</h4><p>同一会话 · #{record.previousSequence||'无'} → #{record.sequence}</p></div></div><pre tabIndex={0} aria-label="请求差异">{requestDiff(previous,record)}</pre></>}
       </div>

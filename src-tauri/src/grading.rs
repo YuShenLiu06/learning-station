@@ -474,7 +474,6 @@ pub async fn start(
                 model::ToolPolicy {
                     mode: "grading".into(),
                     allowed_tools: vec![],
-                    max_calls: 0,
                     authorization: "off".into(),
                 },
                 vec![],

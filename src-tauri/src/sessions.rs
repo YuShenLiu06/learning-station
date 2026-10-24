@@ -165,7 +165,53 @@ pub fn create_exploration(store: &mut ContentStore) -> Result<Session> {
     get(store, &id)
 }
 
+// Read-only compatibility: old receipts identify the exact run, whose persisted
+// user binding is authoritative. Never infer ownership from timestamps or prose.
+fn attribute_legacy_tool_activities(state_dir: &Path, session_id: &str, entries: &mut [Entry]) {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Binding { id: String, session_id: String, user_entry_id: Option<String>, #[serde(default)] tool_calls: Vec<Value> }
+    // Do not follow a redirected private runs directory while projecting history.
+    if !fs::symlink_metadata(state_dir.join("runs")).is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink()) {
+        return;
+    }
+    let users: std::collections::BTreeSet<_> = entries.iter()
+        .filter(|entry| entry.kind == "user").map(|entry| entry.id.clone()).collect();
+    let mut bindings = BTreeMap::<String, Option<Binding>>::new();
+    for entry in entries {
+        if entry.kind != "note" { continue; }
+        let Some(data) = entry.data.as_mut() else { continue; };
+        if data["origin"] != "pi-tool-activity" { continue; }
+        let activity = &mut data["toolActivity"];
+        if (activity["userEntryId"].is_string() && activity["sequence"].is_u64()) || activity["sessionId"] != session_id { continue; }
+        let Some(run_id) = activity["runId"].as_str().filter(|id| valid_id(id)).map(str::to_owned) else { continue; };
+        let user = bindings.entry(run_id.clone()).or_insert_with(|| {
+            let path = state_dir.join("runs").join(format!("{run_id}.json"));
+            let bytes = crate::assets::bounded_read(&path, 8 * 1024 * 1024).ok()?;
+            let binding: Binding = serde_json::from_slice(&bytes).ok()?;
+            if binding.id != run_id || binding.session_id != session_id { return None; }
+            Some(binding)
+        });
+        if let Some(binding) = user {
+            if let Some(user) = binding.user_entry_id.as_ref().filter(|id| valid_id(id) && users.contains(*id)) {
+                activity["userEntryId"] = json!(user);
+            }
+            if let Some(index) = binding.tool_calls.iter().position(|item| item["id"] == activity["id"]) {
+                activity["sequence"] = json!(index);
+            }
+        }
+    }
+}
+
 pub fn get(store: &mut ContentStore, id: &str) -> Result<Session> {
+    let mut session = get_persisted(store, id)?;
+    attribute_legacy_tool_activities(store.state_dir(), id, &mut session.entries);
+    Ok(session)
+}
+
+// Idempotent writers must compare/replay the exact persisted bytes, not the
+// read-only display projection (which may fill fields absent in old receipts).
+pub(crate) fn get_persisted(store: &mut ContentStore, id: &str) -> Result<Session> {
     if !valid_id(id) {
         return Err(CoreError::new("INVALID_INPUT", "会话编号无效。"));
     }
@@ -531,10 +577,21 @@ pub fn append(
 pub(crate) fn append_citation(
     store: &mut ContentStore,
     session_id: &str,
-    mut entry: Entry,
+    entry: Entry,
     expected: Option<&str>,
     request_id: &str,
     citation: Option<&crate::citation_context::CitationContext>,
+) -> Result<Session> {
+    append_inner(store, session_id, entry, expected, request_id, citation, false)
+}
+/// Only the validated exercise review service may reuse byte-identical questions.
+pub(crate) fn append_exercise_revision(store: &mut ContentStore, session_id: &str, entry: Entry, request_id: &str) -> Result<Session> {
+    append_inner(store, session_id, entry, None, request_id, None, true)
+}
+fn append_inner(
+    store: &mut ContentStore, session_id: &str, mut entry: Entry,
+    expected: Option<&str>, request_id: &str,
+    citation: Option<&crate::citation_context::CitationContext>, revision: bool,
 ) -> Result<Session> {
     if request_id.len() < 8 || request_id.len() > 128 {
         return Err(CoreError::new("INVALID_INPUT", "请求缺少防重复编号。"));
@@ -623,7 +680,10 @@ pub(crate) fn append_citation(
                 .and_then(Value::as_str)
                 .filter(|id| valid_id(id))
                 .ok_or_else(|| CoreError::new("INVALID_INPUT", "练习缺少稳定题目编号。"))?;
-            if !ids.insert(id) || question_exists(&old, id) {
+            let existing: Vec<_> = old.entries.iter().filter(|e| e.kind == "exercise")
+                .filter_map(|e| e.data.as_ref()).filter_map(|d| d["exercises"].as_array())
+                .flatten().filter(|q| q["id"].as_str() == Some(id)).collect();
+            if !ids.insert(id) || !existing.is_empty() && (!revision || existing.iter().any(|q| *q != question)) {
                 return Err(CoreError::new(
                     "CONFLICT",
                     "题目编号已存在，未覆盖原题和作答。",
@@ -1726,5 +1786,31 @@ mod general_exact_tests {
         assert!(!answer_matches(&q, ".5", "5"));
         assert!(answer_matches(&q, ".5", " .5 "));
         assert!(answer_matches(&json!({}), "for", "FOR!"));
+    }
+}
+
+#[cfg(test)]
+mod tool_attribution_tests {
+    use super::*;
+    #[test]
+    fn legacy_tool_binding_is_exact_read_only_and_keeps_run_order() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("runs")).unwrap();
+        let entry = |id: &str, kind: &str, data: Value| Entry {
+            id: id.into(), kind: kind.into(), content: String::new(), created_at: "same".into(),
+            selection: None, related_ids: vec![], data: Some(data),
+        };
+        let activity = |id: &str, run: &str| entry(id, "note", json!({"origin":"pi-tool-activity","toolActivity":{"id":id,"sessionId":"session_a","runId":run}}));
+        let mut entries = vec![entry("user_a", "user", json!({})), activity("call_b", "run_a"), activity("call_a", "run_a"), activity("foreign", "run_b"), activity("missing", "run_missing")];
+        let original = json!({"id":"run_a","sessionId":"session_a","userEntryId":"user_a","toolCalls":[{"id":"call_a"},{"id":"call_b"}]}).to_string();
+        let path = temp.path().join("runs/run_a.json");
+        fs::write(&path, &original).unwrap();
+        fs::write(temp.path().join("runs/run_b.json"), json!({"id":"run_b","sessionId":"other_session","userEntryId":"user_a"}).to_string()).unwrap();
+        attribute_legacy_tool_activities(temp.path(), "session_a", &mut entries);
+        assert_eq!(entries[1].data.as_ref().unwrap()["toolActivity"]["userEntryId"], "user_a");
+        assert_eq!(entries[1].data.as_ref().unwrap()["toolActivity"]["sequence"], 1);
+        assert_eq!(entries[2].data.as_ref().unwrap()["toolActivity"]["sequence"], 0);
+        for entry in &entries[3..] { assert!(entry.data.as_ref().unwrap()["toolActivity"]["userEntryId"].is_null()); }
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
     }
 }

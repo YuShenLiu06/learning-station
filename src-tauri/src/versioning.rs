@@ -126,6 +126,25 @@ pub fn read(core: &Core, course: &str, path: &str, version: &str) -> Result<Vec<
     MaterialGit::open_course(core.content.root(), course)?.read(course, version, path)
 }
 
+/// Identity of exactly the bytes about to be published, never a later live read.
+pub(crate) fn write_version(core: &mut Core, course: &str, bytes: &[u8]) -> Result<String> {
+    let (git, _) = record(core, course)?;
+    git.blob_version(bytes)
+}
+
+/// Returns bytes and their blob identity from one immutable checkpoint.
+/// A live filesystem read followed by version_hash would mix two revisions.
+pub fn read_versioned(core: &mut Core, course: &str, path: &str) -> Result<(Vec<u8>, String)> {
+    let (git, cp) = record(core, course)?;
+    read_versioned_at(&git, course, path, &cp.checkpoint_commit_oid)
+}
+
+fn read_versioned_at(git: &MaterialGit, course: &str, path: &str, commit: &str) -> Result<(Vec<u8>, String)> {
+    let version = git.files(course, commit)?.into_iter()
+        .find(|file| file.path == path).ok_or_else(scope)?.blob_oid;
+    Ok((git.read(course, commit, path)?, version))
+}
+
 fn change_of(diff: &MaterialDiff, path: &str) -> Option<crate::material_git::FileChange> {
     diff.changes.iter().find(|c| c.path == path).cloned()
 }
@@ -147,6 +166,23 @@ mod tests {
         let note = crate::library_tree::create(&mut c.content, "section", "A", Some(&course.id), &format!("{name} 正文\n\n末段"), &format!("{name}-note")).unwrap();
         drop(c);
         (dir, e, course.id, note.id)
+    }
+
+    #[test]
+    fn versioned_read_keeps_bytes_and_identity_when_disk_changes_after_capture() {
+        let (_dir, e, course, _) = project_setup("versioned-read");
+        let mut core = e.lock().unwrap();
+        let root = crate::course_project::course_project_root(core.content.root(), &course).unwrap();
+        let path = root.join("materials/summary.txt");
+        std::fs::write(&path, "original bytes").unwrap();
+        let (git, cp) = record(&mut core, &course).unwrap();
+        let expected = git.files(&course, &cp.checkpoint_commit_oid).unwrap().into_iter().find(|f| f.path == "summary.txt").unwrap().blob_oid;
+        std::fs::write(&path, "external edit not yet shown").unwrap();
+        let (bytes, version) = read_versioned_at(&git, &course, "summary.txt", &cp.checkpoint_commit_oid).unwrap();
+        assert_eq!(bytes, b"original bytes");
+        assert_eq!(version, expected);
+        let (_, latest) = read_versioned(&mut core, &course, "summary.txt").unwrap();
+        assert_ne!(latest, version);
     }
 
     // Hand-written flat layout: library root courses/<id>.md files carrying the

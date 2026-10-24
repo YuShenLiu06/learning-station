@@ -45,8 +45,8 @@ test('final SDK wire allows only registered supplements in declared order and on
       // questions/context are checked directly on HTTP in context-chronology.
       const frozenClock={...clock,referenceTime:`2026-10-21T09:00:0${round}Z`};
       const focus={courseId:'course_1',documentId:'doc_1',sourceDocumentId:'doc_1',path:'documents/doc_1.md',type:'markdown',documentVersion:hash(body),commitHash:commit,materialTreeOid:tree,view:round===2?'edit':'read',paragraphs:[{startChar:round===2?1:0,endChar:body.length,text:body.slice(round===2?1:0)}],uiState:'DO_NOT_SEND_UI_STATE',metadata:{permission:'DO_NOT_SEND_PERMISSION',stats:'DO_NOT_SEND_STATS'}};
-      const frozen=[entry('current_time','本轮时间',frozenClock),entry('references','本轮引用',round===0?quote:''),entry('focus','聚焦材料',focus),entry('question','仅作为原生用户消息发送',question)];
-      const request={protocol:1,operation:'generate',apiKey:'synthetic-architecture-key',settings:{provider:'custom',protocol:'openai-completions',baseUrl:`http://127.0.0.1:${server.address().port}/v1`,model:'fixture'},timeContext:clock,learningTools:true,learningSkills:[],toolPolicy:{mode:'question',authorization:'off',allowedTools:LEARNING_PLUGIN.tools,maxCalls:6},debugProtocol:true,debugRegistrations:frozen,nativeSession:{directory,learningSessionId:'architecture_session',runId:`round_${round}`,userEntryId:`user_${round}`,authorizedSourceIds:['doc_1'],protectHistory:false,legacyRecords:[]},materialChanges:true,messages:[{role:'user',content:JSON.stringify({bridge:frozen,contextBridgeManifest:{version:1,entries:[]}})}]};
+      const frozen=[entry('current_time','本轮时间',frozenClock),entry('references','本轮引用',round===0?quote:''),entry('exercise_sources','练习来源',{sources:[{sourceId:'doc_1',path:'documents/doc_1.md',version:hash(body)}]}),entry('focus','聚焦材料',focus),entry('question','仅作为原生用户消息发送',question)];
+      const request={protocol:1,operation:'generate',apiKey:'synthetic-architecture-key',settings:{provider:'custom',protocol:'openai-completions',baseUrl:`http://127.0.0.1:${server.address().port}/v1`,model:'fixture'},timeContext:clock,learningTools:true,learningSkills:[],toolPolicy:{mode:'question',authorization:'off',allowedTools:LEARNING_PLUGIN.tools},debugProtocol:true,debugRegistrations:frozen,nativeSession:{directory,learningSessionId:'architecture_session',runId:`round_${round}`,userEntryId:`user_${round}`,authorizedSourceIds:['doc_1'],protectHistory:false,legacyRecords:[]},materialChanges:true,messages:[{role:'user',content:JSON.stringify({bridge:frozen,contextBridgeManifest:{version:1,entries:[]}})}]};
       await runLearningAgent(request,async event=>{if(event.type==='debug_request')captures.push(event);if(event.type==='context_manifest')inventories.push(event.manifest);},{requestTool:async call=>{
         if(call.type==='debug_probe')return {result:{epoch:1}};
         if(call.type==='session_sync')return {result:{synced:true}};
@@ -56,12 +56,15 @@ test('final SDK wire allows only registered supplements in declared order and on
       }});
       const packet=packets[round],texts=packet.messages.map(content),serialized=JSON.stringify(packet);
       assert.equal(texts.filter(text=>text===question).length,1);
+      const exerciseSources=texts.filter(text=>text.includes('本轮练习可引用来源'));
+      assert.equal(exerciseSources.length,1);
+      assert.deepEqual(JSON.parse(exerciseSources[0]).sources,[{sourceId:'doc_1',path:'documents/doc_1.md',version:hash(body)}]);
       if(round<3)assert(texts.includes('PREVIOUS_NATIVE_QUESTION'));
       for(const forbidden of ['DO_NOT_SEND_','automaticProjection','turnState','materialRole','projectionVersion','contextBridgeManifest','MUST_NOT_SEND_','MUST_NOT_DUPLICATE_','学习指导（','工具授权档位','跨学科学习助手','SUPERSEDED_APPLICATION_RULES','expert coding assistant','Pi documentation','OLD_INTERNAL_'])assert(!serialized.includes(forbidden),forbidden);
       const capture=captures[round];assert.deepEqual(capture.body,packet);
       const application=capture.sources.filter(s=>s.origin==='bridge');
       assert(application.every(s=>s.registrationKey&&s.description&&s.runId));
-      const keys=application.map(s=>s.registrationKey),priority=['current_time','references','focus'];
+      const keys=application.map(s=>s.registrationKey),priority=['current_time','references','exercise_sources','focus','materials'];
       assert(keys.every(key=>priority.includes(key)),'no undeclared application key');
       for(const source of capture.sources.filter(s=>s.origin==='unknown')){const role=source.path[0]==='messages'?packet.messages[source.path[1]].role:'system';if(['assistant','tool'].includes(role))continue;let value=packet;for(const at of source.path)value=value[at];if(source.start!==undefined)value=value.slice(source.start,source.end);assert.equal(value.trim(),'','no unregistered application text at the final wire boundary');}
       for(const userEntryId of new Set(application.map(s=>s.userEntryId))){
@@ -71,10 +74,10 @@ test('final SDK wire allows only registered supplements in declared order and on
         if(questionSource)assert(turn.every(s=>s.path[1]<questionSource.path[1]),'each historical supplement precedes its own native question');
       }
       assert.equal(application.filter(s=>s.registrationKey==='current_time'&&s.userEntryId===`user_${round}`).length,1);
-      assert.equal(texts.filter(text=>text.includes('EXACT_QUOTE')).length,round===3?0:1,'the original quotation remains in its historical turn until Pi compacts it');
+      assert.equal(texts.filter(text=>text.includes('EXACT_QUOTE')).length,round===0?1:0,'one-shot quotation is excluded from later user turns');
       if(round===0)assert(texts.some(v=>v.endsWith(quote)),'reference preserves real newlines and literal backslash-n');
       const values=application.map(s=>{let value=packet;for(const at of s.path)value=value[at];return value;});
-      const material=values.filter(v=>v.startsWith('以下为当前用户正在看的内容'));
+      const material=values.filter(v=>v.startsWith('以下为已提供的材料正文'));
       if(round===0||round===3)assert.equal(material.length,1);
       if(round===1)assert(values.filter(v=>v.startsWith('【Focus：')).some(v=>v.includes(`-${first}\n+${second}\n`)),'native focus diff is inside the merged Focus part');
       if(round===2)assert.equal(material.length,1,'unchanged preserves the initial body without appending a full');

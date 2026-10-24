@@ -38,7 +38,7 @@ cwd 与 Node 目录读取参数都不是强隔离：真实锁版 read/Bash 可�
 
 ## 模型及资源
 
-固定显式 ModelRuntime、内存凭据、`modelsPath=null`、禁止模型目录网络刷新。旧会话资源加载器返回空外部扩展/模板/全局指导/Agents文件，应用仅传既有学习指导；课程项目按上节复用原生文本资源。基础工具表为空，精确开放应用任务策略允许的工具；普通聊天与探索（兼容 question/explain）共用完整学习工具集合与每轮6次预算，始终包含 create_review_card/create_error，不以 Skill 加载作为开关。Rust 的策略构建与校验复用同一白名单，Pi 独立校验并注册相同集合；重开会话按当前策略重建工具表。制卡仅保存本地卡片，不能据此宣称同步 Anki；`edit/grep/find/ls/powershell`均不注册。`read/write/bash`仅在本机设置的工具授权档位（off/read/write/bash，默认off，仅question/explain模式）开启后受控注册，随toolPolicy.authorization由Rust下发；参数与结果仍由Rust校验，read只读本轮manifest已授权来源或会话工作区文件，write只写会话工作区（路径/配额/符号链接受限），bash只在会话工作区以受限环境执行（固定PATH、无HOME、超时与输出有上限），write/bash以持久回执台账幂等，恢复只读台账不重执行。Node权限模式不允许创建子进程（bash由Rust进程执行，不经Node）。
+固定显式 ModelRuntime、内存凭据、`modelsPath=null`、禁止模型目录网络刷新。旧会话资源加载器返回空外部扩展/模板/全局指导/Agents文件，应用仅传既有学习指导；课程项目按上节复用原生文本资源。基础工具表为空，精确开放应用任务策略允许的工具；普通聊天与探索（兼容 question/explain）共用完整学习工具集合与每轮6次预算，始终包含 create_review_card/create_error，不以 Skill 加载作为开关。Rust 的策略构建与校验复用同一白名单，Pi 独立校验并注册相同集合；重开会话按当前策略重建工具表。制卡仅保存本地卡片，不能据此宣称同步 Anki；`edit/grep/find/ls/powershell`均不注册。`read/write/bash`仅在本机设置的工具授权档位（off/read/write/bash，默认off，仅question/explain模式）开启后受控注册，随toolPolicy.authorization由Rust下发；参数与结果仍由Rust校验，read只读本轮manifest已授权来源或会话工作区文件，write在课程内写当前课程materials（路径/配额/符号链接受限），无课程时保持会话工作区，bash只在会话工作区以受限环境执行（固定PATH、无HOME、超时与输出有上限），write/bash以持久回执台账幂等，恢复只读台账不重执行。Node权限模式不允许创建子进程（bash由Rust进程执行，不经Node）。
 
 `list_learning_skills`/`load_learning_skill`是仅question/explain/practice模式注册的只读工具，不挂任何授权档位：它们只读随包 `skills/` 固定允许清单（三个稳定id），复用主动快照同一路径校验（根内canonicalize、拒符号链接、16KiB、frontmatter合法），目录仅返回id/名称/描述不含正文，正文经工具结果通道返回且受工具结果预算约束，超出按SKILL_INVALID单工具拒绝。清单外或含路径成分的 id 分别以 TOOL_SCOPE／INVALID_TOOL_INPUT 拒绝，均不触盘。同run重复load同一指导只返回简短提示（含sha256）；该指导已随模式或工具注册注入时返回"已在指导中"，不重复正文；去重台账按run维度挂Rust，新run或该run压缩完成后可重新取正文。ready事件的learningSkills版本回执语义不变，仍只认主动注入快照，按需加载不进入该回执。
 
@@ -93,3 +93,47 @@ read的持久回执只证明原读取，重放或恢复前（包括Node已有原
 本轮 metadata 携带 [Focus v1](focus-v1.md) 的冻结对象，含课程、焦点文档、原来源文档、视图及固定 Git OID。它与本次 nativeMaterials 来自同次冻结；重试沿原 Focus，Pi 仍独占消息/压缩管理。本层不建立材料接收基准。
 
 Focus 的 `metadataOnlySourceIds` 由 Rust 冻结 Context 生成并限制在本轮授权来源内。Pi 排除这些来源此前的自动材料投影，保留普通历史与用户主动引用；后续恢复文本时重新载入真实完整基准。Git binary 判定仅控制自动投影，不替代 read 工具的类型与授权校验。
+
+## 课程工作区写入（#64）
+
+`read.path` / `write.path` 对课程会话以当前课程 `materials/` 为根，拒绝绝对路径、上级路径、隐藏路径和符号链接组件。`documents/<id>.md` 只允许本轮授权的笔记类来源，read返回正文及业务version；write.content只替换正文，保留稳定ID、归属、类型、来源及其他元数据。创建业务笔记仍使用既有学习服务。附件目录和课程/练习元数据不开放raw写入。
+
+普通材料文件可在根下新建，进入既有课程Git变化清单，后续可按path读取；不冒充侧栏业务笔记。按真实文件名写入UTF-8文本，不限制扩展名；路径读取也不以附件类型白名单拦截，仍校验UTF-8与容量。保存不等于支持应用内预览；不支持预览时应提示可在对应文件目录用外部程序打开，不自动执行文件。raw Markdown不得携带有效业务frontmatter；与Git捕获共用路径排除规则（含大小写别名），不纳入版本的路径在写入与intent前拒绝。覆盖必须传read返回的`expectedVersion`，新建省略；缺版本覆盖、旧版本、跨课或未授权来源均拒绝。旧无课程请求继续使用原会话工作区。Bash目录不随此次write路由改变。
+
+回执仍在私有session账本中，完成回执重放不检查当前内容也不重写文件。课程写入前持久化intent；有intent而缺完成回执视为unknown，不盲目重放。Git沿既有versioning接口记录材料，不在模型参数中接受仓库或绝对路径。普通路径读从同一次不可变快照返回正文与版本，sourceId读取继续遵循原冻结manifest契约。
+
+覆盖前还要求原正文能够在当前 read 字节及 JSON 回包预算内完整呈现；超限返回 TOOL_SIZE_LIMIT，保留原文件且不创建 intent，不提供隐式截断覆盖。课程路径沿 Git 材料准入（支持中文、空格、深层目录），旧无课程工作区继续使用原 ASCII/层数限制。intent 持久化后，只要完成账本仍不可核实，包含文件保存、同步、版本登记及最终回执落盘在内的失败统一报 NATIVE_TOOL_UNKNOWN。
+
+### 冲突副本与中断恢复
+
+macOS/Linux 课程 AI 写入（普通材料和业务笔记）共用 dirfd 发布事务。直接依赖既已锁版的 rustix 1.1.5 `fs` API；从 `/` 开始逐级 `O_DIRECTORY|O_NOFOLLOW` 打开授权目录，以已打开父目录对象执行所有文件创建和 rename，不在发布时重新解析用户路径。其他平台在保存写入意图前明确拒绝此发布路径，没有不安全降级；不引入沙盒或把 advisory lock 当隔离。
+
+每次写入在目标父目录保留 `.learning-write-<原操作ID>/`：`manifest.json` 为持久意图，`new` 为独立的新稿副本，覆盖时 `old` 是原子移入的实际旧对象。先同步新稿/意图和目录，再以 NOREPLACE 移入旧对象，核对实际旧稿是否仍等于基线；匹配才用 NOREPLACE 发布另一份新稿，第三方文件占位时不覆盖。发布版本取自待发布字节，业务元数据仍由 ContentStore 规范化。成功后也保留副本，不自动清理。受管恢复目录经过符号链接与范围检查后不占用 4096 个材料条目配额；总目录扫描仍限制为 65536 个条目。会话 pending 与完成回执同步文件及父目录（含新建祖先目录）后才进入下一阶段；pending 目录同步失败不发布正文。旧会话的小节在移入 old 后暂时缺失时，仅使用已持久化且与当前 sessionId/sectionId 匹配的课程归属证据核对该原操作，当前显式课程变更仍拒绝访问。
+
+版本在最后窗口改变、发布或回执失败时保留旧/新稿；若目标仍为空，尽力用 NOREPLACE 恢复旧稿副本，绝不覆盖第三份。`NATIVE_TOOL_UNKNOWN.details` 返回相对于资料库的 `recoveryPath` 和只读状态（存在性、长度、哈希）；原操作恢复只核对 `target/old/new/manifest/published`，不重做写入。中断可能短暂留下空目标；状态无法读取时明确 unverified。没有自动恢复按钮，用户可在资料库下打开 `recoveryPath`，先把 old/new 复制到资料库外比较保管；确认目标缺失时再将选定完整稿恢复至 manifest 所列原文件名。目标已存在时先保留第三份并比较，不直接覆盖；业务 Markdown 须保留完整元数据头，勿把恢复副本当新笔记导入造成重复 ID。
+
+能力边界：dirfd 绑定的是核验时的授权目录对象；恶意同 UID 进程任意搬走目录、篡改恢复区或持续写入持有的旧文件描述符不属于强隔离保证。原子 rename 保存方式的竞争文件会保留，持续原地写旧 inode 不被描述为不可变快照。本方案提供冲突保留与可定位恢复，不宣称任意外部写者下的原子版本 CAS。
+
+## 用户轮次与唯一 Focus（#73 / #74）
+
+用户主动发送保存的 `userEntryId` 是用户轮身份；同轮工具续跑、程序修正和原问题重试不重新冻结。每次实际 HTTP 请求仍有独立调试编号。进入新轮或重建本轮投影时，旧时间、一次性引用和当前 Focus 声明通过 Pi context edit 排除；探索入口保留其会话生命周期，普通用户、助手和工具历史不删除。
+
+有效 `focus` 注册仅有 0 或 1 项，携带当前位置和本次 Changes/diff。全文使用独立 `materials` 注册，始终带来源路径，不重复声明当前 Focus。旧 Focus 若有 Pi 实际接收回执，将其材料/diff与课程变化降级为明确历史材料，保留原轮身份、完整 hash 链、偏移和接收回执；未送达候选直接排除。原始持久记录保留。无 Focus 的新轮不回填旧焦点；相同正文不同文件按稳定身份分别保留材料基准。压缩丢失基准仍经原机制补齐本轮正文。
+
+验证覆盖锁版 Pi 与 localhost 实际 payload、接收回执及隔离合成会话；不代表原生桌面或真实在线模型已经验收。
+## 工具调用与容量（#72）
+
+ToolPolicy 只携带 mode、allowedTools、authorization，不再携带 maxCalls。Rust 与 Pi 均不对学习工具调用、原回执恢复或材料变化查询设置固定次数预算，普通聊天与探索共用此规则。工具白名单、用户取消、请求超时、参数/结果字节上限和写入版本/恢复约束保持有效；参数或结果容量超限使用 TOOL_SIZE_LIMIT，不再误报调用预算。练习最终输出保留原有至多三次校验修正，独立错误码 OUTPUT_VALIDATION_LIMIT，不参与工具调用计数。
+课程 `write` 仅对已索引、可在学习站正常打开的业务文档进入审阅；普通 raw 材料在原有 write 授权、版本、路径和事务约束内直接保存，不按扩展名猜测预览支持。业务正文完全相同且版本匹配时返回 `persisted=false,status=unchanged`，不写入、不生成空 Diff。旧 raw pending 提案保持可显式拒绝，不因读取或升级自动接受；原操作重放仍核对原提案，新操作不被旧 raw 提案阻塞。
+
+课程写入的 `CONFLICT` 区分固定诊断：`details.reason=write_version_mismatch` 要求重新读取并使用 read 的 version，不能改用 Focus Git OID；`edit_review_pending` 携带原 proposalId、courseId、status，要求用户先处理原建议，accepting/unknown 先核对结果。后者不表示本次产生了新提案或成功保存。Rust 和 Pi 传输都仅输出白名单标识、状态和固定恢复文案，不转发任意错误正文、路径或材料内容；原未决建议不会被自动拒绝、替换或重放。
+
+课程 `write` 的 #71 审阅状态：`proposalPersisted=true` 仅证明修改建议已保留，`persisted=false,status=pending` 不代表正文写入。生成 handler 等待用户决定；接受返回真实写入回执，拒绝返回 `persisted=false,status=rejected`。停止/超时保留提案，恢复时 pending 为未决错误，不作为完成回执注入 Pi；不自动接受或延长模型预算。工具活动使用 `waiting` 表示待审阅，与初始 `running` 分别保存，避免活动幂等键冲突。生成超时或取消后仍在执行的活动标记 `unknown`，不宣称保存失败或成功；稍后真实回执可收尾，超时清理不得覆盖已到达回执。无课程 scratch write/Bash 不纳入此文本审阅承诺。
+
+#71 接受前要求初始 ledger 完整且身份匹配，缺失/损坏不发布但可拒绝后重请。`accepting`/`unknown` 查询已执行结果不依赖当前 write 授权，不能借核对重放发布。接受/拒绝均结算原 session 下同一保存问题、相同完整参数及操作 ID 的所有已登记 run/call 工具活动，不要求原生成或重试仍运行；不同问题或参数的未决调用保持隔离，旧无保存问题绑定的提案仅匹配原 run/call；终结提案归档后继续按原 ID 恢复，未决列表不返回历史终结项（旧平铺终结项首次遇到迁移）。该流程不引入新的工具数量上限。
+
+## 练习引用来源清单
+
+ContextBridge 每个用户轮注册 `exercise_sources`，将同轮 `Context.manifest` 的 `sourceId/path/version` 显式提供给模型；普通聊天的 `generate_exercises` 与专用 practice 共用此清单。路径仅用于识别材料，`sourceIds` 必须填写稳定 ID。清单不包含课程可读目录或历史授权集合，不声明额外正文已读取；空清单也明确提供。旧轮清单沿 turn 生命周期排除，重试及压缩恢复使用原冻结快照。Rust 仍按原冻结 manifest 严格校验，不从文件名或路径猜测 ID，不将未知来源变成可自动修正的授权错误。
+
+练习修改仍走既有 `read/write` 与提案等待链。仅明确编辑视图的冻结题集地址授权读取；read返回结构化题集，write只产生逐题提案。部分接受保存该题的新题集并继续等待其余题，最终回执含 `questionDecisions`（可混合接受/拒绝），不能把部分接受说成全部建议已保存。每题未知结果按原operation核对，不由Pi重放写入。练习导出Markdown不作为题集解析输入或评分依据。

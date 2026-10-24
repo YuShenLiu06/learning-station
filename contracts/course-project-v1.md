@@ -25,13 +25,14 @@
 
 `MaterialGit::init_course(libraryRoot, courseId)` 只初始化新物理课程的普通 `.git/`；
 `open_course` 校验课程绑定、独立 objects/refs，拒绝共享 worktree、alternates、symlink/hardlink 或其他课程仓库。
-不重置既有仓库；旧平铺课程仅在首次版本冻结时经 `ensure_project` 幂等迁移建仓，其余路径不隐式初始化或迁移。`MaterialGit::open` 仅只读兼容旧 bare 快照；旧创建器仅在合成测试编译。
+不重置既有仓库；旧平铺课程仅在首次版本冻结时经 `ensure_project` 幂等迁移建仓。已是物理课程但缺 `.git` 时，版本冻结或普通聊天的原生项目入口可补建课程仓库，保留材料、迁移备份和稳定 ID。
+资料库允许位于源码仓库或 linked worktree 内；每次 Git 调用显式指定课程 `--git-dir` 与 `--work-tree`，不发现、写入或复用祖先仓库。初始化前排他创建不存在的课程 `.git`，既有未标记、损坏或指向外部的仓库仍拒绝接管；初始化中断留下的未知 `.git` 保留并报错，不自动重置。`MaterialGit::open` 仅只读兼容旧 bare 快照；旧创建器仅在合成测试编译。
 
 `FrozenMaterials::capture_project(store, courseId)` 冻结该课程当前 `materials/` 文件；两次捕获相同才返回。
 无文件系统事务承诺；返回后 owned bytes 不受后续编辑影响。附件采用物理路径，不再生成第二套可编辑投影。
 捕获遵守 ContentStore 现有回收记录，按原路径及托管文档 ID 排除已回收材料；托管 Markdown 扩展名与 ContentStore 共用大小写不敏感识别，包含 .md/.MD/.Md。回收后为 Git 删除、恢复后重新新增，旧固定 OID 仍可读取原文。捕获中记录变化报 TRASH_STATE_CHANGED，调用方须刷新后重新冻结。
 回收不会删除原物理文件；Pi 的原始 cwd 工具不能用磁盘存在推断当前材料可见性，后续接入仍须复用现有回收过滤。本层不改变 Pi 工具授权或搬移材料。
-仅纳入既有允许清单中的文本/代码/图片；排除隐藏文件、密钥/供应商配置名称、缓存、嵌套 Git 源码仓库和未知扩展。
+普通材料（assets/ 外）纳入有效 UTF-8 文本，不限制扩展名；不接受除换行、回车、制表符外的控制字符。托管附件仍按既有文本/代码/图片格式校验。排除隐藏文件、密钥/供应商配置名称、缓存、嵌套 Git 源码仓库和不支持的二进制格式。单文件超过 5 MiB 时记录 capacity_exceeded 并继续捕获其他材料，不读取该文件正文；已登记附件的排除记录保留 assetId。
 材料外的 Pi/其他文件不自动摄入。排除报告位于材料树外，已知附件保留 assetId，未注册物理路径的 assetId 为空。
 
 `commit(frozen, parentCommitOid?)` 成功发布持久 ref 后才返回 Checkpoint；失败保留旧回执，未发布对象不代表快照成功。

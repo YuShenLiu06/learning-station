@@ -14,6 +14,8 @@ test('React tool cards distinguish running, persisted success, handler error and
   await render(base,'run_safe');assert.ok(document.querySelector('[aria-label="工具调用"] [aria-label="创建待办 · 运行中"]'));assert.match(document.body.textContent,/正在调用本机工具/);assert.equal(document.querySelector('.tool-activity button'),null);
   const object={kind:'todo',id:'todo_safe',sessionId:'session_safe',sectionId:'section_safe'};await render({...base,status:'succeeded',persisted:true,object});assert.ok(document.querySelector('[aria-label="创建待办 · 成功"]'));await React.act(async()=>document.querySelector('.tool-activity button').click());assert.deepEqual(opened,[object]);assert.equal(document.querySelectorAll('.tool-activity').length,1);
   await render({...base,status:'failed',errorCode:'CONFLICT'});assert.ok(document.querySelector('[aria-label="创建待办 · 失败"]'));assert.match(document.body.textContent,/保存版本发生变化/);assert.equal(document.querySelector('.tool-activity button'),null);
+  await render({...base,name:'write',title:'受控写入',status:'waiting',summary:'AI 修改待确认，建议已保留，正文未修改。'},'run_safe');assert.ok(document.querySelector('[aria-label="受控写入 · 待审阅"]'));assert.equal(document.querySelector('.spin'),null);assert.match(document.body.textContent,/正文未修改/);
+  await render({...base,status:'unknown'},'run_safe');assert.ok(document.querySelector('[aria-label="创建待办 · 结果未确认"]'));assert.equal(document.querySelector('.spin'),null);
   await render(base);assert.ok(document.querySelector('[aria-label="创建待办 · 结果未确认"]'));assert.match(document.body.textContent,/不会自动重跑/);assert.equal(opened.length,1);
   const exerciseObject={kind:'exercise',id:'exercise_safe',sessionId:'session_safe',sectionId:'section_safe'};await render({...base,name:'generate_exercises',title:'生成练习',status:'succeeded',persisted:true,object:exerciseObject});assert.equal(document.querySelector('.tool-activity button').textContent,'打开练习');await React.act(async()=>document.querySelector('.tool-activity button').click());assert.deepEqual(opened.at(-1),exerciseObject);
  }finally{await React.act(async()=>root.unmount());dom.window.close();await unlink(filename).catch(()=>{});}
@@ -33,6 +35,11 @@ test('authorized workspace tool cards render fixed titles without faking unconfi
  assert.equal(written.title,'受控写入');
  assert.equal(written.summary,'已收到本机保存回执。');
  assert.equal(toolState(written,'run_auth'),'succeeded');
+ const blocked=readToolActivity({...base,name:'write',status:'failed',persisted:false,errorCode:'CONFLICT',summary:'已有修改建议待审阅，本次未写入；请先接受或拒绝旧建议，再重新读取后修改。'});
+ assert.equal(toolState(blocked,'run_auth'),'failed');
+ assert.match(blocked.summary,/旧建议/);
+ const unsafe=readToolActivity({...base,name:'write',status:'failed',persisted:false,errorCode:'CONFLICT',summary:'已有修改建议: SECRET'});
+ assert(!unsafe.summary.includes('SECRET'));
  const unfinished=readToolActivity({...base,id:'tool_write_2',toolCallId:'call_write_2',name:'write',status:'succeeded',persisted:false});
  assert.equal(toolState(unfinished,'run_auth'),'unconfirmed');
  const unknown=readToolActivity({...base,name:'shell'});
@@ -43,6 +50,12 @@ test('authorized workspace tool cards render fixed titles without faking unconfi
   assert.ok(document.querySelector('[aria-label="受控写入 · 成功"]'));
   assert.match(document.body.textContent,/受控读取已完成/);
   assert.equal(document.querySelectorAll('.tool-activity button').length,0,'workspace tools open no library object');
+  await React.act(async()=>root.render(React.createElement(ToolActivityCards,{items:[blocked],liveRunId:'run_auth',onOpen:value=>opened.push(value)})));
+  assert.ok(document.querySelector('[aria-label="受控写入 · 失败"]'));
+  assert.match(document.body.textContent,/先接受或拒绝旧建议/);
+  assert(!document.body.textContent.includes('保存版本发生变化'));
+  assert.equal(document.querySelector('.spin'),null);
+
  }finally{await React.act(async()=>root.unmount());dom.window.close();await unlink(filename).catch(()=>{});await unlink(new URL(`./.tool-activities-auth-${process.pid}.mjs`,import.meta.url).pathname).catch(()=>{});}
 });
 

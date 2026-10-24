@@ -566,3 +566,74 @@ fn trash_visibility_requires_a_fresh_ledger_and_hides_copied_managed_ids() {
         || file.path.starts_with("documents/renamed")));
     assert_eq!(f.read(&first, CHILD), f.child.content.as_bytes());
 }
+
+#[path = "nested_course_git_tests.rs"]
+mod nested;
+
+#[test]
+fn oversized_non_text_materials_do_not_block_valid_text_snapshot_and_focus() {
+    let f = Fixture::new();
+    let first = f.commit(None);
+    let large_paths = ["archive.zip", "book.pdf", "video.mp4", "arbitrary.custom"];
+    for path in large_paths {
+        let mut file = fs::File::create(f.root.join("materials").join(path)).unwrap();
+        file.write_all(&[0xff, 0, 0xfe]).unwrap();
+        file.set_len(5 * 1024 * 1024 + 1).unwrap();
+    }
+    let html = b"<!doctype html><title>valid</title>";
+    fs::write(f.root.join("materials/demo.html"), html).unwrap();
+    fs::write(f.root.join("materials/notes.custom"), b"valid arbitrary suffix").unwrap();
+    let next = f.commit(Some(&first.checkpoint_commit_oid));
+    for path in large_paths {
+        assert!(next.excluded_files.iter().any(|entry|
+            entry.file_name == path && entry.reason == "capacity_exceeded" && entry.asset_id.is_empty()));
+        assert!(f.git.read("course_a", &next.checkpoint_commit_oid, path).is_err());
+        assert_eq!(fs::metadata(f.root.join("materials").join(path)).unwrap().len(), 5 * 1024 * 1024 + 1);
+    }
+    assert_eq!(f.read(&next, CHILD), f.child.content.as_bytes());
+    assert_eq!(f.read(&next, "demo.html"), html);
+    assert_eq!(f.read(&next, "notes.custom"), b"valid arbitrary suffix");
+    let focused = f.diff(&first, &next, Some("demo.html"));
+    assert!(focused.changes.iter().any(|change| change.path == "demo.html"));
+}
+
+#[test]
+fn oversized_registered_attachment_keeps_source_id_in_exclusion() {
+    let f = Fixture::new();
+    let asset = f.import("large.txt", b"small original", "large_asset_source");
+    let path = format!("assets/course_a/{}/large.txt", asset.id);
+    let first = f.commit(None);
+    assert_eq!(f.read(&first, &path), b"small original");
+    let file = fs::OpenOptions::new().write(true)
+        .open(f.root.join("materials").join(&path)).unwrap();
+    file.set_len(5 * 1024 * 1024 + 1).unwrap();
+    let next = f.commit(Some(&first.checkpoint_commit_oid));
+    let excluded = next.excluded_files.iter().find(|entry| entry.file_name == path).unwrap();
+    assert_eq!(excluded.reason, "capacity_exceeded");
+    assert_eq!(excluded.asset_id, asset.id);
+    assert!(f.git.read("course_a", &next.checkpoint_commit_oid, &path).is_err());
+    assert_eq!(f.read(&next, CHILD), f.child.content.as_bytes());
+    assert_eq!(f.read(&first, &path), b"small original");
+}
+
+#[test]
+fn oversized_unregistered_paths_do_not_inherit_asset_source_id() {
+    let f = Fixture::new();
+    let asset = f.import("original.txt", b"registered", "large_unregistered_paths");
+    let paths = [
+        "assets/course_a/asset_00000000000000000000000000000000/large.txt".to_owned(),
+        format!("assets/course_a/{}/extra.txt", asset.id),
+    ];
+    for path in &paths {
+        let full = f.root.join("materials").join(path);
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        fs::File::create(full).unwrap().set_len(5 * 1024 * 1024 + 1).unwrap();
+    }
+    let checkpoint = f.commit(None);
+    for path in &paths {
+        let excluded = checkpoint.excluded_files.iter().find(|entry| &entry.file_name == path).unwrap();
+        assert_eq!(excluded.reason, "capacity_exceeded");
+        assert!(excluded.asset_id.is_empty());
+    }
+    assert_eq!(f.read(&checkpoint, &format!("assets/course_a/{}/original.txt", asset.id)), b"registered");
+}

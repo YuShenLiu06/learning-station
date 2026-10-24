@@ -627,7 +627,7 @@ pub fn execute(
 /// JSON escaping can inflate control characters roughly six-fold, so a 16KiB
 /// body could burst the 32KiB wire budget. Measure the serialized reply with a
 /// headroom for the tool_result envelope; an oversized body fails this one
-/// call honestly instead of tripping the whole-run TOOL_LIMIT afterwards.
+/// call honestly instead of tripping the whole-run TOOL_SIZE_LIMIT afterwards.
 fn within_result_budget(reply: &Value) -> bool {
     serde_json::to_vec(reply).is_ok_and(|bytes| bytes.len() + 1024 <= MAX_TOOL_RESULT_BYTES)
 }
@@ -2347,6 +2347,14 @@ mod tests {
         assert!(content.starts_with("---\nname: learning-review\n"));
         assert_eq!(loaded["sha256"].as_str().unwrap(), hash(content));
         assert_eq!(loaded["skillId"], "learning-review");
+        let format = execute(
+            &engine, &scope, "exercise-format-load", "load_learning_skill",
+            json!({"skillId":"learning-exercise-markdown"}),
+        ).unwrap();
+        let body = format["content"].as_str().unwrap();
+        assert_eq!(format["skillId"], "learning-exercise-markdown");
+        assert_eq!(format["sha256"].as_str().unwrap(), hash(body));
+        assert_eq!(body, include_str!("../../skills/learning-exercise-markdown/SKILL.md"));
         // An id outside the fixed allowlist never reaches the disk.
         for (id, code) in [
             ("not-a-skill", "TOOL_SCOPE"),

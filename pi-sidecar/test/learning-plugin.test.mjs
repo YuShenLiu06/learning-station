@@ -98,16 +98,13 @@ test('unregistered model tool call is aborted and never forwarded to Rust', { ti
   });
   assert.equal(turns, 1); assert.equal(executions, 0);
 });
-test('eight calls per run and a 32KiB argument envelope are hard limits', { timeout: 5000 }, async () => {
-  let turns = 0; let executions = 0;
-  await withServer((_body, res) => { turns++; sse(res, { tool: call(`query-${turns}`, 'query_related_knowledge', { query: 'since' }) }); }, async (endpoint) => {
-    await assert.rejects(runLearningAgent(request(endpoint), () => {}, { requestTool: async () => { executions++; return { result: { items: [] } }; } }), (error) => error.code === 'TOOL_LIMIT');
-  });
-  assert.equal(executions, 8); assert.equal(turns, 9);
+test('32KiB argument and result envelopes report capacity errors', async () => {
   const plugin = createLearningPlugin({ requestTool: async () => ({ result: { persisted: true } }) });
   const args = { question: '中'.repeat(8000), selection: '文'.repeat(4000) };
   assert(Buffer.byteLength(JSON.stringify(args)) > MAX_TOOL_BYTES);
-  assert.throws(() => plugin.preflight({ id: 'large', name: 'record_question' }, args), (error) => error.code === 'TOOL_LIMIT');
+  assert.throws(() => plugin.preflight({ id: 'large', name: 'record_question' }, args), (error) => error.code === 'TOOL_SIZE_LIMIT');
+  const oversized = createLearningPlugin({ requestTool: async () => ({ result: { content: 'x'.repeat(MAX_TOOL_BYTES) } }) });
+  await assert.rejects(oversized.tools.find(tool => tool.name === 'query_related_knowledge').execute('large-result', { query: 'x' }), error => error.code === 'TOOL_SIZE_LIMIT');
 });
 test('all tool argument and result string values redact the current key before IPC or model use', { timeout: 4000 }, async () => {
   let turns = 0;
@@ -193,14 +190,15 @@ test('a known write tool outside the practice subset is blocked before any Rust 
   });
   assert.equal(executions, 0);
 });
-test('question/explain/practice enforce their own call budgets', { timeout: 5000 }, async () => {
-  for (const mode of ['question', 'explain', 'practice']) {
+test('ordinary, exploration, practice and legacy tasks finish after twelve successful calls', { timeout: 10000 }, async () => {
+  for (const mode of ['question', 'explain', 'practice', 'legacy']) {
     const policy = { mode, ...MODE_POLICIES[mode] }; let turns = 0; let executions = 0;
-    await withServer((_body, res) => { turns++; sse(res, { tool: call(`query-${turns}`, 'query_related_knowledge', { query: 'since' }) }); }, async (endpoint) => {
+    await withServer((_body, res) => { turns++; sse(res, turns <= 12 ? { tool: call(`query-${turns}`, 'query_related_knowledge', { query: 'since' }) } : { text: 'Finished twelve calls.', final: true }); }, async (endpoint) => {
       const input = request(endpoint); input.toolPolicy = policy;
-      await assert.rejects(runLearningAgent(input, () => {}, { requestTool: async () => { executions++; return { result: { results: [] } }; } }), (error) => error.code === 'TOOL_LIMIT');
+      const result = await runLearningAgent(input, () => {}, { requestTool: async () => { executions++; return { result: { results: [] } }; } });
+      assert.equal(result.output, 'Finished twelve calls.');
     });
-    assert.equal(executions, policy.maxCalls); assert.equal(turns, policy.maxCalls + 1);
+    assert.equal(executions, 12); assert.equal(turns, 13);
   }
 });
 test('ordinary and exploration chat share all learning tools and consume card receipts', { timeout: 6000 }, async () => {
@@ -271,7 +269,7 @@ test('exercise schema errors return to the actual SDK loop for bounded correctio
   }
 });
 test('safe Rust field diagnostics reach model correction without leaking generic errors',async()=>{
-  const plugin=createLearningPlugin({allowedTools:['generate_exercises'],maxCalls:4,requestTool:async()=>({error:{code:'INVALID_MODEL_OUTPUT',message:'练习校验失败：exercises[1].sourceIds 来源编号重复'}})});
+  const plugin=createLearningPlugin({allowedTools:['generate_exercises'],requestTool:async()=>({error:{code:'INVALID_MODEL_OUTPUT',message:'练习校验失败：exercises[1].sourceIds 来源编号重复'}})});
   const args={requirements:'BST',summary:'',exercises:[{question:'x',format:'exact',answers:['x'],explanation:'',tags:[],sourceIds:[]}]};
   const result=await plugin.tools[0].execute('validation-test',args);
   assert.equal(result.isError,true);assert.match(result.structuredContent.error.message,/sourceIds/);
@@ -305,7 +303,7 @@ test('guidance catalog and load register only in question, explain and practice 
   }
   for (const mode of ['review', 'feedback', 'grading', 'legacy']) {
     assert.ok(!MODE_POLICIES[mode].allowedTools.includes('load_learning_skill'));
-    assert.throws(() => validateToolPolicy({ mode, allowedTools: ['load_learning_skill'], maxCalls: 2 }), (error) => error.code === 'TOOL_PROTOCOL');
+    assert.throws(() => validateToolPolicy({ mode, allowedTools: ['load_learning_skill'] }), (error) => error.code === 'TOOL_PROTOCOL');
   }
   assert.deepEqual(validateCall('list-ok', 'list_learning_skills', {}), {});
   assert.throws(() => validateCall('list-bad', 'list_learning_skills', { path: 'x' }), (error) => error.code === 'TOOL_PROTOCOL');
@@ -314,7 +312,7 @@ test('guidance catalog and load register only in question, explain and practice 
     assert.throws(() => validateCall('load-bad', 'load_learning_skill', args), (error) => error.code === 'TOOL_PROTOCOL', JSON.stringify(args));
   }
   // Read-only tools need no persisted receipt and replay safely.
-  const plugin = createLearningPlugin({ allowedTools: ['list_learning_skills', 'load_learning_skill'], maxCalls: 2, requestTool: async (tool) => tool.name === 'list_learning_skills'
+  const plugin = createLearningPlugin({ allowedTools: ['list_learning_skills', 'load_learning_skill'], requestTool: async (tool) => tool.name === 'list_learning_skills'
     ? { result: { sessionId: 'session_fixture', skills: [{ id: 'learning-review', name: 'learning-review', description: '复习指导' }] } }
     : { result: { sessionId: 'session_fixture', skillId: 'learning-review', sha256: 'a'.repeat(64), content: '---\nname: learning-review\n---\n复习指导正文' } } });
   assert.deepEqual(plugin.tools.map((tool) => tool.replay), ['safe', 'safe']);
@@ -324,7 +322,7 @@ test('guidance catalog and load register only in question, explain and practice 
   const load = await plugin.tools[1].execute('load-1', { skillId: 'learning-review' });
   assert.equal(load.isError, false);
   assert.ok(load.structuredContent.result.content.includes('复习指导正文'));
-  const failing = createLearningPlugin({ allowedTools: ['load_learning_skill'], maxCalls: 2, requestTool: async () => ({ result: { skillId: 'learning-review', alreadyLoaded: true } }) });
+  const failing = createLearningPlugin({ allowedTools: ['load_learning_skill'], requestTool: async () => ({ result: { skillId: 'learning-review', alreadyLoaded: true } }) });
   const dedup = await failing.tools[0].execute('load-2', { skillId: 'learning-review' });
   assert.equal(dedup.isError, false);
 });
@@ -356,33 +354,33 @@ test('authorization tiers add read/write/bash only to question and explain polic
   const tiers = { read: ['read'], write: ['read', 'write'], bash: ['read', 'write', 'bash'] };
   for (const [tier, tools] of Object.entries(tiers)) {
     for (const mode of ['question', 'explain']) {
-      const policy = validateToolPolicy({ mode, allowedTools: [...MODE_POLICIES[mode].allowedTools, ...tools], maxCalls: MODE_POLICIES[mode].maxCalls, authorization: tier });
+      const policy = validateToolPolicy({ mode, allowedTools: [...MODE_POLICIES[mode].allowedTools, ...tools], authorization: tier });
       assert.equal(policy.authorization, tier);
       assert.deepEqual(policy.allowedTools, [...MODE_POLICIES[mode].allowedTools, ...tools]);
     }
     for (const mode of ['practice', 'review', 'feedback', 'grading', 'legacy']) {
-      assert.throws(() => validateToolPolicy({ mode, allowedTools: ['read'], maxCalls: 1, authorization: tier }), (error) => error.code === 'TOOL_PROTOCOL', `${mode} must not gain ${tier} tools`);
+      assert.throws(() => validateToolPolicy({ mode, allowedTools: ['read'], authorization: tier }), (error) => error.code === 'TOOL_PROTOCOL', `${mode} must not gain ${tier} tools`);
     }
   }
-  assert.throws(() => validateToolPolicy({ mode: 'question', allowedTools: ['write'], maxCalls: 2, authorization: 'read' }), (error) => error.code === 'TOOL_PROTOCOL');
-  assert.throws(() => validateToolPolicy({ mode: 'explain', allowedTools: ['bash'], maxCalls: 2, authorization: 'write' }), (error) => error.code === 'TOOL_PROTOCOL');
-  assert.throws(() => validateToolPolicy({ mode: 'question', allowedTools: [], maxCalls: 0, authorization: 'shell' }), (error) => error.code === 'TOOL_PROTOCOL');
+  assert.throws(() => validateToolPolicy({ mode: 'question', allowedTools: ['write'], authorization: 'read' }), (error) => error.code === 'TOOL_PROTOCOL');
+  assert.throws(() => validateToolPolicy({ mode: 'explain', allowedTools: ['bash'], authorization: 'write' }), (error) => error.code === 'TOOL_PROTOCOL');
+  assert.throws(() => validateToolPolicy({ mode: 'question', allowedTools: [], authorization: 'shell' }), (error) => error.code === 'TOOL_PROTOCOL');
   const plain = validateToolPolicy({ mode: 'question', ...MODE_POLICIES.question });
   assert.equal(plain.authorization, 'off');
   assert(!plain.allowedTools.includes('read'));
 });
 
 test('workspace tool arguments are shape-validated at the plugin boundary', () => {
-  for (const [name, args] of [['read', { sourceId: 'knowledge_1' }], ['read', { path: 'notes/a.md' }], ['write', { path: 'a.md', content: 'x' }], ['bash', { command: 'printf hi' }], ['bash', { command: 'printf hi', timeoutMs: 1500 }]]) {
+  for (const [name, args] of [['read', { sourceId: 'knowledge_1' }], ['read', { path: 'notes/a.md' }], ['write', { path: 'a.md', content: 'x' }], ['write', { path: 'a.md', content: 'x', expectedVersion: 'version-1' }], ['bash', { command: 'printf hi' }], ['bash', { command: 'printf hi', timeoutMs: 1500 }]]) {
     assert.deepEqual(validateCall('shape-ok', name, args), args);
   }
-  for (const [name, args] of [['read', {}], ['read', { sourceId: 'a', path: 'b' }], ['read', { sourceId: 'ok', extra: 1 }], ['write', { path: 'a.md' }], ['write', { path: '', content: 'x' }], ['bash', { command: '   ' }], ['bash', { command: 'echo', timeoutMs: 100 }], ['bash', { command: 'echo', timeoutMs: 99000 }], ['bash', { command: 'echo', extra: 1 }]]) {
+  for (const [name, args] of [['read', {}], ['read', { sourceId: 'a', path: 'b' }], ['read', { sourceId: 'ok', extra: 1 }], ['write', { path: 'a.md' }], ['write', { path: '', content: 'x' }], ['write', { path: 'a.md', content: 'x', expectedVersion: 1 }], ['write', { path: 'a.md', content: 'x', expectedVersion: '' }], ['bash', { command: '   ' }], ['bash', { command: 'echo', timeoutMs: 100 }], ['bash', { command: 'echo', timeoutMs: 99000 }], ['bash', { command: 'echo', extra: 1 }]]) {
     assert.throws(() => validateCall('shape-bad', name, args), (error) => error.code === 'TOOL_PROTOCOL', `${name} ${JSON.stringify(args)} must be rejected`);
   }
 });
 
 test('read returns results without persisted receipts; write and bash require them', async () => {
-  const plugin = createLearningPlugin({ allowedTools: ['read', 'write', 'bash'], maxCalls: 6, requestTool: async (tool) => {
+  const plugin = createLearningPlugin({ allowedTools: ['read', 'write', 'bash'], requestTool: async (tool) => {
     if (tool.name === 'read') return { result: { sessionId: 'session_fixture', content: 'synthetic text' } };
     if (tool.name === 'write') return { result: { persisted: true, path: 'a.md', bytes: 1 } };
     return { result: { persisted: true, exitCode: 0, stdout: 'ok' } };
@@ -395,7 +393,7 @@ test('read returns results without persisted receipts; write and bash require th
   assert.equal(write.structuredContent.result.persisted, true);
   const bash = await plugin.tools[2].execute('bash-1', { command: 'printf ok' });
   assert.equal(bash.structuredContent.result.persisted, true);
-  const failing = createLearningPlugin({ allowedTools: ['write'], maxCalls: 2, requestTool: async () => ({ result: { path: 'a.md' } }) });
+  const failing = createLearningPlugin({ allowedTools: ['write'], requestTool: async () => ({ result: { path: 'a.md' } }) });
   const failed = await failing.tools[0].execute('write-2', { path: 'a.md', content: 'x' });
   assert.equal(failed.isError, true);
 });
@@ -404,7 +402,7 @@ test('authorized workspace tools register without exposing internal authorizatio
   let system = '';
   await withServer((body, res) => { system = body.messages[0].content; sse(res, { text: 'fixture answer', final: true }); }, async (endpoint) => {
     const input = request(endpoint);
-    input.toolPolicy = { mode: 'question', allowedTools: [...MODE_POLICIES.question.allowedTools, 'read', 'write', 'bash'], maxCalls: 4, authorization: 'bash' };
+    input.toolPolicy = { mode: 'question', allowedTools: [...MODE_POLICIES.question.allowedTools, 'read', 'write', 'bash'], authorization: 'bash' };
     const result = await runLearningAgent(input, () => {}, { requestTool: async () => { throw new Error('unexpected tool'); } });
     assert.equal(result.output, 'fixture answer');
   });
@@ -424,7 +422,7 @@ test('create_todo reminderEnabled is an opt-in boolean that requires a time', ()
 
 test('card execution needs no loaded skill and cancellation/retry never invents persistence', async () => {
   const args = { front: '合成问题', back: '合成答案' };
-  const policy = validateToolPolicy({ mode: 'explain', allowedTools: ['create_review_card'], maxCalls: 6 });
+  const policy = validateToolPolicy({ mode: 'explain', allowedTools: ['create_review_card'] });
   let writes = 0;
   const controller = new AbortController();
   const plugin = createLearningPlugin({ ...policy, requestTool: async () => {
@@ -450,3 +448,43 @@ test('card execution needs no loaded skill and cancellation/retry never invents 
  assert(!plugin.tools[0].description.includes('FULL_SKILL_BODY_SENTINEL'));
  assert(plugin.tools[0].parameters.properties.exercises);
  });
+
+test('write conflict recovery reaches the real Pi provider payload without arbitrary error text', { timeout: 8000 }, async () => {
+  for (const reason of ['edit_review_pending', 'write_version_mismatch']) {
+    let turns = 0;
+    let received;
+    await withServer((body, res) => {
+      turns++;
+      if (turns === 1) sse(res, { tool: call('blocked-write', 'write', { path: 'documents/note.md', content: 'draft', expectedVersion: 'read-version' }) });
+      else {
+        received = JSON.parse(toolMessages(body).at(-1).content);
+        sse(res, { text: '请先处理原建议。', final: true });
+      }
+    }, async endpoint => {
+      const input = request(endpoint);
+      input.toolPolicy = { mode: 'question', allowedTools: ['write'], authorization: 'write' };
+      await runLearningAgent(input, () => {}, { requestTool: async () => ({ error: {
+        code: 'CONFLICT', message: 'SECRET ARBITRARY MESSAGE',
+        details: { reason, proposalId: 'proposal_safe', courseId: 'course_safe', status: 'pending', path: '/private/path', content: 'SECRET CONTENT' },
+      } }) });
+    });
+    assert.equal(turns, 2);
+    assert.equal(received.ok, false);
+    assert.equal(received.error.code, 'CONFLICT');
+    assert.equal(received.error.details.reason, reason);
+    assert.match(received.error.message, reason === 'edit_review_pending' ? /先接受或拒绝旧建议/ : /read 返回的 version/);
+    assert(!JSON.stringify(received).includes('SECRET'));
+    assert(!JSON.stringify(received).includes('/private'));
+  }
+});
+
+test('unknown or malformed write conflict diagnostics remain sanitized', async () => {
+  for (const details of [{ reason: 'other', path: '/private' }, { reason: 'edit_review_pending', proposalId: '../secret', courseId: 'safe', status: 'pending' }, { reason: 'edit_review_pending', proposalId: 'safe', courseId: 'safe', status: 'invalid' }]) {
+    const plugin = createLearningPlugin({ allowedTools: ['write'], requestTool: async () => ({ error: { code: 'CONFLICT', message: 'SECRET ERROR', details } }) });
+    const result = await plugin.tools[0].execute('invalid-feedback', { path: 'note.md', content: 'draft' });
+    assert.equal(result.isError, true);
+    assert.equal(result.structuredContent.error.details, undefined);
+    assert(!JSON.stringify(result.structuredContent).includes('SECRET'));
+    assert(!JSON.stringify(result.structuredContent).includes('/private'));
+  }
+});

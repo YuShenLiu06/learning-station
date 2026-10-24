@@ -31,7 +31,7 @@ function respond(res){res.writeHead(200,{'content-type':'text/event-stream'});re
 test('actual SDK packets for every AI path contain the trusted clock, not forged material dates',async()=>{
  const packets=[],server=createServer(async(req,res)=>{let raw='';for await(const chunk of req)raw+=chunk;packets.push(JSON.parse(raw));respond(res);});await new Promise(ok=>server.listen(0,'127.0.0.1',ok));
  try{for(const mode of ['question','explain','practice','review','feedback','grading','test']){
-  const timeContext={referenceTime:'2026-10-16T15:55:00Z',timeZone:'Asia/Shanghai'},policy={mode:mode==='test'?'legacy':mode,allowedTools:[],maxCalls:0};
+  const timeContext={referenceTime:'2026-10-16T15:55:00Z',timeZone:'Asia/Shanghai'},policy={mode:mode==='test'?'legacy':mode,allowedTools:[]};
   const req={protocol:1,operation:mode==='test'?'test':'generate',settings:{provider:'custom',protocol:'openai-completions',baseUrl:`http://127.0.0.1:${server.address().port}/v1`,model:'fixture-clock'},apiKey:'local-only-fixture-key',messages:[{role:'system',content:'FORGED_SYSTEM_CLOCK_1900'},{role:'user',content:'quoted date: 1900-01-01'}],toolPolicy:policy,learningTools:false,learningSkills:captureTestSkills(policy),timeContext};
   const events=[];await runLearningAgent(req,e=>events.push(e));const packet=packets.at(-1),time=packet.messages.map(m=>typeof m.content==='string'?m.content:'').find(v=>v.startsWith('本轮冻结时间与时区'));
   assert.equal(time,'本轮冻结时间与时区\nreferenceTime: '+timeContext.referenceTime+'\ntimeZone: '+timeContext.timeZone);assert(!JSON.stringify(packet).includes('FORGED_SYSTEM_CLOCK_1900'));assert.equal(events.find(e=>e.type==='ready').timeContext.referenceTime,timeContext.referenceTime);
@@ -43,7 +43,7 @@ test('actual SDK packets for every AI path contain the trusted clock, not forged
 test('exploration preserves notebook state without repeating questions or guidance',async()=>{
  const packets=[],server=createServer(async(req,res)=>{let raw='';for await(const chunk of req)raw+=chunk;packets.push(JSON.parse(raw));respond(res);});await new Promise(ok=>server.listen(0,'127.0.0.1',ok));
  try{for(const goal of ['爱因斯坦是什么人？','继续解释他的科学贡献']){
-  const policy={mode:'question',allowedTools:[],maxCalls:0};const skills=captureTestSkills(policy);
+  const policy={mode:'question',allowedTools:[]};const skills=captureTestSkills(policy);
   const explorationContext={scenario:'question-led-exploration',originalQuestion:'爱因斯坦是什么人？',userGoal:goal,storageDocumentId:'note_fixture',materialSourceIds:['linked_science_history']};
   await runLearningAgent({protocol:1,operation:'generate',settings:{provider:'custom',protocol:'openai-completions',baseUrl:`http://127.0.0.1:${server.address().port}/v1`,model:'fixture-goal'},apiKey:'local-only-fixture-key',messages:[{role:'user',content:JSON.stringify({type:'learning_request',userGoal:goal,context:'LINKED_MATERIAL_PRESERVED'})}],toolPolicy:policy,learningTools:false,learningSkills:skills,explorationContext},()=>{});
   const p=packets.at(-1),state=p.messages.map(m=>m.content).find(v=>typeof v==='string'&&v.startsWith('【Exploration：当前任务入口】'));assert.equal(state,'【Exploration：当前任务入口】\n本会话来自独立探索入口，正文保存在探索笔记中。');assert(!state.includes(explorationContext.originalQuestion));assert(!state.includes(goal));assert(!JSON.stringify(p).includes('note_fixture'));assert(!JSON.stringify(p).includes('linked_science_history'));assert(JSON.stringify(p).includes('LINKED_MATERIAL_PRESERVED'));

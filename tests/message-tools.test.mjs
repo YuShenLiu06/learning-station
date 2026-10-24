@@ -51,7 +51,7 @@ test('tool cards whitelist metadata, collapse history, and never turn activity s
   const entries=[tool,terminal,{...tool,updatedAt:'2026-10-16T00:00:02Z'},{...terminal,id:'other',sessionId:'session_b'}].map((value,i)=>({id:String(i),kind:'note',content:'not assistant prose',data:{origin:'pi-tool-activity',toolActivity:value}}));
   const history=historicalTools(entries,'session_a');assert.equal(history.length,1);assert.equal(history[0].status,'succeeded');
   assert.equal(foldToolActivities(entries.map(x=>x.data.toolActivity),'session_b').length,1);
-  assert.equal(sessionMessages(entries).length,0);
+  assert.equal(sessionMessages(entries).length,1, 'unassigned runs keep one clearly labelled receipt position each');
 });
 test('hand-entered model IDs validate UTF-8 limits and fixed GLM binding without touching connection fields', () => {
   const current={configured:true,provider:'custom',model:'old',baseUrl:'https://example.test/v1',protocol:'openai-completions'};
@@ -71,4 +71,47 @@ test('Feishu never calls missing receipts success and reuses unknown request IDs
   assert.equal(unknown.status,'unknown');assert.equal(feishuRequestId('original',unknown,'new'),'original');
   const sent=feishuTestResult({status:'sent',messageId:'msg_1',reason:'receipt'});
   assert.equal(sent.status,'sent');assert.equal(feishuRequestId('original',sent,'new'),'new');
+});
+
+test('tools stay with their saved question across failure, cancellation, retry and history clipping', async () => {
+  const { toolsByMessage } = await import('../src/toolActivities.ts');
+  const messages=[{id:'u1',role:'user'},{id:'u2',role:'user'},{id:'a2',role:'assistant',runId:'run_2'}];
+  const calls=foldToolActivities([
+    {...tool,id:'first',runId:'run_1',userEntryId:'u1',status:'failed',sequence:0},
+    {...tool,id:'cancelled',runId:'run_1',userEntryId:'u1',sequence:1},
+    {...tool,id:'retry_b',runId:'retry',userEntryId:'u1',sequence:1},
+    {...tool,id:'retry_a',runId:'retry',userEntryId:'u1',sequence:0},
+    {...tool,id:'second',runId:'run_2',userEntryId:'u2',status:'succeeded'},
+  ],'session_a');
+  const grouped=toolsByMessage(messages,calls);
+  assert.deepEqual(grouped.get('u1').map(x=>x.id),['first','cancelled','retry_a','retry_b']);
+  assert.deepEqual(grouped.get('u2').map(x=>x.id),['second']);
+  assert.equal(grouped.has('a2'),false);
+  const window=toolsByMessage(messages.slice(-1),calls);
+  assert.deepEqual([...window.keys()],['a2']);
+  assert.deepEqual(window.get('a2').map(x=>x.id),['second']);
+  assert.equal(toolState(calls[1]),'unconfirmed');
+  assert.equal(toolState(calls[2],'retry'),'running');
+});
+
+test('unbound legacy receipts remain at their recorded position without guessing their question', async () => {
+  const { toolsByMessage } = await import('../src/toolActivities.ts');
+  const entry=(id,kind,data={})=>({id,kind,content:'fixture',createdAt:'same',data});
+  const entries=[entry('u1','user'),entry('receipt','note',{origin:'pi-tool-activity',toolActivity:tool}),entry('u2','user'),entry('terminal','note',{origin:'pi-tool-activity',toolActivity:{...tool,status:'failed'}})];
+  const messages=sessionMessages(entries);
+  assert.deepEqual(messages.map(x=>x.id),['u1','receipt','u2']);
+  assert.equal(messages[1].toolRunId,'run_a');
+  assert.equal(messages[1].content,'');
+  assert.deepEqual([...toolsByMessage(messages,historicalTools(entries,'session_a')).keys()],['receipt']);
+  entries.push(entry('answer','assistant',{runId:'run_a'}));
+  assert.deepEqual(sessionMessages(entries).map(x=>x.id),['u1','u2','answer']);
+  assert.deepEqual([...toolsByMessage(sessionMessages(entries),historicalTools(entries,'session_a')).keys()],['answer']);
+});
+
+
+test('an old run snapshot cannot erase attribution enriched from the durable history', () => {
+  const calls=foldToolActivities([{...tool,userEntryId:'u1',sequence:2},tool],'session_a');
+  assert.equal(calls.length,1);
+  assert.equal(calls[0].userEntryId,'u1');
+  assert.equal(calls[0].sequence,2);
 });

@@ -117,7 +117,9 @@ Tauri devUrl约定 `http://127.0.0.1:1420`，release嵌入 `dist/`。命令snake
 | `check_feishu_status()` | `{ready,reason}`，只读已验证本人通道，不登录、不发送、不返回凭据或收件人参数。 |
 | `test_feishu_notification({requestId})` | `{status:sent|blocked|failed|unknown,messageId:string|null,reason}`。ID为8–128字母数字/下划线/连字符；正文固定测试通知，用户点击才发。发前私有原子Unknown占位；同ID重开/超时均不重发；仅真实成功+messageId才sent。不会启用全部提醒。 |
 
-ToolActivity=`{id,toolCallId,runId,sessionId,name,status:running|succeeded|failed,title,summary,startedAt,updatedAt,persisted,object?,errorCode?}`。id/toolCallId由Core对run+模型opaque ID哈希，不返回rawargs或内部路径。object=`{kind:todo|learning-entry|review-card,id,sessionId,sectionId}`；仅真实保存回执提供。查询成功persisted=false，不能显示“已保存”。
+ToolActivity=`{id,toolCallId,runId,sessionId,userEntryId?,sequence?,name,status:running|succeeded|failed,title,summary,startedAt,updatedAt,persisted,object?,errorCode?}`。id/toolCallId由Core对run+模型opaque ID哈希，不返回rawargs或内部路径。object=`{kind:todo|learning-entry|review-card,id,sessionId,sectionId}`；仅真实保存回执提供。查询成功persisted=false，不能显示“已保存”。
+
+userEntryId 由 Rust 从准确 Run 绑定写入，不能来自模型参数。旧活动缺此字段时，读取会话仅从该 runId 的原运行文件核实 id/sessionId/userEntryId 并检查问题仍在该会话；只补返回投影、不改旧文件，不按时间或相邻正文推断。旧回执同状态重放使用原始持久化数据核对原 requestDigest，通过后仅在 Run/事件显示投影补充归属；不以新增显示字段重写或放宽旧幂等摘要。前端把活动放在对应问题后，重试沿同一问题归属；缺绑定但有同 runId 回复时贴该回复。sequence 由原 Run.toolCalls 的顺序确定，同轮卡片按其排列；无法核实归属的旧回执保留在原活动记录位置，标注所属问题未确认。最近 30 条裁剪不会把早期工具堆到末尾。
 
 工具开始/回执后更新`get_run.toolCalls`并发`generation.tool`事件。历史复用Session.entries：kind=note，data=`{origin:"pi-tool-activity",toolActivity}`；按toolCallId取最新快照，不当普通学习正文、不回灌模型历史。历史只有running而无终态显示结果未确认，不自动重跑；打开仅按稳定ID调用已有待办/学习记录/复习接口。
 
@@ -143,3 +145,11 @@ ToolActivity=`{id,toolCallId,runId,sessionId,name,status:running|succeeded|faile
 ### Focus 冻结
 
 `freeze_focus {request:{sessionId,input:{documentId,expectedBody,expectedVersion?,view,ranges,questionId?,assetId?},selection,injections,assistantReferences,exerciseReferences}}` 返回 [FocusSnapshot](focus-v1.md)。这是一次本机私有材料冻结，不发模型、不改变权限。`start_generation` 增可选 `focus`；既有调用兼容，带 Focus 的请求严格绑定原冻结记录。
+
+### 练习整题修改审阅
+
+`decide_exercise_proposal({courseId,id,questionId,accept})` 每次决定一整题，返回 `{persisted,status,complete,version}`；全部处理后原提案归档。`edit_proposal` 可带 `exercise:{documentId,version,changes:[{id,before?,after?,status,operation}]}`，题干中的选项、答案、解析、格式与量表不可拆分接受。未改题保持普通内容展示，UI不展示底层JSON。
+
+仅用户打开练习“编辑 Markdown”视图的冻结 Focus 为该练习增加读取授权；做题视图不授完整答案读取权、不自动发送正文。工具 `read` 的 `documents/<exerciseDocumentId>.md` 返回 `{exercises:[...]}` JSON 字符串及文档版本。`write.content` 顶层只允许 `exercises`；保留id表示原题/修改，新增省略id，删除从数组省略。原id必须属于该题集，来源限原题集持久化manifest。修改与新增由Rust生成新题id，未改题保留稳定id。
+
+每次接受先验证当前版本及1至5题限制，追加不可变exercise修订entry，再通过既有保留旧稿事务更新页面指向。原entry、作答及评分不重写；新题不继承旧题作答。`originalExerciseEntryId` 保留原映射，`exerciseEntryId` 指当前修订，`exerciseEditOperation` 供原操作核对。未知结果不重放；数量限制/版本冲突仍保留该题待决。未保存Markdown草稿、受影响题未提交作答或错因会阻止接受；拒绝不丢输入。直接编辑Markdown只改变展示，不改变评分题集。

@@ -103,7 +103,7 @@ pub fn validate(mut data: Value, manifest: &[ManifestItem], namespace: &str) -> 
     validate_stored(&data, manifest, false)?;
     Ok(data)
 }
-fn validate_stored(data: &Value, manifest: &[ManifestItem], legacy: bool) -> Result<()> {
+pub(crate) fn validate_stored(data: &Value, manifest: &[ManifestItem], legacy: bool) -> Result<()> {
     if serde_json::to_vec(data)?.len() > 256 * 1024 || manifest.len() > 64 {
         return Err(invalid());
     }
@@ -119,6 +119,7 @@ fn validate_stored(data: &Value, manifest: &[ManifestItem], legacy: bool) -> Res
             "manual",
             "businessUserEntryId",
             "toolArgumentsHash",
+            "revisionDocumentId", "originalExerciseEntryId",
         ]
     } else {
         &[
@@ -131,6 +132,7 @@ fn validate_stored(data: &Value, manifest: &[ManifestItem], legacy: bool) -> Res
             "requirements",
             "businessUserEntryId",
             "toolArgumentsHash",
+            "revisionDocumentId", "originalExerciseEntryId",
         ]
     };
     known(data, fields)?;
@@ -251,7 +253,7 @@ fn validate_stored(data: &Value, manifest: &[ManifestItem], legacy: bool) -> Res
     }
     Ok(())
 }
-fn stored_manifest(data: &Value, fallback: &[ManifestItem]) -> Result<Vec<ManifestItem>> {
+pub(crate) fn stored_manifest(data: &Value, fallback: &[ManifestItem]) -> Result<Vec<ManifestItem>> {
     match data.get("contextManifest") {
         Some(value) => serde_json::from_value(value.clone()).map_err(|_| invalid()),
         None => Ok(fallback.to_vec()),
@@ -388,7 +390,7 @@ fn materialize(
                 || document
                     .metadata
                     .extra
-                    .get("exerciseEntryId")
+                    .get("originalExerciseEntryId").or_else(|| document.metadata.extra.get("exerciseEntryId"))
                     .and_then(Value::as_str)
                     != Some(entry_id)
             {
@@ -540,7 +542,8 @@ pub fn origin(store: &ContentStore, document: &Document) -> Result<ExerciseOrigi
         .filter(|id| valid_id(id)).map(str::to_owned).ok_or_else(&bad);
     if document.metadata.kind != "exercise" { return Err(bad()); }
     let session_id = field("originSessionId")?;
-    let entry_id = field("exerciseEntryId")?;
+    let current_entry_id = field("exerciseEntryId")?;
+    let entry_id = document.metadata.extra.get("originalExerciseEntryId").and_then(Value::as_str).unwrap_or(&current_entry_id).to_owned();
     let native_page = entry_id.strip_prefix("entry_").map(|suffix| format!("exdoc_{suffix}"));
     let legacy_request = format!("legacy_{}", &hash(&format!("{session_id}\n{entry_id}"))[..32]);
     let legacy_page = format!("exdoc_{}", &hash(&legacy_request)[..32]);
@@ -556,7 +559,16 @@ pub fn origin(store: &ContentStore, document: &Document) -> Result<ExerciseOrigi
     let digest = hash(&serde_json::to_string(&json!({"sessionId":session_id,"sourceDocumentId":source_document_id,"exerciseEntryId":entry_id,"data":data}))?);
     if document.metadata.extra.get("sourceDocumentId").and_then(Value::as_str) != Some(&source_document_id)
         || document.metadata.extra.get("requestDigest").and_then(Value::as_str) != Some(&digest) { return Err(bad()); }
-    Ok(ExerciseOrigin { session_id, entry_id, source_document_id })
+    if current_entry_id != entry_id {
+        let revision = store.read_relative(&format!("sessions/{session_id}/entries/{current_entry_id}.md"))?;
+        let revision_data = revision.metadata.extra.get("data").ok_or_else(&bad)?;
+        if revision.metadata.extra.get("sessionId").and_then(Value::as_str) != Some(&session_id)
+            || revision.metadata.extra.get("entryKind").and_then(Value::as_str) != Some("exercise")
+            || revision_data.get("revisionDocumentId").and_then(Value::as_str) != Some(&document.id)
+            || revision_data.get("originalExerciseEntryId").and_then(Value::as_str) != Some(&entry_id)
+            || revision_data.get("sourceDocumentId").and_then(Value::as_str) != Some(&source_document_id) { return Err(bad()); }
+    }
+    Ok(ExerciseOrigin { session_id, entry_id: current_entry_id, source_document_id })
 }
 pub fn get(store: &mut ContentStore, document_id: &str) -> Result<ExerciseDocument> {
     let document = read_document(store, document_id)?;
@@ -614,6 +626,11 @@ pub fn materialize_legacy(
         .find(|entry| entry.id == exercise_entry_id && entry.kind == "exercise")
         .ok_or_else(|| CoreError::new("NOT_FOUND", "找不到原练习记录。"))?;
     let data = entry.data.clone().ok_or_else(invalid)?;
+    if let Some(document_id) = data.get("revisionDocumentId").and_then(Value::as_str) {
+        let document = store.read(document_id)?;
+        if origin(store, &document)?.session_id != session_id { return Err(conflict()); }
+        return Ok(document);
+    }
     validate_stored(
         &data,
         &stored_manifest(&data, &session.context_manifest)?,
@@ -723,6 +740,23 @@ mod tests {
             3
         );
     }
+    #[test]
+    fn file_paths_and_history_only_ids_never_become_exercise_sources() {
+        let manifest = vec![ManifestItem {
+            id: "section_ex".into(),
+            path: "courses/course_one/materials/documents/section_ex.md".into(),
+            version: "frozen_version".into(), included_chars: 20,
+        }];
+        for id in ["materials/documents/section_ex.md", "courses/course_one/materials/documents/section_ex.md", "../documents/section_ex.md", "history_only", "invented"] {
+            let mut data = raw();
+            data["exercises"][0]["sourceIds"] = json!([id]);
+            let error = validate(data, &manifest, "run_sources").unwrap_err();
+            assert_eq!(error.code, "INVALID_MODEL_OUTPUT");
+            assert_eq!(error.details.unwrap()["recoverable"], false);
+        }
+        assert!(validate(raw(), &manifest, "run_sources").is_ok());
+    }
+
     #[test]
     fn strict_structure_rejects_unknown_fields_lengths_and_untrusted_sources_before_write() {
         let (_directory, mut store, session, source) = fixture();

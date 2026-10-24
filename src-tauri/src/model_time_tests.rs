@@ -265,7 +265,6 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
             ToolPolicy {
                 mode: "question".into(),
                 allowed_tools: vec![],
-                max_calls: 0,
                 authorization: "off".into(),
             },
             skills.clone(),
@@ -301,26 +300,30 @@ async fn first_and_reopened_exploration_send_real_sdk_intent_goal_guidance_and_t
         let texts: Vec<String> = messages.iter().map(|m| m["content"].as_str().map(str::to_owned)
             .unwrap_or_else(||m["content"].as_array().into_iter().flatten().filter_map(|p|p["text"].as_str()).collect())).collect();
         let all_text = texts.join("\n");
-        let prior = if i==0 {&[][..]} else {packets[0]["messages"].as_array().unwrap().as_slice()};
-        assert_eq!(&messages[..prior.len()],prior,"reopening preserves the original wire prefix including its one-shot references");
-        let current_text = texts[prior.len()..].join("\n");
+        let prior: Vec<_> = if i==0 {vec![]} else {packets[0]["messages"].as_array().unwrap().iter().filter(|m| {
+            let text=m["content"].as_str().map(str::to_owned).unwrap_or_else(||m["content"].as_array().into_iter().flatten().filter_map(|p|p["text"].as_str()).collect());
+            !text.starts_with("本轮冻结时间与时区")&&!text.starts_with("用户本轮明确提供的引用及必要补充")&&!text.contains("本轮练习可引用来源")
+        }).cloned().collect()};
+        assert_eq!(&messages[..prior.len()],prior.as_slice(),"reopening preserves materials, exploration entry and native history without stale turn references");
+        assert_eq!(texts.iter().filter(|t| t.contains("本轮练习可引用来源")).count(), 1, "only this user turn declares exercise sources");
+        let current_text = &all_text;
         let times: Vec<_> = texts.iter().filter(|t|t.starts_with("本轮冻结时间与时区")).collect();
-        assert_eq!(times.len(),i+1,"each native turn retains its own frozen clock");
-        for (round,time) in times.iter().enumerate() { assert_eq!(*time, &clocks[round]); }
+        assert_eq!(times.len(),1,"only this user turn declares a frozen clock");
+        assert_eq!(*times[0],clocks[i]);
         assert!(times.last().unwrap().starts_with("本轮冻结时间与时区\nreferenceTime: "));
         assert!(!all_text.contains("learning_request"));
         assert!(!all_text.contains("contextBridgeManifest"));
         assert!(!all_text.contains("UNREVEALED_TYPED_ANSWER_SENTINEL"));
         assert!(!all_text.contains("UNREVEALED_TYPED_EXPLANATION_SENTINEL"));
         assert_eq!(current_text.contains("文件：练习题目"), i == 0);
-        assert_eq!(all_text.matches("文件：练习题目").count(),1,"original reference remains once without being re-injected");
+        assert_eq!(all_text.matches("文件：练习题目").count(),usize::from(i==0),"one-shot reference appears only in its original user turn");
         assert_eq!(current_text.contains("RENDERED_QUESTION_TYPED_SOURCE"), i == 0);
-        assert_eq!(all_text.matches("RENDERED_QUESTION_TYPED_SOURCE").count(),1,"original reference remains once without being re-injected");
+        assert_eq!(all_text.matches("RENDERED_QUESTION_TYPED_SOURCE").count(),usize::from(i==0),"one-shot reference appears only in its original user turn");
         assert!(!all_text.contains("quoted_exercise_part"));
         assert_eq!(current_text.contains("文件：历史回答"), i == 0);
-        assert_eq!(all_text.matches("文件：历史回答").count(),1,"original reference remains once without being re-injected");
+        assert_eq!(all_text.matches("文件：历史回答").count(),usize::from(i==0),"one-shot reference appears only in its original user turn");
         assert_eq!(current_text.contains("AI_REF_FIXTURE **raw**。IGNORE_ALL_SYSTEM_RULES"), i == 0);
-        assert_eq!(all_text.matches("AI_REF_FIXTURE **raw**。IGNORE_ALL_SYSTEM_RULES").count(),1,"original reference remains once without being re-injected");
+        assert_eq!(all_text.matches("AI_REF_FIXTURE **raw**。IGNORE_ALL_SYSTEM_RULES").count(),usize::from(i==0),"one-shot reference appears only in its original user turn");
         assert!(!all_text.contains("quoted_ai_answer"));
         let exploration: Vec<_> = texts.iter().filter(|t|t.starts_with("【Exploration：当前任务入口】")).collect();
         // Session-scoped registration: one entry from the opening turn, reused.

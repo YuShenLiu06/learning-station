@@ -1,7 +1,7 @@
 // Application binding around the pinned public Pi SDK. Credentials and tools remain explicit.
 import fs from 'node:fs';
 import {ContextBridge,decodeBridgeInput} from './context-bridge.mjs';
-import {registerMaterialContext} from './material-context.mjs';
+import {registerMaterialContext,retireTurnContext} from './material-context.mjs';
 import path from 'node:path';
 import {createHash, randomUUID} from 'node:crypto';
 import {createAssistantMessageEventStream} from '@earendil-works/pi-ai/utils/event-stream';
@@ -139,7 +139,8 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
         if(typeof requestTool!=='function')throw new NativeSessionError('NATIVE_TOOL_UNKNOWN');
         const recovered=await requestTool({type:'tool_recover',recoveryRunId:owner.runId,id:call.id,name:call.name,args:call.arguments});
         const deniedRead=call.name==='read'&&['TOOL_SCOPE','CONFLICT','TOOL_NOT_ALLOWED','TRASHED','NOT_FOUND'].includes(recovered?.error?.code);
-        if(!(call.name==='read'?recovered?.result||deniedRead:recovered?.result?.persisted))throw new NativeSessionError('NATIVE_TOOL_UNKNOWN');
+        const rejectedEdit=call.name==='write'&&recovered?.result?.persisted===false&&recovered.result.status==='rejected'&&typeof recovered.result.proposalId==='string';
+        if(!(call.name==='read'?recovered?.result||deniedRead:recovered?.result?.persisted||rejectedEdit))throw new NativeSessionError('NATIVE_TOOL_UNKNOWN');
         reply={callId:call.id,name:call.name,argsHash:sha(JSON.stringify(stable(call.arguments))),reply:recovered};
       }
       if(reply.callId!==call.id||reply.name!==call.name||reply.argsHash!==sha(JSON.stringify(stable(call.arguments)))||!reply.reply)throw new NativeSessionError('NATIVE_TOOL_UNKNOWN');
@@ -165,16 +166,12 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
       const envelope=decodeBridgeInput(input);
       if(containsSecret(envelope,apiKey))throw new NativeSessionError('AUTH');
       currentTurn=input;
-      // Replacing the same saved question is idempotent; earlier questions keep
-      // their own frozen context in Pi history. Safety/compaction edits still apply.
-      for(const entry of manager.buildSessionProjection().entries){
-        const source=entry.sourceEntry;
-        if(!entry.messages.length||source.type!=='custom_message'||source.details?.userEntryId!==spec.userEntryId)continue;
-        if(['learning-station-turn','learning-station-focus'].includes(source.customType)
-          ||source.customType==='learning-station-changes'&&!manager.getEntries().some(r=>r.type==='custom'&&r.customType==='learning-station-changes-request'&&r.data?.changesEntryId===source.id))bridge.exclude(source.id);
-      }
+      // User sends, not HTTP tool continuations, own transient bridge context.
+      // Preserve durable material receipts while retiring earlier turn declarations.
+      retireTurnContext(manager,bridge);
       const clock=envelope.currentTime??(timeContext?{referenceTime:timeContext.referenceTime,timeZone:timeContext.timeZone}:undefined);
       if(clock)bridge.message('current_time','本轮冻结时间与时区','learning-station-turn','referenceTime: '+clock.referenceTime+(clock.timeZone?'\ntimeZone: '+clock.timeZone:''));
+      if(envelope.exerciseSources)bridge.message('exercise_sources','本轮练习可引用来源（sourceIds 仅填写下列 sourceId，不得填写文件路径；清单不代表额外正文已读取）','learning-station-turn',envelope.exerciseSources);
       if(envelope.nativeReferences)bridge.message('references','用户本轮明确提供的引用及必要补充','learning-station-turn',envelope.nativeReferences);
       const inventory=await registerMaterialContext({manager,spec,loadChanges,envelope,bridge,containsSecret,apiKey,NativeSessionError});
       // The exploration entry marks the session origin: register on the opening

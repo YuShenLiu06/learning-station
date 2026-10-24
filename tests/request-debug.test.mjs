@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
-import {requestText,requestDiff,orderedSources,sourceContent,sourceReadingContent,sourceRole,sourceRound,isCurrentQuestion,sourcePresentation} from '../src/requestDebug.ts';
+import {requestText,requestDiff,orderedSources,sourceContent,sourceReadingContent,sourceRole,sourceRound,isCurrentQuestion,sourcePresentation,currentContextSources,currentContextSnapshot,completeContextSources} from '../src/requestDebug.ts';
 const record=(sequence,session,body,extra={})=>({sequence,identity:{sessionId:session},complete:true,body,...extra});
 test('actual captured JSON strings expose Focus, citations and Changes; diff never crosses sessions',()=>{
   const before=record(1,'s1',{messages:[{role:'user',content:JSON.stringify({focus:{body:'Focus A'},citationContext:'citation A',changes:'Changes A'})}]});
@@ -45,15 +45,31 @@ test('real settings component toggles capture and clears shown request after dis
   const React=await import('react');const {createRoot}=await import('react-dom/client');const {RequestDebugSettings}=await import(file.href);
   let copiedJson='';Object.defineProperty(dom.window.navigator,'clipboard',{configurable:true,value:{writeText:async text=>{copiedJson=text;}}});let enabled=false;const commands=[];const entries=[record(1,'s1',{messages:[{role:'user',content:'Focus A'}]}),record(2,'s1',{messages:[{role:'user',content:'Focus B'}]},{previousSequence:1})].map(r=>({...r,phase:'initial',status:'HTTP 200',time:'fixture',bodyBytes:100}));
   entries[1].registrations=[{key:'actual_provider',lifetime:'OneShot',position:'References',value:'registered line one\nregistered line two'+('\nSYNTHETIC_OFFSCREEN_TAIL'.repeat(1500))}];
-  entries[1].sources=[{path:['messages',0,'content'],origin:'bridge',name:'learning-station-material',sourcePath:'native/fixture/material'}];
+  entries[1].identity.runId='current-run';
+  entries[1].sources=[{path:['messages',0,'content'],origin:'bridge',name:'learning-station-material',registrationKey:'focus',runId:'current-run',sourcePath:'native/fixture/material'}];
+  entries[1].body.system='cwd rules\nproject rules';
+  entries[1].body.messages.push({role:'user',content:'part A\npart B'});
+  entries[1].sources.push(
+    {path:['system'],start:0,end:9,origin:'pi',name:'cwd',sourcePath:'system.sections/cwd'},
+    {path:['system'],start:10,end:23,origin:'pi',name:'project_context',sourcePath:'system.sections/project_context'},
+    {path:['messages',1,'content'],start:0,end:6,origin:'pi',name:'message-first',sourcePath:'native/message/first'},
+    {path:['messages',1,'content'],start:7,end:13,origin:'unknown',name:'message-second',sourcePath:'native/message/second'});
   globalThis.debugTestCall=async(command,args)=>{commands.push([command,args]);if(command==='request_debug_decode')return {complete:true,finalProjection:{entries:[{content:'Focus B'}]}};if(command==='request_debug_export')return {path:'/fixture/context-bridge.json',complete:true};if(command==='request_debug_set')enabled=args.enabled;return {enabled,records:enabled?entries:[],dropped:0};};
   const root=createRoot(document.getElementById('root'));
   try{
     await React.act(async()=>root.render(React.createElement(RequestDebugSettings)));
     assert.equal(document.querySelector('input').checked,false);assert.match(document.body.textContent,/已关闭，不采集/);
-    await React.act(async()=>document.querySelector('input').click());assert.equal(enabled,true);assert.match(document.body.textContent,/导出解码 JSON/);await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent==='导出解码 JSON').click());assert.match(document.body.textContent,/已导出.*context-bridge.json/);assert.deepEqual(commands.find(([command])=>command==='request_debug_export')[1],{sequence:2});await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent==='上下文').click());assert.match(document.querySelector('pre').textContent,/Focus B/);
+    await React.act(async()=>document.querySelector('input').click());assert.equal(enabled,true);assert.match(document.body.textContent,/导出解码 JSON/);await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent==='导出解码 JSON').click());assert.match(document.body.textContent,/已导出.*context-bridge.json/);assert.deepEqual(commands.find(([command])=>command==='request_debug_export')[1],{sequence:2});await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent==='本轮新增上下文').click());assert.match(document.body.textContent,/Focus B/);
     await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent==='与上次差异').click());assert.match(document.querySelector('pre').textContent,/- Focus A/);
-    await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent==='来源').click());assert.doesNotMatch(document.body.textContent,/actual_provider/);await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent.startsWith('展开冻结详情')).click());assert.match(document.body.textContent,/actual_provider/);assert.match(document.body.textContent,/OneShot/);assert.match(document.body.textContent,/registered line one/);const snapshotToolbar=document.querySelector('[aria-label="内部注册快照操作"]');await React.act(async()=>[...snapshotToolbar.querySelectorAll('button')].find(b=>b.textContent==='全部折叠').click());await React.act(async()=>[...snapshotToolbar.querySelectorAll('button')].find(b=>b.textContent==='复制完整 JSON').click());assert.deepEqual(JSON.parse(copiedJson),entries[1].registrations);assert.match(copiedJson,/SYNTHETIC_OFFSCREEN_TAIL/);assert.match(document.body.textContent,/learning-station-material/);await React.act(async()=>document.querySelector('[aria-label="请求 #1"]').click());await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent==='导出解码 JSON').click());assert.deepEqual(commands.filter(([command])=>command==='request_debug_export').at(-1)[1],{sequence:1});
+    await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent==='完整上下文').click());const systemSources=document.querySelector('[aria-label="来源定位 · system"]');
+    assert.ok(systemSources);assert.equal(systemSources.open,false);await React.act(async()=>systemSources.querySelector('summary').click());assert.equal(systemSources.open,true);
+    assert.match(systemSources.textContent,/system.sections\/cwd/);assert.match(systemSources.textContent,/system.sections\/project_context/);
+    assert.equal(systemSources.querySelectorAll('.debug-source-row').length,2);
+    assert.match(systemSources.parentElement.textContent,/cwd rules\nproject rules/,'the complete system text remains available');
+    const messageSources=document.querySelector('[aria-label="来源定位 · messages/1"]');assert.ok(messageSources);
+    assert.match(messageSources.textContent,/native\/message\/first/);assert.match(messageSources.textContent,/native\/message\/second/);
+    assert.equal(messageSources.querySelectorAll('.debug-source-row').length,2);
+    assert.doesNotMatch(document.body.textContent,/actual_provider/);await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent.startsWith('展开冻结详情')).click());assert.match(document.body.textContent,/actual_provider/);assert.match(document.body.textContent,/OneShot/);assert.match(document.body.textContent,/registered line one/);const snapshotToolbar=document.querySelector('[aria-label="内部注册快照操作"]');await React.act(async()=>[...snapshotToolbar.querySelectorAll('button')].find(b=>b.textContent==='全部折叠').click());await React.act(async()=>[...snapshotToolbar.querySelectorAll('button')].find(b=>b.textContent==='复制完整 JSON').click());assert.deepEqual(JSON.parse(copiedJson),entries[1].registrations);assert.match(copiedJson,/SYNTHETIC_OFFSCREEN_TAIL/);assert.match(document.body.textContent,/focus/);await React.act(async()=>document.querySelector('[aria-label="请求 #1"]').click());await React.act(async()=>[...document.querySelectorAll('button')].find(b=>b.textContent==='导出解码 JSON').click());assert.deepEqual(commands.filter(([command])=>command==='request_debug_export').at(-1)[1],{sequence:1});
     await React.act(async()=>document.querySelector('input').click());assert.equal(enabled,false);assert.equal(document.querySelector('pre'),null);assert.doesNotMatch(document.body.textContent,/Focus [AB]/);assert.ok(commands.some(([command])=>command==='request_debug_set'));
   }finally{await React.act(async()=>root.unmount());delete globalThis.debugTestCall;await unlink(file);await unlink(new URL(file.href.replace(/\.mjs$/,'.css'))).catch(()=>{});dom.window.close();}
 });
@@ -97,4 +113,24 @@ test('Focus reader preserves the merged wire with course changes without decodin
  const f=sourcePresentation(r,{path:['messages',0,'content'],origin:'bridge',name:'learning-station-focus',registrationKey:'focus'});
  assert.equal(f.sections[0].text,focus);assert.equal(f.sections[0].format,'text');assert.equal(JSON.stringify(r),original);
  assert.ok(f.sections[0].text.endsWith('code: \\n'));
+});
+
+test('current additions exclude retained history, unknown owners and native questions; continuation keeps user round',()=>{
+ const sources=[
+  {origin:'bridge',registrationKey:'focus',userEntryId:'previous',runId:'old'},
+  {origin:'bridge',registrationKey:'focus',userEntryId:'current',runId:'original-run'},
+  {origin:'bridge',registrationKey:'current_time',runId:'retry-run'},
+  {origin:'bridge',registrationKey:'focus'},
+  {origin:'bridge',userEntryId:'current'},
+  {origin:'user',registrationKey:'question',userEntryId:'current'},
+  {origin:'pi',name:'compactionSummary'},
+ ].map((source,index)=>({...source,name:source.name??'fixture',path:['messages',index,'content']}));
+ const r=record(8,'s',{system:'rules',messages:sources.map((_,i)=>({role:'user',content:'text '+i})).concat([{role:'assistant',content:null,tool_calls:[{id:'call',function:{arguments:'{}'}}]},{role:'tool',tool_call_id:'call',content:'result'}])},{identity:{sessionId:'s',runId:'retry-run',userEntryId:'current'},phase:'tool_continuation',sources});
+ assert.deepEqual(currentContextSources(r),[sources[1],sources[2]]);
+ assert.deepEqual(currentContextSnapshot(r).map(s=>s.value),['text 1','text 2']);
+ const complete=completeContextSources(r);
+ assert.equal(complete.length,10);assert.match(sourceContent(r,complete[8]),/tool_calls/);assert.match(sourceContent(r,complete[9]),/tool_call_id/);
+ assert.match(complete[7].name,/compactionSummary/);
+ assert.deepEqual(currentContextSources({...r,sources:undefined}),[]);
+ assert.equal(completeContextSources({...r,sources:undefined}).length,10);
 });

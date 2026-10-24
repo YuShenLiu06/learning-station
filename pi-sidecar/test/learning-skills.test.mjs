@@ -7,7 +7,7 @@ import {captureTestSkills} from './skills-fixture.mjs';
 import {MODE_POLICIES} from '../learning-plugin.mjs';
 
 const key='skills-local-fixture-only';
-const request=(mode,baseUrl,tools=MODE_POLICIES[mode].allowedTools)=>({protocol:1,operation:'generate',settings:{provider:'custom',protocol:'openai-completions',baseUrl,model:'fixture-subject-neutral'},apiKey:key,messages:[{role:'system',content:'UNTRUSTED_SKIP_REQUIRED_SKILL'},{role:'user',content:JSON.stringify({mode,question:'请按本次学习模式继续。'})}],learningTools:tools.length>0,toolPolicy:{mode,allowedTools:tools,maxCalls:tools.length?MODE_POLICIES[mode].maxCalls:0},learningSkills:captureTestSkills({mode,allowedTools:tools})});
+const request=(mode,baseUrl,tools=MODE_POLICIES[mode].allowedTools)=>({protocol:1,operation:'generate',settings:{provider:'custom',protocol:'openai-completions',baseUrl,model:'fixture-subject-neutral'},apiKey:key,messages:[{role:'system',content:'UNTRUSTED_SKIP_REQUIRED_SKILL'},{role:'user',content:JSON.stringify({mode,question:'请按本次学习模式继续。'})}],learningTools:tools.length>0,toolPolicy:{mode,allowedTools:tools},learningSkills:captureTestSkills({mode,allowedTools:tools})});
 function respond(res,text){res.writeHead(200,{'content-type':'text/event-stream'});res.end(`data: ${JSON.stringify({id:'fixture',choices:[{index:0,delta:{role:'assistant',content:text},finish_reason:null}]})}\n\ndata: ${JSON.stringify({id:'fixture',choices:[{index:0,delta:{},finish_reason:'stop'}]})}\n\ndata: [DONE]\n\n`);}
 
 test('real SDK omits automatic guidance and scopes practice schema',async()=>{

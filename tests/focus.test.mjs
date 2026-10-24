@@ -8,7 +8,7 @@ const dom = new JSDOM('<div id="root"></div>', {url:'http://127.0.0.1/',pretendT
 Object.assign(globalThis,{window:dom.window,document:dom.window.document,location:dom.window.location,isTauri:true,IS_REACT_ACT_ENVIRONMENT:true,requestAnimationFrame:dom.window.requestAnimationFrame.bind(dom.window),cancelAnimationFrame:dom.window.cancelAnimationFrame.bind(dom.window)});
 Object.defineProperty(globalThis,'navigator',{configurable:true,value:dom.window.navigator});
 for(const name of ['Window','Range','HTMLElement','HTMLInputElement','HTMLSelectElement','HTMLTextAreaElement','Element','Node','Event','MouseEvent','KeyboardEvent','MutationObserver','DOMRect'])globalThis[name]=dom.window[name];
-globalThis.getComputedStyle=dom.window.getComputedStyle.bind(dom.window);globalThis.ResizeObserver=class{observe(){}unobserve(){}disconnect(){}};Range.prototype.getClientRects=()=>[];Range.prototype.getBoundingClientRect=()=>new DOMRect();
+globalThis.getComputedStyle=dom.window.getComputedStyle.bind(dom.window);globalThis.ResizeObserver=class{observe(){}unobserve(){}disconnect(){}};HTMLElement.prototype.scrollIntoView=()=>{};Range.prototype.getClientRects=()=>[];Range.prototype.getBoundingClientRect=()=>new DOMRect();
 const file=new URL(`./.focus-${process.pid}.mjs`,import.meta.url);
 await build({stdin:{contents:`export {App} from './src/App';export {captureFocus,readFocus} from './src/focus';export {sessionMessages} from './src/sessionMessages';export {freezeRequestedContext,readRequestedContext} from './src/requestedContext';export {mergeOutgoing} from './src/outgoingMessages';`,resolveDir:process.cwd(),loader:'tsx'},outfile:file.pathname,bundle:true,packages:'external',platform:'node',format:'esm',jsx:'automatic',define:{'import.meta.env.DEV':'false'}});
 const React=await import('react'),{createRoot}=await import('react-dom/client'),ui=await import(file.href),{mockIPC,mockWindows,clearMocks}=await import('@tauri-apps/api/mocks');
@@ -44,17 +44,31 @@ test('actual React/native path keeps the original Focus through page switch, can
  docs.set('exercise_e',{id:'exercise_e',path:'exercises/exercise_e.md',metadata:{id:'exercise_e',kind:'exercise',title:'E练习',parentId:'note_a',originSessionId:'course_session',exerciseEntryId:'exercise_entry'},body:'# E练习',version:'v1'});
  const session={id:'course_session',courseId:'course_c',sectionId:'note_a',version:'s1',entries:[],contextManifest:[]};
  session.entries.push({id:'exercise_entry',kind:'exercise',content:'Q',data:{exercises:[{id:'q1',question:'First?',format:'exact',answers:['one']},{id:'q2',question:'Second?',format:'exact',answers:['two']}]}});
- const calls=[],runs=new Map();let active='note_a',freezeCount=0,runReads=0,rejectFreeze=true;
+ let releaseInitial;const initialLoad=new Promise(resolve=>{releaseInitial=resolve;});let firstRead=true,firstDraft=true;
+ let proposals=[{id:'initial_pending',courseId:'course_c',path:'documents/note_a.md',original:'原文😀',content:'首次加载中的建议',status:'pending'}];const calls=[],runs=new Map();let active='note_a',freezeCount=0,runReads=0,rejectFreeze=true,exercisePending=null,revision=0,draftReadFailure=false,recoveredDraft=null;
  mockWindows('focus-isolated-fixture');mockIPC(async(command,args={})=>{calls.push({command,args:clone(args)});switch(command){
   case 'get_app_state':return {root:'/tmp/focus-fixture',activeDocumentId:active,documents:[...docs.values()].map(d=>({id:d.id,title:d.metadata.title,kind:'section',path:d.path,version:d.version})),model:{configured:true,provider:'custom',protocol:'openai-completions',baseUrl:'http://127.0.0.1/mock',model:'fixture',usageGate:''}};
   case 'get_library_tree':return {nodes:[{id:'course_c',title:'C课程',kind:'course',path:'courses/course_c.md',version:'v1'},...[...docs.values()].map(d=>({id:d.id,title:d.metadata.title,kind:d.metadata.kind,parentId:d.metadata.parentId,courseId:'course_c',path:d.path,version:d.version}))],warnings:[]};
   case 'get_ui_preferences':return {fontSize:16,assistantWidth:346,sidebarWidth:240,sidebarCollapsed:false,expandedNodeIds:['course_c','note_a'],toolAuthorizationTier:'off'};
-  case 'save_ui_preferences':return args;case 'get_ui_draft':return null;case 'save_ui_draft':return {key:args.key,data:args.data,version:'draft',updatedAt:'fixture'};
+  case 'save_ui_preferences':return args;case 'get_ui_draft':if(args.key==='section:note_b'&&draftReadFailure)throw Error('Synthetic draft read failure');if(args.key==='section:note_b'&&recoveredDraft)return clone(recoveredDraft);if(args.key==='section:note_a'&&firstDraft){firstDraft=false;await initialLoad;}return args.key==='section:note_b'?{key:args.key,data:{body:'仍未保存的本机草稿'},version:'draft',updatedAt:'fixture'}:null;case 'save_ui_draft':return {key:args.key,data:args.data,version:'draft',updatedAt:'fixture'};
+  case 'edit_proposals':return exercisePending?[{id:exercisePending.id,stamp:exercisePending.id}]:proposals.filter(p=>p.courseId===args.courseId).map(p=>({id:p.id,stamp:'1'}));
+  case 'edit_proposal':return clone(exercisePending?.id===args.id?exercisePending:proposals.find(p=>p.id===args.id));
+  case 'list_course_files':return [];
+  case 'decide_edit_proposal':proposals=proposals.filter(p=>p.id!==args.id);return {persisted:false,status:'rejected'};
   case 'record_ui_metric':return null;case 'list_todos':case 'list_notifications':return [];
-  case 'open_document':active=args.id;return clone(docs.get(args.id));case 'start_session':return {session:clone(session)};case 'get_session':return clone(session);
+  case 'open_document':active=args.id;if(args.id==='note_a'&&firstRead){firstRead=false;await initialLoad;}return clone(docs.get(args.id));case 'start_session':return {session:clone(session)};case 'get_session':return clone(session);
   case 'get_exercise_document':return {session:clone(session)};
+  case 'decide_exercise_proposal':{
+   assert.equal(args.accept,true);const change=exercisePending.exercise.changes[0];
+   const doc=docs.get('exercise_e'),old=session.entries.find(e=>e.id===doc.metadata.exerciseEntryId);
+   const questions=old.data.exercises.flatMap(q=>q.id===change.before.id?(change.after?[change.after]:[]):[q]);
+   doc.metadata.exerciseEntryId='revision_'+(++revision);doc.version='v'+(revision+1);
+   session.entries.push({id:doc.metadata.exerciseEntryId,kind:'exercise',content:'revised',data:{exercises:questions}});
+   exercisePending=null;return{persisted:true,status:'accepted',complete:true,version:doc.version};
+  }
+
   case 'load_session_context':return {text:'',manifest:[],warnings:[],truncated:false};
-  case 'freeze_focus':{freezeCount++;if(rejectFreeze){rejectFreeze=false;throw {code:'CONTEXT_CONFLICT',message:'Synthetic preflight rejection'};}if(args.request.input.documentId==='exercise_e')return {...focus('exercise_e'),sourceDocumentId:'note_a',type:'exercise',view:args.request.input.view,paragraphs:[],exercise:{questionId:args.request.input.questionId||'q1',number:2,answered:false,graded:false}};assert.equal(args.request.input.documentId,'note_a');assert.equal(args.request.input.view,'read');return focus();}
+  case 'freeze_focus':{freezeCount++;if(rejectFreeze){rejectFreeze=false;throw {code:'CONTEXT_CONFLICT',message:'Synthetic preflight rejection'};}if(args.request.input.documentId==='exercise_e'){const questions=session.entries.find(e=>e.id===docs.get('exercise_e').metadata.exerciseEntryId).data.exercises;if(args.request.input.questionId&&!questions.some(q=>q.id===args.request.input.questionId))throw {code:'CONTEXT_CONFLICT',message:'题目已不属于当前版本'};return {...focus('exercise_e'),sourceDocumentId:'note_a',type:'exercise',view:args.request.input.view,paragraphs:[],exercise:{questionId:args.request.input.questionId||questions[0].id,number:1,answered:false,graded:false}};}assert.equal(args.request.input.documentId,'note_a');assert.equal(args.request.input.view,'read');return focus();}
   case 'append_entry':if(!session.entries.some(e=>e.data?.clientMessageId===args.entry.data.clientMessageId))session.entries.push({...clone(args.entry),id:'saved_user_'+session.entries.filter(e=>e.kind==='user').length});return clone(session);
   case 'start_generation':{const id='run_'+hash(args.requestId).slice(0,32);const run={id,sessionId:session.id,userEntryId:args.userEntryId,status:runs.size?'succeeded':'running',content:'A的回复',contextSnapshotVersion:1,contextManifest:[],focus:clone(args.focus)};runs.set(id,run);if(run.status==='succeeded')session.entries.push({id:'reply_'+id,kind:'assistant',content:run.content,data:{runId:id,focus:clone(args.focus),contextManifest:[]}});return {};}
   case 'get_run':runReads++;return clone(runs.get(args.runId));
@@ -63,7 +77,18 @@ test('actual React/native path keeps the original Focus through page switch, can
  }},{shouldMockEvents:true});
  const root=createRoot(document.getElementById('root'));
  try{
-  await React.act(async()=>root.render(React.createElement(ui.App)));await wait(()=>document.querySelector('[aria-label="向学习助手提问"]')?.disabled===false);
+  await React.act(async()=>root.render(React.createElement(ui.App)));
+  await wait(()=>document.querySelector('.review-file-link'));
+  assert.equal(document.querySelector('.document-title-row h1'),null,'initial body and draft are still loading');
+  await click(document.querySelector('.review-file-link'));
+  await wait(()=>document.querySelector('.inline-edit-review')?.textContent.includes('首次加载中的建议'));
+  assert.equal(document.querySelector('.document-title-row h1').textContent,'A笔记');
+  assert.equal(calls.filter(c=>c.command==='open_document').length,2,'pending navigation restarts an uncommitted initial read');
+  assert.equal(calls.filter(c=>c.command==='get_ui_draft'&&c.args.key==='section:note_a').length,2,'pending navigation loads the draft before showing review');
+  await React.act(async()=>releaseInitial());
+  assert.match(document.querySelector('.inline-edit-review').textContent,/首次加载中的建议/);
+  await click(button('拒绝'));await wait(()=>!document.querySelector('.review-file-link'));
+  await wait(()=>document.querySelector('[aria-label="向学习助手提问"]')?.disabled===false);
   const textarea=document.querySelector('[aria-label="向学习助手提问"]');await React.act(async()=>{Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(textarea,'解释A');textarea.dispatchEvent(new Event('input',{bubbles:true}));});
   await click(document.querySelector('[aria-label="发送问题"]'));await wait(()=>button('重试保存并生成'));assert.equal(document.querySelector('[aria-label="向学习助手提问"]').value,'解释A','preflight rejection retains the draft');await click(button('重试保存并生成'));await wait(()=>calls.some(c=>c.command==='start_generation'));
   await click([...document.querySelectorAll('.tree-row')].find(el=>el.title==='B笔记'));await wait(()=>document.querySelector('.document-title-row h1')?.textContent==='B笔记');
@@ -77,10 +102,104 @@ test('actual React/native path keeps the original Focus through page switch, can
   assert.match(document.querySelector('.message.assistant .context-sources').textContent,/documents\/note_a.md/);assert.equal(document.querySelector('.document-title-row h1').textContent,'B笔记');
   await click([...document.querySelectorAll('.tree-row')].find(el=>el.title==='E练习'));await wait(()=>document.querySelectorAll('.exercise-card').length===2);
   await React.act(async()=>document.querySelectorAll('.exercise-card textarea')[1].focus());
-  async function sendAgain(){const box=document.querySelector('[aria-label="向学习助手提问"]');await React.act(async()=>{Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(box,'当前题');box.dispatchEvent(new Event('input',{bubbles:true}));});await click(document.querySelector('[aria-label="发送问题"]'));await wait(()=>!document.querySelector('.generating'));}
+  async function sendAgain(){const startsBefore=calls.filter(c=>c.command==='start_generation').length;const box=document.querySelector('[aria-label="向学习助手提问"]');await React.act(async()=>{Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(box,'当前题');box.dispatchEvent(new Event('input',{bubbles:true}));});await click(document.querySelector('[aria-label="发送问题"]'));await wait(()=>calls.filter(c=>c.command==='start_generation').length===startsBefore+1&&!document.querySelector('.generating'));}
   await sendAgain();let frozenCall=calls.filter(c=>c.command==='freeze_focus').at(-1).args.request.input;assert.equal(frozenCall.questionId,'q2');assert.equal(frozenCall.view,'exercise');
   await click(button('编辑 Markdown'));await wait(()=>document.querySelector('[aria-label="编辑小节正文"]'));
   await sendAgain();frozenCall=calls.filter(c=>c.command==='freeze_focus').at(-1).args.request.input;assert.equal(frozenCall.view,'edit');assert.equal(frozenCall.questionId,'q2');
+  async function proposeAndAccept(questionId,after){
+   const questions=session.entries.find(e=>e.id===docs.get('exercise_e').metadata.exerciseEntryId).data.exercises;
+   exercisePending={id:'proposal_'+revision,courseId:'course_c',path:'documents/exercise_e.md',original:JSON.stringify({exercises:questions}),content:'structured proposal',status:'pending',exercise:{documentId:'exercise_e',version:docs.get('exercise_e').version,changes:[{id:questionId,before:clone(questions.find(q=>q.id===questionId)),after,status:'pending'}]}};
+   await wait(()=>button('查看题目差异'));await click(button('查看题目差异'));
+   await wait(()=>button(after?'接受此题修改':'接受删除题目'));await click(button(after?'接受此题修改':'接受删除题目'));
+   await wait(()=>!document.querySelector('.review-dock')&&document.querySelectorAll('.exercise-card').length===(after?questions.length:questions.length-1));
+  }
+  for(const [id,after,focusIndex,expectedFocus] of [['q2',{id:'q3',question:'Revised second?',format:'exact',answers:['three']},1,undefined],['q3',{id:'q4',question:'Another revision?',format:'exact',answers:['four']},0,'q1'],['q4',null,1,undefined]]){
+   if(id!=='q2'){
+    await click(button('做题'));await wait(()=>document.querySelectorAll('.exercise-card').length===2);
+    await React.act(async()=>document.querySelectorAll('.exercise-card textarea')[focusIndex].focus());
+    await click(button('编辑 Markdown'));await wait(()=>document.querySelector('[aria-label="编辑小节正文"]'));
+   }
+   await proposeAndAccept(id,after);
+   await sendAgain();frozenCall=calls.filter(c=>c.command==='freeze_focus').at(-1).args.request.input;
+   assert.equal(frozenCall.view,'exercise');assert.equal(frozenCall.questionId,expectedFocus,'only a question in the current entry may remain focused');
+   await click(button('编辑 Markdown'));await wait(()=>document.querySelector('[aria-label="编辑小节正文"]'));
+   await sendAgain();frozenCall=calls.filter(c=>c.command==='freeze_focus').at(-1).args.request.input;
+   assert.equal(frozenCall.view,'edit');assert.equal(frozenCall.questionId,expectedFocus,'edit view must preserve valid focus and omit stale focus');
+  }
+  // The remaining current question can still be explicitly focused.
+  await click(button('做题'));await wait(()=>document.querySelectorAll('.exercise-card').length===1);
+  await React.act(async()=>document.querySelector('.exercise-card textarea').focus());
+  await sendAgain();assert.equal(calls.filter(c=>c.command==='freeze_focus').at(-1).args.request.input.questionId,'q1');
+  await click([...document.querySelectorAll('.tree-row')].find(el=>el.title==='B笔记'));
+  await click(button('编辑'));await wait(()=>document.querySelector('.document-editor:not([hidden]) [aria-label="编辑小节正文"]'));
+  // Real App routing: a proposal arriving while CodeMirror is open is reachable
+  // from the course sidebar, including two proposals for the same document.
+  assert.equal(document.querySelector('[aria-label="文件变更审批"]'),null);
+  proposals=[{id:'first',courseId:'course_c',path:'documents/note_b.md',original:'原文😀\n\n尾段',content:'# First proposal',status:'pending'}, {id:'second',courseId:'course_c',path:'documents/note_b.md',original:'原文😀\n\n尾段',content:'# Second proposal',status:'pending'}];
+  await wait(()=>document.querySelectorAll('.course-sidebar-panel .review-file-link').length===2);
+  assert.match(document.querySelector('[aria-label="文件变更审批"]').textContent,/文件变更审批 · 2/);
+  assert.equal(document.querySelectorAll('.assistant-panel .review-file-link').length,0);
+  for(const row of document.querySelectorAll('.review-file-link')){assert.ok(row.classList.contains('tree-row'));assert.ok(row.querySelector('.tree-title'));assert.match(row.getAttribute('aria-label'),/修改待确认/);assert.equal(row.querySelector('small'),null);assert.equal(row.querySelectorAll('svg').length,1);}
+  // The library selector only changes the tree presentation, not the active course's approvals.
+  await React.act(async()=>{const select=document.querySelector('[aria-label="切换课程"]');Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set.call(select,'');select.dispatchEvent(new Event('change',{bubbles:true}));});
+  assert.equal(document.querySelector('[aria-label="切换课程"]').value,'');
+  assert.equal(document.querySelectorAll('.course-sidebar-panel .review-file-link').length,2);
+  const groupToggle=document.querySelector('[aria-label="文件变更审批"] .course-group-heading');
+  await click(groupToggle);assert.equal(groupToggle.getAttribute('aria-expanded'),'false');
+  assert.equal(groupToggle.nextElementSibling.hidden,true);await click(groupToggle);
+  const countBefore=calls.length;
+  await click(document.querySelectorAll('.course-sidebar-panel .review-file-link')[1]);
+  assert.equal(document.querySelector('.document-editor:not([hidden])'),null);
+  assert.match(document.querySelector('.inline-edit-review').textContent,/Second proposal/);
+  assert.equal(button('接受').disabled,true,'unsaved draft prevents acceptance');
+  assert.match(document.querySelector('[aria-label="文件变更审批"]').textContent,/B笔记/);
+  assert.equal(calls.slice(countBefore).some(c=>['open_document','save_document','decide_edit_proposal'].includes(c.command)),false,'locating the current document neither reloads nor saves/accepts it');
+  assert.match(document.querySelector('.toolbar-hint').textContent,/审阅修改/);
+  await click([...document.querySelectorAll('.tree-row')].find(el=>el.title==='A笔记'));
+  await wait(()=>document.querySelector('.document-title-row h1')?.textContent==='A笔记');
+  const beforeCross=calls.filter(c=>c.command==='open_document').length;
+  await click(document.querySelectorAll('.course-sidebar-panel .review-file-link')[1]);
+  assert.equal(document.querySelector('.document-title-row h1').textContent,'B笔记');
+  assert.match(document.querySelector('.inline-edit-review').textContent,/Second proposal/);
+  assert.equal(calls.filter(c=>c.command==='open_document').length,beforeCross+1,'cross-document review verifies once and reuses the result');
+  assert.equal(button('接受').disabled,true,'cross-document navigation retains the existing local draft');
+  await click(button('拒绝'));assert.equal(calls.filter(c=>c.command==='decide_edit_proposal').at(-1).args.id,'second');
+  await click(button('拒绝'));assert.equal(document.querySelector('[aria-label="文件变更审批"]'),null);
+  await click(button('编辑'));assert.match(document.querySelector('.document-editor:not([hidden])').textContent,/仍未保存的本机草稿/);
+  assert.equal(calls.slice(countBefore).some(c=>c.command==='save_document'),false);
+  // Reopening a pending proposal after a failed initial draft read must not
+  // silently replace either the local edit or the stored body/question.
+  for (const useSaved of [true,false]) {
+   proposals=[];active='note_b';draftReadFailure=true;
+   recoveredDraft={key:'section:note_b',data:{body:'找回的正文',question:'找回的问题'},version:'old',updatedAt:'fixture'};
+   await React.act(async()=>root.render(null));await React.act(async()=>root.render(React.createElement(ui.App)));
+   await wait(()=>button('重试读取原草稿'));
+   await wait(()=>document.querySelector('[aria-label="向学习助手提问"]')?.disabled===false);await tick(30);
+   await click(button('编辑'));await wait(()=>document.querySelector('.document-editor:not([hidden]) .cm-editor'));
+   const {EditorView}=await import('@codemirror/view');
+   await React.act(async()=>{const view=EditorView.findFromDOM(document.querySelector('.document-editor:not([hidden]) .cm-editor'));view.dispatch({changes:{from:0,to:view.state.doc.length,insert:'窗口里的正文'}});});
+   await React.act(async()=>{const box=document.querySelector('[aria-label="向学习助手提问"]');Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(box,'窗口里的问题');box.dispatchEvent(new Event('input',{bubbles:true}));});
+   await click([...document.querySelectorAll('.tree-row')].find(el=>el.title==='A笔记'));
+   draftReadFailure=false;
+   proposals=[{id:'recovery',courseId:'course_c',path:'documents/note_b.md',original:docs.get('note_b').body,content:'恢复时的建议',status:'pending'}];
+   await wait(()=>document.querySelector('.review-file-link'));
+   const beforeRecovery=calls.length;
+   await click(document.querySelector('.review-file-link'));
+   await tick(750);
+   assert.ok(button('使用找回的草稿'),'different recovered input requires an explicit choice');
+   assert.equal(calls.slice(beforeRecovery).some(c=>c.command==='save_ui_draft'&&c.args.key==='section:note_b'),false,'no automatic overwrite while the choice is unresolved');
+   const dialog=document.querySelector('[role="dialog"]');
+   for(const text of ['窗口里的正文','找回的正文','找回的问题'])assert.ok(dialog.textContent.includes(text),text+': '+dialog.textContent);
+   await click(button(useSaved?'使用找回的草稿':'保留当前输入并备份'));
+   await wait(()=>!button('使用找回的草稿'));await tick(750);
+   assert.equal(document.querySelector('[aria-label="向学习助手提问"]').value,'窗口里的问题','course chat input stays independent');
+   assert.equal(!!button('恢复到当前对话'),useSaved,'recovered section question is available through the existing restore control');
+   if(useSaved)assert.ok(button('恢复到当前对话').parentElement.textContent.includes('找回的问题'));
+   const writes=calls.slice(beforeRecovery).filter(c=>c.command==='save_ui_draft'&&c.args.key==='section:note_b');
+   assert.ok(writes.length);assert.deepEqual(writes.at(-1).args.data,useSaved?recoveredDraft.data:{body:'窗口里的正文',question:''});
+  }
+
+
 
  }finally{await React.act(async()=>root.unmount());clearMocks();}
 });

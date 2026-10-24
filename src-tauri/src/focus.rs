@@ -137,7 +137,9 @@ pub fn freeze(core: &mut Core, request: FreezeRequest) -> Result<Focus> {
                     let graded = attempt.is_some_and(|a| origin.session.entries.iter().any(|e| e.kind == "feedback" && e.data.as_ref().is_some_and(|d| d["attemptId"] == a.id)));
                     focus.exercise = Some(json!({"questionId":id,"number":number+1,"answered":attempt.is_some(),"graded":graded}));
                 }
-                // The editable exercise contains reference answers; never automatic body or read authority.
+                // Only the explicit edit view reveals answers and authorizes this one structured document.
+                // Exercise view never grants full-answer read authority or automatic body.
+                if i.view == "edit" { catalog.push(ManifestItem { id:document.id.clone(), path:document.path.clone(), version:document.version.clone(), included_chars:0 }); }
             } else if let Some(asset_id) = &i.asset_id {
                 if i.view != "asset" { return Err(conflict()); }
                 let asset = inventory.iter().find(|a| &a.id == asset_id).ok_or_else(conflict)?;
@@ -517,6 +519,13 @@ mod tests {
         let f = freeze(&mut c, r).unwrap(); assert_eq!(f.exercise.as_ref().unwrap()["number"], 1); assert_eq!(f.exercise.as_ref().unwrap()["answered"], false); assert!(f.paragraphs.is_empty());
         let session = crate::sessions::get(&mut c.content, &sid).unwrap(); let ctx = load(&mut c, &session, &f).unwrap().context;
         assert!(!serde_json::to_string(&f).unwrap().contains("HIDDEN_SECRET")); assert!(!ctx.text.contains("HIDDEN_SECRET"));
+        assert!(!load(&mut c, &session, &f).unwrap().course_read_manifest.unwrap().iter().any(|m|m.id==exercise.document.id));
+        let mut edit = request(&c, &sid, &exercise.document.id); edit.input.view = "edit".into(); edit.input.ranges.clear();
+        let edit_focus = freeze(&mut c, edit).unwrap();
+        let editable = load(&mut c, &session, &edit_focus).unwrap();
+        assert!(editable.course_read_manifest.unwrap().iter().any(|m|m.id==exercise.document.id));
+        assert!(!editable.context.text.contains("HIDDEN_SECRET"));
+
     }
     #[test]
     fn ignored_ranges_foreign_courses_and_tampered_snapshots_fail_closed() {

@@ -319,6 +319,25 @@ impl ContentStore {
 
     /// Saves only if the current bytes still match the version read by the editor.
     pub fn save(&mut self, id: &str, content: &str, expected_version: &str) -> Result<Document> {
+        self.save_inner(id, content, expected_version, None)
+    }
+    pub(crate) fn save_course_tool(
+        &mut self,
+        id: &str,
+        content: &str,
+        expected_version: &str,
+        operation: &str,
+    ) -> Result<Document> {
+        self.save_inner(id, content, expected_version, Some(operation))
+    }
+
+    fn save_inner(
+        &mut self,
+        id: &str,
+        content: &str,
+        expected_version: &str,
+        operation: Option<&str>,
+    ) -> Result<Document> {
         let current = self.read(id)?;
         if current.version != expected_version {
             return Err(conflict());
@@ -371,8 +390,24 @@ impl ContentStore {
             .ok_or_else(|| CoreError::new("LIMIT_EXCEEDED", "文档版本号已达上限"))?;
         let content = serialize(&metadata, &body)?;
         let target = self.checked_path(&current.path, false)?;
-        self.atomic_write(&target, &content, Some(expected_version))?;
-        self.register(&current.path)
+        if let Some(operation) = operation {
+            self.snapshot(&current)?;
+            crate::course_write_transaction::publish(
+                &self.root,
+                &current.path,
+                Some(current.content.as_bytes()),
+                content.as_bytes(),
+                operation,
+            )?;
+            let saved = self.register(&current.path)?;
+            if saved.content != content {
+                return Err(conflict());
+            }
+            Ok(saved)
+        } else {
+            self.atomic_write(&target, &content, Some(expected_version))?;
+            self.register(&current.path)
+        }
     }
 
     /// Registers a file written by another local subsystem without scanning the library.
