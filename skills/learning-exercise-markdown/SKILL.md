@@ -68,7 +68,7 @@ description: 说明学习站练习题的本地 Markdown 格式，以及生成、
 
 1. 请用户先在当前练习切到“编辑 Markdown”视图，再发送修改要求。做题视图的聚焦本身不授予完整题集和参考答案读取权限；不要代替用户扩大授权。通过当前授权的练习文档地址读取，例如 `documents/<exerciseDocumentId>.md`。这是工具地址，不是把本地文件从 `exercises/` 移到课程目录；不得自行拼接其他课程的 ID。
 2. 练习专用读取返回 `version` 和 `content`；`content` 是结构化题集的 JSON 字符串，不是上述导出 Markdown。先解析实际读回结果，保留不打算修改的题目及字段。
-3. `write.content` 使用同样的题集结构：顶层只有 `exercises`。`write.expectedVersion` 使用本次读取的版本，不猜测、不沿用旧回合版本。
+3. `write.content` 必须是题集对象序列化后的 JSON 字符串（例如 `JSON.stringify` 的结果），不是对象；解析后顶层只有 `exercises`。`write.expectedVersion` 使用本次读取的版本，不猜测、不沿用旧回合版本。
 4. 保留已有题目的 `id` 表示原题不变或提出修改；新增题目省略 `id`；删除题目从题集数组中省略。不能伪造其他题目 ID。变更题与新增题的最终 ID 由程序生成，未变题保留原 ID。
 5. 等待逐题审阅。每题的题干、选项、答案、解析和量表作为一个整体接受或拒绝。待审阅不等于已保存；只报告回执已确认的结果。
 
