@@ -600,9 +600,11 @@ export function App() {
   function focusInput(): FocusInput | undefined {
     // 聚焦＝用户当前正在看的文章，覆盖所有会话类型：课程会话维持课程一致；无课程会话（含探索）只要打开的是普通/探索文档即冻结，练习页不产生无课程聚焦。
     if (!current || isContainer || (session.courseId ? courseId !== session.courseId : current.section.kind === 'exercise')) return;
-    const input = captureFocus(activeId, current.body, current.body === current.savedBody ? current.section.version : undefined, focusedAsset?.asset.courseId === courseId ? 'asset' : editing ? 'edit' : current.section.kind === 'exercise' ? 'exercise' : 'read', focusedAsset?.asset.courseId === courseId ? focusedAsset.asset.id : undefined, exerciseFocus.current?.documentId === activeId ? exerciseFocus.current.questionId : undefined);
-    if (current.section.kind === 'exercise' && exerciseFocus.current?.documentId === activeId) input.questionId = exerciseFocus.current.questionId;
-    return input;
+    // Accepted revisions keep historical questions in the session. Only the current
+    // page's entry can supply a question focus, including while editing Markdown.
+    const focusedQuestion = exerciseFocus.current?.documentId === activeId ? exerciseFocus.current.questionId : undefined;
+    const questionId = current.section.kind === 'exercise' && session.exercises.some(exercise => exercise.id === focusedQuestion && (!current.section.exerciseEntryId || exercise.entryId === current.section.exerciseEntryId)) ? focusedQuestion : undefined;
+    return captureFocus(activeId, current.body, current.body === current.savedBody ? current.section.version : undefined, focusedAsset?.asset.courseId === courseId ? 'asset' : editing ? 'edit' : current.section.kind === 'exercise' ? 'exercise' : 'read', focusedAsset?.asset.courseId === courseId ? focusedAsset.asset.id : undefined, questionId);
   }
   async function freezeFocus(input: FocusInput, target: string, selection: string, injections: ContextInjection[], assistantReferences: AssistantReference[], exerciseReferences: ExerciseReference[]): Promise<FocusSnapshot> {
     await prepareSource(input.documentId);
