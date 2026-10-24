@@ -1,4 +1,4 @@
-.app-shell{--left:calc(62px + clamp(180px,var(--sidebar-width,240px),480px))}
+.app-shell{--sidebar-right-space:clamp(280px,var(--assistant-width,346px),max(280px,calc(100vw - 242px - 350px)));--left:calc(62px + clamp(180px,var(--sidebar-width,240px),min(480px,max(180px,calc(100vw - 412px - var(--sidebar-right-space))))))}
 .app-shell.sidebar-collapsed{--left:62px}
 .app-shell .workspace-sidebar{padding:0;display:flex;flex-direction:row;position:relative;visibility:visible;width:auto;overflow:visible}
 .workspace-rail{width:62px;flex:none;display:flex;flex-direction:column;align-items:center;gap:9px;padding:16px 5px 12px;border-right:1px solid var(--line)}
@@ -8,7 +8,7 @@
 .course-sidebar-panel{min-width:0;flex:1;display:flex;flex-direction:column;position:relative;overflow:hidden;padding:12px 10px}
 .course-sidebar-panel[hidden]{display:none}.course-sidebar-heading{display:flex;align-items:center;gap:4px;margin:3px 0 15px}
 .course-sidebar-heading select{width:100%;min-width:0;font-weight:600;font-size:15px;background:transparent;color:var(--ink);border:0;padding:5px}.course-sidebar-heading button{padding:7px}
-.course-create-menu{display:flex;flex-direction:column;border:1px solid var(--line);border-radius:6px;padding:4px;margin-bottom:10px}.course-create-menu button{justify-content:flex-start;padding:8px}
+.course-sidebar-panel .course-create-menu{position:static;top:auto;left:auto;right:auto;flex-shrink:0;display:flex;flex-direction:column;border:1px solid var(--line);border-radius:6px;padding:4px;margin-bottom:10px}.course-create-menu button{justify-content:flex-start;padding:8px}
 .course-sidebar-panel .sidebar-tree-body{min-height:0;overflow:auto;flex:1}.course-group-heading{width:100%;justify-content:flex-start;padding:13px 5px 8px;font-size:12px;color:var(--muted);border-top:1px solid var(--line);margin-top:10px}
 .course-session-tree .library-tree>.tree-row:first-child{display:none}.course-session-tree .tree-row{padding-left:5px}
 .course-file-tools{display:flex;align-items:center;justify-content:space-between;font-size:10px;color:var(--muted);padding:5px}.course-file-tools button{padding:4px}
