@@ -2,6 +2,9 @@
 //! receipt ledger and Bash cwd remain session-scoped.
 use super::*;
 use crate::app::Core;
+#[path = "course_workspace/text_review.rs"]
+mod text_review;
+pub(crate) use text_review::text_proposal_decide;
 
 #[cfg(test)]
 thread_local! {
@@ -299,6 +302,8 @@ struct Proposal {
     receipt: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     exercise: Option<crate::exercise_edits::Review>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text_review: Option<text_review::Review>,
 }
 
 fn proposal_path(core: &Core, course: &str, id: &str) -> Result<PathBuf> {
@@ -383,6 +388,7 @@ fn stage(
     };
     let p = Proposal {
         exercise,
+        text_review: None,
         id: id.into(),
         course_id: course.into(),
         session_id: scope.session_id.clone(),
@@ -401,6 +407,9 @@ fn stage(
     Ok(proposal_receipt(&p))
 }
 fn proposal_receipt(p: &Proposal) -> Value {
+    if p.receipt.is_none() {
+        if let Some(review) = &p.text_review { return review.progress(p); }
+    }
     p.receipt.clone().unwrap_or_else(|| json!({"persisted":false,"proposalPersisted":true,"proposalId":p.id,"courseId":p.course_id,"sessionId":p.session_id,"path":p.path,"status":p.status,"message":"建议已保留，正文未修改；等待用户决定，不得依赖建议内容继续执行。"}))
 }
 
@@ -439,9 +448,10 @@ pub(crate) fn proposal_list(engine: &crate::app::Engine, course: &str) -> Result
 pub(crate) fn proposal_get(engine: &crate::app::Engine, course: &str, id: &str) -> Result<Value> {
     let mut core = engine.lock()?;
     check_course(&mut core, course)?;
-    let p = read_proposal(&core, course, id)?;
+    let mut p = read_proposal(&core, course, id)?;
+    text_review::prepare(&core, &mut p)?;
     Ok(
-        json!({"id":p.id,"courseId":p.course_id,"path":p.path,"original":p.original,"content":p.content,"status":p.status,"expectedVersion":p.expected_version,"exercise":p.exercise}),
+        json!({"id":p.id,"courseId":p.course_id,"path":p.path,"original":p.original,"content":p.content,"status":p.status,"expectedVersion":p.expected_version,"exercise":p.exercise,"textReview":p.text_review.as_ref().map(|r| r.view(&p.original))}),
     )
 }
 pub(crate) fn proposal_result(engine: &crate::app::Engine, result: Value) -> Result<Value> {
@@ -491,6 +501,10 @@ pub(crate) fn proposal_decide(
     let mut core = engine.lock()?;
     check_course(&mut core, course_id)?;
     let mut p = read_proposal(&core, course_id, id)?;
+    if p.text_review.is_some() && p.status == "pending" {
+        drop(core); drop(_authorization);
+        return text_review::decide_all(engine, course_id, id, accept);
+    }
     if p.status != "pending" {
         if matches!(p.status.as_str(), "accepting" | "unknown") {
             let ledger = workspace_root(&core.state_dir, &p.session_id)

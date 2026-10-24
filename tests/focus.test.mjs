@@ -45,15 +45,24 @@ test('actual React/native path keeps the original Focus through page switch, can
  const session={id:'course_session',courseId:'course_c',sectionId:'note_a',version:'s1',entries:[],contextManifest:[]};
  session.entries.push({id:'exercise_entry',kind:'exercise',content:'Q',data:{exercises:[{id:'q1',question:'First?',format:'exact',answers:['one']},{id:'q2',question:'Second?',format:'exact',answers:['two']}]}});
  let releaseInitial;const initialLoad=new Promise(resolve=>{releaseInitial=resolve;});let firstRead=true,firstDraft=true;
- let proposals=[{id:'initial_pending',courseId:'course_c',path:'documents/note_a.md',original:'原文😀',content:'首次加载中的建议',status:'pending'}];const calls=[],runs=new Map();let active='note_a',freezeCount=0,runReads=0,rejectFreeze=true,exercisePending=null,revision=0,draftReadFailure=false,recoveredDraft=null;
+ let proposals=[{id:'initial_pending',courseId:'course_c',path:'documents/note_a.md',original:'原文😀',content:'首次加载中的建议',status:'pending'}];const calls=[],runs=new Map();let active='note_a',freezeCount=0,runReads=0,rejectFreeze=true,exercisePending=null,revision=0,draftReadFailure=false,recoveredDraft=null,partialDraft=null,partialFailure=false;
  mockWindows('focus-isolated-fixture');mockIPC(async(command,args={})=>{calls.push({command,args:clone(args)});switch(command){
   case 'get_app_state':return {root:'/tmp/focus-fixture',activeDocumentId:active,documents:[...docs.values()].map(d=>({id:d.id,title:d.metadata.title,kind:'section',path:d.path,version:d.version})),model:{configured:true,provider:'custom',protocol:'openai-completions',baseUrl:'http://127.0.0.1/mock',model:'fixture',usageGate:''}};
   case 'get_library_tree':return {nodes:[{id:'course_c',title:'C课程',kind:'course',path:'courses/course_c.md',version:'v1'},...[...docs.values()].map(d=>({id:d.id,title:d.metadata.title,kind:d.metadata.kind,parentId:d.metadata.parentId,courseId:'course_c',path:d.path,version:d.version}))],warnings:[]};
   case 'get_ui_preferences':return {fontSize:16,assistantWidth:346,sidebarWidth:240,sidebarCollapsed:false,expandedNodeIds:['course_c','note_a'],toolAuthorizationTier:'off'};
-  case 'save_ui_preferences':return args;case 'get_ui_draft':if(args.key==='section:note_b'&&draftReadFailure)throw Error('Synthetic draft read failure');if(args.key==='section:note_b'&&recoveredDraft)return clone(recoveredDraft);if(args.key==='section:note_a'&&firstDraft){firstDraft=false;await initialLoad;}return args.key==='section:note_b'?{key:args.key,data:{body:'仍未保存的本机草稿'},version:'draft',updatedAt:'fixture'}:null;case 'save_ui_draft':return {key:args.key,data:args.data,version:'draft',updatedAt:'fixture'};
-  case 'edit_proposals':return exercisePending?[{id:exercisePending.id,stamp:exercisePending.id}]:proposals.filter(p=>p.courseId===args.courseId).map(p=>({id:p.id,stamp:'1'}));
+  case 'save_ui_preferences':return args;case 'get_ui_draft':if(args.key==='section:note_a'&&partialDraft)return clone(partialDraft);if(args.key==='section:note_b'&&draftReadFailure)throw Error('Synthetic draft read failure');if(args.key==='section:note_b'&&recoveredDraft)return clone(recoveredDraft);if(args.key==='section:note_a'&&firstDraft){firstDraft=false;await initialLoad;}return args.key==='section:note_b'?{key:args.key,data:{body:'仍未保存的本机草稿'},version:'draft',updatedAt:'fixture'}:null;case 'save_ui_draft':if(args.key==='section:note_a'&&partialDraft)partialDraft={key:args.key,data:clone(args.data)};return {key:args.key,data:args.data,version:'draft',updatedAt:'fixture'};
+  case 'edit_proposals':return exercisePending?[{id:exercisePending.id,stamp:exercisePending.id}]:proposals.filter(p=>p.courseId===args.courseId).map(p=>({id:p.id,stamp:p.textReview?.version||'1'}));
   case 'edit_proposal':return clone(exercisePending?.id===args.id?exercisePending:proposals.find(p=>p.id===args.id));
   case 'list_course_files':return [];
+  case 'decide_text_proposal': {
+   assert.deepEqual(Object.keys(args).sort(),['accept','courseId','hunkId','id']);
+   const p=proposals.find(p=>p.id===args.id),h=p.textReview.hunks.find(h=>h.id===args.hunkId),doc=docs.get('note_a');
+   if(args.accept){if(partialFailure)throw {code:'CONFLICT',message:'Synthetic external edit conflict'};assert.equal(partialDraft.data.body,doc.body,'the next decision must see the updated clean backup');}
+   h.status=args.accept?'accepted':'rejected';
+   if(args.accept){doc.body=p.textReview.hunks.map(c=>c.prefix+(c.status==='accepted'?c.after:c.before)).join('')+p.textReview.tail;doc.version+='x';p.textReview.version=doc.version;}
+   const complete=p.textReview.hunks.every(c=>c.status!=='pending');if(complete)proposals=proposals.filter(c=>c!==p);
+   return {persisted:args.accept,status:h.status,complete,version:doc.version};
+  }
   case 'decide_edit_proposal':proposals=proposals.filter(p=>p.id!==args.id);return {persisted:false,status:'rejected'};
   case 'record_ui_metric':return null;case 'list_todos':case 'list_notifications':return [];
   case 'open_document':active=args.id;if(args.id==='note_a'&&firstRead){firstRead=false;await initialLoad;}return clone(docs.get(args.id));case 'start_session':return {session:clone(session)};case 'get_session':return clone(session);
@@ -198,6 +207,38 @@ test('actual React/native path keeps the original Focus through page switch, can
    const writes=calls.slice(beforeRecovery).filter(c=>c.command==='save_ui_draft'&&c.args.key==='section:note_b');
    assert.ok(writes.length);assert.deepEqual(writes.at(-1).args.data,useSaved?recoveredDraft.data:{body:'窗口里的正文',question:''});
   }
+
+  // Real App -> nativeCall -> invoke: canonical regions, persisted selection,
+  // restart, rejection without draft writes, and immediate consecutive accepts.
+  function setupPartial(){
+   const doc=docs.get('note_a');doc.body='# Heading\n\nOld first\n\nKeep\n\nOld last';doc.version='partial-v1';
+   partialDraft={key:'section:note_a',data:{body:doc.body,question:''}};
+   proposals=[{id:'partial',courseId:'course_c',path:'documents/note_a.md',status:'pending',original:doc.body,content:doc.body.replace('Old first','New first').replace('Old last','New last'),textReview:{version:doc.version,hunks:[{id:'h0',prefix:'# Heading\n\n',before:'Old first\n\n',after:'New first\n\n',status:'pending'},{id:'h1',prefix:'Keep\n\n',before:'Old last',after:'New last',status:'pending'}],tail:''}}];
+   active='note_a';
+  }
+  async function reopenPartial(){await React.act(async()=>root.render(null));await React.act(async()=>root.render(React.createElement(ui.App)));await wait(()=>button('接受此处')&&!button('接受此处').disabled);}
+  setupPartial();await reopenPartial();
+  assert.equal(document.querySelectorAll('[data-review-hunk]').length,2);
+  assert.ok(document.querySelector('[aria-label="当前修改"]').textContent.includes('Old first'));
+  await click(document.querySelector('[aria-label="下一处修改"]'));
+  assert.ok(document.querySelector('[aria-label="当前修改"]').textContent.includes('Old last'));
+  await click(document.querySelector('[aria-label="上一处修改"]'));
+  await click(button('接受此处'));await wait(()=>document.querySelectorAll('[data-review-hunk]').length===1);
+  assert.ok(docs.get('note_a').body.includes('New first'));assert.ok(docs.get('note_a').body.includes('Old last'));
+  await reopenPartial();
+  assert.ok(document.querySelector('[aria-label="当前修改"]').textContent.includes('Old last'));
+  const beforeReject=calls.length;await click(button('拒绝此处'));await wait(()=>!document.querySelector('.review-dock'));
+  assert.equal(calls.slice(beforeReject).some(c=>c.command==='save_ui_draft'),false);
+  assert.ok(docs.get('note_a').body.includes('New first'));assert.ok(docs.get('note_a').body.includes('Old last'));
+  setupPartial();await reopenPartial();await click(button('接受此处'));await wait(()=>document.querySelectorAll('[data-review-hunk]').length===1);
+  await click(button('接受此处'));await wait(()=>!document.querySelector('.review-dock'));
+  assert.ok(docs.get('note_a').body.includes('New last'),'immediate second acceptance uses synchronized clean backup');
+  setupPartial();await reopenPartial();partialFailure=true;
+  const beforeAll=calls.filter(c=>c.command==='decide_text_proposal').length;
+  await click(document.querySelector('.review-more summary'));await click(button('接受剩余修改'));
+  await wait(()=>document.querySelector('.review-recovery')?.textContent.includes('Synthetic external edit conflict'));
+  assert.equal(calls.filter(c=>c.command==='decide_text_proposal').length,beforeAll+1,'whole-page action stops at the first failed region');
+  assert.equal(document.querySelectorAll('[data-review-hunk]').length,2);partialFailure=false;
 
 
 
