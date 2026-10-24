@@ -45,12 +45,12 @@ test('actual React/native path keeps the original Focus through page switch, can
  const session={id:'course_session',courseId:'course_c',sectionId:'note_a',version:'s1',entries:[],contextManifest:[]};
  session.entries.push({id:'exercise_entry',kind:'exercise',content:'Q',data:{exercises:[{id:'q1',question:'First?',format:'exact',answers:['one']},{id:'q2',question:'Second?',format:'exact',answers:['two']}]}});
  let releaseInitial;const initialLoad=new Promise(resolve=>{releaseInitial=resolve;});let firstRead=true,firstDraft=true;
- let proposals=[{id:'initial_pending',courseId:'course_c',path:'documents/note_a.md',original:'原文😀',content:'首次加载中的建议',status:'pending'}];const calls=[],runs=new Map();let active='note_a',freezeCount=0,runReads=0,rejectFreeze=true,exercisePending=null,revision=0;
+ let proposals=[{id:'initial_pending',courseId:'course_c',path:'documents/note_a.md',original:'原文😀',content:'首次加载中的建议',status:'pending'}];const calls=[],runs=new Map();let active='note_a',freezeCount=0,runReads=0,rejectFreeze=true,exercisePending=null,revision=0,draftReadFailure=false,recoveredDraft=null;
  mockWindows('focus-isolated-fixture');mockIPC(async(command,args={})=>{calls.push({command,args:clone(args)});switch(command){
   case 'get_app_state':return {root:'/tmp/focus-fixture',activeDocumentId:active,documents:[...docs.values()].map(d=>({id:d.id,title:d.metadata.title,kind:'section',path:d.path,version:d.version})),model:{configured:true,provider:'custom',protocol:'openai-completions',baseUrl:'http://127.0.0.1/mock',model:'fixture',usageGate:''}};
   case 'get_library_tree':return {nodes:[{id:'course_c',title:'C课程',kind:'course',path:'courses/course_c.md',version:'v1'},...[...docs.values()].map(d=>({id:d.id,title:d.metadata.title,kind:d.metadata.kind,parentId:d.metadata.parentId,courseId:'course_c',path:d.path,version:d.version}))],warnings:[]};
   case 'get_ui_preferences':return {fontSize:16,assistantWidth:346,sidebarWidth:240,sidebarCollapsed:false,expandedNodeIds:['course_c','note_a'],toolAuthorizationTier:'off'};
-  case 'save_ui_preferences':return args;case 'get_ui_draft':if(args.key==='section:note_a'&&firstDraft){firstDraft=false;await initialLoad;}return args.key==='section:note_b'?{key:args.key,data:{body:'仍未保存的本机草稿'},version:'draft',updatedAt:'fixture'}:null;case 'save_ui_draft':return {key:args.key,data:args.data,version:'draft',updatedAt:'fixture'};
+  case 'save_ui_preferences':return args;case 'get_ui_draft':if(args.key==='section:note_b'&&draftReadFailure)throw Error('Synthetic draft read failure');if(args.key==='section:note_b'&&recoveredDraft)return clone(recoveredDraft);if(args.key==='section:note_a'&&firstDraft){firstDraft=false;await initialLoad;}return args.key==='section:note_b'?{key:args.key,data:{body:'仍未保存的本机草稿'},version:'draft',updatedAt:'fixture'}:null;case 'save_ui_draft':return {key:args.key,data:args.data,version:'draft',updatedAt:'fixture'};
   case 'edit_proposals':return exercisePending?[{id:exercisePending.id,stamp:exercisePending.id}]:proposals.filter(p=>p.courseId===args.courseId).map(p=>({id:p.id,stamp:'1'}));
   case 'edit_proposal':return clone(exercisePending?.id===args.id?exercisePending:proposals.find(p=>p.id===args.id));
   case 'list_course_files':return [];
@@ -167,6 +167,38 @@ test('actual React/native path keeps the original Focus through page switch, can
   await click(button('拒绝'));assert.equal(document.querySelector('[aria-label="文件变更审批"]'),null);
   await click(button('编辑'));assert.match(document.querySelector('.document-editor:not([hidden])').textContent,/仍未保存的本机草稿/);
   assert.equal(calls.slice(countBefore).some(c=>c.command==='save_document'),false);
+  // Reopening a pending proposal after a failed initial draft read must not
+  // silently replace either the local edit or the stored body/question.
+  for (const useSaved of [true,false]) {
+   proposals=[];active='note_b';draftReadFailure=true;
+   recoveredDraft={key:'section:note_b',data:{body:'找回的正文',question:'找回的问题'},version:'old',updatedAt:'fixture'};
+   await React.act(async()=>root.render(null));await React.act(async()=>root.render(React.createElement(ui.App)));
+   await wait(()=>button('重试读取原草稿'));
+   await wait(()=>document.querySelector('[aria-label="向学习助手提问"]')?.disabled===false);await tick(30);
+   await click(button('编辑'));await wait(()=>document.querySelector('.document-editor:not([hidden]) .cm-editor'));
+   const {EditorView}=await import('@codemirror/view');
+   await React.act(async()=>{const view=EditorView.findFromDOM(document.querySelector('.document-editor:not([hidden]) .cm-editor'));view.dispatch({changes:{from:0,to:view.state.doc.length,insert:'窗口里的正文'}});});
+   await React.act(async()=>{const box=document.querySelector('[aria-label="向学习助手提问"]');Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(box,'窗口里的问题');box.dispatchEvent(new Event('input',{bubbles:true}));});
+   await click([...document.querySelectorAll('.tree-row')].find(el=>el.title==='A笔记'));
+   draftReadFailure=false;
+   proposals=[{id:'recovery',courseId:'course_c',path:'documents/note_b.md',original:docs.get('note_b').body,content:'恢复时的建议',status:'pending'}];
+   await wait(()=>document.querySelector('.review-file-link'));
+   const beforeRecovery=calls.length;
+   await click(document.querySelector('.review-file-link'));
+   await tick(750);
+   assert.ok(button('使用找回的草稿'),'different recovered input requires an explicit choice');
+   assert.equal(calls.slice(beforeRecovery).some(c=>c.command==='save_ui_draft'&&c.args.key==='section:note_b'),false,'no automatic overwrite while the choice is unresolved');
+   const dialog=document.querySelector('[role="dialog"]');
+   for(const text of ['窗口里的正文','找回的正文','找回的问题'])assert.ok(dialog.textContent.includes(text),text+': '+dialog.textContent);
+   await click(button(useSaved?'使用找回的草稿':'保留当前输入并备份'));
+   await wait(()=>!button('使用找回的草稿'));await tick(750);
+   assert.equal(document.querySelector('[aria-label="向学习助手提问"]').value,'窗口里的问题','course chat input stays independent');
+   assert.equal(!!button('恢复到当前对话'),useSaved,'recovered section question is available through the existing restore control');
+   if(useSaved)assert.ok(button('恢复到当前对话').parentElement.textContent.includes('找回的问题'));
+   const writes=calls.slice(beforeRecovery).filter(c=>c.command==='save_ui_draft'&&c.args.key==='section:note_b');
+   assert.ok(writes.length);assert.deepEqual(writes.at(-1).args.data,useSaved?recoveredDraft.data:{body:'窗口里的正文',question:''});
+  }
+
 
 
  }finally{await React.act(async()=>root.unmount());clearMocks();}

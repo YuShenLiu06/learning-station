@@ -343,10 +343,7 @@ export function App() {
     });
     if (docsRef.current[id]) {
       if (verified && preserveDraft && needsDraft) {
-        const local = docsRef.current[id];
-        const body = local.body !== local.savedBody ? local.body : verifiedDraft?.data.body ?? local.body;
-        const opened = { ...local, body, draftLoaded: true, recovery: body !== local.savedBody || local.recovery };
-        docsRef.current = { ...docsRef.current, [id]: opened }; setDocs(old => ({ ...old, [id]: opened }));
+        reconcileBackup(`section:${id}`, verifiedDraft);
         return true;
       }
       if (!isContainerKind(docsRef.current[id].section.kind)) void call<LearningSession>('session_open', { sectionId: id }).then(value => { setSessions(old => ({ ...old, [id]: value })); if (stillCurrent()) adoptCourseChat(value); if (value.courseId) void reloadConversations(value.courseId); }).catch(error => { if (stillCurrent()) setAiError(`学习记录尚未读到：${errorText(error)}`); });
@@ -768,12 +765,15 @@ export function App() {
     if (key === 'workspace') workspaceDraftLoaded.current = loaded;
     else { const id = key.slice('section:'.length); setDocs(old => old[id] ? ({ ...old, [id]: { ...old[id], draftLoaded: loaded } }) : old); }
   }
+  function reconcileBackup(key: string, saved: UiDraft | null) {
+    if (saved && draftInputsDiffer(key, currentDraftData(key), saved.data)) { setBackupConflict(saved); return; }
+    markDraftLoaded(key, true); clearDraftError(key);
+  }
   async function retryBackup(key: string) {
     markDraftLoaded(key, false);
     try {
       const saved = await call<UiDraft | null>('draft_get', { key });
-      if (saved && draftInputsDiffer(key, currentDraftData(key), saved.data)) { setBackupConflict(saved); return; }
-      markDraftLoaded(key, true); clearDraftError(key);
+      reconcileBackup(key, saved);
     } catch (error) { reportDraftError(key, error); }
   }
   async function resolveBackup(useSaved: boolean) {
