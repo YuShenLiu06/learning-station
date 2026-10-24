@@ -7,7 +7,7 @@ description: 说明学习站练习题的本地 Markdown 格式，以及生成、
 
 学习站把练习保存为本地 Markdown 文件，但不是把任意 Markdown 解析成可评分练习。区分以下两份相关记录：
 
-- `exercises/<documentId>.md`：带元数据的练习文档，正文由程序生成，供阅读和导出。
+- 练习文档：带元数据，正文由程序生成，供阅读和导出。旧布局或尚未归入课程时可位于 `exercises/<documentId>.md`；归入课程、完成迁移后位于 `courses/<courseId>/materials/documents/<documentId>.md`。以实际文档路径为准，不根据旧布局猜测。
 - `sessions/<sessionId>/entries/<entryId>.md`：原会话的记录也使用 Markdown 文件，元数据中的 `data` 保存结构化题目 ID、题干、答案、解析、来源及评分量表。做题与评分读取这份数据；练习文档元数据指向当前题集记录。
 
 直接修改 `.md` 正文中的“参考答案”不会改变评分依据。不要把写入普通文本、修改页面标题或生成一段 Markdown 说成“已更新练习题”。只有工具的持久化回执能够证明修改完成。
@@ -66,7 +66,7 @@ description: 说明学习站练习题的本地 Markdown 格式，以及生成、
 
 只在用户明确要求修改该练习、并已有相应读取/写入授权时操作：
 
-1. 请用户先在当前练习切到“编辑 Markdown”视图，再发送修改要求。做题视图的聚焦本身不授予完整题集和参考答案读取权限；不要代替用户扩大授权。通过当前授权的练习文档地址读取，例如 `documents/<exerciseDocumentId>.md`。这是工具地址，不是把本地文件从 `exercises/` 移到课程目录；不得自行拼接其他课程的 ID。
+1. 请用户先在当前练习切到“编辑 Markdown”视图，再发送修改要求。做题视图的聚焦本身不授予完整题集和参考答案读取权限；不要代替用户扩大授权。通过当前授权的练习文档地址读取，例如 `documents/<exerciseDocumentId>.md`。这是相对当前课程材料的工具地址，旧布局由应用处理；不得自行移动练习文件或拼接其他课程的 ID。
 2. 练习专用读取返回 `version` 和 `content`；`content` 是结构化题集的 JSON 字符串，不是上述导出 Markdown。先解析实际读回结果，保留不打算修改的题目及字段。
 3. `write.content` 必须是题集对象序列化后的 JSON 字符串（例如 `JSON.stringify` 的结果），不是对象；解析后顶层只有 `exercises`。`write.expectedVersion` 使用本次读取的版本，不猜测、不沿用旧回合版本。
 4. 保留已有题目的 `id` 表示原题不变或提出修改；新增题目省略 `id`；删除题目从题集数组中省略。不能伪造其他题目 ID。变更题与新增题的最终 ID 由程序生成，未变题保留原 ID。
