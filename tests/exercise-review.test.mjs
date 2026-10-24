@@ -35,3 +35,30 @@ test('whole-question review renders options, answers and unchanged questions, pe
   assert.equal(calls.length,3);assert.equal(refreshes,2);assert.equal(document.querySelector('.review-dock'),null);assert.match(document.body.textContent,/Normal exercises/);
  } finally {await React.act(async()=>root.unmount());dom.window.close();delete globalThis.exerciseReviewCall;await unlink(filename);}
 });
+
+test('exercise acceptance and rejection pass through the real native adapter to Tauri invoke', async () => {
+ const filename = new URL(`./.exercise-native-${process.pid}.mjs`, import.meta.url);
+ await build({entryPoints:['src/native.ts'],outfile:filename.pathname,bundle:true,packages:'external',platform:'node',format:'esm',plugins:[{name:'exercise-tauri-invoke',setup(b){
+  b.onResolve({filter:/^@tauri-apps\/api\/core$/},()=>({path:'core',namespace:'fixture'}));
+  b.onLoad({filter:/.*/,namespace:'fixture'},()=>({contents:'export const invoke=(...args)=>globalThis.exerciseNativeInvoke(...args);',loader:'js'}));
+ }}]});
+ const calls=[];
+ let failure;
+ globalThis.exerciseNativeInvoke=async(command,args)=>{
+  calls.push([command,args]);
+  if(failure)throw failure;
+  return {persisted:args.accept,status:args.accept?'accepted':'rejected',complete:false,version:'saved-version'};
+ };
+ try {
+  const {nativeCall}=await import(filename.href);
+  for(const accept of [true,false]){
+   const payload={courseId:'course',id:'proposal',questionId:'question',accept};
+   const result=await nativeCall('decide_exercise_proposal',payload);
+   assert.deepEqual(calls.at(-1),['decide_exercise_proposal',payload]);
+   assert.deepEqual(result,{persisted:accept,status:accept?'accepted':'rejected',complete:false,version:'saved-version'});
+  }
+  failure={code:'CONFLICT',message:'原题已变化，建议保留。'};
+  await assert.rejects(nativeCall('decide_exercise_proposal',{courseId:'course',id:'proposal',questionId:'question',accept:true}),error=>error===failure);
+  assert.equal(calls.length,3);
+ } finally {delete globalThis.exerciseNativeInvoke;await unlink(filename);}
+});

@@ -153,7 +153,7 @@ async function generation(payload: Record<string, unknown>, mode: string, prompt
 
 export async function nativeCall(command: string, payload: Record<string, unknown>): Promise<unknown> {
   switch (command) {
-    case 'list_course_files': case 'reveal_course_file': case 'edit_proposals': case 'edit_proposal': case 'decide_edit_proposal': return ipc(command, payload);
+    case 'list_course_files': case 'reveal_course_file': case 'edit_proposals': case 'edit_proposal': case 'decide_edit_proposal': case 'decide_exercise_proposal': return ipc(command, payload);
     case 'request_debug_decode': case 'request_debug_export': case 'request_debug_get': case 'request_debug_set': return ipc(command, payload);
     case 'get_exercise_reference': case 'get_feishu_bot_settings': case 'configure_feishu_bot': case 'start_feishu_bot': case 'stop_feishu_bot': case 'get_feishu_bot_snapshot': case 'get_grading_settings': case 'set_grading_model': case 'grade_attempt': case 'get_grade_run': case 'cancel_grade_run': case 'check_anki_connection': case 'get_anki_due': case 'reveal_anki_card': case 'answer_anki_card': case 'get_anki_operation': case 'add_review_items_to_anki': return ipc(command, payload);
     case 'course_sessions': return ipc(command, payload);
