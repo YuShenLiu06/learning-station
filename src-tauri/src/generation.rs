@@ -1695,6 +1695,11 @@ pub(crate) fn settle_proposal_activity(
     publish_tool_activity(engine, &activity, &sink)
 }
 
+#[cfg(test)]
+thread_local! {
+    static ACTIVITY_CORE_LOCKED: std::cell::RefCell<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
+}
+
 fn publish_tool_activity(engine: &Engine, activity: &ToolActivity, sink: &Sink) -> Result<()> {
     let run = get(engine, &activity.run_id)?;
     if run.id != activity.run_id || run.session_id != activity.session_id {
@@ -1707,20 +1712,28 @@ fn publish_tool_activity(engine: &Engine, activity: &ToolActivity, sink: &Sink) 
     // A decision IPC and the waiting handler may both settle the same call.
     // Reuse the first persisted activity (including timestamps) for idempotency.
     let mut core = engine.lock()?;
-    // Serialize against completion publication; timeout cleanup must not erase
-    // a receipt that arrived after its initial snapshot.
-    if activity.status == "unknown" && get(engine, &activity.run_id)?.tool_calls.iter()
-        .any(|previous| previous.id == activity.id && previous.status != "running") {
-        return Ok(());
-    }
-    let saved = sessions::get_persisted(&mut core.content, &activity.session_id)?
+    #[cfg(test)]
+    ACTIVITY_CORE_LOCKED.with(|hook| {
+        if let Some((locked, resume)) = hook.borrow_mut().take() {
+            locked.send(()).unwrap();
+            resume.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        }
+    });
+    // Inspect durable activities under core alone. Taking runs here would
+    // invert completion's runs -> core order and can deadlock on timeout.
+    let saved_activities = sessions::get_persisted(&mut core.content, &activity.session_id)?
         .entries
         .into_iter()
         .filter_map(|entry| {
             entry.data.and_then(|data| {
                 serde_json::from_value::<ToolActivity>(data["toolActivity"].clone()).ok()
             })
-        })
+        }).collect::<Vec<_>>();
+    if activity.status == "unknown" && saved_activities.iter()
+        .any(|previous| previous.id == activity.id && previous.status != "running") {
+        return Ok(());
+    }
+    let saved = saved_activities.into_iter()
         .find(|previous| previous.id == activity.id && previous.status == activity.status);
     let activity = match saved.as_ref() {
         Some(previous)
@@ -1849,6 +1862,51 @@ mod lifecycle_tests {
         };
         (temp, engine, session)
     }
+    #[test]
+    fn timeout_activity_does_not_invert_completion_lock_order() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (_temp, engine, session) = setup();
+        let run = run(&session.id);
+        let scope = crate::learning_tools::ToolScope { session_id:session.id.clone(), section_id:session.section_id.clone(), run_id:run.id.clone(), allowed_ids:vec![] };
+        engine.runs.lock().unwrap().insert(run.id.clone(), ManagedRun {run, cancel:Arc::new(AtomicBool::new(false))});
+        let sink: Sink = Arc::new(|_| {});
+        let mut activity = new_tool_activity(&scope, "concurrent-timeout", "write").unwrap();
+        publish_tool_activity(&engine, &activity, &sink).unwrap();
+        activity.status = "unknown".into();
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker_engine = engine.clone();
+        let cleanup = std::thread::spawn(move || {
+            ACTIVITY_CORE_LOCKED.with(|hook| *hook.borrow_mut() = Some((locked_tx, resume_rx)));
+            let result = publish_tool_activity(&worker_engine, &activity, &sink);
+            done_tx.send(()).unwrap();
+            result
+        });
+        locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let completion_engine = engine.clone();
+        let (completion_tx, completion_rx) = mpsc::channel();
+        let completion = std::thread::spawn(move || {
+            // Match generation completion exactly: hold runs while persist
+            // obtains core through run_path. Cleanup already holds core.
+            let mut runs = completion_engine.runs.lock().unwrap();
+            let managed = runs.get_mut(&scope.run_id).unwrap();
+            managed.run.status = "failed".into();
+            resume_tx.send(()).unwrap();
+            let result = persist(&completion_engine, &managed.run);
+            completion_tx.send(()).unwrap();
+            result
+        });
+        completion_rx.recv_timeout(Duration::from_secs(5)).expect("completion must not deadlock with timeout cleanup");
+        done_rx.recv_timeout(Duration::from_secs(5)).expect("timeout cleanup must finish");
+        completion.join().unwrap().unwrap();
+        cleanup.join().unwrap().unwrap();
+        let saved = get(&engine,"run_lifecycle").unwrap();
+        assert_eq!(saved.status,"failed");
+        assert_eq!(saved.tool_calls[0].status,"unknown");
+    }
+
     #[test]
     fn interrupted_tools_preserve_waiting_and_unknown_until_real_receipt() {
         let (_temp, engine, session) = setup();
