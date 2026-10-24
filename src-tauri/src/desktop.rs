@@ -559,6 +559,10 @@ async fn decide_edit_proposal(state: State<'_, Arc<Engine>>, course_id: String, 
 async fn decide_exercise_proposal(state: State<'_, Arc<Engine>>, course_id: String, id: String, question_id: String, accept: bool) -> Result<Value> {
     work(state.inner().clone(), move |e| crate::authorized_tools::exercise_proposal_decide(e, &course_id, &id, &question_id, accept)).await
 }
+#[tauri::command]
+async fn decide_text_proposal(state: State<'_, Arc<Engine>>, course_id: String, id: String, hunk_id: String, accept: bool) -> Result<Value> {
+    work(state.inner().clone(), move |e| crate::authorized_tools::text_proposal_decide(e, &course_id, &id, &hunk_id, accept)).await
+}
 // Read-only: durable write/bash receipt summaries of one session workspace.
 // No arguments, command text or file contents ever leave the ledger.
 #[tauri::command]
@@ -1115,6 +1119,7 @@ pub fn run() {
             edit_proposal,
             decide_edit_proposal,
             decide_exercise_proposal,
+            decide_text_proposal,
             get_session,
             append_entry,
             load_context,
