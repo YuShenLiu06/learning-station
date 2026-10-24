@@ -313,6 +313,29 @@ pub(crate) fn execute(
     })
 }
 
+/// Fixed diagnostics only: never forward arbitrary messages, paths, or content
+/// from tool errors into model transport or activity cards.
+pub(crate) fn write_conflict_feedback(error: &CoreError) -> Option<Value> {
+    if error.code != "CONFLICT" { return None; }
+    let details = error.details.as_ref()?;
+    match details["reason"].as_str()? {
+        "write_version_mismatch" => Some(json!({"message":"文件版本不匹配，本次未写入；请重新读取并使用 read 返回的 version，不要使用 Focus 的 Git OID。",
+            "details":{"reason":"write_version_mismatch"}})),
+        "edit_review_pending" => {
+            let proposal = details["proposalId"].as_str().filter(|id| crate::types::valid_id(id))?;
+            let course = details["courseId"].as_str().filter(|id| crate::types::valid_id(id))?;
+            let status = details["status"].as_str()?;
+            let message = match status {
+                "pending" => "已有修改建议待审阅，本次未写入；请先接受或拒绝旧建议，再重新读取后修改。",
+                "accepting" | "unknown" => "旧建议结果尚未核实，本次未写入；请在学习站核对原建议，不要重复写入。",
+                _ => return None,
+            };
+            Some(json!({"message":message,"details":{"reason":"edit_review_pending","proposalId":proposal,"courseId":course,"status":status}}))
+        }
+        _ => None,
+    }
+}
+
 fn course_write_unknown(engine: &crate::app::Engine, session_id: &str, ledger: &Path) -> CoreError {
     let mut error = CoreError::new(
         "NATIVE_TOOL_UNKNOWN",
@@ -1200,6 +1223,30 @@ mod tests {
         assert_eq!(super::proposal_decide(&engine,&course,&operation,true).unwrap_err().code,"CONFLICT");
         assert_eq!(super::proposal_decide(&engine,&course,&operation,false).unwrap()["status"],"rejected");
         assert_eq!(std::fs::read_to_string(target).unwrap(),"new authorized text");
+    }
+
+    #[test]
+    fn write_conflict_identifies_pending_review_and_recovers_after_explicit_rejection() {
+        let (_dir, engine, scope, id, _) = course_fixture("write");
+        let read = super::execute(&engine,&scope,"read-version","read",json!({"sourceId":id})).unwrap();
+        let args = json!({"path":format!("documents/{id}.md"),"content":"proposed body","expectedVersion":read["version"]});
+        let pending = super::execute(&engine,&scope,"old-proposal","write",args.clone()).unwrap();
+        let before = engine.lock().unwrap().content.read(&id).unwrap();
+        let blocked = super::execute(&engine,&scope,"new-proposal","write",args.clone()).unwrap_err();
+        assert_eq!(blocked.code,"CONFLICT");
+        let feedback = super::write_conflict_feedback(&blocked).unwrap();
+        assert_eq!(feedback["details"]["reason"],"edit_review_pending");
+        assert_eq!(feedback["details"]["proposalId"],pending["proposalId"]);
+        assert_eq!(feedback["details"]["status"],"pending");
+        assert_eq!(engine.lock().unwrap().content.read(&id).unwrap().content,before.content);
+        let mut wrong = args.clone(); wrong["expectedVersion"] = json!("0".repeat(40));
+        let mismatch = super::execute(&engine,&scope,"wrong-oid","write",wrong).unwrap_err();
+        assert_eq!(super::write_conflict_feedback(&mismatch).unwrap()["details"]["reason"],"write_version_mismatch");
+        super::proposal_decide(&engine,pending["courseId"].as_str().unwrap(),pending["proposalId"].as_str().unwrap(),false).unwrap();
+        let next = super::execute(&engine,&scope,"after-reject","write",args).unwrap();
+        assert_eq!(next["status"],"pending");
+        assert_eq!(next["persisted"],false);
+        assert_ne!(next["proposalId"],pending["proposalId"]);
     }
 
     #[test]

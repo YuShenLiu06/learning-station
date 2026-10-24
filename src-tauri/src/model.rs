@@ -1344,12 +1344,7 @@ async fn run_sidecar(
                                     return Err(sidecar_error(&error.code))
                                 }
                                 Err(error) => {
-                                    let mut reply = tool_failure(&call.id, &error.code);
-                                    // Only validator-produced diagnostics: never echo model values or arbitrary IO errors.
-                                    if error.code == "INVALID_MODEL_OUTPUT" && error.details.as_ref().is_some_and(|d| d["field"].is_string()) {
-                                        reply["error"]["message"] = json!(error.message);
-                                    }
-                                    reply
+                                    tool_error_reply(&call.id, &error)
                                 },
                             };
                             if serde_json::to_vec(&reply)
@@ -1652,6 +1647,18 @@ fn validate_tool_call(call: &ToolCall) -> Result<()> {
     }
     Ok(())
 }
+fn tool_error_reply(id: &str, error: &CoreError) -> Value {
+    let mut reply = tool_failure(id, &error.code);
+    // Only validator-produced or fixed, whitelisted write diagnostics.
+    if error.code == "INVALID_MODEL_OUTPUT" && error.details.as_ref().is_some_and(|d| d["field"].is_string()) {
+        reply["error"]["message"] = json!(error.message);
+    } else if let Some(feedback) = crate::authorized_tools::write_conflict_feedback(error) {
+        reply["error"]["message"] = feedback["message"].clone();
+        reply["error"]["details"] = feedback["details"].clone();
+    }
+    reply
+}
+
 fn tool_failure(id: &str, code: &str) -> Value {
     let safe = if !code.is_empty()
         && code.len() <= 64
@@ -3054,6 +3061,23 @@ mod tests {
             "TIMEOUT"
         );
     }
+    #[test]
+    fn write_conflict_transport_keeps_only_fixed_recovery_fields() {
+        let error = CoreError::new("CONFLICT","secret arbitrary message").details(json!({
+            "reason":"edit_review_pending","proposalId":"proposal_safe","courseId":"course_safe","status":"pending","content":"secret content","path":"/private/path"}));
+        let packet = tool_error_reply("call",&error);
+        assert_eq!(packet["error"]["details"]["proposalId"],"proposal_safe");
+        assert_eq!(packet["error"]["code"],"CONFLICT");
+        assert!(packet["error"]["message"].as_str().unwrap().contains("旧建议"));
+        assert!(!packet.to_string().contains("secret"));
+        assert!(!packet.to_string().contains("/private"));
+        for details in [json!({"reason":"unknown"}),json!({"reason":"edit_review_pending","proposalId":"../bad","courseId":"course_safe","status":"pending"})] {
+            let packet = tool_error_reply("call",&CoreError::new("CONFLICT","secret").details(details));
+            assert!(packet["error"]["details"].is_null());
+            assert!(!packet.to_string().contains("secret"));
+        }
+    }
+
     #[test]
     fn unknown_sidecar_error_is_sanitized() {
         let error = sidecar_error("fixture-secret raw provider body");

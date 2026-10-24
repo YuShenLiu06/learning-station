@@ -1,6 +1,21 @@
 import {freezeTodoTime} from './time-context.mjs';
 import { Type } from 'typebox';
 
+// Match Rust's fixed write diagnostics; arbitrary error strings never pass.
+function writeConflictFeedback(error) {
+  if (error?.code !== 'CONFLICT') return null;
+  const details = error.details;
+  if (details?.reason === 'write_version_mismatch') return {
+    message: '文件版本不匹配，本次未写入；请重新读取并使用 read 返回的 version，不要使用 Focus 的 Git OID。',
+    details: { reason: 'write_version_mismatch' },
+  };
+  if (details?.reason !== 'edit_review_pending' || typeof details.proposalId !== 'string' || typeof details.courseId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/u.test(details.proposalId || '') || !/^[A-Za-z0-9_-]{1,128}$/u.test(details.courseId || '')) return null;
+  const message = details.status === 'pending'
+    ? '已有修改建议待审阅，本次未写入；请先接受或拒绝旧建议，再重新读取后修改。'
+    : ['accepting', 'unknown'].includes(details.status) ? '旧建议结果尚未核实，本次未写入；请在学习站核对原建议，不要重复写入。' : null;
+  return message ? { message, details: { reason: 'edit_review_pending', proposalId: details.proposalId, courseId: details.courseId, status: details.status } } : null;
+}
+
 export const LEARNING_PLUGIN = Object.freeze({
   id: 'learning-station.learning', version: '1.2.0',
   tools: Object.freeze(['record_question', 'create_error', 'query_related_knowledge', 'create_review_card', 'create_note', 'create_todo', 'generate_exercises', 'list_learning_skills', 'load_learning_skill']),
@@ -197,6 +212,10 @@ export function createLearningPlugin({ requestTool, secret = '', fail = () => {}
         isError = true;
         const code = typeof reply.error?.code === 'string' && /^[A-Z_]{1,64}$/u.test(reply.error.code) ? reply.error.code : 'TOOL_FAILED';
         body = { ok: false, error: { code, message: code === 'INVALID_MODEL_OUTPUT' && typeof reply.error.message === 'string' && reply.error.message.length < 500 ? reply.error.message : safeMessages.TOOL_FAILED } };
+        if (name === 'write') {
+          const feedback = writeConflictFeedback(reply.error);
+          if (feedback) Object.assign(body.error, redactStrings(feedback, secret));
+        }
       } else {
         const result = redactStrings(reply.result, secret);
         if (!result || typeof result !== 'object' || Array.isArray(result)) { fail('TOOL_PROTOCOL'); throw new LearningToolError('TOOL_PROTOCOL'); }

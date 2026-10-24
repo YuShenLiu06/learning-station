@@ -26,6 +26,11 @@ export function readToolActivity(raw: unknown): ToolActivity | null {
   // overlong or off-vocabulary text falls back. Model arguments and raw output are never rendered.
   const diagnostic = result.status === 'failed' && result.errorCode === 'INVALID_MODEL_OUTPUT' && typeof value.summary === 'string' && value.summary.length <= 80 && SAFE_FIELD_DIAGNOSTIC.test(value.summary) ? value.summary : '';
   result.summary = result.status === 'failed' ? (diagnostic || '工具未完成，未确认保存成功。') : result.name === 'query_related_knowledge' ? '相关学习记录查询已完成，未写入新内容。' : result.name === 'read' ? '受控读取已完成，未写入内容。' : ['list_learning_skills', 'load_learning_skill'].includes(result.name) ? '内置学习指导读取已完成，未写入内容。' : result.persisted && (result.object || ['write', 'bash'].includes(result.name)) ? '已收到本机保存回执。' : '等待本机工具结果。';
+  if (result.name === 'write' && result.status === 'failed' && result.errorCode === 'CONFLICT' && [
+    '已有修改建议待审阅，本次未写入；请先接受或拒绝旧建议，再重新读取后修改。',
+    '旧建议结果尚未核实，本次未写入；请在学习站核对原建议，不要重复写入。',
+    '文件版本不匹配，本次未写入；请重新读取并使用 read 返回的 version，不要使用 Focus 的 Git OID。',
+  ].includes(String(value.summary))) result.summary = String(value.summary);
   if (result.name === 'write' && !result.persisted && ['AI 修改待确认，建议已保留，正文未修改。', '用户已拒绝建议，正文未修改。', '内容未变化，未重复写入。'].includes(String(value.summary))) result.summary = String(value.summary);
   return result;
 }

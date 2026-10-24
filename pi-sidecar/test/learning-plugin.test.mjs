@@ -448,3 +448,43 @@ test('card execution needs no loaded skill and cancellation/retry never invents 
  assert(!plugin.tools[0].description.includes('FULL_SKILL_BODY_SENTINEL'));
  assert(plugin.tools[0].parameters.properties.exercises);
  });
+
+test('write conflict recovery reaches the real Pi provider payload without arbitrary error text', { timeout: 8000 }, async () => {
+  for (const reason of ['edit_review_pending', 'write_version_mismatch']) {
+    let turns = 0;
+    let received;
+    await withServer((body, res) => {
+      turns++;
+      if (turns === 1) sse(res, { tool: call('blocked-write', 'write', { path: 'documents/note.md', content: 'draft', expectedVersion: 'read-version' }) });
+      else {
+        received = JSON.parse(toolMessages(body).at(-1).content);
+        sse(res, { text: '请先处理原建议。', final: true });
+      }
+    }, async endpoint => {
+      const input = request(endpoint);
+      input.toolPolicy = { mode: 'question', allowedTools: ['write'], authorization: 'write' };
+      await runLearningAgent(input, () => {}, { requestTool: async () => ({ error: {
+        code: 'CONFLICT', message: 'SECRET ARBITRARY MESSAGE',
+        details: { reason, proposalId: 'proposal_safe', courseId: 'course_safe', status: 'pending', path: '/private/path', content: 'SECRET CONTENT' },
+      } }) });
+    });
+    assert.equal(turns, 2);
+    assert.equal(received.ok, false);
+    assert.equal(received.error.code, 'CONFLICT');
+    assert.equal(received.error.details.reason, reason);
+    assert.match(received.error.message, reason === 'edit_review_pending' ? /先接受或拒绝旧建议/ : /read 返回的 version/);
+    assert(!JSON.stringify(received).includes('SECRET'));
+    assert(!JSON.stringify(received).includes('/private'));
+  }
+});
+
+test('unknown or malformed write conflict diagnostics remain sanitized', async () => {
+  for (const details of [{ reason: 'other', path: '/private' }, { reason: 'edit_review_pending', proposalId: '../secret', courseId: 'safe', status: 'pending' }, { reason: 'edit_review_pending', proposalId: 'safe', courseId: 'safe', status: 'invalid' }]) {
+    const plugin = createLearningPlugin({ allowedTools: ['write'], requestTool: async () => ({ error: { code: 'CONFLICT', message: 'SECRET ERROR', details } }) });
+    const result = await plugin.tools[0].execute('invalid-feedback', { path: 'note.md', content: 'draft' });
+    assert.equal(result.isError, true);
+    assert.equal(result.structuredContent.error.details, undefined);
+    assert(!JSON.stringify(result.structuredContent).includes('SECRET'));
+    assert(!JSON.stringify(result.structuredContent).includes('/private'));
+  }
+});
