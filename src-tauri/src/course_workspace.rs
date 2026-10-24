@@ -424,7 +424,15 @@ pub(crate) fn proposal_list(engine: &crate::app::Engine, course: &str) -> Result
     // A crash after the decision was saved leaves a flat terminal record.
     // Settle its original activity before removing it from this recovery queue.
     for p in terminal {
-        settle_decision(engine, &p)?;
+        if let Err(error) = settle_decision(engine, &p) {
+            // A recycled conversation cannot receive its durable activity yet.
+            // Keep the flat checkpoint for restoration, without hiding other
+            // pending proposals or bypassing the trash read/write boundary.
+            if error.code == "TRASHED" && engine.lock()?.content.is_trashed(&p.session_id) {
+                continue;
+            }
+            return Err(error);
+        }
     }
     Ok(json!(result))
 }

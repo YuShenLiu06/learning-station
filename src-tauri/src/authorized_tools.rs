@@ -1560,6 +1560,62 @@ mod tests {
     }
 
     #[test]
+    fn proposal_poll_preserves_recycled_session_terminal_until_restore() {
+        let (dir, engine, scope, document_id, _) = course_fixture("write");
+        let before = engine.lock().unwrap().content.read(&document_id).unwrap();
+        let mut args = json!({"path":format!("documents/{document_id}.md"),"content":"old draft","expectedVersion":before.version});
+        let terminal = super::execute(&engine, &scope, "terminal-trash", "write", args.clone()).unwrap();
+        let course = terminal["courseId"].as_str().unwrap();
+        let id = terminal["proposalId"].as_str().unwrap();
+        let path = dir.path().join(format!("state/edit-proposals/{course}/{id}.json"));
+        let archive = path.parent().unwrap().join("archive").join(path.file_name().unwrap());
+        // Crash checkpoint: rejection is durable, but its activity is not settled.
+        let mut data: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        data["status"] = json!("rejected");
+        crate::course_write_transaction::durable_json(&path, &data).unwrap();
+        args["content"] = json!("new draft");
+        let pending = super::execute(&engine, &scope, "new-pending", "write", args).unwrap();
+        let trash = {
+            let mut core = engine.lock().unwrap();
+            let preview = crate::trash::preview(&mut core.content, &scope.session_id).unwrap();
+            crate::trash::trash(&mut core.content, &scope.session_id, &preview.version, "terminal-session-trash").unwrap()
+        };
+        let session_path = dir.path().join(format!("library/sessions/{}/session.md", scope.session_id));
+        let session_before = std::fs::read(&session_path).unwrap();
+        let proposal_before = std::fs::read(&path).unwrap();
+        let run_path = dir.path().join(format!("state/runs/{}.json", scope.run_id));
+        let run_before = std::fs::read(&run_path).unwrap();
+        let reopened = Engine::new(dir.path().join("library"), dir.path().join("state")).unwrap();
+        for _ in 0..2 {
+            let list = super::proposal_list(&reopened, course).unwrap();
+            assert_eq!(list.as_array().unwrap().len(), 1);
+            assert_eq!(list[0]["id"], pending["proposalId"]);
+            assert_eq!(super::proposal_get(&reopened, course, pending["proposalId"].as_str().unwrap()).unwrap()["content"], "new draft");
+            assert_eq!(std::fs::read(&session_path).unwrap(), session_before);
+            assert_eq!(std::fs::read(&path).unwrap(), proposal_before);
+            assert_eq!(std::fs::read(&run_path).unwrap(), run_before);
+            assert!(!archive.exists());
+            assert!(reopened.lock().unwrap().content.is_trashed(&scope.session_id));
+        }
+        // A recycled owner does not excuse unrelated corruption.
+        std::fs::write(&run_path, "broken checkpoint").unwrap();
+        let error = super::proposal_list(&reopened, course).unwrap_err();
+        assert_ne!(error.code, "TRASHED");
+        assert!(path.exists() && !archive.exists());
+        std::fs::write(&run_path, run_before).unwrap();
+        {
+            let mut core = reopened.lock().unwrap();
+            crate::trash::restore(&mut core.content, &trash.trash_id, "terminal-session-restore").unwrap();
+        }
+        let list = super::proposal_list(&reopened, course).unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        assert_eq!(list[0]["id"], pending["proposalId"]);
+        assert!(!path.exists() && archive.exists());
+        assert_eq!(crate::generation::get(&reopened, &scope.run_id).unwrap().tool_calls[0].status, "succeeded");
+        assert_eq!(reopened.lock().unwrap().content.read(&document_id).unwrap().body, before.body);
+    }
+
+    #[test]
     fn proposal_poll_migrates_legacy_terminal_files_and_ignores_archive_contents() {
         let (dir, engine, scope, document_id, _) = course_fixture("write");
         let before = engine.lock().unwrap().content.read(&document_id).unwrap();
