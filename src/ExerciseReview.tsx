@@ -25,10 +25,9 @@ export function ExerciseReview({ review }: { review: EditReviewState }) {
   rows.push(...changes.filter(c => !c.before).map(change => ({change})));
   return <section ref={review.diffRoot} className="exercise-review" aria-label="逐题修改差异">
     {review.dirty && <p className="review-draft-warning">请先处理未保存的 Markdown 草稿，原文和建议均保留。</p>}
-    {rows.map(({question,change}, index) => {
+    {rows.filter(({question,change}) => change && ['pending','accepting'].includes(change.status) || (!change || change.status === 'rejected' ? question : change.after)).map(({question,change}, index) => {
       const pending = change && ['pending','accepting'].includes(change.status);
       const shown = !change || change.status === 'rejected' ? question : change.after;
-      if (!pending && !shown) return null;
       return <article key={change?.id || question!.id} className="exercise-review-question">
         <header><strong>第 {index + 1} 题</strong>{pending && <span>{!change.before ? '新增题目' : !change.after ? '删除题目' : '修改题目'}</span>}{change?.status === 'accepted' && <span>已保存</span>}</header>
         {pending ? <>
