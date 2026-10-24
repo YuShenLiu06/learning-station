@@ -295,7 +295,7 @@ export function App() {
       // The current editor already owns its loaded body. Locating a proposal must
       // not reload it (or save it) just to leave edit mode.
       const intent = ++navigationIntent.current;
-      if (id !== activeIdRef.current) {
+      if (id !== activeIdRef.current || docsRef.current[id]?.draftLoaded !== true) {
         const section = await call<Section>('section_open', { id });
         if (intent !== navigationIntent.current) return false;
         if (!await openSection(id, section, true)) return false;
@@ -326,7 +326,8 @@ export function App() {
     const sequence = ++openSequence.current, beforeNavigation = navigationIntent.current;
     const cached = docsRef.current[id];
     if (verified && (verified.id !== id || !preserveDraft && cached && (cached.saving || cached.body !== cached.savedBody))) throw new Error('来源有未保存的编辑，请先处理；历史引用与当前草稿仍保留。');
-    const verifiedDraft = verified && !cached && nativeAvailable ? await call<UiDraft | null>('draft_get', { key: `section:${id}` }) : null;
+    const needsDraft = !cached || preserveDraft && cached.draftLoaded !== true;
+    const verifiedDraft = verified && needsDraft && nativeAvailable ? await call<UiDraft | null>('draft_get', { key: `section:${id}` }) : null;
     if (sequence !== openSequence.current || beforeNavigation !== navigationIntent.current) return;
     if (verified && !preserveDraft && verifiedDraft?.data.body !== undefined && verifiedDraft.data.body !== verified.body) throw new Error('来源有待恢复的草稿，未将其作为历史版本展示；请先处理草稿。');
     navigationRef.current.ensureExpanded(ancestorIds(nodesRef.current, id));
@@ -341,6 +342,13 @@ export function App() {
       catch (error) { if (stillCurrent()) setAiError(errorText(error)); }
     });
     if (docsRef.current[id]) {
+      if (verified && preserveDraft && needsDraft) {
+        const local = docsRef.current[id];
+        const body = local.body !== local.savedBody ? local.body : verifiedDraft?.data.body ?? local.body;
+        const opened = { ...local, body, draftLoaded: true, recovery: body !== local.savedBody || local.recovery };
+        docsRef.current = { ...docsRef.current, [id]: opened }; setDocs(old => ({ ...old, [id]: opened }));
+        return true;
+      }
       if (!isContainerKind(docsRef.current[id].section.kind)) void call<LearningSession>('session_open', { sectionId: id }).then(value => { setSessions(old => ({ ...old, [id]: value })); if (stillCurrent()) adoptCourseChat(value); if (value.courseId) void reloadConversations(value.courseId); }).catch(error => { if (stillCurrent()) setAiError(`学习记录尚未读到：${errorText(error)}`); });
       if (verified && (!preserveDraft || cached.body === cached.savedBody && !cached.saving)) { const opened = { section: verified, body: verified.body, savedBody: verified.body, saving: false, draftLoaded: docsRef.current[id].draftLoaded }; docsRef.current = { ...docsRef.current, [id]: opened }; setDocs(old => ({ ...old, [id]: opened })); }
       else if (!verified && nativeAvailable) void call<Section>('section_open', { id }).then(section => {

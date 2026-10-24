@@ -44,18 +44,19 @@ test('actual React/native path keeps the original Focus through page switch, can
  docs.set('exercise_e',{id:'exercise_e',path:'exercises/exercise_e.md',metadata:{id:'exercise_e',kind:'exercise',title:'E练习',parentId:'note_a',originSessionId:'course_session',exerciseEntryId:'exercise_entry'},body:'# E练习',version:'v1'});
  const session={id:'course_session',courseId:'course_c',sectionId:'note_a',version:'s1',entries:[],contextManifest:[]};
  session.entries.push({id:'exercise_entry',kind:'exercise',content:'Q',data:{exercises:[{id:'q1',question:'First?',format:'exact',answers:['one']},{id:'q2',question:'Second?',format:'exact',answers:['two']}]}});
- let proposals=[];const calls=[],runs=new Map();let active='note_a',freezeCount=0,runReads=0,rejectFreeze=true,exercisePending=null,revision=0;
+ let releaseInitial;const initialLoad=new Promise(resolve=>{releaseInitial=resolve;});let firstRead=true,firstDraft=true;
+ let proposals=[{id:'initial_pending',courseId:'course_c',path:'documents/note_a.md',original:'原文😀',content:'首次加载中的建议',status:'pending'}];const calls=[],runs=new Map();let active='note_a',freezeCount=0,runReads=0,rejectFreeze=true,exercisePending=null,revision=0;
  mockWindows('focus-isolated-fixture');mockIPC(async(command,args={})=>{calls.push({command,args:clone(args)});switch(command){
   case 'get_app_state':return {root:'/tmp/focus-fixture',activeDocumentId:active,documents:[...docs.values()].map(d=>({id:d.id,title:d.metadata.title,kind:'section',path:d.path,version:d.version})),model:{configured:true,provider:'custom',protocol:'openai-completions',baseUrl:'http://127.0.0.1/mock',model:'fixture',usageGate:''}};
   case 'get_library_tree':return {nodes:[{id:'course_c',title:'C课程',kind:'course',path:'courses/course_c.md',version:'v1'},...[...docs.values()].map(d=>({id:d.id,title:d.metadata.title,kind:d.metadata.kind,parentId:d.metadata.parentId,courseId:'course_c',path:d.path,version:d.version}))],warnings:[]};
   case 'get_ui_preferences':return {fontSize:16,assistantWidth:346,sidebarWidth:240,sidebarCollapsed:false,expandedNodeIds:['course_c','note_a'],toolAuthorizationTier:'off'};
-  case 'save_ui_preferences':return args;case 'get_ui_draft':return args.key==='section:note_b'?{key:args.key,data:{body:'仍未保存的本机草稿'},version:'draft',updatedAt:'fixture'}:null;case 'save_ui_draft':return {key:args.key,data:args.data,version:'draft',updatedAt:'fixture'};
+  case 'save_ui_preferences':return args;case 'get_ui_draft':if(args.key==='section:note_a'&&firstDraft){firstDraft=false;await initialLoad;}return args.key==='section:note_b'?{key:args.key,data:{body:'仍未保存的本机草稿'},version:'draft',updatedAt:'fixture'}:null;case 'save_ui_draft':return {key:args.key,data:args.data,version:'draft',updatedAt:'fixture'};
   case 'edit_proposals':return exercisePending?[{id:exercisePending.id,stamp:exercisePending.id}]:proposals.filter(p=>p.courseId===args.courseId).map(p=>({id:p.id,stamp:'1'}));
   case 'edit_proposal':return clone(exercisePending?.id===args.id?exercisePending:proposals.find(p=>p.id===args.id));
   case 'list_course_files':return [];
   case 'decide_edit_proposal':proposals=proposals.filter(p=>p.id!==args.id);return {persisted:false,status:'rejected'};
   case 'record_ui_metric':return null;case 'list_todos':case 'list_notifications':return [];
-  case 'open_document':active=args.id;return clone(docs.get(args.id));case 'start_session':return {session:clone(session)};case 'get_session':return clone(session);
+  case 'open_document':active=args.id;if(args.id==='note_a'&&firstRead){firstRead=false;await initialLoad;}return clone(docs.get(args.id));case 'start_session':return {session:clone(session)};case 'get_session':return clone(session);
   case 'get_exercise_document':return {session:clone(session)};
   case 'decide_exercise_proposal':{
    assert.equal(args.accept,true);const change=exercisePending.exercise.changes[0];
@@ -76,7 +77,18 @@ test('actual React/native path keeps the original Focus through page switch, can
  }},{shouldMockEvents:true});
  const root=createRoot(document.getElementById('root'));
  try{
-  await React.act(async()=>root.render(React.createElement(ui.App)));await wait(()=>document.querySelector('[aria-label="向学习助手提问"]')?.disabled===false);
+  await React.act(async()=>root.render(React.createElement(ui.App)));
+  await wait(()=>document.querySelector('.review-file-link'));
+  assert.equal(document.querySelector('.document-title-row h1'),null,'initial body and draft are still loading');
+  await click(document.querySelector('.review-file-link'));
+  await wait(()=>document.querySelector('.inline-edit-review')?.textContent.includes('首次加载中的建议'));
+  assert.equal(document.querySelector('.document-title-row h1').textContent,'A笔记');
+  assert.equal(calls.filter(c=>c.command==='open_document').length,2,'pending navigation restarts an uncommitted initial read');
+  assert.equal(calls.filter(c=>c.command==='get_ui_draft'&&c.args.key==='section:note_a').length,2,'pending navigation loads the draft before showing review');
+  await React.act(async()=>releaseInitial());
+  assert.match(document.querySelector('.inline-edit-review').textContent,/首次加载中的建议/);
+  await click(button('拒绝'));await wait(()=>!document.querySelector('.review-file-link'));
+  await wait(()=>document.querySelector('[aria-label="向学习助手提问"]')?.disabled===false);
   const textarea=document.querySelector('[aria-label="向学习助手提问"]');await React.act(async()=>{Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(textarea,'解释A');textarea.dispatchEvent(new Event('input',{bubbles:true}));});
   await click(document.querySelector('[aria-label="发送问题"]'));await wait(()=>button('重试保存并生成'));assert.equal(document.querySelector('[aria-label="向学习助手提问"]').value,'解释A','preflight rejection retains the draft');await click(button('重试保存并生成'));await wait(()=>calls.some(c=>c.command==='start_generation'));
   await click([...document.querySelectorAll('.tree-row')].find(el=>el.title==='B笔记'));await wait(()=>document.querySelector('.document-title-row h1')?.textContent==='B笔记');
@@ -128,6 +140,10 @@ test('actual React/native path keeps the original Focus through page switch, can
   assert.match(document.querySelector('[aria-label="文件变更审批"]').textContent,/文件变更审批 · 2/);
   assert.equal(document.querySelectorAll('.assistant-panel .review-file-link').length,0);
   for(const row of document.querySelectorAll('.review-file-link')){assert.ok(row.classList.contains('tree-row'));assert.ok(row.querySelector('.tree-title'));assert.match(row.getAttribute('aria-label'),/修改待确认/);assert.equal(row.querySelector('small'),null);assert.equal(row.querySelectorAll('svg').length,1);}
+  // The library selector only changes the tree presentation, not the active course's approvals.
+  await React.act(async()=>{const select=document.querySelector('[aria-label="切换课程"]');Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set.call(select,'');select.dispatchEvent(new Event('change',{bubbles:true}));});
+  assert.equal(document.querySelector('[aria-label="切换课程"]').value,'');
+  assert.equal(document.querySelectorAll('.course-sidebar-panel .review-file-link').length,2);
   const groupToggle=document.querySelector('[aria-label="文件变更审批"] .course-group-heading');
   await click(groupToggle);assert.equal(groupToggle.getAttribute('aria-expanded'),'false');
   assert.equal(groupToggle.nextElementSibling.hidden,true);await click(groupToggle);
