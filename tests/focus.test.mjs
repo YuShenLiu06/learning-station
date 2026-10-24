@@ -8,7 +8,7 @@ const dom = new JSDOM('<div id="root"></div>', {url:'http://127.0.0.1/',pretendT
 Object.assign(globalThis,{window:dom.window,document:dom.window.document,location:dom.window.location,isTauri:true,IS_REACT_ACT_ENVIRONMENT:true,requestAnimationFrame:dom.window.requestAnimationFrame.bind(dom.window),cancelAnimationFrame:dom.window.cancelAnimationFrame.bind(dom.window)});
 Object.defineProperty(globalThis,'navigator',{configurable:true,value:dom.window.navigator});
 for(const name of ['Window','Range','HTMLElement','HTMLInputElement','HTMLSelectElement','HTMLTextAreaElement','Element','Node','Event','MouseEvent','KeyboardEvent','MutationObserver','DOMRect'])globalThis[name]=dom.window[name];
-globalThis.getComputedStyle=dom.window.getComputedStyle.bind(dom.window);globalThis.ResizeObserver=class{observe(){}unobserve(){}disconnect(){}};Range.prototype.getClientRects=()=>[];Range.prototype.getBoundingClientRect=()=>new DOMRect();
+globalThis.getComputedStyle=dom.window.getComputedStyle.bind(dom.window);globalThis.ResizeObserver=class{observe(){}unobserve(){}disconnect(){}};HTMLElement.prototype.scrollIntoView=()=>{};Range.prototype.getClientRects=()=>[];Range.prototype.getBoundingClientRect=()=>new DOMRect();
 const file=new URL(`./.focus-${process.pid}.mjs`,import.meta.url);
 await build({stdin:{contents:`export {App} from './src/App';export {captureFocus,readFocus} from './src/focus';export {sessionMessages} from './src/sessionMessages';export {freezeRequestedContext,readRequestedContext} from './src/requestedContext';export {mergeOutgoing} from './src/outgoingMessages';`,resolveDir:process.cwd(),loader:'tsx'},outfile:file.pathname,bundle:true,packages:'external',platform:'node',format:'esm',jsx:'automatic',define:{'import.meta.env.DEV':'false'}});
 const React=await import('react'),{createRoot}=await import('react-dom/client'),ui=await import(file.href),{mockIPC,mockWindows,clearMocks}=await import('@tauri-apps/api/mocks');
@@ -44,12 +44,16 @@ test('actual React/native path keeps the original Focus through page switch, can
  docs.set('exercise_e',{id:'exercise_e',path:'exercises/exercise_e.md',metadata:{id:'exercise_e',kind:'exercise',title:'E练习',parentId:'note_a',originSessionId:'course_session',exerciseEntryId:'exercise_entry'},body:'# E练习',version:'v1'});
  const session={id:'course_session',courseId:'course_c',sectionId:'note_a',version:'s1',entries:[],contextManifest:[]};
  session.entries.push({id:'exercise_entry',kind:'exercise',content:'Q',data:{exercises:[{id:'q1',question:'First?',format:'exact',answers:['one']},{id:'q2',question:'Second?',format:'exact',answers:['two']}]}});
- const calls=[],runs=new Map();let active='note_a',freezeCount=0,runReads=0,rejectFreeze=true;
+ let proposals=[];const calls=[],runs=new Map();let active='note_a',freezeCount=0,runReads=0,rejectFreeze=true;
  mockWindows('focus-isolated-fixture');mockIPC(async(command,args={})=>{calls.push({command,args:clone(args)});switch(command){
   case 'get_app_state':return {root:'/tmp/focus-fixture',activeDocumentId:active,documents:[...docs.values()].map(d=>({id:d.id,title:d.metadata.title,kind:'section',path:d.path,version:d.version})),model:{configured:true,provider:'custom',protocol:'openai-completions',baseUrl:'http://127.0.0.1/mock',model:'fixture',usageGate:''}};
   case 'get_library_tree':return {nodes:[{id:'course_c',title:'C课程',kind:'course',path:'courses/course_c.md',version:'v1'},...[...docs.values()].map(d=>({id:d.id,title:d.metadata.title,kind:d.metadata.kind,parentId:d.metadata.parentId,courseId:'course_c',path:d.path,version:d.version}))],warnings:[]};
   case 'get_ui_preferences':return {fontSize:16,assistantWidth:346,sidebarWidth:240,sidebarCollapsed:false,expandedNodeIds:['course_c','note_a'],toolAuthorizationTier:'off'};
-  case 'save_ui_preferences':return args;case 'get_ui_draft':return null;case 'save_ui_draft':return {key:args.key,data:args.data,version:'draft',updatedAt:'fixture'};
+  case 'save_ui_preferences':return args;case 'get_ui_draft':return args.key==='section:note_b'?{key:args.key,data:{body:'仍未保存的本机草稿'},version:'draft',updatedAt:'fixture'}:null;case 'save_ui_draft':return {key:args.key,data:args.data,version:'draft',updatedAt:'fixture'};
+  case 'edit_proposals':return proposals.filter(p=>p.courseId===args.courseId).map(p=>({id:p.id,stamp:'1'}));
+  case 'edit_proposal':return clone(proposals.find(p=>p.id===args.id));
+  case 'list_course_files':return [];
+  case 'decide_edit_proposal':proposals=proposals.filter(p=>p.id!==args.id);return {persisted:false,status:'rejected'};
   case 'record_ui_metric':return null;case 'list_todos':case 'list_notifications':return [];
   case 'open_document':active=args.id;return clone(docs.get(args.id));case 'start_session':return {session:clone(session)};case 'get_session':return clone(session);
   case 'get_exercise_document':return {session:clone(session)};
@@ -81,6 +85,39 @@ test('actual React/native path keeps the original Focus through page switch, can
   await sendAgain();let frozenCall=calls.filter(c=>c.command==='freeze_focus').at(-1).args.request.input;assert.equal(frozenCall.questionId,'q2');assert.equal(frozenCall.view,'exercise');
   await click(button('编辑 Markdown'));await wait(()=>document.querySelector('[aria-label="编辑小节正文"]'));
   await sendAgain();frozenCall=calls.filter(c=>c.command==='freeze_focus').at(-1).args.request.input;assert.equal(frozenCall.view,'edit');assert.equal(frozenCall.questionId,'q2');
+  await click([...document.querySelectorAll('.tree-row')].find(el=>el.title==='B笔记'));
+  await click(button('编辑'));await wait(()=>document.querySelector('.document-editor:not([hidden]) [aria-label="编辑小节正文"]'));
+  // Real App routing: a proposal arriving while CodeMirror is open is reachable
+  // from the course sidebar, including two proposals for the same document.
+  assert.equal(document.querySelector('[aria-label="文件变更审批"]'),null);
+  proposals=[{id:'first',courseId:'course_c',path:'documents/note_b.md',original:'原文😀\n\n尾段',content:'# First proposal',status:'pending'}, {id:'second',courseId:'course_c',path:'documents/note_b.md',original:'原文😀\n\n尾段',content:'# Second proposal',status:'pending'}];
+  await wait(()=>document.querySelectorAll('.course-sidebar-panel .review-file-link').length===2);
+  assert.match(document.querySelector('[aria-label="文件变更审批"]').textContent,/文件变更审批 · 2/);
+  assert.equal(document.querySelectorAll('.assistant-panel .review-file-link').length,0);
+  const groupToggle=document.querySelector('[aria-label="文件变更审批"] .course-group-heading');
+  await click(groupToggle);assert.equal(groupToggle.getAttribute('aria-expanded'),'false');
+  assert.equal(groupToggle.nextElementSibling.hidden,true);await click(groupToggle);
+  const countBefore=calls.length;
+  await click(document.querySelectorAll('.course-sidebar-panel .review-file-link')[1]);
+  assert.equal(document.querySelector('.document-editor:not([hidden])'),null);
+  assert.match(document.querySelector('.inline-edit-review').textContent,/Second proposal/);
+  assert.equal(button('接受').disabled,true,'unsaved draft prevents acceptance');
+  assert.match(document.querySelector('[aria-label="文件变更审批"]').textContent,/B笔记/);
+  assert.equal(calls.slice(countBefore).some(c=>['open_document','save_document','decide_edit_proposal'].includes(c.command)),false,'locating the current document neither reloads nor saves/accepts it');
+  assert.match(document.querySelector('.toolbar-hint').textContent,/审阅修改/);
+  await click([...document.querySelectorAll('.tree-row')].find(el=>el.title==='A笔记'));
+  await wait(()=>document.querySelector('.document-title-row h1')?.textContent==='A笔记');
+  const beforeCross=calls.filter(c=>c.command==='open_document').length;
+  await click(document.querySelectorAll('.course-sidebar-panel .review-file-link')[1]);
+  assert.equal(document.querySelector('.document-title-row h1').textContent,'B笔记');
+  assert.match(document.querySelector('.inline-edit-review').textContent,/Second proposal/);
+  assert.equal(calls.filter(c=>c.command==='open_document').length,beforeCross+1,'cross-document review verifies once and reuses the result');
+  assert.equal(button('接受').disabled,true,'cross-document navigation retains the existing local draft');
+  await click(button('拒绝'));assert.equal(calls.filter(c=>c.command==='decide_edit_proposal').at(-1).args.id,'second');
+  await click(button('拒绝'));assert.equal(document.querySelector('[aria-label="文件变更审批"]'),null);
+  await click(button('编辑'));assert.match(document.querySelector('.document-editor:not([hidden])').textContent,/仍未保存的本机草稿/);
+  assert.equal(calls.slice(countBefore).some(c=>c.command==='save_document'),false);
+
 
  }finally{await React.act(async()=>root.unmount());clearMocks();}
 });

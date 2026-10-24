@@ -93,6 +93,15 @@ test('inline review is contextual, protects drafts, navigates changes and disapp
    assert.equal(decisions.length, count + 1); assert.equal(decisions.at(-1).accept, false);
    assert.equal(document.querySelector('.review-dock'), null);
   }
+  // A late open in the previous course must not reveal its retained proposal.
+  visible = [a]; await render({}, true);
+  let finishOpen;const pendingOpen=new Promise(resolve=>{finishOpen=resolve;});
+  await render({onOpen:()=>pendingOpen});
+  await React.act(async()=>document.querySelector('.review-file-link').click());
+  visible=[];await render({courseId:'course_other',documentId:'doc_other'});
+  await React.act(async()=>finishOpen());
+  assert.equal(document.querySelector('.review-file-links'),null);
+  assert.equal(document.querySelector('.inline-edit-review'),null);
   visible = []; await React.act(async () => { await new Promise(r => setTimeout(r, 1100)); });
   assert.equal(document.querySelector('.review-dock'), null); assert.equal(document.querySelector('.review-file-links'), null);
  } finally { await React.act(async () => root.unmount()); dom.window.close(); delete globalThis.reviewCall; await unlink(filename).catch(() => {}); }

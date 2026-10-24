@@ -12,7 +12,7 @@ const errorText = (error: unknown) => error instanceof Error ? error.message : S
 export type ReviewQuestion = { id: string; question: string; format: string; answers: string[]; explanation?: string; tags?: string[]; sourceIds?: string[]; rubric?: { criteria: {id:string;label:string;description:string;maxPoints:number}[] } };
 export type QuestionChange = { id: string; before?: ReviewQuestion; after?: ReviewQuestion; status: string };
 export type EditProposal = { exercise?: { documentId: string; version: string; changes: QuestionChange[] }; id: string; courseId: string; path: string; original: string; content: string; status: string; expectedVersion?: string };
-type Props = { courseId: string; documentId: string; isDirty: (id: string) => boolean; isLoaded: (id: string) => boolean; onAccepted: (id: string) => Promise<void>; onOpen: (id: string) => void | Promise<void>; notify: (message: string) => void };
+type Props = { courseId: string; documentId: string; isDirty: (id: string) => boolean; isLoaded: (id: string) => boolean; onAccepted: (id: string) => Promise<void>; onOpen: (id: string) => void | boolean | Promise<void | boolean>; notify: (message: string) => void };
 export const proposalDocumentId = (path: string) => /^documents\/([^/]+)\.md$/u.exec(path)?.[1] || '';
 export const proposalFileName = (path: string) => path.split('/').at(-1) || '文本文件';
 
@@ -29,7 +29,10 @@ export function needsReviewSource(text: string) {
 }
 
 export function useEditReview(props: Props) {
-  const [items, setItems] = useState<EditProposal[]>([]);
+  const [storedItems, setItems] = useState<EditProposal[]>([]);
+  const items = storedItems.filter(p => p.courseId === props.courseId);
+  const [selectedId, setSelectedId] = useState('');
+  const locateSequence = useRef(0);
   const [selectedRaw, setSelectedRaw] = useState('');
   const [jump, setJump] = useState('');
   const [busy, setBusy] = useState(false);
@@ -40,7 +43,7 @@ export function useEditReview(props: Props) {
   // A late poll must not put a just-decided proposal back into the document.
   const settled = useRef(new Set<string>());
   useEffect(() => {
-    setItems([]); setSelectedRaw(''); setError(''); settled.current.clear();
+    setItems([]); setSelectedRaw(''); setSelectedId(''); setError(''); settled.current.clear(); locateSequence.current++;
     if (!nativeAvailable || !props.courseId) return;
     let stopped = false;
     const cache = new Map<string, { stamp: string; proposal: EditProposal }>();
@@ -63,7 +66,8 @@ export function useEditReview(props: Props) {
   }, [props.courseId]);
   const raw = items.find(p => p.id === selectedRaw);
   const readOnly = !!raw && !!proposalDocumentId(raw.path);
-  const proposal = raw || items.find(p => proposalDocumentId(p.path) === props.documentId);
+  const documentItems = items.filter(p => proposalDocumentId(p.path) === props.documentId);
+  const proposal = raw || documentItems.find(p => p.id === selectedId) || documentItems[0];
   const blocks = useMemo(() => {
     if (!proposal || proposal.exercise) return [];
     // Keep code fences, lists and tables intact; never split their Markdown
@@ -96,17 +100,20 @@ export function useEditReview(props: Props) {
   }, [jump, proposal?.id]);
   async function locate(p: EditProposal) {
     const owner = latest.current.courseId;
+    if (p.courseId !== owner || !items.some(item => item.id === p.id)) return;
+    const sequence = ++locateSequence.current;
+    const current = () => latest.current.courseId === owner && sequence === locateSequence.current;
     const id = proposalDocumentId(p.path);
     setSelectedRaw('');
     if (id) {
-      try { await latest.current.onOpen(id); }
+      try { if (await latest.current.onOpen(id) === false) return; }
       catch {
-        if (latest.current.courseId !== owner) return;
+        if (!current()) return;
         // Failed navigation must never offer a second route around draft guards.
         setSelectedRaw(p.id);
       }
     } else setSelectedRaw(p.id);
-    if (latest.current.courseId === owner) setJump(p.id);
+    if (current()) { setSelectedId(p.id); setJump(p.id); }
   }
   const dirty = proposal ? props.isDirty(proposalDocumentId(proposal.path)) : false;
   async function decide(accept: boolean) {
@@ -186,7 +193,7 @@ export function EditReviewDock({ review, editing, onRead }: { review: EditReview
 export function EditReviewLinks({ review, title }: { review: EditReviewState; title: (p: EditProposal) => string }) {
   if (!review.items.length && !review.error) return null;
   return <div className="review-file-links" aria-label="待审阅文件">
-    {review.items.map(p => <button className="review-file-link" key={p.id} onClick={() => review.locate(p)}><FileText size={17}/><span><strong>{title(p)}</strong><small>{p.status === 'pending' ? '修改待确认 · 查看正文差异' : '写入待核对 · 查看保留的内容'}</small></span><ArrowUpRight size={15}/></button>)}
-    {!review.items.length && review.error && <p className="inline-error" role="alert">修改建议暂未读到：{review.error}<button onClick={review.dismissError}>关闭提示</button></p>}
+    {review.items.map(p => <button className="review-file-link" key={p.id} disabled={review.busy} aria-current={review.proposal?.id === p.id ? true : undefined} onClick={() => review.locate(p)}><FileText size={17}/><span><strong>{title(p)}</strong><small>{p.status === 'pending' ? '修改待确认 · 查看正文差异' : '写入待核对 · 查看保留的内容'}</small></span><ArrowUpRight size={15}/></button>)}
+    {review.error && <p className="inline-error" role="alert">文件变更审批：{review.error}<button onClick={review.dismissError}>关闭提示</button></p>}
   </div>;
 }

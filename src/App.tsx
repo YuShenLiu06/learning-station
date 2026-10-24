@@ -1,4 +1,4 @@
-import { useEditReview, EditReviewContent, EditReviewDock, EditReviewLinks, proposalDocumentId, proposalFileName } from './EditReview';
+import { useEditReview, EditReviewContent, EditReviewDock, proposalFileName } from './EditReview';
 import { captureFocus } from './focus';
 import { locateCitation } from './citation';
 import { renderedCitation, renderedCitationRange } from './renderedCitation';
@@ -292,8 +292,14 @@ export function App() {
     isLoaded: id => docsRef.current[id]?.draftLoaded === true,
     isDirty: id => { const d = docsRef.current[id]; return !!d && (d.body !== d.savedBody || d.saving || d.draftLoaded === false); },
     notify, onOpen: async id => {
-      const section = await call<Section>('section_open', { id });
-      if (id !== activeIdRef.current) await openSection(id, section);
+      // The current editor already owns its loaded body. Locating a proposal must
+      // not reload it (or save it) just to leave edit mode.
+      const intent = ++navigationIntent.current;
+      if (id !== activeIdRef.current) {
+        const section = await call<Section>('section_open', { id });
+        if (intent !== navigationIntent.current) return false;
+        if (!await openSection(id, section, true)) return false;
+      } else switchView('lesson');
       setEditing(false);
     },
     onAccepted: async id => {
@@ -315,14 +321,14 @@ export function App() {
   useEffect(() => { setFocusedAsset(null); }, [activeId]);
   useEffect(() => { if (activeId) questionDrafts.current[activeId] = question; }, [activeId, question]);
   useEffect(() => { if (toast) { const timer = setTimeout(() => setToast(''), 4500); return () => clearTimeout(timer); } }, [toast]);
-  const openSection = useCallback(async (id: string, verified?: Section) => {
+  const openSection = useCallback(async (id: string, verified?: Section, preserveDraft = false) => {
     const started = performance.now();
     const sequence = ++openSequence.current, beforeNavigation = navigationIntent.current;
     const cached = docsRef.current[id];
-    if (verified && (verified.id !== id || cached && (cached.saving || cached.body !== cached.savedBody))) throw new Error('来源有未保存的编辑，请先处理；历史引用与当前草稿仍保留。');
+    if (verified && (verified.id !== id || !preserveDraft && cached && (cached.saving || cached.body !== cached.savedBody))) throw new Error('来源有未保存的编辑，请先处理；历史引用与当前草稿仍保留。');
     const verifiedDraft = verified && !cached && nativeAvailable ? await call<UiDraft | null>('draft_get', { key: `section:${id}` }) : null;
     if (sequence !== openSequence.current || beforeNavigation !== navigationIntent.current) return;
-    if (verified && verifiedDraft?.data.body !== undefined && verifiedDraft.data.body !== verified.body) throw new Error('来源有待恢复的草稿，未将其作为历史版本展示；请先处理草稿。');
+    if (verified && !preserveDraft && verifiedDraft?.data.body !== undefined && verifiedDraft.data.body !== verified.body) throw new Error('来源有待恢复的草稿，未将其作为历史版本展示；请先处理草稿。');
     navigationRef.current.ensureExpanded(ancestorIds(nodesRef.current, id));
     activeIdRef.current = id; setActiveId(id); setAssetsOpen(false); setQuestion(questionForSection(questionDrafts.current, id)); switchView('lesson'); setEditing(false); setSelection(''); setAiError(''); setOpenError('');
     const intent = navigationIntent.current;
@@ -336,8 +342,8 @@ export function App() {
     });
     if (docsRef.current[id]) {
       if (!isContainerKind(docsRef.current[id].section.kind)) void call<LearningSession>('session_open', { sectionId: id }).then(value => { setSessions(old => ({ ...old, [id]: value })); if (stillCurrent()) adoptCourseChat(value); if (value.courseId) void reloadConversations(value.courseId); }).catch(error => { if (stillCurrent()) setAiError(`学习记录尚未读到：${errorText(error)}`); });
-      if (verified) { const opened = { section: verified, body: verified.body, savedBody: verified.body, saving: false, draftLoaded: docsRef.current[id].draftLoaded }; docsRef.current = { ...docsRef.current, [id]: opened }; setDocs(old => ({ ...old, [id]: opened })); }
-      else if (nativeAvailable) void call<Section>('section_open', { id }).then(section => {
+      if (verified && (!preserveDraft || cached.body === cached.savedBody && !cached.saving)) { const opened = { section: verified, body: verified.body, savedBody: verified.body, saving: false, draftLoaded: docsRef.current[id].draftLoaded }; docsRef.current = { ...docsRef.current, [id]: opened }; setDocs(old => ({ ...old, [id]: opened })); }
+      else if (!verified && nativeAvailable) void call<Section>('section_open', { id }).then(section => {
         if (!stillCurrent()) return;
         const local = docsRef.current[id];
         if (!local || local.saving || section.version === local.section.version) return;
@@ -345,7 +351,7 @@ export function App() {
         setDocs(old => ({ ...old, [id]: { section, body: section.body, savedBody: section.body, saving: false, draftLoaded: local.draftLoaded } }));
         setEditedIds(old => { const next = new Set(old); next.delete(id); return next; });
       }).catch(error => { if (stillCurrent()) setOpenError(errorText(error)); });
-      return;
+      return true;
     }
     setOpening(true);
     try {
@@ -358,6 +364,7 @@ export function App() {
       if (stillCurrent() && !isContainerKind(section.kind)) void call<LearningSession>('session_open', { sectionId: id }).then(learning => { setSessions(previous => ({ ...previous, [id]: learning })); if (stillCurrent()) adoptCourseChat(learning); if (learning.courseId) void reloadConversations(learning.courseId); }).catch(error => { if (activeIdRef.current === id) setAiError(`小节已打开，学习记录暂未载入：${errorText(error)}`); });
       requestAnimationFrame(() => recordMetric('section-ready', performance.now() - started));
       if (draft.value?.data.question) { questionDrafts.current[id] = draft.value.data.question; if (stillCurrent()) setQuestion(draft.value.data.question); }
+      return stillCurrent();
     } catch (error) { if (verified) throw error; if (stillCurrent()) setOpenError(errorText(error)); }
     finally { if (stillCurrent()) setOpening(false); }
   }, []);
@@ -924,7 +931,7 @@ export function App() {
         <div className="topbar-navigation"><button className="icon-button navigation-toggle" aria-label={navigation.collapsed ? '展开侧边栏' : '折叠为图标栏'} title={navigation.collapsed ? '展开左侧目录' : '收起左侧目录'} aria-expanded={!navigation.collapsed} onClick={()=>navigation.setCollapsed(!navigation.collapsed)}>{navigation.collapsed ? <PanelLeftOpen size={19}/> : <PanelLeftClose size={19}/>}</button><div className="breadcrumbs"><span>{view === 'lesson' ? (activeCourse?.title || '我的学习空间') : view === 'review' ? '复习与历史' : view === 'settings' ? '设置' : view === 'explorations' ? '探索' : view === 'history-index' ? '学习历史' : view === 'trash' ? '回收区' : view === 'history' ? '历史会话' : '学习待办'}</span><ChevronRight size={12} /><span className="breadcrumb-current">{view === 'lesson' ? '阅读与理解' : view === 'review' ? '把学过的串起来' : view === 'settings' ? '本机偏好' : view === 'explorations' ? '从问题开始' : view === 'history-index' ? '真实学习记录' : view === 'trash' ? '可恢复的学习内容' : view === 'history' ? '只读记录' : '接着完成下一步'}</span></div></div>
         <div className="topbar-actions"><button className={`icon-button navigation-toggle notice-button ${boot.notices.some(notice => !notice.read) ? 'has-notices' : ''}`} aria-label="通知" title="通知" onClick={() => setNotifications(!notifications)}><Clock3 size={19} /></button>{view === 'lesson' && <button className="icon-button navigation-toggle" aria-label={rightbar ? '收起学习助手' : '打开学习助手'} title={rightbar ? '收起右侧学习助手' : '打开右侧学习助手'} aria-expanded={rightbar} onClick={() => setRightbar(!rightbar)}>{rightbar ? <PanelRightClose size={19} /> : <PanelRightOpen size={19} />}</button>}</div>
       </header>
-    <WorkspaceSidebar onRefreshNodes={refreshTree} onToggleCollapsed={()=>navigation.setCollapsed(!navigation.collapsed)} conversations={conversations} activeSessionId={session.id} onSessionOpen={(owner,id)=>{void changeConversation(owner,id);}} onSessionCreate={owner=>{void changeConversation(owner);}} onSessionRename={(owner,id)=>{void beginRename(owner,id);}} onSessionTrash={(owner,id)=>{if(busyRef.current){notify('请先停止生成，再将对话移至回收区。');return;}setTrashingChat({courseId:owner,sessionId:id});}} sidebarWidth={sidebarWidth.width} onSidebarWidth={sidebarWidth.setWidth} collapsed={navigation.collapsed} nodes={nodes} activeId={activeId} expandedIds={navigation.expandedIds} onExpanded={navigation.setExpandedIds} onOpen={id => { void openSection(id); }} onNew={setCreatingNode} onImport={() => setImporting(true)} onLearning={()=>switchView('lesson')} onExplorations={enterExplorations} onHistory={()=>switchView('history-index')} onTrash={()=>switchView('trash')} onTrashNode={node=>{if(busyRef.current){notify('请先停止生成，再将内容移至回收区。');return;}setTrashNode(node);}} blocked={!!busyId} onInject={id=>{void injectDocument(id);}} injectedIds={injections.map(item=>item.documentId)} onRemoveInjection={removeInjection} canInject={!!session.id} onReview={() => switchView('review')} onTasks={() => switchView('tasks')} onSettings={openSettings} view={view} loading={loading} dirtyIds={Object.entries(docs).filter(([,doc])=>doc.body!==doc.savedBody).map(([id])=>id)} taskCount={boot.tasks.filter(task=>!task.completed).length} modelReady={modelReady}/>
+    <WorkspaceSidebar editReview={editReview} onRefreshNodes={refreshTree} onToggleCollapsed={()=>navigation.setCollapsed(!navigation.collapsed)} conversations={conversations} activeSessionId={session.id} onSessionOpen={(owner,id)=>{void changeConversation(owner,id);}} onSessionCreate={owner=>{void changeConversation(owner);}} onSessionRename={(owner,id)=>{void beginRename(owner,id);}} onSessionTrash={(owner,id)=>{if(busyRef.current){notify('请先停止生成，再将对话移至回收区。');return;}setTrashingChat({courseId:owner,sessionId:id});}} sidebarWidth={sidebarWidth.width} onSidebarWidth={sidebarWidth.setWidth} collapsed={navigation.collapsed} nodes={nodes} activeId={activeId} expandedIds={navigation.expandedIds} onExpanded={navigation.setExpandedIds} onOpen={id => { void openSection(id); }} onNew={setCreatingNode} onImport={() => setImporting(true)} onLearning={()=>switchView('lesson')} onExplorations={enterExplorations} onHistory={()=>switchView('history-index')} onTrash={()=>switchView('trash')} onTrashNode={node=>{if(busyRef.current){notify('请先停止生成，再将内容移至回收区。');return;}setTrashNode(node);}} blocked={!!busyId} onInject={id=>{void injectDocument(id);}} injectedIds={injections.map(item=>item.documentId)} onRemoveInjection={removeInjection} canInject={!!session.id} onReview={() => switchView('review')} onTasks={() => switchView('tasks')} onSettings={openSettings} view={view} loading={loading} dirtyIds={Object.entries(docs).filter(([,doc])=>doc.body!==doc.savedBody).map(([id])=>id)} taskCount={boot.tasks.filter(task=>!task.completed).length} modelReady={modelReady}/>
 
     <main className="main-area">
 
@@ -983,7 +990,6 @@ export function App() {
       <SelectionContextTray references={composerRefs} busy={!!busyId} onRemove={removeComposerReference} onAsk={() => openPanel('explain', '请帮我理解这段内容。')} onPractice={() => openPanel('practice')} onReview={(quote,reference) => setCardDraft({ front: quote, back: '', sessionId: session.id, sectionId: reference.kind === 'assistant' ? '' : reference.documentId })}/>
       {!!session.legacySessionIds?.length && <div className="model-prompt">本课程支持多个独立对话。原有 {session.legacySessionIds.length} 段对话已备份并保留。<button className="text-back" onClick={()=>switchView('history-index')}>查看学习历史</button></div>}
       <div className="assistant-scroll">
-        <EditReviewLinks review={editReview} title={proposal => nodes.find(node => node.id === proposalDocumentId(proposal.path))?.title || proposalFileName(proposal.path)}/>
 
         <RequestContextView value={contextView.sessionId && contextView.sessionId !== session.id ? { status: 'loading' } : contextView} independent={current?.section.kind === 'exploration'} onRetry={() => setContextRetry(old => old + 1)} />
 
