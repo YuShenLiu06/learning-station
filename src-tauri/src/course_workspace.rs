@@ -200,7 +200,7 @@ fn course_write_locked(
     }
     let current_version = baseline.as_ref().map(|(_, version)| version.clone());
     if args.expected_version != current_version {
-        return Err(conflict());
+        return Err(conflict().details(json!({"reason":"write_version_mismatch"})));
     }
     if doc.as_ref().is_some_and(|d| d.metadata.kind == "exercise") && call_id.is_none() {
         return Err(CoreError::new("INVALID_INPUT", "练习必须逐题审阅，不能整份覆盖。"));
@@ -374,7 +374,7 @@ fn stage(
             return Err(CoreError::new(
                 "CONFLICT",
                 "该文件已有待审阅建议，请先接受或拒绝；正文未修改。",
-            ));
+            ).details(json!({"reason":"edit_review_pending","proposalId":other.id,"courseId":course,"status":other.status})));
         }
     }
     let exercise = match document(core, scope, course, &args.path)? {

@@ -1653,6 +1653,11 @@ fn finish_tool_activity(
     activity.error_code = Some("TOOL_FAILED".into());
     if let Err(error) = result {
         activity.error_code = Some(error.code.clone());
+        if activity.name == "write" {
+            if let Some(feedback) = crate::authorized_tools::write_conflict_feedback(error) {
+                activity.summary = feedback["message"].as_str().unwrap().into();
+            }
+        }
         if error.code == "INVALID_MODEL_OUTPUT"
             && error
                 .details
