@@ -673,6 +673,9 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
             }
             Err(e) => Err(e),
         };
+        if result.is_err() {
+            let _ = settle_interrupted_tools(&engine, &id, &sink);
+        }
         let mut runs = engine.runs.lock().unwrap_or_else(|e| e.into_inner());
         let m = runs.get_mut(&id).unwrap();
         match result {
@@ -1567,8 +1570,14 @@ fn finish_tool_activity(
 ) {
     activity.updated_at = timestamp();
     if let Ok(value) = result {
+        if activity.name == "write" && value["status"] == "unchanged" && value["persisted"] == false
+            && value["sessionId"] == scope.session_id {
+            activity.status = "succeeded".into();
+            activity.summary = "内容未变化，未重复写入。".into();
+            return;
+        }
         if activity.name == "write" && value["proposalId"].is_string() && value["persisted"] == false {
-            activity.status = if value["status"] == "pending" { "running" } else { "succeeded" }.into();
+            activity.status = if value["status"] == "pending" { "waiting" } else { "succeeded" }.into();
             activity.summary = if value["status"] == "pending" { "AI 修改待确认，建议已保留，正文未修改。" } else { "用户已拒绝建议，正文未修改。" }.into();
             return;
         }
@@ -1654,6 +1663,19 @@ fn finish_tool_activity(
         }
     }
 }
+// A cancelled handler may leave blocking work in flight. Preserve uncertainty;
+// only its eventual durable receipt can confirm whether the write completed.
+fn settle_interrupted_tools(engine: &Engine, run_id: &str, sink: &Sink) -> Result<()> {
+    for mut activity in get(engine, run_id)?.tool_calls.into_iter().filter(|a| a.status == "running") {
+        activity.status = "unknown".into();
+        activity.summary = "生成已结束，工具结果尚未核实；请核对原回执，不要重复写入。".into();
+        activity.error_code = Some("NATIVE_TOOL_UNKNOWN".into());
+        activity.updated_at = timestamp();
+        publish_tool_activity(engine, &activity, sink)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn settle_proposal_activity(
     engine: &Engine,
     scope: &crate::learning_tools::ToolScope,
@@ -1673,6 +1695,11 @@ pub(crate) fn settle_proposal_activity(
     publish_tool_activity(engine, &activity, &sink)
 }
 
+#[cfg(test)]
+thread_local! {
+    static ACTIVITY_CORE_LOCKED: std::cell::RefCell<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
+}
+
 fn publish_tool_activity(engine: &Engine, activity: &ToolActivity, sink: &Sink) -> Result<()> {
     let run = get(engine, &activity.run_id)?;
     if run.id != activity.run_id || run.session_id != activity.session_id {
@@ -1685,14 +1712,28 @@ fn publish_tool_activity(engine: &Engine, activity: &ToolActivity, sink: &Sink) 
     // A decision IPC and the waiting handler may both settle the same call.
     // Reuse the first persisted activity (including timestamps) for idempotency.
     let mut core = engine.lock()?;
-    let saved = sessions::get_persisted(&mut core.content, &activity.session_id)?
+    #[cfg(test)]
+    ACTIVITY_CORE_LOCKED.with(|hook| {
+        if let Some((locked, resume)) = hook.borrow_mut().take() {
+            locked.send(()).unwrap();
+            resume.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        }
+    });
+    // Inspect durable activities under core alone. Taking runs here would
+    // invert completion's runs -> core order and can deadlock on timeout.
+    let saved_activities = sessions::get_persisted(&mut core.content, &activity.session_id)?
         .entries
         .into_iter()
         .filter_map(|entry| {
             entry.data.and_then(|data| {
                 serde_json::from_value::<ToolActivity>(data["toolActivity"].clone()).ok()
             })
-        })
+        }).collect::<Vec<_>>();
+    if activity.status == "unknown" && saved_activities.iter()
+        .any(|previous| previous.id == activity.id && previous.status != "running") {
+        return Ok(());
+    }
+    let saved = saved_activities.into_iter()
         .find(|previous| previous.id == activity.id && previous.status == activity.status);
     let activity = match saved.as_ref() {
         Some(previous)
@@ -1735,6 +1776,9 @@ fn publish_tool_activity(engine: &Engine, activity: &ToolActivity, sink: &Sink) 
             .iter_mut()
             .find(|item| item.tool_call_id == activity.tool_call_id)
         {
+            if activity.status == "unknown" && previous.status != "running" {
+                return Ok(());
+            }
             *previous = activity.clone();
         } else {
             managed.run.tool_calls.push(activity.clone());
@@ -1818,6 +1862,82 @@ mod lifecycle_tests {
         };
         (temp, engine, session)
     }
+    #[test]
+    fn timeout_activity_does_not_invert_completion_lock_order() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (_temp, engine, session) = setup();
+        let run = run(&session.id);
+        let scope = crate::learning_tools::ToolScope { session_id:session.id.clone(), section_id:session.section_id.clone(), run_id:run.id.clone(), allowed_ids:vec![] };
+        engine.runs.lock().unwrap().insert(run.id.clone(), ManagedRun {run, cancel:Arc::new(AtomicBool::new(false))});
+        let sink: Sink = Arc::new(|_| {});
+        let mut activity = new_tool_activity(&scope, "concurrent-timeout", "write").unwrap();
+        publish_tool_activity(&engine, &activity, &sink).unwrap();
+        activity.status = "unknown".into();
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker_engine = engine.clone();
+        let cleanup = std::thread::spawn(move || {
+            ACTIVITY_CORE_LOCKED.with(|hook| *hook.borrow_mut() = Some((locked_tx, resume_rx)));
+            let result = publish_tool_activity(&worker_engine, &activity, &sink);
+            done_tx.send(()).unwrap();
+            result
+        });
+        locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let completion_engine = engine.clone();
+        let (completion_tx, completion_rx) = mpsc::channel();
+        let completion = std::thread::spawn(move || {
+            // Match generation completion exactly: hold runs while persist
+            // obtains core through run_path. Cleanup already holds core.
+            let mut runs = completion_engine.runs.lock().unwrap();
+            let managed = runs.get_mut(&scope.run_id).unwrap();
+            managed.run.status = "failed".into();
+            resume_tx.send(()).unwrap();
+            let result = persist(&completion_engine, &managed.run);
+            completion_tx.send(()).unwrap();
+            result
+        });
+        completion_rx.recv_timeout(Duration::from_secs(5)).expect("completion must not deadlock with timeout cleanup");
+        done_rx.recv_timeout(Duration::from_secs(5)).expect("timeout cleanup must finish");
+        completion.join().unwrap().unwrap();
+        cleanup.join().unwrap().unwrap();
+        let saved = get(&engine,"run_lifecycle").unwrap();
+        assert_eq!(saved.status,"failed");
+        assert_eq!(saved.tool_calls[0].status,"unknown");
+    }
+
+    #[test]
+    fn interrupted_tools_preserve_waiting_and_unknown_until_real_receipt() {
+        let (_temp, engine, session) = setup();
+        let run = run(&session.id);
+        let scope = crate::learning_tools::ToolScope { session_id:session.id.clone(), section_id:session.section_id.clone(), run_id:run.id.clone(), allowed_ids:vec![] };
+        engine.runs.lock().unwrap().insert(run.id.clone(), ManagedRun {run, cancel:Arc::new(AtomicBool::new(false))});
+        let sink: Sink = Arc::new(|_| {});
+        let mut pending = new_tool_activity(&scope, "pending", "write").unwrap();
+        publish_tool_activity(&engine, &pending, &sink).unwrap();
+        finish_tool_activity(&mut pending, &scope, &Ok(json!({"status":"pending","proposalId":"proposal","persisted":false})));
+        publish_tool_activity(&engine, &pending, &sink).unwrap();
+        assert_eq!(get(&engine,&scope.run_id).unwrap().tool_calls[0].status,"waiting");
+        let mut in_flight = new_tool_activity(&scope, "in-flight", "write").unwrap();
+        publish_tool_activity(&engine, &in_flight, &sink).unwrap();
+        settle_interrupted_tools(&engine, &scope.run_id, &sink).unwrap();
+        let snapshot = get(&engine,&scope.run_id).unwrap();
+        assert_eq!(snapshot.tool_calls[0].status,"waiting");
+        assert_eq!(snapshot.tool_calls[1].status,"unknown");
+        assert!(!snapshot.tool_calls[1].persisted);
+        let stale_unknown = snapshot.tool_calls[1].clone();
+        finish_tool_activity(&mut in_flight, &scope, &Ok(json!({"persisted":true,"sessionId":session.id})));
+        publish_tool_activity(&engine, &in_flight, &sink).unwrap();
+        publish_tool_activity(&engine, &stale_unknown, &sink).unwrap();
+        assert_eq!(get(&engine,&scope.run_id).unwrap().tool_calls[1].status,"succeeded");
+        settle_proposal_activity(&engine, &scope, "pending", &json!({"persisted":false,"status":"rejected","proposalId":"proposal"})).unwrap();
+        let mut core = engine.lock().unwrap();
+        let saved = sessions::get_persisted(&mut core.content,&session.id).unwrap();
+        assert!(saved.entries.iter().any(|entry| entry.data.as_ref().is_some_and(|d| d["toolActivity"]["status"] == "waiting")));
+        assert!(saved.entries.iter().any(|entry| entry.data.as_ref().is_some_and(|d| d["toolActivity"]["status"] == "unknown")));
+    }
+
     #[test]
     fn appended_question_is_reused_for_retries_without_duplicate_history() {
         let (_temp, engine, session) = setup();

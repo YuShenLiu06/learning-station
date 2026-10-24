@@ -577,10 +577,21 @@ pub fn append(
 pub(crate) fn append_citation(
     store: &mut ContentStore,
     session_id: &str,
-    mut entry: Entry,
+    entry: Entry,
     expected: Option<&str>,
     request_id: &str,
     citation: Option<&crate::citation_context::CitationContext>,
+) -> Result<Session> {
+    append_inner(store, session_id, entry, expected, request_id, citation, false)
+}
+/// Only the validated exercise review service may reuse byte-identical questions.
+pub(crate) fn append_exercise_revision(store: &mut ContentStore, session_id: &str, entry: Entry, request_id: &str) -> Result<Session> {
+    append_inner(store, session_id, entry, None, request_id, None, true)
+}
+fn append_inner(
+    store: &mut ContentStore, session_id: &str, mut entry: Entry,
+    expected: Option<&str>, request_id: &str,
+    citation: Option<&crate::citation_context::CitationContext>, revision: bool,
 ) -> Result<Session> {
     if request_id.len() < 8 || request_id.len() > 128 {
         return Err(CoreError::new("INVALID_INPUT", "请求缺少防重复编号。"));
@@ -669,7 +680,10 @@ pub(crate) fn append_citation(
                 .and_then(Value::as_str)
                 .filter(|id| valid_id(id))
                 .ok_or_else(|| CoreError::new("INVALID_INPUT", "练习缺少稳定题目编号。"))?;
-            if !ids.insert(id) || question_exists(&old, id) {
+            let existing: Vec<_> = old.entries.iter().filter(|e| e.kind == "exercise")
+                .filter_map(|e| e.data.as_ref()).filter_map(|d| d["exercises"].as_array())
+                .flatten().filter(|q| q["id"].as_str() == Some(id)).collect();
+            if !ids.insert(id) || !existing.is_empty() && (!revision || existing.iter().any(|q| *q != question)) {
                 return Err(CoreError::new(
                     "CONFLICT",
                     "题目编号已存在，未覆盖原题和作答。",

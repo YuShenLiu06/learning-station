@@ -276,6 +276,14 @@ pub(crate) fn execute(
         result["replayed"] = json!(true);
         return Ok(result);
     }
+    // Direct course writes share the same revocation boundary as accepting a
+    // proposal. Acquire only after replay (which may itself settle a proposal).
+    let _authorization = if name == "write" {
+        Some(crate::app::UI_PREFERENCE_WRITE.lock().map_err(|_| CoreError::new("BUSY", "界面设置暂不可用。"))?)
+    } else { None };
+    if name == "write" && tier_rank(&engine.ui_preferences()?.tool_authorization_tier) < required {
+        return Err(not_allowed());
+    }
     let outcome = (|| {
     let mut result = match name {
         "read" => execute_read(engine, scope, decode::<ReadArgs>(args)?),
@@ -477,7 +485,7 @@ fn execute_read(engine: &crate::app::Engine, scope: &ToolScope, args: ReadArgs) 
 #[path = "course_workspace.rs"]
 mod course_workspace;
 use course_workspace::{course_read, course_write};
-pub(crate) use course_workspace::{proposal_list, proposal_get, proposal_decide, proposal_result};
+pub(crate) use course_workspace::{proposal_list, proposal_get, proposal_decide, proposal_result, exercise_proposal_decide};
 
 fn execute_write(
     engine: &crate::app::Engine,
@@ -993,6 +1001,207 @@ mod tests {
         } else { Ok(result) }
     }
 
+    fn exercise_review_fixture() -> (tempfile::TempDir, Arc<Engine>, ToolScope, String, Value) {
+        let (dir, engine, mut scope, source, _) = course_fixture("write");
+        let (document, original) = {
+            let mut core = engine.lock().unwrap();
+            let raw = json!({"summary":"synthetic","exercises":[
+                {"question":"A or B?\n\nA. one\nB. two","format":"exact","answers":["A"],"explanation":"one","tags":[],"sourceIds":[]},
+                {"question":"Unchanged","format":"exact","answers":["same"],"explanation":"same","tags":[],"sourceIds":[]}
+            ]});
+            let data = crate::exercises::validate(raw, &[], "review-fixture").unwrap();
+            let document = crate::exercises::create(&mut core.content, &scope.session_id, &source, data, "review-exercise-create").unwrap();
+            let payload = crate::exercise_edits::payload(&mut core.content, &document.id).unwrap();
+            (document, payload)
+        };
+        scope.allowed_ids.push(document.id.clone());
+        let mut runs = engine.runs.lock().unwrap();
+        let run = &mut runs.get_mut(&scope.run_id).unwrap().run;
+        run.course_read_manifest.as_mut().unwrap().push(crate::types::ManifestItem { id:document.id.clone(), path:document.path, version:document.version, included_chars:0 });
+        crate::app::atomic_json(&engine.lock().unwrap().state_dir.join("runs").join(format!("{}.json",run.id)), run).unwrap();
+        drop(runs);
+        (dir,engine,scope,document.id,original)
+    }
+    #[test]
+    fn exercise_review_persists_whole_questions_replays_and_preserves_historical_grading() {
+        let (dir,engine,scope,id,original) = exercise_review_fixture();
+        let before = engine.lock().unwrap().content.read(&id).unwrap();
+        let origin_entry = before.metadata.extra["exerciseEntryId"].as_str().unwrap().to_owned();
+        let old_entry_bytes = engine.lock().unwrap().content.read(&origin_entry).unwrap().content;
+        let mut suggested = original.clone(); suggested["exercises"][0]["answers"] = json!(["B"]); suggested["exercises"][0]["explanation"] = json!("two");
+        let args = json!({"path":format!("documents/{id}.md"),"content":suggested.to_string(),"expectedVersion":before.version});
+        let pending = super::execute(&engine,&scope,"exercise-review","write",args.clone()).unwrap();
+        let course = pending["courseId"].as_str().unwrap(); let proposal = pending["proposalId"].as_str().unwrap();
+        assert_eq!(engine.lock().unwrap().content.read(&id).unwrap().version,before.version);
+        let qid = original["exercises"][0]["id"].as_str().unwrap();
+        let result = super::exercise_proposal_decide(&engine,course,proposal,qid,true).unwrap();
+        assert_eq!(result["persisted"],true); assert_eq!(result["complete"],true);
+        let loaded = crate::exercises::get(&mut engine.lock().unwrap().content,&id).unwrap();
+        assert_ne!(loaded.exercises["exercises"][0]["id"],qid);
+        assert_eq!(loaded.exercises["exercises"][1],original["exercises"][1]);
+        assert_eq!(loaded.exercises["exercises"][0]["answers"],json!(["B"]));
+        assert_eq!(engine.lock().unwrap().content.read(&origin_entry).unwrap().content,old_entry_bytes);
+        let version = loaded.document.version;
+        super::exercise_proposal_decide(&engine,course,proposal,qid,true).unwrap();
+        assert_eq!(engine.lock().unwrap().content.read(&id).unwrap().version,version);
+        let replay = super::execute(&engine,&scope,"exercise-review","write",args).unwrap(); assert_eq!(replay["persisted"],true);
+        let answer = crate::sessions::append(&mut engine.lock().unwrap().content,&scope.session_id,crate::types::Entry { id:String::new(),kind:"attempt".into(),content:"A".into(),created_at:String::new(),selection:None,related_ids:vec![],data:Some(json!({"exerciseId":qid,"exerciseEntryId":origin_entry,"answer":"A"})) },None,"review-old-answer").unwrap();
+        assert_eq!(answer.entries.iter().find(|e|e.kind=="feedback").unwrap().data.as_ref().unwrap()["correct"],true);
+        drop(engine);
+        let reopened = Engine::new(dir.path().join("library"),dir.path().join("state")).unwrap();
+        assert_eq!(crate::exercises::get(&mut reopened.lock().unwrap().content,&id).unwrap().document.version,version);
+        assert!(super::proposal_list(&reopened,course).unwrap().as_array().unwrap().is_empty());
+        let mut core=reopened.lock().unwrap();
+        let preview=crate::trash::preview(&mut core.content,&id).unwrap();
+        let trashed=crate::trash::trash(&mut core.content,&id,&preview.version,"review-trash").unwrap();
+        assert!(core.content.is_trashed(&origin_entry));
+        crate::trash::restore(&mut core.content,&trashed.trash_id,"review-restore").unwrap();
+        assert_eq!(crate::exercises::get(&mut core.content,&id).unwrap().document.version,version);
+
+    }
+    #[test]
+    fn exercise_review_rejection_conflict_scope_and_revocation_leave_original() {
+        let (_dir,engine,scope,id,original) = exercise_review_fixture();
+        let before = engine.lock().unwrap().content.read(&id).unwrap();
+        let mut suggested = original.clone(); suggested["exercises"][0]["question"] = json!("changed"); suggested["exercises"].as_array_mut().unwrap().pop();
+        let args = json!({"path":format!("documents/{id}.md"),"content":suggested.to_string(),"expectedVersion":before.version});
+        let mut outside = scope.clone(); outside.allowed_ids.retain(|x|x!=&id);
+        assert!(super::execute(&engine,&outside,"outside-exercise","write",args.clone()).is_err());
+        let p = super::execute(&engine,&scope,"exercise-mixed","write",args).unwrap(); let course=p["courseId"].as_str().unwrap(); let proposal=p["proposalId"].as_str().unwrap();
+        let first=original["exercises"][0]["id"].as_str().unwrap(); let second=original["exercises"][1]["id"].as_str().unwrap();
+        super::exercise_proposal_decide(&engine,course,proposal,first,false).unwrap();
+        engine.save_ui_preferences(UiPreferences::default()).unwrap();
+        assert_eq!(super::exercise_proposal_decide(&engine,course,proposal,second,true).unwrap_err().code,"TOOL_NOT_ALLOWED");
+        engine.save_ui_preferences(UiPreferences {tool_authorization_tier:"write".into(),..UiPreferences::default()}).unwrap();
+        let edited=crate::content::serialize(&before.metadata,"local edit").unwrap();
+        engine.lock().unwrap().content.save(&id,&edited,&before.version).unwrap();
+        assert_eq!(super::exercise_proposal_decide(&engine,course,proposal,second,true).unwrap_err().code,"CONFLICT");
+        super::exercise_proposal_decide(&engine,course,proposal,second,false).unwrap();
+        assert_eq!(engine.lock().unwrap().content.read(&id).unwrap().body,"local edit");
+    }
+
+    #[test]
+    fn exercise_review_partial_recovery_and_count_limit_remain_decidable() {
+        let (dir,engine,scope,id,original) = exercise_review_fixture();
+        let before = engine.lock().unwrap().content.read(&id).unwrap();
+        let mut suggested = original.clone(); suggested["exercises"].as_array_mut().unwrap().clear();
+        suggested["exercises"].as_array_mut().unwrap().push(json!({"question":"New","format":"exact","answers":["new"],"explanation":"new","tags":[],"sourceIds":[]}));
+        let p = super::execute(&engine,&scope,"exercise-replace","write",json!({"path":format!("documents/{id}.md"),"content":suggested.to_string(),"expectedVersion":before.version})).unwrap();
+        let course=p["courseId"].as_str().unwrap(); let proposal=p["proposalId"].as_str().unwrap();
+        let first=original["exercises"][0]["id"].as_str().unwrap(); let second=original["exercises"][1]["id"].as_str().unwrap();
+        let early_path=dir.path().join(format!("state/edit-proposals/{course}/{proposal}.json"));
+        let mut early:Value=serde_json::from_slice(&std::fs::read(&early_path).unwrap()).unwrap();
+        early["exercise"]["changes"].as_array_mut().unwrap().iter_mut().find(|c|c["id"]==first).unwrap()["status"]=json!("accepting");
+        crate::course_write_transaction::durable_json(&early_path,&early).unwrap();
+        assert_eq!(super::exercise_proposal_decide(&engine,course,proposal,first,true).unwrap_err().code,"NOT_PUBLISHED");
+        assert_eq!(engine.lock().unwrap().content.read(&id).unwrap().version,before.version);
+        super::exercise_proposal_decide(&engine,course,proposal,first,true).unwrap();
+        let saved=crate::exercises::get(&mut engine.lock().unwrap().content,&id).unwrap();
+        let path=dir.path().join(format!("state/edit-proposals/{course}/{proposal}.json"));
+        let mut record:Value=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        record["exercise"]["changes"].as_array_mut().unwrap().iter_mut().find(|c|c["id"]==first).unwrap()["status"]=json!("accepting");
+        crate::course_write_transaction::durable_json(&path,&record).unwrap();
+        super::exercise_proposal_decide(&engine,course,proposal,first,true).unwrap();
+        assert_eq!(crate::exercises::get(&mut engine.lock().unwrap().content,&id).unwrap().document.version,saved.document.version);
+        assert_eq!(super::exercise_proposal_decide(&engine,course,proposal,second,true).unwrap_err().code,"INVALID_INPUT");
+        assert_eq!(super::proposal_get(&engine,course,proposal).unwrap()["exercise"]["changes"].as_array().unwrap().iter().find(|c|c["id"]==second).unwrap()["status"],"pending");
+        super::exercise_proposal_decide(&engine,course,proposal,"new_0",true).unwrap();
+        super::exercise_proposal_decide(&engine,course,proposal,second,true).unwrap();
+        let loaded=crate::exercises::get(&mut engine.lock().unwrap().content,&id).unwrap();
+        assert_eq!(loaded.exercises["exercises"].as_array().unwrap().len(),1);
+        assert_eq!(loaded.exercises["exercises"][0]["question"],"New");
+    }
+    #[test]
+    fn exercise_review_rejects_forged_sources_ids_and_unsubmitted_drafts() {
+        let (_dir,engine,scope,id,original) = exercise_review_fixture();
+        let before=engine.lock().unwrap().content.read(&id).unwrap();
+        for field in ["id","sourceIds"] {
+            let mut invalid=original.clone(); invalid["exercises"][0][field]=if field=="id" {json!("foreign_question")} else {json!(["unauthorized_source"])};
+            assert!(super::execute(&engine,&scope,&format!("forged-{field}"),"write",json!({"path":format!("documents/{id}.md"),"content":invalid.to_string(),"expectedVersion":before.version})).is_err());
+        }
+        let mut changed=original.clone(); changed["exercises"][0]["question"]=json!("changed");
+        let p=super::execute(&engine,&scope,"exercise-draft","write",json!({"path":format!("documents/{id}.md"),"content":changed.to_string(),"expectedVersion":before.version})).unwrap();
+        let first=original["exercises"][0]["id"].as_str().unwrap();
+        engine.drafts.save(&format!("exercise:{first}"),crate::drafts::DraftData {question:"unsent input".into(),..Default::default()},None).unwrap();
+        assert_eq!(super::exercise_proposal_decide(&engine,p["courseId"].as_str().unwrap(),p["proposalId"].as_str().unwrap(),first,true).unwrap_err().code,"CONFLICT");
+        assert_eq!(engine.lock().unwrap().content.read(&id).unwrap().version,before.version);
+    }
+
+    #[test]
+    #[ignore = "isolated native exercise review GUI fixture"]
+    fn create_exercise_review_gui_fixture() {
+        let (dir,engine,scope,id,original)=exercise_review_fixture();
+        let before=engine.lock().unwrap().content.read(&id).unwrap();
+        let mut next=original.clone();
+        next["exercises"][0]["question"]=json!("下列哪个选项表示数字二？\n\nA. one\nB. two");
+        next["exercises"][0]["answers"]=json!(["B"]);
+        next["exercises"][0]["explanation"]=json!("two 表示二，与题目中的数字对应。");
+        next["exercises"].as_array_mut().unwrap().push(json!({"question":"新增：用英语写出数字三。","format":"exact","answers":["three"],"explanation":"three 表示三。","tags":[],"sourceIds":[]}));
+        let p=super::execute(&engine,&scope,"gui-exercise-review","write",json!({"path":format!("documents/{id}.md"),"content":next.to_string(),"expectedVersion":before.version})).unwrap();
+        let root=dir.keep();
+        std::fs::create_dir_all("/tmp/exercise-review-evidence").unwrap();
+        crate::app::atomic_json(std::path::Path::new("/tmp/exercise-review-evidence/fixture.json"),&json!({"library":root.join("library"),"state":root.join("state"),"documentId":id,"proposal":p})).unwrap();
+        println!("EXERCISE_REVIEW_FIXTURE {}",root.display());
+    }
+
+    #[test]
+    fn raw_files_save_without_review_and_noop_documents_do_not_stage() {
+        let (dir, engine, scope, id, _) = course_fixture("write");
+        let before = engine.lock().unwrap().content.read(&id).unwrap();
+        let unchanged = super::execute(&engine, &scope, "unchanged", "write", json!({
+            "path":format!("documents/{id}.md"),"content":before.body,"expectedVersion":before.version
+        })).unwrap();
+        assert_eq!(unchanged["status"], "unchanged");
+        assert_eq!(unchanged["persisted"], false);
+        let course = unchanged["courseId"].as_str().unwrap();
+        for (index, path) in ["notes/a.txt", "notes/a.md", "notes/a.py", "notes/a.docx"].iter().enumerate() {
+            let args = json!({"path":path,"content":"original"});
+            let call = format!("raw-{index}");
+            let saved = super::execute(&engine, &scope, &call, "write", args.clone()).unwrap();
+            assert_eq!(saved["persisted"], true);
+            assert!(saved["proposalId"].is_null());
+            assert_eq!(super::execute(&engine, &scope, &call, "write", args).unwrap()["replayed"], true);
+            assert_eq!(super::execute(&engine, &scope, &format!("missing-version-{index}"), "write", json!({"path":path,"content":"changed"})).unwrap_err().code, "CONFLICT");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(dir.path().join(format!("library/courses/{course}/materials/{path}")), std::fs::Permissions::from_mode(0o750)).unwrap();
+            }
+            let saved = super::execute(&engine, &scope, &format!("replace-{index}"), "write", json!({"path":path,"content":"changed","expectedVersion":saved["version"]})).unwrap();
+            assert_eq!(saved["persisted"], true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(std::fs::metadata(dir.path().join(format!("library/courses/{course}/materials/{path}"))).unwrap().permissions().mode() & 0o7777, 0o750);
+            }
+        }
+        assert!(super::proposal_list(&engine, course).unwrap().as_array().unwrap().is_empty());
+        assert_eq!(engine.lock().unwrap().content.read(&id).unwrap().version, before.version);
+    }
+
+    #[test]
+    fn legacy_raw_pending_is_explicitly_rejectable_without_blocking_new_write() {
+        let (dir, engine, scope, id, _) = course_fixture("write");
+        let course = engine.lock().unwrap().content.read(&id).unwrap().metadata.extra["parentId"].as_str().unwrap().to_owned();
+        let args = json!({"path":"legacy.txt","content":"old proposed text"});
+        let (operation, _) = crate::learning_tools::operation_id(&engine,&scope,"legacy-raw","write",&args).unwrap();
+        let proposal = json!({"id":operation,"courseId":course,"sessionId":scope.session_id,
+            "sectionId":scope.section_id,"runId":scope.run_id,"callId":"legacy-raw","allowedIds":scope.allowed_ids,
+            "path":"legacy.txt","expectedVersion":null,"original":"","content":"old proposed text","status":"pending","receipt":null});
+        let receipt = json!({"persisted":false,"proposalPersisted":true,"proposalId":operation,"courseId":course,
+            "sessionId":scope.session_id,"path":"legacy.txt","status":"pending"});
+        crate::course_write_transaction::durable_json(&dir.path().join(format!("state/edit-proposals/{course}/{operation}.json")),&proposal).unwrap();
+        let ledger = super::LedgerEntry { name:"write".into(), arguments_hash:crate::types::hash(&serde_json::to_string(&args).unwrap()), result:receipt, created_at:crate::types::timestamp() };
+        crate::course_write_transaction::durable_json(&dir.path().join(format!("state/workspaces/{}/receipts/{operation}.json",scope.session_id)),&ledger).unwrap();
+        assert_eq!(super::execute(&engine,&scope,"legacy-raw","write",args).unwrap()["status"],"pending");
+        let target = dir.path().join(format!("library/courses/{course}/materials/legacy.txt"));
+        assert!(!target.exists(), "reading or replaying old pending must not publish");
+        assert_eq!(super::execute(&engine,&scope,"new-raw","write",json!({"path":"legacy.txt","content":"new authorized text"})).unwrap()["persisted"],true);
+        assert_eq!(super::proposal_decide(&engine,&course,&operation,true).unwrap_err().code,"CONFLICT");
+        assert_eq!(super::proposal_decide(&engine,&course,&operation,false).unwrap()["status"],"rejected");
+        assert_eq!(std::fs::read_to_string(target).unwrap(),"new authorized text");
+    }
+
     #[test]
     fn proposals_preserve_original_serialize_and_recover_decisions() {
         let (dir, engine, scope, id, _) = course_fixture("write");
@@ -1305,8 +1514,10 @@ mod tests {
 
     #[test]
     fn proposal_poll_migrates_legacy_terminal_files_and_ignores_archive_contents() {
-        let (dir, engine, scope, _, _) = course_fixture("write");
-        let pending = super::execute(&engine, &scope, "legacy", "write", json!({"path":"legacy.txt","content":"draft"})).unwrap();
+        let (dir, engine, scope, document_id, _) = course_fixture("write");
+        let before = engine.lock().unwrap().content.read(&document_id).unwrap();
+        let args = json!({"path":format!("documents/{document_id}.md"),"content":"draft","expectedVersion":before.version});
+        let pending = super::execute(&engine, &scope, "legacy", "write", args.clone()).unwrap();
         let course = pending["courseId"].as_str().unwrap(); let id = pending["proposalId"].as_str().unwrap();
         let path = dir.path().join(format!("state/edit-proposals/{course}/{id}.json"));
         let mut data: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -1321,7 +1532,7 @@ mod tests {
         std::fs::write(archive.join("historical.json"), "invalid history").unwrap();
         assert!(super::proposal_list(&engine, course).unwrap().as_array().unwrap().is_empty());
         assert_eq!(super::proposal_get(&engine, course, id).unwrap()["status"], "rejected");
-        assert_eq!(super::execute(&engine, &scope, "fresh", "write", json!({"path":"legacy.txt","content":"new"})).unwrap()["status"], "pending");
+        assert_eq!(super::execute(&engine, &scope, "fresh", "write", args).unwrap()["status"], "pending");
     }
 
     #[test]
@@ -1361,7 +1572,8 @@ mod tests {
             // new pending publication is forbidden after revocation succeeds.
             assert_eq!(super::proposal_decide(&engine, &course, &proposal, true).unwrap(), receipt);
             engine.save_ui_preferences(UiPreferences { tool_authorization_tier: "write".into(), ..UiPreferences::default() }).unwrap();
-            let pending = super::execute(&engine, &scope, "after-revocation", "write", json!({"path":"next.txt","content":"Must remain pending"})).unwrap();
+            let latest = engine.lock().unwrap().content.read(&id).unwrap();
+            let pending = super::execute(&engine, &scope, "after-revocation", "write", json!({"path":format!("documents/{id}.md"),"content":"Must remain pending","expectedVersion":latest.version})).unwrap();
             engine.patch_all_ui_preferences(None, None, None, None, None, Some(if patch { "read" } else { "off" }.into())).unwrap();
             let next = pending["proposalId"].as_str().unwrap();
             assert_eq!(super::proposal_decide(&engine, &course, next, true).unwrap_err().code, "TOOL_NOT_ALLOWED");
@@ -1723,8 +1935,9 @@ mod tests {
 
     #[test]
     fn course_write_refuses_unreadable_initial_receipt_before_publication() {
-        let (dir, engine, scope, _, _) = course_fixture("write");
-        let args = json!({"path":"result.txt","content":"must not publish"});
+        let (dir, engine, scope, id, _) = course_fixture("write");
+        let before = engine.lock().unwrap().content.read(&id).unwrap();
+        let args = json!({"path":format!("documents/{id}.md"),"content":"must not publish","expectedVersion":before.version});
         let (request, _) = crate::learning_tools::operation_id(&engine,&scope,"receipt-failure","write",&args).unwrap();
         let ledger = dir.path().join(format!("state/workspaces/{}/receipts/{request}.json",scope.session_id));
         let proposal = super::execute(&engine, &scope, "receipt-failure", "write", args).unwrap();
@@ -1732,7 +1945,7 @@ mod tests {
         std::fs::create_dir_all(&ledger).unwrap();
         assert_eq!(super::proposal_decide(&engine, proposal["courseId"].as_str().unwrap(), proposal["proposalId"].as_str().unwrap(), true).unwrap_err().code,"NATIVE_TOOL_UNKNOWN");
         assert!(!ledger.with_extension("pending").exists());
-        assert!(!dir.path().join(format!("library/courses/{}/materials/result.txt", proposal["courseId"].as_str().unwrap())).exists());
+        assert_eq!(engine.lock().unwrap().content.read(&id).unwrap().content, before.content);
         assert_eq!(super::proposal_get(&engine, proposal["courseId"].as_str().unwrap(), proposal["proposalId"].as_str().unwrap()).unwrap()["status"], "pending");
     }
 
@@ -2464,8 +2677,8 @@ mod m2_independent_review {
         assert!(r.is_ok(),"authorized source read must follow frozen focus, not session creation anchor");
         e.save_ui_preferences(UiPreferences{tool_authorization_tier:"write".into(),..UiPreferences::default()}).unwrap();
         let written=super::execute(&e,&scope,"write-second-note","write",json!({"path":"answer.txt","content":"synthetic B"})).unwrap();
-        assert_eq!(written["persisted"],false);
-        assert_eq!(super::proposal_decide(&e,written["courseId"].as_str().unwrap(),written["proposalId"].as_str().unwrap(),true).unwrap()["persisted"],true);
+        assert_eq!(written["persisted"],true);
+        assert!(written["proposalId"].is_null());
         assert_eq!(super::execute(&e,&scope,"write-second-note","write",json!({"path":"answer.txt","content":"synthetic B"})).unwrap()["replayed"],true);
         assert!(super::execute(&e,&scope,"write-escape-note","write",json!({"path":"../escape","content":"x"})).is_err());
         e.save_ui_preferences(UiPreferences{tool_authorization_tier:"bash".into(),..UiPreferences::default()}).unwrap();

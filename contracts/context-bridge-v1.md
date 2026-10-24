@@ -93,3 +93,5 @@ JSON 模式使用同一视图范围：本轮为已定位注册片段，完整为
 ## 练习引用来源清单
 
 ContextBridge 每个用户轮注册 `exercise_sources`，将同轮 `Context.manifest` 的 `sourceId/path/version` 显式提供给模型；普通聊天的 `generate_exercises` 与专用 practice 共用此清单。路径仅用于识别材料，`sourceIds` 必须填写稳定 ID。清单不包含课程可读目录或历史授权集合，不声明额外正文已读取；空清单也明确提供。旧轮清单沿 turn 生命周期排除，重试及压缩恢复使用原冻结快照。Rust 仍按原冻结 manifest 严格校验，不从文件名或路径猜测 ID，不将未知来源变成可自动修正的授权错误。
+
+练习编辑例外：仅冻结 Focus 的 `type=exercise,view=edit` 将该documentId及版本加入 `courseReadManifest`，不加入实际正文manifest、不自动提供参考答案。普通做题Focus仍不授该ID完整读取权。结构化题集只能经后续显式授权read取得。

@@ -81,6 +81,11 @@ fn document(
             return Err(out_of_scope());
         }
         let doc = core.content.read(id)?;
+        if doc.metadata.kind == "exercise" {
+            crate::exercises::origin(&core.content, &doc)?;
+            if crate::course_sessions::course(&core.content, &doc.id)?.as_deref() != Some(course) { return Err(out_of_scope()); }
+            return Ok(Some(doc));
+        }
         if doc.path != format!("courses/{course}/materials/{path}")
             || !matches!(
                 doc.metadata.kind.as_str(),
@@ -111,7 +116,9 @@ pub(super) fn course_read(
     target(&core, &course, path)?;
     let doc = document(&core, scope, &course, path)?;
     let (text, version) = if let Some(doc) = doc {
-        (doc.body, doc.version)
+        if doc.metadata.kind == "exercise" {
+            (serde_json::to_string(&crate::exercise_edits::payload(&mut core.content, &doc.id)?)?, doc.version)
+        } else { (doc.body, doc.version) }
     } else {
         let (bytes, version) = crate::versioning::read_versioned(&mut core, &course, path)?;
         let text = crate::material_git::validate_material_text(&bytes)?.to_owned();
@@ -173,7 +180,7 @@ fn course_write_locked(
         return Err(invalid());
     }
     let baseline = if let Some(doc) = &doc {
-        Some((doc.body.clone(), doc.version.clone()))
+        Some((if doc.metadata.kind == "exercise" { serde_json::to_string(&crate::exercise_edits::payload(&mut core.content, &doc.id)?)? } else { doc.body.clone() }, doc.version.clone()))
     } else if existing.is_some() {
         let (bytes, version) = crate::versioning::read_versioned(core, &course, &args.path)?;
         Some((
@@ -195,6 +202,14 @@ fn course_write_locked(
     if args.expected_version != current_version {
         return Err(conflict());
     }
+    if doc.as_ref().is_some_and(|d| d.metadata.kind == "exercise") && call_id.is_none() {
+        return Err(CoreError::new("INVALID_INPUT", "练习必须逐题审阅，不能整份覆盖。"));
+    }
+    if doc.is_some() && baseline.as_ref().is_some_and(|(body, _)| body == &args.content) {
+        return Ok(Some(json!({"persisted":false,"status":"unchanged", "sessionId":scope.session_id,
+            "courseId":course,"path":args.path,"version":current_version})));
+
+    }
     let content = if let Some(doc) = &doc {
         crate::content::serialize(&doc.metadata, &args.content)?
     } else {
@@ -209,7 +224,9 @@ fn course_write_locked(
         .file_stem()
         .and_then(|name| name.to_str())
         .ok_or_else(invalid)?;
-    if let Some(call_id) = call_id {
+    // Only indexed documents have a normal in-app reading/review surface.
+    // Raw material formats retain the already-authorized transactional write.
+    if let Some(call_id) = call_id.filter(|_| doc.is_some()) {
         return stage(
             core,
             scope,
@@ -280,6 +297,8 @@ struct Proposal {
     content: String,
     status: String,
     receipt: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exercise: Option<crate::exercise_edits::Review>,
 }
 
 fn proposal_path(core: &Core, course: &str, id: &str) -> Result<PathBuf> {
@@ -358,7 +377,12 @@ fn stage(
             ));
         }
     }
+    let exercise = match document(core, scope, course, &args.path)? {
+        Some(doc) if doc.metadata.kind == "exercise" => Some(crate::exercise_edits::prepare(&mut core.content, &doc.id, &args.content, id)?),
+        _ => None,
+    };
     let p = Proposal {
+        exercise,
         id: id.into(),
         course_id: course.into(),
         session_id: scope.session_id.clone(),
@@ -409,7 +433,7 @@ pub(crate) fn proposal_get(engine: &crate::app::Engine, course: &str, id: &str) 
     check_course(&mut core, course)?;
     let p = read_proposal(&core, course, id)?;
     Ok(
-        json!({"id":p.id,"courseId":p.course_id,"path":p.path,"original":p.original,"content":p.content,"status":p.status,"expectedVersion":p.expected_version}),
+        json!({"id":p.id,"courseId":p.course_id,"path":p.path,"original":p.original,"content":p.content,"status":p.status,"expectedVersion":p.expected_version,"exercise":p.exercise}),
     )
 }
 pub(crate) fn proposal_result(engine: &crate::app::Engine, result: Value) -> Result<Value> {
@@ -485,6 +509,7 @@ pub(crate) fn proposal_decide(
         drop(_authorization);
         return settle_decision(engine, &p);
     }
+    if p.exercise.is_some() { return Err(CoreError::new("INVALID_INPUT", "请逐题接受或拒绝练习修改。")); }
     if accept && tier_rank(&tier) < 2 {
         return Err(not_allowed());
     }
@@ -728,4 +753,88 @@ fn settle_decision(engine: &crate::app::Engine, p: &Proposal) -> Result<Value> {
     let core = engine.lock()?;
     archive_proposal(&core, p)?;
     Ok(receipt)
+}
+
+/// One whole question per decision; partial decisions survive restart in the existing proposal.
+pub(crate) fn exercise_proposal_decide(engine: &crate::app::Engine, course_id: &str, id: &str, question_id: &str, accept: bool) -> Result<Value> {
+    let authorization = crate::app::UI_PREFERENCE_WRITE.lock().map_err(|_| invalid())?;
+    let tier = engine.ui_preferences()?.tool_authorization_tier;
+    let mut core = engine.lock()?;
+    check_course(&mut core, course_id)?;
+    let mut p = read_proposal(&core, course_id, id)?;
+    let mut review = p.exercise.clone().ok_or_else(invalid)?;
+    let index = review.changes.iter().position(|c| c.id == question_id).ok_or_else(invalid)?;
+    let path = proposal_path(&core, course_id, id)?;
+    if matches!(p.status.as_str(), "accepted" | "rejected") {
+        drop(core); drop(authorization);
+        settle_decision(engine, &p)?;
+        return Ok(json!({"persisted":review.changes[index].status == "accepted","status":review.changes[index].status,"complete":true,"version":review.version}));
+    }
+    let status = review.changes[index].status.clone();
+    if status == "accepting" {
+        let doc = core.content.read(&review.document_id)?;
+        if doc.metadata.extra.get("exerciseEditOperation").and_then(Value::as_str) != Some(&review.changes[index].operation) {
+            let recovery = crate::course_write_transaction::recovery_path(&doc.path, &review.changes[index].operation);
+            let no_intent = fs::symlink_metadata(core.content.root().join(&recovery).join("manifest.json")).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+            if no_intent && doc.version == review.version {
+                review.changes[index].status = "pending".into();
+                p.exercise = Some(review);
+                crate::course_write_transaction::durable_json(&path, &p)?;
+                return Err(CoreError::new("NOT_PUBLISHED", "已核实此题尚未发布，原题仍在。可重新接受或拒绝，未自动重放。"));
+            }
+            return Err(CoreError::new("NATIVE_TOOL_UNKNOWN", "此题保存结果待核对；原题与建议已保留，未重复执行。")
+                .details(crate::course_write_transaction::inspect(core.content.root(), &doc.path, &review.changes[index].operation)?));
+        }
+        let loaded = crate::exercises::get(&mut core.content, &review.document_id)?;
+        if crate::exercises::render(&loaded.exercises)? != doc.body { return Err(conflict()); }
+        review.version = doc.version;
+        review.changes[index].status = "accepted".into();
+    } else if status == "pending" {
+        if review.changes.iter().any(|c| c.status == "accepting") { return Err(CoreError::new("NATIVE_TOOL_UNKNOWN", "请先核对此前题目的保存结果。")); }
+        if accept {
+            if tier_rank(&tier) < 2 { return Err(not_allowed()); }
+            let scope = ToolScope { session_id:p.session_id.clone(), section_id:p.section_id.clone(), run_id:p.run_id.clone(), allowed_ids:p.allowed_ids.clone() };
+            if course(&mut core, &scope)?.as_deref() != Some(course_id) || document(&core, &scope, course_id, &p.path)?.is_none() { return Err(out_of_scope()); }
+            let ledger = workspace_root(&core.state_dir, &p.session_id).join("receipts").join(format!("{id}.json"));
+            let entry = read_ledger(&ledger)?;
+            if !matches_pending_ledger(&p, &entry)? { return Err(conflict()); }
+            let loaded = crate::exercises::get(&mut core.content, &review.document_id)?;
+            if engine.drafts.get(&format!("section:{}", review.document_id))?.is_some_and(|d| d.data.body != loaded.document.body) {
+                return Err(CoreError::new("CONFLICT", "练习有未保存的 Markdown 草稿，请先处理草稿；建议保留。"));
+            }
+            if let Some(before) = &review.changes[index].before {
+                let qid = before["id"].as_str().ok_or_else(invalid)?;
+                if let Some(draft) = engine.drafts.get(&format!("exercise:{qid}"))? {
+                    let answer = loaded.session.entries.iter().rev().find(|e| e.kind == "attempt" && e.data.as_ref().is_some_and(|d| d["exerciseId"] == qid)).map(|e| e.content.as_str()).unwrap_or("");
+                    let cause = loaded.session.entries.iter().rev().find(|e| e.kind == "error" && e.data.as_ref().is_some_and(|d| d["exerciseId"] == qid && d["cause"].is_string())).and_then(|e| e.data.as_ref()).and_then(|d| d["cause"].as_str()).unwrap_or("");
+                    if !draft.data.question.is_empty() && draft.data.question != answer || !draft.data.body.is_empty() && draft.data.body != cause {
+                        return Err(CoreError::new("CONFLICT", "此题还有未提交作答或错因草稿。请先拒绝此题修改并处理输入，再重新请求修改；草稿和原题均保留。"));
+                    }
+                }
+            }
+            let data = crate::exercise_edits::next(&mut core.content, &review, index)?;
+            review.changes[index].status = "accepting".into();
+            p.exercise = Some(review.clone());
+            crate::course_write_transaction::durable_json(&path, &p)?;
+            let doc = crate::exercise_edits::publish(&mut core.content, &review, index, data)?;
+            review.version = doc.version;
+            review.changes[index].status = "accepted".into();
+        } else { review.changes[index].status = "rejected".into(); }
+    }
+    let complete = review.changes.iter().all(|c| matches!(c.status.as_str(), "accepted" | "rejected"));
+    let persisted = review.changes[index].status == "accepted";
+    p.exercise = Some(review.clone());
+    if complete {
+        let any = review.changes.iter().any(|c| c.status == "accepted");
+        p.status = if any { "accepted" } else { "rejected" }.into();
+        p.receipt = Some(json!({"persisted":any,"status":p.status,"proposalId":id,"courseId":course_id,"sessionId":p.session_id,"path":p.path,"version":review.version,"questionDecisions":review.changes.iter().map(|c|json!({"id":c.id,"status":c.status})).collect::<Vec<_>>()}));
+        let ledger = workspace_root(&core.state_dir, &p.session_id).join("receipts").join(format!("{id}.json"));
+        let mut entry = read_ledger(&ledger)?;
+        entry.result = proposal_receipt(&p);
+        crate::course_write_transaction::durable_json(&ledger, &entry)?;
+    }
+    crate::course_write_transaction::durable_json(&path, &p)?;
+    drop(core); drop(authorization);
+    if complete { settle_decision(engine, &p)?; }
+    Ok(json!({"persisted":persisted,"status":review.changes[index].status,"complete":complete,"version":review.version}))
 }

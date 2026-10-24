@@ -73,6 +73,20 @@ async fn get_library_tree(
     .await
 }
 #[tauri::command]
+async fn list_course_files(state: State<'_, Arc<Engine>>, course_id: String) -> Result<Vec<crate::course_files::CourseFile>> {
+    work(state.inner().clone(), move |e| { let mut core=e.lock()?; core.content.refresh()?; crate::course_files::list(&core.content,&course_id) }).await
+}
+// Explicit user action: reveal only, never execute a material or shell command.
+#[tauri::command]
+async fn reveal_course_file(state: State<'_, Arc<Engine>>, course_id: String, path: String) -> Result<()> {
+    work(state.inner().clone(), move |e| {
+        let core=e.lock()?;
+        let path=crate::course_files::resolve(&core.content,&course_id,&path)?;
+        let status=std::process::Command::new("/usr/bin/open").arg("-R").arg(path).status()?;
+        if status.success(){Ok(())}else{Err(CoreError::new("IO","Finder 未能定位该文件，请重试。"))}
+    }).await
+}
+#[tauri::command]
 async fn list_sessions(state: State<'_, Arc<Engine>>) -> Result<Vec<DocumentSummary>> {
     work(state.inner().clone(), |e| {
         let mut core = e.lock()?;
@@ -540,6 +554,10 @@ async fn edit_proposal(state: State<'_, Arc<Engine>>, course_id: String, id: Str
 #[tauri::command]
 async fn decide_edit_proposal(state: State<'_, Arc<Engine>>, course_id: String, id: String, accept: bool) -> Result<Value> {
     work(state.inner().clone(), move |e| crate::authorized_tools::proposal_decide(e, &course_id, &id, accept)).await
+}
+#[tauri::command]
+async fn decide_exercise_proposal(state: State<'_, Arc<Engine>>, course_id: String, id: String, question_id: String, accept: bool) -> Result<Value> {
+    work(state.inner().clone(), move |e| crate::authorized_tools::exercise_proposal_decide(e, &course_id, &id, &question_id, accept)).await
 }
 // Read-only: durable write/bash receipt summaries of one session workspace.
 // No arguments, command text or file contents ever leave the ledger.
@@ -1057,6 +1075,8 @@ pub fn run() {
             request_debug_get, request_debug_set, request_debug_decode, request_debug_export,
             get_app_state,
             get_library_tree,
+            list_course_files,
+            reveal_course_file,
             list_sessions,
             course_sessions,
             course_session_create,
@@ -1094,6 +1114,7 @@ pub fn run() {
             edit_proposals,
             edit_proposal,
             decide_edit_proposal,
+            decide_exercise_proposal,
             get_session,
             append_entry,
             load_context,

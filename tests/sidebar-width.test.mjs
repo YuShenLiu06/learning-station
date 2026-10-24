@@ -6,7 +6,18 @@ test('left width drag preserves inputs, releases correctly, persists independent
  mockIPC(async(command,args={})=>{if(command==='get_ui_preferences'){if(readGate)await readGate;if(failRead)throw {code:'IO',message:'Controlled preference read failure'};return structuredClone(prefs);}if(command==='save_ui_preferences'){writes.push(structuredClone(args));prefs={...prefs,...args};return structuredClone(prefs);}throw Error('Unexpected mock IPC '+command);});
  const filename=new URL(`./.sidebar-width-${process.pid}.mjs`,import.meta.url);await build({stdin:{contents:"export {useSidebarWidth} from './src/useSidebarWidth';export {SidebarResizeHandle} from './src/SidebarResizeHandle';",resolveDir:process.cwd(),loader:'tsx'},outfile:filename.pathname,bundle:true,packages:'external',platform:'node',format:'esm',jsx:'automatic',define:{'import.meta.env.DEV':'false'}});
  const React=await import('react'),{createRoot}=await import('react-dom/client'),{useSidebarWidth,SidebarResizeHandle}=await import(filename.href);let root=createRoot(document.getElementById('root'));let mainWidth=800;
- function Fixture(){const size=useSidebarWidth();const[collapsed,setCollapsed]=React.useState(false);const[input,setInput]=React.useState('');return React.createElement('div',null,React.createElement('button',{id:'collapse',onClick:()=>setCollapsed(!collapsed)},'toggle'),React.createElement('button',{id:'retry',onClick:()=>{void size.retry().catch(()=>{});}},'retry'),React.createElement('p',{id:'error'},size.error),React.createElement('aside',{ref:el=>{if(el)el.getBoundingClientRect=()=>({width:collapsed?64:size.width});},'data-width':size.width},!collapsed&&React.createElement(SidebarResizeHandle,{width:size.width,onChange:size.setWidth})),React.createElement('main',{className:'main-area',ref:el=>{if(el)Object.defineProperty(el,'clientWidth',{configurable:true,get:()=>mainWidth});}},React.createElement('input',{value:input,onChange:e=>setInput(e.target.value)})));}
+ function Fixture(){
+  const size=useSidebarWidth();const[collapsed,setCollapsed]=React.useState(false);const[input,setInput]=React.useState('');
+  return React.createElement('div',{className:'app-shell'},
+   React.createElement('button',{id:'collapse',onClick:()=>setCollapsed(!collapsed)},'toggle'),
+   React.createElement('button',{id:'retry',onClick:()=>{void size.retry().catch(()=>{});}},'retry'),
+   React.createElement('p',{id:'error'},size.error),
+   React.createElement('aside',{'data-width':size.width},
+    React.createElement('nav',null,'global navigation'),
+    React.createElement('section',{className:'course-sidebar-panel',hidden:collapsed,ref:el=>{if(el)el.getBoundingClientRect=()=>({width:size.width});}},!collapsed&&React.createElement(SidebarResizeHandle,{width:size.width,onChange:size.setWidth}))),
+   React.createElement('main',{className:'main-area',ref:el=>{if(el)Object.defineProperty(el,'clientWidth',{configurable:true,get:()=>mainWidth});}},React.createElement('input',{value:input,onChange:e=>setInput(e.target.value)})));
+ }
+
  const act=React.act;const tick=ms=>act(async()=>{await new Promise(resolve=>setTimeout(resolve,ms));});const event=(target,type,x,buttons=1)=>act(async()=>{const event=new MouseEvent(type,{bubbles:true,cancelable:true,clientX:x,button:0,buttons});Object.defineProperty(event,'pointerId',{value:5});target.dispatchEvent(event);});const input=()=>document.querySelector('input');const handle=()=>document.querySelector('[aria-label="调整目录宽度"]');
  try{
   await act(async()=>root.render(React.createElement(Fixture)));assert.equal(handle().getAttribute('aria-valuenow'),'310');const originalInput=input();await act(async()=>{Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(originalInput,'retain my question');originalInput.dispatchEvent(new Event('input',{bubbles:true}));});handle().setPointerCapture=()=>{throw Error('capture unavailable');};
