@@ -205,6 +205,11 @@ fn course_write_locked(
     if doc.as_ref().is_some_and(|d| d.metadata.kind == "exercise") && call_id.is_none() {
         return Err(CoreError::new("INVALID_INPUT", "练习必须逐题审阅，不能整份覆盖。"));
     }
+    if doc.is_some() && baseline.as_ref().is_some_and(|(body, _)| body == &args.content) {
+        return Ok(Some(json!({"persisted":false,"status":"unchanged", "sessionId":scope.session_id,
+            "courseId":course,"path":args.path,"version":current_version})));
+
+    }
     let content = if let Some(doc) = &doc {
         crate::content::serialize(&doc.metadata, &args.content)?
     } else {
@@ -219,7 +224,9 @@ fn course_write_locked(
         .file_stem()
         .and_then(|name| name.to_str())
         .ok_or_else(invalid)?;
-    if let Some(call_id) = call_id {
+    // Only indexed documents have a normal in-app reading/review surface.
+    // Raw material formats retain the already-authorized transactional write.
+    if let Some(call_id) = call_id.filter(|_| doc.is_some()) {
         return stage(
             core,
             scope,

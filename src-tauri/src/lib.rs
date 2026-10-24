@@ -53,3 +53,5 @@ pub mod feishu_bot;
 pub mod feishu_ws;
 
 mod course_write_transaction;
+
+pub mod course_files;

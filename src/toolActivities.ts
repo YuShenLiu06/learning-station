@@ -14,7 +14,7 @@ const SAFE_FIELD_DIAGNOSTIC = new RegExp(`^(?:练习校验失败：${FIELD_PATHS
 export function readToolActivity(raw: unknown): ToolActivity | null {
   if (!raw || typeof raw !== 'object') return null;
   const value = raw as Record<string, unknown>;
-  if (!safeId(value.id) || !safeId(value.toolCallId) || !safeId(value.runId) || !safeId(value.sessionId) || typeof value.name !== 'string' || !Object.hasOwn(titles, value.name) || !['running', 'succeeded', 'failed'].includes(String(value.status))) return null;
+  if (!safeId(value.id) || !safeId(value.toolCallId) || !safeId(value.runId) || !safeId(value.sessionId) || typeof value.name !== 'string' || !Object.hasOwn(titles, value.name) || !['running', 'waiting', 'unknown', 'succeeded', 'failed'].includes(String(value.status))) return null;
   const result: ToolActivity = { id: value.id, toolCallId: value.toolCallId, runId: value.runId, sessionId: value.sessionId, name: value.name, status: value.status as ToolActivity['status'], title: titles[value.name], summary: '', startedAt: typeof value.startedAt === 'string' ? value.startedAt : '', updatedAt: typeof value.updatedAt === 'string' ? value.updatedAt : '', persisted: value.persisted === true };
   if (safeId(value.userEntryId)) result.userEntryId = value.userEntryId;
   if (Number.isSafeInteger(value.sequence) && (value.sequence as number) >= 0) result.sequence = value.sequence as number;
@@ -26,7 +26,7 @@ export function readToolActivity(raw: unknown): ToolActivity | null {
   // overlong or off-vocabulary text falls back. Model arguments and raw output are never rendered.
   const diagnostic = result.status === 'failed' && result.errorCode === 'INVALID_MODEL_OUTPUT' && typeof value.summary === 'string' && value.summary.length <= 80 && SAFE_FIELD_DIAGNOSTIC.test(value.summary) ? value.summary : '';
   result.summary = result.status === 'failed' ? (diagnostic || '工具未完成，未确认保存成功。') : result.name === 'query_related_knowledge' ? '相关学习记录查询已完成，未写入新内容。' : result.name === 'read' ? '受控读取已完成，未写入内容。' : ['list_learning_skills', 'load_learning_skill'].includes(result.name) ? '内置学习指导读取已完成，未写入内容。' : result.persisted && (result.object || ['write', 'bash'].includes(result.name)) ? '已收到本机保存回执。' : '等待本机工具结果。';
-  if (result.name === 'write' && !result.persisted && ['AI 修改待确认，建议已保留，正文未修改。', '用户已拒绝建议，正文未修改。'].includes(String(value.summary))) result.summary = String(value.summary);
+  if (result.name === 'write' && !result.persisted && ['AI 修改待确认，建议已保留，正文未修改。', '用户已拒绝建议，正文未修改。', '内容未变化，未重复写入。'].includes(String(value.summary))) result.summary = String(value.summary);
   return result;
 }
 export function foldToolActivities(values: unknown[], sessionId: string) {
@@ -43,8 +43,10 @@ export function foldToolActivities(values: unknown[], sessionId: string) {
   }
   return [...latest.values()];
 }
-export function toolState(item: ToolActivity, liveRunId?: string): 'running' | 'succeeded' | 'failed' | 'unconfirmed' {
-  if (item.name === 'write' && item.summary === '用户已拒绝建议，正文未修改。') return 'succeeded';
+export function toolState(item: ToolActivity, liveRunId?: string): 'running' | 'waiting' | 'succeeded' | 'failed' | 'unconfirmed' {
+  if (item.name === 'write' && ['用户已拒绝建议，正文未修改。', '内容未变化，未重复写入。'].includes(item.summary)) return 'succeeded';
+  if (item.status === 'unknown') return 'unconfirmed';
+  if (item.status === 'waiting') return 'waiting';
   if (item.status === 'running') return item.runId === liveRunId ? 'running' : 'unconfirmed';
   if (item.status === 'succeeded' && !readOnlyTool(item.name) && (!item.persisted || (!item.object && !['write', 'bash'].includes(item.name)))) return 'unconfirmed';
   return item.status;
