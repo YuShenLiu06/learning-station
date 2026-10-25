@@ -12,6 +12,8 @@
 
 模型端点与凭据由本人配置，密钥写入本机 Keychain。飞书与 Anki 需要已有程序/授权，应用不自动安装、授权或发送；Coding Plan 用途限制仍保留，不自动绕过。
 
+Windows x64 的安装方法、验证记录和功能限制见 [Windows 预览版](docs/releases/windows-preview.md)。
+
 ## 本机开发
 
 准备 Rust、Xcode Command Line Tools 和 **Node v24.18.0（darwin arm64）**。运行时版本及校验值锁定在 `runtime/manifest.json`；构建只复制现有 Node，不自动下载运行时。

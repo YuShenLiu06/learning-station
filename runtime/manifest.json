@@ -4,5 +4,12 @@
   "arch": "arm64",
   "sha256": "ee6fb0e015284d83a91e8ec5213f43a157f8a392b58555301682892ba928c04a",
   "licenseSha256": "148eacf7863ef4329224a29398623077200a27194aa075569faf4a0a85566ca5",
-  "source": "existing local official Node distribution; no runtime installation"
+  "source": "existing local official Node distribution; no runtime installation",
+  "windowsX64": {
+    "version": "v24.18.0",
+    "platform": "win32",
+    "arch": "x64",
+    "sha256": "9a4eb5f1c29c6a2e93852ead46b999e284a6a5ca8bab4d4e241d587d025a52de",
+    "source": "https://nodejs.org/dist/v24.18.0/SHASUMS256.txt"
+  }
 }

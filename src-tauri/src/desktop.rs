@@ -34,10 +34,14 @@ async fn request_debug_export(state: State<'_, Arc<Engine>>, sequence: u64) -> R
 async fn open_content_url(url: String) -> Result<()> {
     let url = crate::content_url::validate(&url)?;
     tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(windows)]
+        return crate::windows::open(std::path::Path::new(&url), false);
+        #[cfg(not(windows))]
         let status = std::process::Command::new("/usr/bin/open")
             .arg(url)
             .status()
             .map_err(CoreError::io)?;
+        #[cfg(not(windows))]
         if status.success() {
             Ok(())
         } else {
@@ -82,7 +86,11 @@ async fn reveal_course_file(state: State<'_, Arc<Engine>>, course_id: String, pa
     work(state.inner().clone(), move |e| {
         let core=e.lock()?;
         let path=crate::course_files::resolve(&core.content,&course_id,&path)?;
+        #[cfg(windows)]
+        return crate::windows::open(&path, true);
+        #[cfg(not(windows))]
         let status=std::process::Command::new("/usr/bin/open").arg("-R").arg(path).status()?;
+        #[cfg(not(windows))]
         if status.success(){Ok(())}else{Err(CoreError::new("IO","Finder 未能定位该文件，请重试。"))}
     }).await
 }
@@ -1024,13 +1032,12 @@ pub fn run() {
             #[cfg(not(debug_assertions))]
             crate::model::set_sidecar_dir(app.path().resource_dir()?.join("pi-sidecar"))?;
             #[cfg(not(debug_assertions))]
-            crate::model::set_node_path(app.path().resource_dir()?.join("runtime/node"))?;
+            crate::model::set_node_path(app.path().resource_dir()?.join(if cfg!(windows) { "runtime/node.exe" } else { "runtime/node" }))?;
             #[cfg(not(debug_assertions))]
             crate::feishu_bot::set_resource_dir(app.path().resource_dir()?.join("feishu-bot"))?;
             #[cfg(not(debug_assertions))]
             crate::learning_skills::set_resource_dir(app.path().resource_dir()?.join("skills"))?;
-            let home = std::env::var_os("HOME")
-                .map(std::path::PathBuf::from)
+            let home = std::env::home_dir()
                 .ok_or("无法定位本机用户目录")?;
             let forced_qa = crate::qa::locations(&std::env::current_exe()?)?;
             let (library, state_dir) = match forced_qa {

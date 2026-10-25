@@ -1,0 +1,20 @@
+{
+  "bundle": {
+    "targets": [
+      "nsis"
+    ],
+    "resources": {
+      "../runtime/node.exe": "runtime/node.exe"
+    },
+    "windows": {
+      "nsis": {
+        "languages": [
+          "SimpChinese",
+          "English"
+        ],
+        "displayLanguageSelector": true,
+        "installMode": "currentUser"
+      }
+    }
+  }
+}

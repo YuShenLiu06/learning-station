@@ -20,3 +20,5 @@ evidence/
 docs/*build*.json
 docs/acceptance.md
 tools/local/
+
+runtime/node.exe

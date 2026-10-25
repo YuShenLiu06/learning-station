@@ -86,7 +86,10 @@ const PROTOCOL: &str = "openai-completions";
 const ANTHROPIC: &str = "anthropic-messages";
 const USAGE_GATE: &str = "PLAN_USAGE_UNCONFIRMED";
 const KEYCHAIN_SERVICE: &str = "com.yushen.learning-station.pi-api-key";
+#[cfg(not(windows))]
 const NODE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../runtime/node");
+#[cfg(windows)]
+const NODE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../runtime/node.exe");
 static NODE_RESOURCE: OnceLock<PathBuf> = OnceLock::new();
 pub fn node_path() -> PathBuf {
     NODE_RESOURCE
@@ -859,8 +862,7 @@ pub async fn generate_scoped(
     .await
 }
 fn configured_agent_dir(sidecar_dir: &Path) -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
+    let home = std::env::home_dir()
         .unwrap_or_else(|| PathBuf::from("/"));
     if let Some(path) = std::env::var_os("PI_CODING_AGENT_DIR") {
         let path = PathBuf::from(path);
@@ -1073,13 +1075,13 @@ async fn run_sidecar(
             if !agent_dir.is_absolute() {
                 return Err(runtime_error());
             }
-            let home = std::env::var_os("HOME").map(PathBuf::from);
+            let home = std::env::home_dir();
             for path in native_project_read_allowlist(&canonical_root, agent_dir, home.as_deref()) {
                 command.arg(format!("--allow-fs-read={}", path.display()));
             }
         }
     }
-    let mut child = command
+    command
         .arg(directory.join("sidecar.mjs"))
         .current_dir(&directory)
         .env_clear()
@@ -1092,8 +1094,10 @@ async fn run_sidecar(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    crate::windows::prepare_child(command.as_std_mut());
+    let mut child = command.spawn()
         .map_err(|_| runtime_error())?;
     let started = Instant::now();
     let deadline = started + Duration::from_secs(if operation == "test" { 30 } else { 120 });

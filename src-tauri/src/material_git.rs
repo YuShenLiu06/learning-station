@@ -888,7 +888,7 @@ impl MaterialGit {
             .env_clear()
             .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_GLOBAL", if cfg!(windows) { "NUL" } else { "/dev/null" })
             .env("GIT_ATTR_NOSYSTEM", "1")
             .env("GIT_NO_REPLACE_OBJECTS", "1")
             .env("GIT_NO_LAZY_FETCH", "1")
@@ -903,9 +903,9 @@ impl MaterialGit {
             .args([
                 "--no-pager",
                 "-c",
-                "core.hooksPath=/dev/null",
+                if cfg!(windows) { "core.hooksPath=NUL" } else { "core.hooksPath=/dev/null" },
                 "-c",
-                "core.attributesFile=/dev/null",
+                if cfg!(windows) { "core.attributesFile=NUL" } else { "core.attributesFile=/dev/null" },
                 "-c",
                 "commit.gpgSign=false",
                 "-c",
@@ -935,6 +935,8 @@ impl MaterialGit {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        #[cfg(windows)]
+        crate::windows::prepare_child(&mut command);
         let mut child = command.spawn().map_err(|_| git_error())?;
         // Input commands (hash-object/mktree/commit-tree) emit only one OID.
         // Dropping stdin closes it before waiting, including a failed write.

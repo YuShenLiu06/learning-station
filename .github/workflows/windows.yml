@@ -1,0 +1,51 @@
+name: Windows preview build
+
+on:
+  push:
+    branches: [codex/windows-build]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-build:
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: 24.18.0
+      - name: Set up pinned Rust
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            src-tauri/target
+          key: windows-x64-${{ hashFiles('src-tauri/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: windows-x64-${{ hashFiles('src-tauri/Cargo.lock') }}-
+      - name: Install locked dependencies
+        run: |
+          npm ci --ignore-scripts
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm --prefix pi-sidecar ci --ignore-scripts
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm --prefix tools/feishu-bot ci --ignore-scripts
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Build Windows x64 installer
+        run: npm run tauri -- build --ci --bundles nsis -- --locked
+      - name: Install and check isolated application
+        run: ./scripts/windows-smoke.ps1
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4
+        with:
+          name: learning-station-windows-x64-${{ github.sha }}
+          path: |
+            delivery/*
+          retention-days: 14
+          if-no-files-found: error

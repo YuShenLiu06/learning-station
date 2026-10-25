@@ -91,7 +91,8 @@ impl BotWorker {
         if !node.is_absolute() || !script.is_absolute() || !state_dir.is_absolute() {
             return Err(error());
         }
-        let mut child = Command::new(node)
+        let mut command = Command::new(node);
+        command
             .arg("--disable-warning=ExperimentalWarning")
             .arg(script)
             .arg("--state-dir")
@@ -99,8 +100,10 @@ impl BotWorker {
             .env_clear()
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        crate::windows::prepare_child(&mut command);
+        let mut child = command.spawn()
             .map_err(|_| error())?;
         let mut input = child.stdin.take().ok_or_else(error)?;
         let output = child.stdout.take().ok_or_else(error)?;
