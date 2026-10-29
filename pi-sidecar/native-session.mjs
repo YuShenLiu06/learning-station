@@ -1,13 +1,14 @@
 // Application binding around the pinned public Pi SDK. Credentials and tools remain explicit.
 import fs from 'node:fs';
 import {ContextBridge,decodeBridgeInput} from './context-bridge.mjs';
+import {validateImages,imageCompatibleStream,imageSourceText} from './image-input.mjs';
 import {registerMaterialContext,retireTurnContext} from './material-context.mjs';
 import path from 'node:path';
 import {createHash, randomUUID} from 'node:crypto';
 import {createAssistantMessageEventStream} from '@earendil-works/pi-ai/utils/event-stream';
 import {Agent} from '@earendil-works/pi-agent-core';
 import {InMemoryCredentialStore} from '@earendil-works/pi-ai';
-import {AgentSession, SessionManager, SettingsManager, ModelRuntime, DefaultResourceLoader, getAgentDir, createExtensionRuntime, convertToLlm} from '@earendil-works/pi-coding-agent';
+import {AgentSession, SessionManager, SettingsManager, ModelRuntime, DefaultResourceLoader, getAgentDir, createExtensionRuntime, convertToLlm, resizeImage} from '@earendil-works/pi-coding-agent';
 const stable = v=>Array.isArray(v)?v.map(stable):v&&typeof v==='object'?Object.fromEntries(Object.keys(v).sort().map(k=>[k,stable(v[k])])):v;
 const sha = value => createHash('sha256').update(value).digest('hex');
 const redact=(v,key)=>typeof v==='string'?v.replaceAll(key,'[REDACTED]'):Array.isArray(v)?v.map(x=>redact(x,key)):v&&typeof v==='object'?Object.fromEntries(Object.entries(v).map(([k,x])=>[k,redact(x,key)])):v;
@@ -58,6 +59,7 @@ function validateInner(spec){
 function validate(spec){try{return validateInner(spec);}catch(error){throw error instanceof NativeSessionError?error:new NativeSessionError('NATIVE_SESSION_INVALID',error);}}
 // Pi native messages are the only model transcript. Business Markdown remains independently intact.
 export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn,apiKey,thinkingLevel,finishTurn,beforeToolCall,requestTool,onManifest,onLifecycle,loadChanges,timeContext,checkpoint:providedCheckpoint}){
+  streamFn=imageCompatibleStream(streamFn);
   const {file,binding}=validate(spec);
   const cwd=spec.projectRoot??spec.directory;
   const lock=path.join(spec.directory,'active.lock');let lockFd;
@@ -224,10 +226,18 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
         name:message.customType??message.role,sourcePath:`native/${entry.sourceEntry.id}/${message.customType??message.role}`,
       }))),
       async requestTool(call,signal){manager.appendCustomEntry('learning-station-tool',{runId:spec.runId,callId:call.id,argsHash:sha(JSON.stringify(stable(call.args)))});sync(file);await checkpoint();return requestTool(call,signal);},
-      async prompt(question){
+      async prompt(question, imageInput=[]){
         await pendingProjection;
+        const images=validateImages(imageInput);
+        const acceptedImages=model.input?.includes('image')?images:[];
+        const questionText=imageSourceText(question,acceptedImages);
+        const reserveImages=(text,attachments)=>{
+          // Pi 1.3.0 may expand compressed images up to its 4.5 MiB base64 limit.
+          const imageBytes=attachments.reduce((bytes,image)=>bytes+Math.max(image.data.length,4.5*1024*1024)-image.data.length,Buffer.byteLength(JSON.stringify(attachments)));
+          if(attachments.length&&fs.statSync(file).size+imageBytes+Buffer.byteLength(text)+4*1024*1024>MAX_FILE)throw new NativeSessionError('IMAGE_LIMIT');
+        };
         if(question.includes(apiKey))throw new NativeSessionError('AUTH');
-        const inputHash=sha(question);if(record.inputHash&&record.inputHash!==inputHash)throw new NativeSessionError();record.inputHash=inputHash;
+        const inputHash=sha(images.length?JSON.stringify([question,images]):question);if(record.inputHash&&record.inputHash!==inputHash)throw new NativeSessionError();record.inputHash=inputHash;
         if(record.status==='complete')return {cached:record.finalContent};
         persist(record);
         // Preserve a previously accepted user once, including after a failed run.
@@ -239,9 +249,23 @@ export async function openNativeSession(spec, {model,systemPrompt,tools,streamFn
           const accepted=text(entry.message);
           const visible=manager.buildSessionProjection().entries.some(e=>e.sourceEntry.id===entry.id&&e.messages.some(m=>m.role==='user'&&text(m)===accepted));
           const retry=visible?'继续处理上一条已保存用户问题；不得重新执行已完成工具。':`继续处理这条已保存用户问题：\n\n${accepted}\n\n不得重新执行已完成工具。`;
-          await session.sendCustomMessage({customType:'learning-station-retry',content:retry,display:false,details:{userEntryId:spec.userEntryId}},{triggerTurn:true});
+          const visibleImages=manager.buildSessionProjection().entries.some(e=>(e.sourceEntry.id===entry.id||e.sourceEntry.customType==='learning-station-retry'&&e.sourceEntry.details?.userEntryId===spec.userEntryId)&&e.messages.some(m=>Array.isArray(m.content)&&m.content.some(part=>part.type==='image')));
+          const restoreImages=acceptedImages.length&&!visibleImages;
+          const retryText=restoreImages?imageSourceText(retry,acceptedImages):retry;
+          let retryImages=[];
+          if(restoreImages){
+            reserveImages(retryText,acceptedImages);
+            retryImages=Array.isArray(entry.message.content)?entry.message.content.filter(part=>part.type==='image'):[];
+            if(!retryImages.length)for(const image of acceptedImages){
+              const normalized=await resizeImage(Buffer.from(image.data,'base64'),image.mimeType,model.inputLimits?.images?.resize);
+              if(!normalized)throw new NativeSessionError('INVALID_INPUT');
+              retryImages.push({type:'image',data:normalized.data,mimeType:normalized.mimeType});
+            }
+          }
+          await session.sendCustomMessage({customType:'learning-station-retry',content:restoreImages?[{type:'text',text:retryText},...retryImages]:retry,display:false,details:{userEntryId:spec.userEntryId}},{triggerTurn:true});
         }else{
-          await session.prompt(question,{expandPromptTemplates:!!spec.projectRoot,source:'rpc'});
+          reserveImages(questionText,acceptedImages);
+          await session.prompt(questionText,{images:acceptedImages.map(({type,data,mimeType})=>({type,data,mimeType})),expandPromptTemplates:!!spec.projectRoot,source:'rpc'});
 
         }
         await agent.waitForIdle();await pendingProjection;return {};

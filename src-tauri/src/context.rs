@@ -679,7 +679,7 @@ impl Builder<'_> {
                     }
                 }
                 Ok((asset, None)) => self.warn(format!(
-                    "IMAGE_NOT_SENT: {} 仅在本机预览，未向模型发送图像。",
+                    "IMAGE_REFERENCE: {} 图片由独立通道按模型能力发送；文本清单不代表图片已发送。",
                     asset.id
                 )),
                 Err(error) => self.warn(format!(
@@ -887,7 +887,7 @@ mod asset_reference_tests {
         assert!(loaded
             .warnings
             .iter()
-            .any(|w| w.starts_with("IMAGE_NOT_SENT")));
+            .any(|w| w.starts_with("IMAGE_REFERENCE")));
         assert!(!loaded.manifest.iter().any(|item| item.id == image.id));
         let plain = library_tree::create(
             &mut store,
@@ -1157,7 +1157,15 @@ mod required_context_tests {
 }
 
 /// Match authored references outside escaped text and code; never interpret a code example as consent.
-fn asset_ids(body: &str) -> Vec<String> {
+pub(crate) fn asset_ids(body: &str) -> Vec<String> {
+    reference_ids(body, false)
+}
+
+pub(crate) fn image_ids(body: &str) -> Vec<String> {
+    reference_ids(body, true)
+}
+
+fn reference_ids(body: &str, images_only: bool) -> Vec<String> {
     let (body, _) = take_chars(body, MAX_CONTEXT_CHARS);
     let bytes = body.as_bytes();
     let mut index = 0;
@@ -1193,6 +1201,11 @@ fn asset_ids(body: &str) -> Vec<String> {
             continue;
         }
         if bytes[index] == b'[' {
+            if images_only && (index == 0 || bytes[index - 1] != b'!'
+                || bytes[..index - 1].iter().rev().take_while(|b| **b == b'\\').count() % 2 == 1) {
+                index += 1;
+                continue;
+            }
             let mut end = None;
             for (offset, ch) in body[index + 1..].char_indices().take(201) {
                 if ch == '\n' || ch == '\r' {
@@ -1229,6 +1242,10 @@ fn asset_ids(body: &str) -> Vec<String> {
 #[cfg(test)]
 mod asset_reference_syntax_tests {
     use super::*;
+    #[test]
+    fn image_channel_ignores_text_links_code_and_escaped_images() {
+        assert_eq!(image_ids(r"[text](asset:text_id) ![image](asset:image_id) `![code](asset:code_id)` \![escaped](asset:escaped_id)"), vec!["image_id"]);
+    }
     #[test]
     fn code_fences_inline_and_escaped_links_are_not_automatic_context() {
         let text = r#"[visible](asset:visible_id)

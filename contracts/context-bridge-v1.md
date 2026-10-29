@@ -1,5 +1,11 @@
 # ContextBridge v1 清单契约
 
+## 显式图片引用
+
+本次问题和冻结正文中的 `asset:` 图片引用经 Rust 附件门禁与本次课程版本核对，进入独立 Pi `images` 通道，不将 base64 塞进文本注册值，不把图片计作文字 manifest 正文。每轮最多4张、每张5MiB；PNG/JPEG/GIF/WebP，重复引用按附件 ID 去重。每个已保存问题在私有 `image-snapshots` 固定 ID/版本；重试不发现新引用，图片改版、回收、越课明确拒绝。模型能力未知或不支持时不发送当前/历史图片，本机预览不代表已送达模型。通用 read 工具仍维持原文本契约。
+
+图片能力偏好 IPC 为 `set_model_image_support(supportsImages?: boolean|null)`，持久化到当前模型通道，返回现有 ModelSettings 加可选 `supportsImages`；模型名称或绑定变化后恢复自动，生成中拒绝修改。不增加凭据或网络权限。
+
 ## 课程可读范围与实际正文
 
 - `Run.courseReadManifest?: ManifestItem[]` 仅是本次提交的课程可读来源与精确版本快照，不含正文、不进入模型 payload，也不是已读/已收到/完整基准证据。其 `includedChars` 不参与投影判断；兼容值0不能解释为阅读状态。字段缺省的旧Run继续使用原授权快照。

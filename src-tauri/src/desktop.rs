@@ -741,6 +741,10 @@ async fn test_model(state: State<'_, Arc<Engine>>) -> Result<ModelTest> {
     result
 }
 #[tauri::command]
+async fn set_model_image_support(state: State<'_, Arc<Engine>>, supports_images: Option<bool>) -> Result<ModelSettings> {
+    state.set_model_image_support(supports_images).await
+}
+#[tauri::command]
 async fn check_feishu_status(
     state: State<'_, Arc<Engine>>,
 ) -> Result<crate::feishu::IdentityStatus> {
@@ -1138,6 +1142,7 @@ pub fn run() {
             test_feishu_notification,
             set_model,
             set_model_limits,
+            set_model_image_support,
             create_todo,
             list_todos,
             set_todo_done,

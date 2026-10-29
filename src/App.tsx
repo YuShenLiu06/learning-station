@@ -49,7 +49,8 @@ import type { EditorHandle } from './Editor';
 import { RequestContextView } from './RequestContextView';
 import type { ContextViewState } from './RequestContextView';
 import { useFontSize } from './useFontSize';
-import { Markdown } from './Markdown';
+import { Markdown, ImageAttachments } from './Markdown';
+import { clipboardImage, insertPastedImage, useImagePaste } from './ImagePaste';
 import { composerKeyAction } from './keyboard';
 import { draftInputsDiffer, questionForSection, unbackedSectionHasInput } from './draftPolicy';
 import { flushExerciseDrafts, hasExerciseInput } from './exerciseDraft';
@@ -262,6 +263,7 @@ export function App() {
   const session = chat ? { ...chat, ...(current?.section.kind === 'exercise' && readingSession ? { exercises: readingSession.exercises, exerciseSessionId: readingSession.exerciseSessionId } : {}) } : readingSession ?? emptySession(activeId);
   const chatDraft = useChatDraft(session.courseId ? session.id : '');
   const chatDraftRef = useRef(chatDraft); chatDraftRef.current = chatDraft;
+  const composerImagePaste = useImagePaste();
   const conversation = mergeOutgoing(session.messages, outgoing, session.id);
   const toolCalls = foldToolActivities([...(session.toolCalls || []), ...(liveTools[session.id] || [])], session.id);
   const displayedMessages = conversation.slice(-30);
@@ -513,6 +515,21 @@ export function App() {
     return () => clearTimeout(timer);
   }, [session.id, activeId, requestSelection, current?.body, current?.savedBody, current?.section.version, busyId, contextRetry, injectionKey]);
   function updateComposer(value: string) { if (session.courseId) chatDraft.setQuestion(value); else setQuestion(value); }
+  function pasteComposerImage(event: React.ClipboardEvent<HTMLTextAreaElement>) {
+    const file = clipboardImage(event.clipboardData); if (!file) return;
+    event.preventDefault();
+    const id = session.id, documentId = activeId, original = composerQuestion;
+    const from = event.currentTarget.selectionStart, to = event.currentTarget.selectionEnd;
+    composerImagePaste.paste(file, session.courseId || current?.section.courseId, citation => {
+      if (session.courseId) chatDraftRef.current.setQuestion(value => insertPastedImage(value, original, from, to, citation), id);
+      else {
+        const value = insertPastedImage(questionDrafts.current[documentId] || '', original, from, to, citation);
+        questionDrafts.current[documentId] = value;
+        if (activeIdRef.current === documentId) setQuestion(value);
+        else if (nativeAvailable) void call('draft_save', { key: `section:${documentId}`, data: { body: docsRef.current[documentId]?.body || '', question: value } }).catch(error => reportDraftError(`section:${documentId}`, error));
+      }
+    });
+  }
   function updateTargetSession(result: LearningSession, _independentTarget = false) {
     if (result.courseId) setCourseChats(old => old[result.courseId!]?.id === result.id ? { ...old, [result.courseId!]: result } : old);
     const reconciled = reconcileOutgoing(outgoingRef.current, result.messages, result.id);
@@ -657,6 +674,7 @@ export function App() {
   async function ask(preset?: string) {
     const value = (preset ?? composerQuestion).trim();
     if (!value || busyRef.current) return;
+    if (composerImagePaste.busy) { notify('图片正在保存，请完成后再发送。'); return; }
     if (conversationOperation.current || materialQuestionPending.current) { notify('正在准备对话与引用，问题仍保留，请稍候发送。'); return; }
     if (modelChangingRef.current) { notify('正在更换模型，请稍候再提问。'); return; }
     if (!canCompose || !session.id) { setAiError('学习会话尚未就绪，请重试打开，问题仍保留。'); return; }
@@ -971,7 +989,7 @@ export function App() {
             {current.section.kind === 'exercise' && !editing && (!editReview.proposal?.exercise || editReview.raw) && <section className="exercise-workspace" aria-label="练习作答" onFocusCapture={e=>trackExerciseFocus(e.target)} onPointerDown={e=>trackExerciseFocus(e.target)}><p className="muted small">题目与评分使用已保存题集。请切到“编辑 Markdown”再让 AI 修改题目，随后逐题审阅；直接改 Markdown 只改变展示。</p>{session.exercises.filter(exercise=>!current.section.exerciseEntryId || exercise.entryId===current.section.exerciseEntryId).map(exercise=><ExerciseCard key={exercise.id} exercise={exercise} sessionId={exercise.sessionId || session.id} canGrade={modelReady} onRefresh={async()=>{updateTargetSession(await call<LearningSession>('session_refresh',{sectionId:activeId,sessionId:exercise.sessionId || session.id}));}} onReferenceSelection={(part,entryId,selected,position,rendered)=>{void quoteExercise(activeId,exercise.sessionId || session.id,exercise.id,part,entryId,selected,position,rendered);}} onAnswer={answer=>submitAnswer(exercise,answer)} onReason={reason=>saveReason(exercise,reason)}/>)}<details className="exercise-markdown"><summary>明确展开参考与完整 Markdown</summary><Markdown text={current.body} courseId={courseId} onAsset={(id,assetId)=>{void openAsset(id,assetId);}}/></details></section>}
             {current.section.kind !== 'exercise' && !isContainer && session.exercises.length > 0 && <details className="legacy-exercises"><summary>本页练习记录 · {session.exercises.length} 题</summary>{[...new Map(session.exercises.filter(exercise=>exercise.entryId).map(exercise=>[exercise.entryId!,exercise])).values()].map(exercise=><button key={exercise.entryId} className="quiet-button" onClick={()=>{void openExerciseEntry(exercise.entryId!);}}>打开练习文档 · {exercise.prompt.slice(0,36)}</button>)}</details>}
             {!editing && current.section.kind !== 'exercise' && <div className="reading-content" tabIndex={0}>{editReview.proposal && !editReview.raw ? <EditReviewContent review={editReview} hideTitle={editReview.proposal.original.split('\n')[0].replace(/^#\s+/, '').trim().toLowerCase() === current.section.title.replace(/^\d+\s*[·.、-]\s*/, '').trim().toLowerCase()} onAsset={(id,assetId)=>{void openAsset(id,assetId);}}/> : <Markdown text={current.body} courseId={courseId} onAsset={(id,assetId)=>{void openAsset(id,assetId);}} className={current.body.split('\n')[0].replace(/^#\s+/, '').trim().toLowerCase() === current.section.title.replace(/^\d+\s*[·.、-]\s*/, '').trim().toLowerCase() ? 'hide-redundant-title' : ''} />}<div className="reading-end"><span /><BookOpen size={15} /><span /></div></div>}
-            {Object.entries(docs).filter(([id]) => editedIds.has(id)).map(([id, doc]) => <div key={id} className="document-editor" hidden={!editing || activeId !== id}><Suspense fallback={<div className="muted small">正在打开编辑器…</div>}><Editor ref={handle=>{if(handle)editorRefs.current.set(id,handle);else editorRefs.current.delete(id);}} initial={doc.body} onReady={() => { const started = editorStartedAt.current[id]; if (started !== undefined) { recordMetric('editor-ready', performance.now() - started); delete editorStartedAt.current[id]; } }} onChange={body => changeBody(id, body)} onSelection={(value,start,body)=>{if(activeIdRef.current===id && doc.section.kind !== 'exercise')setSelection(value,locateCitation(body,value,start).locator,body);}} onSave={() => { void save(id); }} /></Suspense></div>)}
+            {Object.entries(docs).filter(([id]) => editedIds.has(id)).map(([id, doc]) => <div key={id} className="document-editor" hidden={!editing || activeId !== id}><Suspense fallback={<div className="muted small">正在打开编辑器…</div>}><Editor ref={handle=>{if(handle)editorRefs.current.set(id,handle);else editorRefs.current.delete(id);}} initial={doc.body} courseId={containingCourse(nodes, id)?.id || doc.section.courseId} onReady={() => { const started = editorStartedAt.current[id]; if (started !== undefined) { recordMetric('editor-ready', performance.now() - started); delete editorStartedAt.current[id]; } }} onChange={body => changeBody(id, body)} onSelection={(value,start,body)=>{if(activeIdRef.current===id && doc.section.kind !== 'exercise')setSelection(value,locateCitation(body,value,start).locator,body);}} onSave={() => { void save(id); }} /></Suspense></div>)}
           </div>
           {!editReview.raw && <EditReviewDock review={editReview} editing={editing} onRead={() => setEditing(false)}/>}
 
@@ -1011,7 +1029,7 @@ export function App() {
         </>
         {partial && partial.mode !== 'practice' && partial.sessionId === session.id && busyId && <article className="message assistant partial-message"><div className="message-label"><Sparkles size={12} />正在回复</div><Markdown text={partial.content} /></article>}{partial?.mode === 'practice' && partial.sessionId === session.id && !busyId && aiError && <details className="recovery-message"><summary>查看练习模型原返回（含参考）</summary><pre>{partial.content}</pre></details>}{busyId && <div className="generating" role="status"><LoaderCircle size={15} className="spin" /><div>{!activeRunId ? '正在核对来源与保存问题…' : partial?.mode === 'practice' ? '正在接收、校验并保存练习…' : '正在等待模型回复…'}<small>来源以核对后的实际清单为准</small></div></div>}{(aiError || practiceFailure?.sourceId === activeId && practiceFailure.sessionId === session.id) && <div className="inline-error" role="alert"><strong>这次没有得到回复</strong><p>{aiError || practiceFailure?.error}</p><span>输入仍保留，可以修改后重试。</span>{practiceFailure?.sourceId === activeId && practiceFailure.sessionId === session.id && <button className="quiet-button" disabled={!!busyId} onClick={()=>{void generateExercise(true);}}>{practiceFailure.unknown ? practiceFailure.recovery ? '继续完成保存' : '核对上次练习生成' : '重试生成练习'}</button>}</div>}<div ref={chatEnd} />
       </div>
-      <div className="composer-area"><div className="composer"><ComposerReferenceChips references={composerRefs} busy={!!busyId} onRemove={removeComposerReference} onOpenAssistant={item=>{void openAssistantQuote(item);}}/><textarea ref={questionRef} aria-label="向学习助手提问" placeholder={canCompose ? '写下问题，或显式加入材料后提问…' : '先选择或新建对话'} value={composerQuestion} disabled={!canCompose} rows={3} onChange={event => updateComposer(event.target.value)} onCompositionStart={() => { cancelAnimationFrame(composerCommitFrame.current); composerComposing.current = true; }} onCompositionEnd={() => { composerCommitFrame.current = requestAnimationFrame(() => { composerComposing.current = false; }); }} onBlur={() => { cancelAnimationFrame(composerCommitFrame.current); composerComposing.current = false; }} onKeyDown={event => { const action = composerKeyAction(event.nativeEvent, composerComposing.current); if (action === 'native') return; event.preventDefault(); if (action === 'send') void ask(); }} /><div className="composer-bottom"><ComposerToolTierPicker busy={!!busyId} /><ChatModelPicker model={boot.model} busy={!!busyId || modelChanging} onApply={changeModel} onSettings={openSettings} /><button type="button" onClick={()=>{if(busyId)void cancel();else void ask();}} className="send-button" aria-label={busyId ? '停止生成' : modelReady ? '发送问题' : '配置模型后提问'} disabled={!busyId && (!canCompose || !composerQuestion.trim() || modelChanging)}>{busyId ? <Square size={15} /> : <ArrowUp size={17} />}</button></div></div></div>
+      <div className="composer-area"><div className="composer"><ComposerReferenceChips references={composerRefs} busy={!!busyId} onRemove={removeComposerReference} onOpenAssistant={item=>{void openAssistantQuote(item);}}/><ImageAttachments text={composerQuestion} courseId={session.courseId || current?.section.courseId}/>{composerImagePaste.status}<textarea onPaste={pasteComposerImage} ref={questionRef} aria-label="向学习助手提问" placeholder={canCompose ? '写下问题，或显式加入材料后提问…' : '先选择或新建对话'} value={composerQuestion} disabled={!canCompose} rows={3} onChange={event => updateComposer(event.target.value)} onCompositionStart={() => { cancelAnimationFrame(composerCommitFrame.current); composerComposing.current = true; }} onCompositionEnd={() => { composerCommitFrame.current = requestAnimationFrame(() => { composerComposing.current = false; }); }} onBlur={() => { cancelAnimationFrame(composerCommitFrame.current); composerComposing.current = false; }} onKeyDown={event => { const action = composerKeyAction(event.nativeEvent, composerComposing.current); if (action === 'native') return; event.preventDefault(); if (action === 'send') void ask(); }} /><div className="composer-bottom"><ComposerToolTierPicker busy={!!busyId} /><ChatModelPicker model={boot.model} busy={!!busyId || modelChanging} onApply={changeModel} onSettings={openSettings} /><button type="button" onClick={()=>{if(busyId)void cancel();else void ask();}} className="send-button" aria-label={busyId ? '停止生成' : modelReady ? '发送问题' : '配置模型后提问'} disabled={!busyId && (!canCompose || !composerQuestion.trim() || modelChanging || composerImagePaste.busy)}>{busyId ? <Square size={15} /> : <ArrowUp size={17} />}</button></div></div></div>
     </aside>}
 
     {renamingChat && <Dialog title="重命名对话" description="只修改名称，原历史与会话编号保持不变。" onClose={()=>setRenamingChat(null)}><RenameConversation session={renamingChat} onSave={async title=>{const result=await call<LearningSession>('course_session_rename',{courseId:renamingChat.courseId,sessionId:renamingChat.id,title,expectedVersion:renamingChat.version});updateTargetSession(result);await reloadConversations(renamingChat.courseId!);setRenamingChat(null);}}/></Dialog>}

@@ -273,7 +273,7 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
     // Serialize source validation and queued-run reservation with recycle/restore operations.
     // Taking this mutex does not read a Keychain item; credentials are resolved only after context.
     let model_store = engine.model.lock().await;
-    let (ctx, session, exploration_context, projection, source_id, course_read_manifest) = {
+    let (ctx, session, exploration_context, projection, source_id, course_read_manifest, images) = {
         let mut core = engine.lock()?;
         let session = sessions::get(&mut core.content, &request.session_id)?;
         let frozen = request.focus.as_ref().map(|focus| crate::focus::load(&mut core, &session, focus)).transpose()?;
@@ -363,6 +363,10 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
                 return Err(CoreError::new("CONTEXT_CONFLICT", "引用来源与本次课程版本不一致，请重新选择。"));
             }
         }
+        let native_user_id = request.user_entry_id.clone()
+            .unwrap_or_else(|| format!("entry_{}", &hash(&format!("{id}-user"))[..32]));
+        let images = crate::image_context::capture(&core.content, &core.state_dir, &session,
+            &native_user_id, &request.prompt, &ctx, course_read_manifest.as_deref())?;
         // Native Pi owns model history. Rust retains business records without clipping them into the prompt.
         ctx.history_manifest.clear();
         ctx.warnings.retain(|w| !w.starts_with("TRUNCATED_HISTORY"));
@@ -386,7 +390,7 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
             None
         };
         (ctx, session, intent, projection, source_id,
-            course_read_manifest,)
+            course_read_manifest, images)
     };
     // Resolve visible sources and recycle-bin protections before touching this app's credential.
     // The authorization tier comes only from local user preferences; a read failure stays closed.
@@ -419,7 +423,10 @@ pub async fn start(engine: Arc<Engine>, request: GenerationRequest, sink: Sink) 
         &projection,
         time_context.clone(),
     )?;
-    let messages = frozen_prompt.messages;
+    let mut messages = frozen_prompt.messages;
+    if let Some(message) = messages.last_mut() {
+        message["images"] = json!(images);
+    }
     let native_user_id = request
         .user_entry_id
         .clone()

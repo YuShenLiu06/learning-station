@@ -1,6 +1,7 @@
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';import assert from 'node:assert/strict';import {build} from 'esbuild';import {JSDOM} from 'jsdom';import {unlink} from 'node:fs/promises';
 const dom=new JSDOM('<div id="root"></div>',{url:'http://127.0.0.1/',pretendToBeVisual:true});Object.assign(globalThis,{window:dom.window,document:dom.window.document,location:dom.window.location,isTauri:true,IS_REACT_ACT_ENVIRONMENT:true});Object.defineProperty(globalThis,'navigator',{configurable:true,value:dom.window.navigator});for(const name of ['HTMLElement','HTMLInputElement','HTMLSelectElement','HTMLTextAreaElement','Element','Node','Event','MouseEvent','KeyboardEvent'])globalThis[name]=dom.window[name];
-const file=new URL(`./.model-limits-${process.pid}.mjs`,import.meta.url);await build({stdin:{contents:`export {ModelLimitsSettings,modelLimitsInput} from './src/ModelLimitsSettings';export {SettingsPage} from './src/SettingsPage';export {nativeCall} from './src/native';export {modelFailureMessage} from './src/modelPolicy';`,resolveDir:process.cwd(),loader:'tsx'},outfile:file.pathname,bundle:true,packages:'external',platform:'node',format:'esm',jsx:'automatic',define:{'import.meta.env.DEV':'false'}});
+const file=new URL(`./.model-limits-${process.pid}.mjs`,import.meta.url);await build({stdin:{contents:`export {ModelLimitsSettings,modelLimitsInput} from './src/ModelLimitsSettings';export {SettingsPage} from './src/SettingsPage';export {nativeCall} from './src/native';export {modelFailureMessage} from './src/modelPolicy';`,resolveDir:process.cwd(),loader:'tsx'},outfile:fileURLToPath(file),bundle:true,packages:'external',platform:'node',format:'esm',jsx:'automatic',define:{'import.meta.env.DEV':'false'}});
 const React=await import('react'),{createRoot}=await import('react-dom/client'),ui=await import(file.href),{mockIPC,clearMocks,mockWindows}=await import('@tauri-apps/api/mocks');
 const initial={configured:true,credentialStored:true,verified:true,connected:true,provider:'custom',protocol:'openai-completions',baseUrl:'http://127.0.0.1/mock-only/v1',requestUrl:'http://127.0.0.1/mock-only/v1/chat/completions',model:'fixture-model',maxOutputTokens:4096,contextWindow:null};
 const tick=async()=>React.act(async()=>{await new Promise(resolve=>setTimeout(resolve,0));});const wait=async check=>{for(let i=0;i<100;i++){if(check())return;await tick();}assert.ok(check(),'UI timeout: '+document.body.textContent);};
@@ -38,4 +39,24 @@ test('native model mapping preserves limits and keeps length versus incomplete d
  mockIPC((command,args)=>{if(command==='get_model_settings')return {...initial,maxOutputTokens:32768,contextWindow:null};if(command==='set_model_limits'){assert.deepEqual(args,{maxOutputTokens:2,contextWindow:2048});return {...initial,...args};}throw Error(command);});try{assert.equal((await ui.nativeCall('model_get',{})).maxOutputTokens,32768);const saved=await ui.nativeCall('model_limits_save',{maxOutputTokens:2,contextWindow:2048,apiKey:'ignored-ui-fixture',model:'must-not-change'});assert.equal(saved.maxOutputTokens,2);assert.equal(saved.contextWindow,2048);assert.equal(saved.model,initial.model);assert.match(ui.modelFailureMessage({code:'MODEL_LENGTH',message:'length'},'generation'),/达到输出上限.*MODEL_LENGTH/);assert.match(ui.modelFailureMessage({code:'MODEL_INCOMPLETE',message:'EOF'},'generation'),/未完整结束.*MODEL_INCOMPLETE/);}finally{clearMocks();}
 });
 
-test.after(async()=>{clearMocks();dom.window.close();await unlink(file).catch(()=>{});});
+test('image input setting persists tri-state capability without losing edited token limits',async()=>{
+ await fixture((command,args)=>{assert.equal(command,'set_model_image_support');return {...initial,...args};},async({calls})=>{
+  await input('最大输出 token','5000');
+  for(const [selected,expected] of [['on',true],['off',false],['auto',null]]){
+   const select=document.querySelector('[aria-label="图片输入"]');
+   await React.act(async()=>{select.value=selected;select.dispatchEvent(new Event('change',{bubbles:true}));});
+   assert.ok(calls.length,document.body.textContent); assert.deepEqual(calls.at(-1).args,{supportsImages:expected});
+   assert.equal(document.querySelector('[aria-label="图片输入"]').value,selected);
+   assert.equal(document.querySelector('[aria-label="最大输出 token"]').value,'5000');
+  }
+ });
+});
+
+test('fixed coding channel does not offer unsupported image capability override',async()=>{
+ await fixture(()=>assert.fail('no model request'),async()=>{
+  assert.equal(document.querySelector('[aria-label="图片输入"]'),null);
+  assert.match(document.body.textContent,/固定通道仅支持文本/);
+ },{model:{...initial,provider:'zhipu-coding'}});
+});
+
+test.after(async()=>{clearMocks();dom.window.close();await unlink(file).catch(()=>{});await unlink(new URL(file.href.replace(/\.mjs$/u,'.css'))).catch(()=>{});});
