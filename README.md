@@ -10,11 +10,11 @@
 - Pi 原生会话负责消息、工具结果、准确重开和已知容量下的压缩；默认编码工具未开放。
 - 本机 Anki/AnkiConnect 复习与 CSV 备用导出；本人飞书机器人的显式启停、通知和手动测试。
 
-模型端点与凭据由本人配置，密钥写入本机 Keychain。飞书与 Anki 需要已有程序/授权，应用不自动安装、授权或发送；Coding Plan 用途限制仍保留，不自动绕过。
+模型端点与凭据由本人配置，密钥写入 macOS Keychain 或 Windows 凭据管理器。飞书与 Anki 需要已有程序/授权，应用不自动安装、授权或发送；Coding Plan 用途限制仍保留，不自动绕过。
 
 ## 本机开发
 
-准备 Rust、Xcode Command Line Tools 和 **Node v24.18.0（darwin arm64）**。运行时版本及校验值锁定在 `runtime/manifest.json`；构建只复制现有 Node，不自动下载运行时。
+准备 Rust 和 **Node v24.18.0**：macOS 使用 darwin arm64 及 Xcode Command Line Tools；Windows 使用 win32 x64/arm64 及相应的 Rust 构建工具。运行时版本及各平台校验值锁定在 `runtime/manifest.json`；构建只复制现有 Node，不自动下载运行时。
 
 ```sh
 npm ci --ignore-scripts
@@ -24,7 +24,7 @@ node scripts/prepare-runtime.mjs
 npm run tauri -- dev
 ```
 
-开发环境使用项目内 `runtime/node`。旧 CLI 兼容适配器不带个人配置，固定路径仅为开发占位；日常飞书通知使用独立 Bot 适配器。
+开发环境使用项目内 `runtime/node`，Windows 使用 `runtime/node.exe`。Windows 旧版本未写入系统凭据管理器的模型密钥需要重新保存；不尝试迁移或读取其他应用凭据。Windows 课程 AI 文件写入仍按原契约报不支持，不影响普通聊天。旧 CLI 兼容适配器不带个人配置，固定路径仅为开发占位；日常飞书通知使用独立 Bot 适配器。
 
 ## 验证状态与范围
 

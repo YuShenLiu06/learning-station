@@ -44,7 +44,7 @@
       "../pi-sidecar/node_modules/": "pi-sidecar/node_modules/",
       "../pi-sidecar/learning-plugin.mjs": "pi-sidecar/learning-plugin.mjs",
       "../pi-sidecar/response-diagnostics.mjs": "pi-sidecar/response-diagnostics.mjs",
-      "../runtime/node": "runtime/node",
+      "../runtime/node*": "runtime/",
       "../runtime/LICENSE": "runtime/LICENSE",
       "../tools/feishu-bot/worker.mjs": "feishu-bot/worker.mjs",
       "../tools/feishu-bot/adapter.mjs": "feishu-bot/adapter.mjs",

@@ -32,7 +32,9 @@ async function start(request) {
     toolBridge.close();
     finished = true;
     clearTimeout(total);
-    process.exit(0);
+    // Let provider handles close normally; forced exit races libuv on Windows.
+    process.stdin.destroy();
+    process.exitCode = 0;
   } catch (error) {
     clearTimeout(total);
     await exitError(typeof error?.code === 'string' ? error.code : 'PI_RUNTIME', error?.diagnostic);

@@ -50,6 +50,18 @@ pub fn error() -> CoreError {
         "原生学习会话缺失或损坏；旧记录仍保留，未静默创建新会话。请保留本机状态目录后恢复备份。",
     )
 }
+/// Windows requires a writable handle for FlushFileBuffers, and backup semantics
+/// to open a directory. Do not silently skip durable checkpoints on that platform.
+pub(crate) fn sync_path(path: &Path) -> std::io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.write(true).custom_flags(0x02000000); // FILE_FLAG_BACKUP_SEMANTICS
+    }
+    options.open(path)?.sync_all()
+}
 pub fn atomic(path: &Path, value: &Value) -> Result<()> {
     use std::io::Write;
     let mut file = tempfile::NamedTempFile::new_in(path.parent().ok_or_else(error)?)?;
@@ -62,7 +74,7 @@ pub fn atomic(path: &Path, value: &Value) -> Result<()> {
     file.write_all(&serde_json::to_vec(value)?)?;
     file.as_file().sync_all()?;
     file.persist(path).map_err(CoreError::io)?;
-    fs::File::open(path.parent().unwrap())?.sync_all()?;
+    sync_path(path.parent().unwrap())?;
     Ok(())
 }
 pub fn prepare(
@@ -174,9 +186,9 @@ pub fn sync_directory(directory: &Path) -> Result<()> {
         if meta.file_type().is_symlink() || !meta.is_file() || meta.len() > 32 * 1024 * 1024 {
             return Err(error());
         }
-        fs::File::open(&p)?.sync_all()?;
+        sync_path(&p)?;
     }
-    fs::File::open(directory)?.sync_all()?;
+    sync_path(directory)?;
     Ok(())
 }
 
@@ -297,6 +309,17 @@ mod tests {
         model::ToolCall,
     };
     use std::sync::{atomic::AtomicBool, Arc};
+    #[test]
+    fn checkpoint_flushes_private_files_and_directory_without_rewriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        fs::write(&transcript, b"synthetic transcript\n").unwrap();
+        atomic(&dir.path().join("binding.json"), &json!({"initialized":true})).unwrap();
+        sync_directory(dir.path()).unwrap();
+        assert_eq!(fs::read(&transcript).unwrap(), b"synthetic transcript\n");
+        fs::create_dir(dir.path().join("unexpected-directory")).unwrap();
+        assert_eq!(sync_directory(dir.path()).unwrap_err().code, "NATIVE_SESSION_INVALID");
+    }
     fn setup() -> (tempfile::TempDir, Arc<Engine>, Session, String) {
         let dir = tempfile::tempdir().unwrap();
         let e = Engine::new(dir.path().join("lib"), dir.path().join("state")).unwrap();
