@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { build } from 'esbuild';
@@ -14,7 +15,7 @@ test('actual React course conversations create, select, rename and restore indep
   dom.window.Range.prototype.getClientRects=()=>[];dom.window.Range.prototype.getBoundingClientRect=()=>new dom.window.DOMRect();
   const {mockIPC,mockWindows,clearMocks}=await import('@tauri-apps/api/mocks');mockWindows('main');
   const filename=new URL(`./.course-conversations-${process.pid}.mjs`,import.meta.url);
-  await build({entryPoints:['src/App.tsx'],outfile:filename.pathname,bundle:true,packages:'external',platform:'node',format:'esm',jsx:'automatic',define:{'import.meta.env.DEV':'false'}});
+  await build({entryPoints:['src/App.tsx'],outfile:fileURLToPath(filename),bundle:true,packages:'external',platform:'node',format:'esm',jsx:'automatic',define:{'import.meta.env.DEV':'false'}});
   const React=await import('react'),{createRoot}=await import('react-dom/client'),{App}=await import(filename.href);
   const clone=value=>structuredClone(value),commands=[],drafts=new Map(),docs=new Map(),sessions=new Map(),selected=new Map([['course_a','old_chat']]),runs=new Map(),created=new Map();
   const doc=(id,kind,title,parentId=null)=>({id,path:`courses/${id}.md`,version:'v1',metadata:{id,kind,title,parentId,order:0,goals:[],tags:[],links:[],version:1},body:`# ${title}\n\nSynthetic private material ${id}`,content:''});
@@ -130,5 +131,5 @@ test('actual React course conversations create, select, rename and restore indep
     let releaseList;blockedList={promise:new Promise(resolve=>{releaseList=resolve;})};const selectedCalls=commands.filter(value=>value.command==='course_session_select').length;await selectCourse('course_a');await click(row('语法讨论'));await wait(()=>heading()==='语法讨论');releaseList();await tick(50);assert.equal(selected.get('course_a'),first);assert.equal(heading(),'语法讨论');assert.equal(commands.filter(value=>value.command==='course_session_select').length-selectedCalls,1);
     await click(newChat('course_a'));await wait(()=>heading()==='新对话 4');await click(row('材料乙'));await wait(()=>reading()==='材料乙');const originalDraft=composer().value;let releaseStale;blockedNoteRead={promise:new Promise(resolve=>{releaseStale=resolve;})};await click(button('带我梳理这一页'));await wait(()=>composer().disabled);await click(row('材料甲'));await wait(()=>reading()==='材料甲');blockedNoteRead=null;releaseStale();await wait(()=>!composer().disabled);assert.equal(composer().value,originalDraft);assert.equal(document.querySelector('.composer-reference'),null,'stale preparation must not enqueue its old material');
     assert.ok(drafts.has('chat:old_chat'));assert.ok(drafts.has('chat:'+first));
-  }finally{await React.act(async()=>root.unmount());clearMocks();dom.window.close();await unlink(filename).catch(()=>{});}
+  }finally{await React.act(async()=>root.unmount());clearMocks();dom.window.close();await unlink(filename).catch(()=>{});await unlink(new URL(filename.href.replace(/\.mjs$/u,'.css'))).catch(()=>{});}
 });

@@ -1,6 +1,14 @@
 # Pi 原生会话 v1
 
+## 图片输入与 Windows 检查点
+
+私有生成输入可带顶层 `images: {type:'image', data:string, mimeType:string, sourceId?:string}[]`，仅由 Rust 从同课程显式 `![...](asset:...)` 引用冻结产生；不接受图片远程 URL 或任意主机路径。顺序为问题中首次引用、再冻结材料中首次引用，按 ID 去重；sourceId 用于给模型说明图号与引用的对应，不作为 Pi 图片块字段。每张原始字节最多5MiB，最多4张，PNG/JPEG/GIF/WebP。二进制 JSON 最多28MiB，与原有4MiB文本/控制预算分开。
+
+`settings.supportsImages?: boolean|null` 显式覆盖当前自定义模型能力；缺省/空值采用锁版 Pi 目录准确 ID 的一致能力，未知按纯文本。Pi 使用原生 `prompt` 的 `images` 参数；受控流边界对纯文本模型排除当前和历史图片，包括压缩请求。用户轮输入身份包括图片，重试不得改变原图；Rust保存 ID/版本清单，恢复仍重验当前课程权限和版本，旧原始记录不删除。
+
 Windows 的 Rust 检查点用可写文件句柄和带 `FILE_FLAG_BACKUP_SEMANTICS` 的目录句柄同步；Node 在权限模式下委托 `session_sync`，不自行打开目录，确认语义不降级。
+
+原生会话仍有32MiB文件保护。新增或恢复图片前按现有文件、每张图的原编码与锁版 Pi 4.5MiB规范化编码上界中的较大值、JSON开销、问题及4MiB回合余量检查，容量不足报 `IMAGE_LIMIT`，提示新建课程对话或减少图片，不通过放宽读取保护处理。回合余量不构成原有任意工具历史增长的总量保证。
 
 原生会话部分仅使用应用内部私有管道，不新增模型权限或任意路径接口。锁定 `@earendil-works/pi-coding-agent`、agent-core、pi-ai 均为1.3.0。
 

@@ -53,9 +53,10 @@ export function useChatDraft(sessionId: string) {
     question: current?.question || '', loaded: !!current?.loaded, error: current?.error, conflict: current?.conflict, flush,
     retry: async () => { if (!current?.loaded) return load(sessionId); try { await flush(sessionId); current.error = undefined; } catch (error) { current.error = String(error); } refresh(); },
     resolve(useSaved: boolean) { if (!current) return; if (useSaved) current.question = current.conflict || ''; current.conflict = undefined; current.loaded = true; current.edited = true; current.error = undefined; refresh(); },
-    setQuestion(question: string) {
-      const draft = drafts.current.get(sessionId) || { question: '', loaded: !nativeAvailable, edited: false };
-      draft.question = question; draft.edited = true; drafts.current.set(sessionId, draft); refresh();
+    setQuestion(question: string | ((current: string) => string), id = sessionId) {
+      const draft = drafts.current.get(id) || { question: '', loaded: !nativeAvailable, edited: false };
+      draft.question = typeof question === 'function' ? question(draft.question) : question; draft.edited = true; drafts.current.set(id, draft); refresh();
+      if (id !== sessionId) void flush(id).catch(error => { draft.error = String(error); refresh(); });
     },
   };
 }

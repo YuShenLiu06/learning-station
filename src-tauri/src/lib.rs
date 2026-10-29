@@ -15,6 +15,7 @@ pub mod drafts;
 pub mod feishu;
 pub mod file_metadata;
 pub mod generation;
+mod image_context;
 pub mod focus;
 pub mod learning_skills;
 pub mod learning_tools;

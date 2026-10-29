@@ -183,6 +183,16 @@ impl Engine {
             .map_err(|_| CoreError::new("BUSY", "模型配置暂不可用。"))? = settings.clone();
         Ok(settings)
     }
+    pub async fn set_model_image_support(&self, supports_images: Option<bool>) -> Result<ModelSettings> {
+        let mut store = self.model.lock().await;
+        if self.runs.lock().map_err(|_| CoreError::new("BUSY", "生成状态暂不可用。"))?
+            .values().any(|run| ["queued", "running"].contains(&run.run.status.as_str())) {
+            return Err(CoreError::new("BUSY", "生成中不能修改图片能力，请先停止并等待结束。"));
+        }
+        let settings = store.set_image_support(supports_images)?;
+        *self.model_summary.write().map_err(|_| CoreError::new("BUSY", "模型配置暂不可用。"))? = settings.clone();
+        Ok(settings)
+    }
     pub fn new(library_root: PathBuf, state_dir: PathBuf) -> Result<Arc<Self>> {
         fs::create_dir_all(&state_dir)?;
         #[cfg(unix)]

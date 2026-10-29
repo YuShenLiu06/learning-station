@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { build } from 'esbuild';
@@ -67,7 +68,7 @@ test('controlled React flow preserves next draft, retries one saved user entry, 
     }
   },{shouldMockEvents:true});
   const filename=new URL(`./.ui-flow-${process.pid}.mjs`,import.meta.url);
-  await build({entryPoints:['src/App.tsx'],outfile:filename.pathname,bundle:true,packages:'external',platform:'node',format:'esm',jsx:'automatic',define:{'import.meta.env.DEV':'false'}});
+  await build({entryPoints:['src/App.tsx'],outfile:fileURLToPath(filename),bundle:true,packages:'external',platform:'node',format:'esm',jsx:'automatic',define:{'import.meta.env.DEV':'false'}});
   const React=await import('react');const {createRoot}=await import('react-dom/client');
   const {App}=await import(filename.href);const root=createRoot(document.getElementById('root'));
   const tick=async(ms=0)=>{await React.act(async()=>{await new Promise(resolve=>setTimeout(resolve,ms));});};
@@ -103,6 +104,6 @@ test('controlled React flow preserves next draft, retries one saved user entry, 
     assert.equal(commands.some(x=>['test_model','configure_model'].includes(x.command)),false);
     await click(document.querySelector('[aria-label="历史"]'));await waitFor(()=>button('fixture session history'));await click(button('fixture session history'));await waitFor(()=>document.querySelector('.history-page .tool-activity'));assert.equal(document.querySelectorAll('.history-page .tool-activity').length,2);assert.equal(document.querySelectorAll('.history-page .message.user .tool-activity').length,2);assert.match(document.querySelector('.history-page .tool-succeeded').textContent,/创建待办.*成功/);await click(button('打开待办'));await waitFor(()=>document.querySelector('[role="dialog"]'));assert.match(document.querySelector('[role="dialog"]').textContent,/Controlled persisted task/);assert.equal(commands.filter(x=>x.command==='start_generation').filter(x=>x.args.mode!=='practice').length,2);
   }finally{
-    await React.act(async()=>root.unmount());clearMocks();dom.window.close();await unlink(filename).catch(()=>{});
+    await React.act(async()=>root.unmount());clearMocks();dom.window.close();await unlink(filename).catch(()=>{});await unlink(new URL(filename.href.replace(/\.mjs$/u,'.css'))).catch(()=>{});
   }
 });

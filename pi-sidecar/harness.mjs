@@ -3,6 +3,7 @@ import {resolveTimeContext} from './time-context.mjs';
 import { resolveLearningSkills } from './learning-skills.mjs';
 import {randomUUID} from 'node:crypto';
 import { openNativeSession } from './native-session.mjs';
+import { supportsImageInput, validateImages, imageCompatibleStream, imageSourceText } from './image-input.mjs';
 import {decodeBridgeInput,projectStandalone} from './context-bridge.mjs';
 import { Agent } from '@earendil-works/pi-agent-core';
 import { streamSimple } from '@earendil-works/pi-ai/api/openai-completions';
@@ -39,6 +40,7 @@ export const SAFE_MESSAGES = Object.freeze({
   MODEL_THINKING_ONLY: '模型仅返回思考内容，没有最终正文；思考内容未当作学习答案。',
   MODEL_EMPTY: '模型声明结束，但没有返回有效正文。',
   OUTPUT_LIMIT: '模型输出超过限制，已停止；已收到的内容已保留。',
+  IMAGE_LIMIT: '本对话剩余容量不足以保存这些图片，请新建课程对话后发送；原对话已保留。',
   LIMIT_EXCEEDED: '完整材料变化及必要正文超过发送容量；未截断，原问题与版本保留。',
   CONTEXT_CONFLICT: '聚焦正文与固定材料类型不一致，正文未发送；请保留原问题并重新核对聚焦材料。',
   TOOL_SIZE_LIMIT: '学习工具参数或结果超过容量限制。',
@@ -86,11 +88,12 @@ export function resolveModelLimits(settings, operation = 'generate') {
   return { contextWindow: context ?? 0, maxTokens: operation === 'test' ? Math.min(max, settings.provider === 'custom' ? 256 : 2048) : max };
 }
 export function createModel(settings, operation = 'generate') {
+  if (settings?.supportsImages != null && typeof settings.supportsImages !== 'boolean') throw new SafeError('INVALID_MODEL_SETTINGS');
   if (!['custom', 'glm-pi', 'openai-compatible'].includes(settings?.provider) || !['openai-completions', ...(settings.provider === 'custom' ? ['anthropic-messages'] : [])].includes(settings.protocol ?? (settings.provider === 'custom' ? '' : 'openai-completions')) || typeof settings.model !== 'string' || !settings.model.trim() || Buffer.byteLength(settings.model) > 256 || /[\u0000-\u001f\u007f]/u.test(settings.model)) throw new SafeError('INVALID_MODEL_SETTINGS');
   const limits = resolveModelLimits(settings, operation);
   if (settings.provider === 'custom') return {
     id: settings.model, name: settings.model, provider: 'learning-custom', api: settings.protocol,
-    baseUrl: normalizeEndpoint(settings.baseUrl, 'custom'), reasoning: false, input: ['text'],
+    baseUrl: normalizeEndpoint(settings.baseUrl, 'custom'), reasoning: false, input: supportsImageInput(settings) ? ['text', 'image'] : ['text'],
     ...limits,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     compat: settings.protocol === 'anthropic-messages' ? { supportsStrictTools: false, supportsEagerToolInputStreaming: false, supportsLongCacheRetention: false, supportsCacheControlOnTools: false, sendSessionAffinityHeaders: false } : { supportsReasoningEffort: false, maxTokensField: 'max_tokens', supportsDeveloperRole: false, supportsStore: false, supportsUsageInStreaming: false, zaiToolStream: false },
@@ -260,6 +263,8 @@ export async function runLearningAgent(request, emit, { signal, streamFn: fixtur
   if (typeof request.apiKey !== 'string' || !request.apiKey || Buffer.byteLength(request.apiKey) > 16384 || /[\u0000-\u0020\u007f]/u.test(request.apiKey)) throw new SafeError('AUTH');
   let timeContext;try{timeContext=resolveTimeContext(request.timeContext);}catch{throw new SafeError('TIME_CONTEXT_INVALID');}
   const model = createModel(request.settings, request.operation);
+  const images = validateImages(request.images);
+  if (images.length && request.operation !== 'generate') throw new SafeError('INVALID_INPUT');
   if (model.api === 'anthropic-messages' && (request.apiKey.includes('sk-ant-oat') || /\/(?:v1|messages)$/u.test(new URL(model.baseUrl).pathname))) throw new SafeError('INVALID_MODEL_SETTINGS');
   const diagnostic = createResponseDiagnostic(request.operation, model.api);
   const targetUrl = new URL(model.baseUrl);
@@ -347,7 +352,7 @@ export async function runLearningAgent(request, emit, { signal, streamFn: fixtur
     const systemPrompt=agentOptions.initialState.systemPrompt;
     native=await openNativeSession(request.nativeSession,{model,systemPrompt,timeContext,tools:plugin?.tools??[],streamFn:agentOptions.streamFn,apiKey:request.apiKey,thinkingLevel:glm?'max':'off',beforeToolCall:agentOptions.beforeToolCall,finishTurn:agentOptions.finishTurn,requestTool,loadChanges:request.materialChanges===true?async ({baseCommitOid,focusBaseCommitOid})=>{const reply=await requestTool({type:'material_changes',id:'changes_'+randomUUID(),baseCommitOid,focusBaseCommitOid});if(!reply?.result)throw new SafeError(reply?.error?.code??'TOOL_PROTOCOL');return reply.result;}:undefined,checkpoint:async()=>{const reply=await requestTool({type:'session_sync',id:'sync_'+randomUUID()});if(reply?.result?.synced!==true)throw new SafeError('NATIVE_SESSION_INVALID');},onManifest:manifest=>{const write=emit({type:'context_manifest',manifest});manifestWrites.push(write);return write;},onLifecycle:event=>{const write=emit({type:'session_lifecycle',event:event.type,reason:event.reason,aborted:event.aborted});manifestWrites.push(write);return write;}});
     agent=native.agent;
-  }else agent=new Agent(agentOptions);
+  }else agent=new Agent({...agentOptions,streamFn:imageCompatibleStream(agentOptions.streamFn)});
   const unsubscribe = agent.subscribe(async (event) => {
     if (event.type === 'message_start' && event.message.role === 'assistant') {
       currentText = '';
@@ -396,9 +401,12 @@ export async function runLearningAgent(request, emit, { signal, streamFn: fixtur
       let envelope;try{envelope=decodeBridgeInput(JSON.parse(history.at(-1).content));}catch{throw new SafeError('INVALID_INPUT');}
       if(typeof envelope.question!=='string')throw new SafeError('INVALID_INPUT');
       await native.applyContext(envelope);
-      const outcome=await native.prompt(envelope.question);
+      const outcome=await native.prompt(envelope.question, images);
       if(outcome.cached){await sendText(outcome.cached);await Promise.all(manifestWrites);await emit({type:'done',settled:true,stopReason:'stop',outputBytes:Buffer.byteLength(output),finalContent:outcome.cached,toolCalls:0,cached:true,diagnostic:diagnostic.snapshot()});return {output:outcome.cached,partialOutput:output,settled:true};}
-    }else await agent.prompt(history.at(-1));
+    }else {
+      const last = history.at(-1);
+      await agent.prompt(images.length && model.input?.includes('image') ? {...last, content: [{type:'text',text:imageSourceText(last.content,images)}, ...images.map(({type,data,mimeType})=>({type,data,mimeType}))]} : last);
+    }
     await agent.waitForIdle();
     let validatedOutput = true;
     if (request.outputValidation === true && policy.mode === 'practice') {

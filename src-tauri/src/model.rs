@@ -133,6 +133,8 @@ fn usage_gate() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelProfileSettings {
+    #[serde(default)]
+    pub supports_images: Option<bool>,
     pub profile: String,
     #[serde(default = "coding_provider")]
     pub provider: String,
@@ -151,6 +153,7 @@ fn default_profiles() -> Vec<ModelProfileSettings> {
     [("bigmodel-coding", DOMESTIC), ("zai-coding", INTERNATIONAL)]
         .into_iter()
         .map(|(profile, url)| ModelProfileSettings {
+            supports_images: None,
             profile: profile.into(),
             provider: coding_provider(),
             protocol: protocol_name(),
@@ -166,6 +169,8 @@ fn default_profiles() -> Vec<ModelProfileSettings> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelSettings {
+    #[serde(default)]
+    pub supports_images: Option<bool>,
     pub configured: bool,
     pub provider: String,
     #[serde(default = "protocol_name")]
@@ -192,6 +197,7 @@ pub struct ModelSettings {
 impl Default for ModelSettings {
     fn default() -> Self {
         Self {
+            supports_images: None,
             configured: false,
             provider: "custom".into(),
             protocol: protocol_name(),
@@ -396,6 +402,7 @@ impl ModelStore {
                         saved.configured = profile.configured;
                         saved.max_output_tokens = profile.max_output_tokens;
                         saved.context_window = profile.context_window;
+                        saved.supports_images = profile.supports_images;
                         // External usage remains blocked independently of any saved verification flag.
                         saved.verified =
                             profile.verified && !usage_blocked(&saved.provider, &profile.base_url);
@@ -467,6 +474,22 @@ impl ModelStore {
         self.settings = next;
         Ok(self.settings())
     }
+    pub fn set_image_support(&mut self, supports_images: Option<bool>) -> Result<ModelSettings> {
+        if !self.settings.configured {
+            return Err(CoreError::new("NOT_CONFIGURED", "请先保存供应商连接。"));
+        }
+        if self.settings.provider != "custom" && supports_images == Some(true) {
+            return Err(invalid("此固定模型通道仅支持文本。"));
+        }
+        let mut next = self.settings();
+        let profile = next.profiles.iter_mut().find(|p| p.profile == next.active_profile)
+            .ok_or_else(|| invalid("模型通道配置无效。"))?;
+        profile.supports_images = supports_images;
+        next.supports_images = supports_images;
+        self.persist(&next)?;
+        self.settings = next;
+        Ok(self.settings())
+    }
     // Limits may be reused only for the same endpoint/protocol/provider binding.
     fn limits_for_binding(
         &self,
@@ -509,6 +532,7 @@ impl ModelStore {
         let mut next = self.settings();
         next.model = model.into();
         next.verified = false;
+        next.supports_images = None;
         if let Some(profile) = next
             .profiles
             .iter_mut()
@@ -516,6 +540,7 @@ impl ModelStore {
         {
             profile.model = model.into();
             profile.verified = false;
+            profile.supports_images = None;
         }
         self.persist(&next)?;
         self.settings = next;
@@ -603,6 +628,9 @@ impl ModelStore {
             self.limits_for_binding(&profile, provider, protocol, &endpoint);
         next.max_output_tokens = max_output_tokens;
         next.context_window = context_window;
+        next.supports_images = self.settings.profiles.iter().find(|p|
+            p.profile == profile && p.provider == provider && p.protocol == protocol
+                && p.base_url == endpoint && p.model == model).and_then(|p| p.supports_images);
         let item = ModelProfileSettings {
             profile: profile.clone(),
             provider: provider.into(),
@@ -613,6 +641,7 @@ impl ModelStore {
             verified: next.verified,
             max_output_tokens,
             context_window,
+            supports_images: next.supports_images,
         };
         if let Some(saved) = next.profiles.iter_mut().find(|p| p.profile == profile) {
             *saved = item;
@@ -1009,7 +1038,7 @@ mod native_project_scope_tests {
 
 async fn run_sidecar(
     mut credentials: ModelCredentials,
-    messages: Vec<Value>,
+    mut messages: Vec<Value>,
     cancel: Arc<AtomicBool>,
     mut on_delta: impl FnMut(&str) + Send,
     operation: &str,
@@ -1036,6 +1065,13 @@ async fn run_sidecar(
         return Err(cancelled());
     }
     if messages.len() > 128 {
+        return Err(sidecar_error("INVALID_INPUT"));
+    }
+    let images = messages.last_mut().and_then(Value::as_object_mut)
+        .and_then(|message| message.remove("images")).unwrap_or_else(|| json!([]));
+    // Keep the existing text budget separate from the bounded binary channel.
+    let image_bytes = serde_json::to_vec(&images).map_err(|_| sidecar_error("INVALID_INPUT"))?.len();
+    if images.as_array().is_none_or(|items| items.len() > 4) || image_bytes > 28 * MAX_OUTPUT {
         return Err(sidecar_error("INVALID_INPUT"));
     }
     let directory = SIDECAR_DIR
@@ -1069,6 +1105,7 @@ async fn run_sidecar(
         settings: &'a ModelSettings,
         api_key: &'a str,
         messages: &'a [Value],
+        images: &'a Value,
         learning_tools: bool,
         tool_policy: &'a ToolPolicy,
         learning_skills: &'a [crate::learning_skills::SkillSnapshot],
@@ -1092,6 +1129,7 @@ async fn run_sidecar(
         settings: &credentials.settings,
         api_key: &credentials.api_key,
         messages: &messages,
+        images: &images,
         learning_tools: tool_handler.is_some()
             && operation == "generate"
             && !policy.allowed_tools.is_empty(),
@@ -1104,11 +1142,11 @@ async fn run_sidecar(
         material_changes: request_context.material_changes.is_some(),
     };
     let mut input = serde_json::to_vec(&sidecar_input).map_err(|_| sidecar_error("INVALID_INPUT"))?;
-    if input.len()>4*MAX_OUTPUT-1 && sidecar_input.debug_registrations.is_some() {
+    if input.len()>4*MAX_OUTPUT + image_bytes - 1 && sidecar_input.debug_registrations.is_some() {
         input.fill(0);sidecar_input.debug_registrations=None;
         input=serde_json::to_vec(&sidecar_input).map_err(|_|sidecar_error("INVALID_INPUT"))?;
     }
-    if input.len() > 4 * MAX_OUTPUT - 1 {
+    if input.len() > 4 * MAX_OUTPUT + image_bytes - 1 {
         input.fill(0);
         return Err(sidecar_error("INVALID_INPUT"));
     }
@@ -1921,6 +1959,7 @@ fn sidecar_error(code: &str) -> CoreError {
         "NATIVE_SESSION_INVALID" => ("NATIVE_SESSION_INVALID","原生学习会话缺失或损坏；旧学习记录仍保留，未静默创建新会话。"),
         "NATIVE_SESSION_BUSY" => ("NATIVE_SESSION_BUSY","本学习会话仍有请求在执行，请稍后核对原请求。"),
         "NATIVE_TOOL_UNKNOWN" => ("NATIVE_TOOL_UNKNOWN","原工具调用回执尚未核实；未重复执行写入，请保留原请求编号。"),
+        "IMAGE_LIMIT" => ("IMAGE_LIMIT", "当前对话没有足够空间保存这些图片。原记录仍保留，请新建课程对话后重新发送，或减少图片。"),
         "INVALID_INPUT" => (
             "INVALID_INPUT",
             "模型输入无效或过大，请缩小所选材料后重试。",
@@ -3192,6 +3231,7 @@ mod policy_feedback_tests {
         settings.active_profile = "custom".into();
         settings.usage_gate = USAGE_GATE.into();
         settings.profiles.push(ModelProfileSettings {
+            supports_images: None,
             profile: "custom".into(),
             provider: "custom".into(),
             protocol: PROTOCOL.into(),
@@ -3364,6 +3404,7 @@ mod configuration_response_tests {
         settings.active_profile = "custom".into();
         settings.verified = true;
         settings.profiles.push(ModelProfileSettings {
+            supports_images: None,
             profile: "custom".into(),
             provider: "custom".into(),
             protocol: ANTHROPIC.into(),
@@ -3422,6 +3463,17 @@ mod time_intent_tests;
 #[cfg(test)]
 mod model_limit_tests {
     use super::*;
+    #[test]
+    fn image_capability_is_local_persisted_and_resets_when_model_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = configured(temp.path());
+        assert_eq!(store.settings().supports_images, None);
+        assert_eq!(store.set_image_support(Some(true)).unwrap().supports_images, Some(true));
+        assert_eq!(ModelStore::new(temp.path()).unwrap().settings().supports_images, Some(true));
+        assert_eq!(store.set_model("different-model").unwrap().supports_images, None);
+        assert_eq!(store.set_image_support(Some(false)).unwrap().supports_images, Some(false));
+        assert_eq!(store.set_image_support(None).unwrap().supports_images, None);
+    }
     fn configured(dir: &Path) -> ModelStore {
         let mut store = ModelStore::new(dir).unwrap();
         let mut settings = ModelSettings {
@@ -3435,6 +3487,7 @@ mod model_limit_tests {
             ..ModelSettings::default()
         };
         settings.profiles.push(ModelProfileSettings {
+            supports_images: None,
             profile: "custom".into(),
             provider: settings.provider.clone(),
             protocol: settings.protocol.clone(),

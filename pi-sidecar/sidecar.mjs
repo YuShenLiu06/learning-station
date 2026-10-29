@@ -16,7 +16,7 @@ async function exitError(code = 'PI_RUNTIME', diagnostic) {
   if (finished) return;
   finished = true;
   abort.abort();
-  const safe = ['PLAN_USAGE_UNCONFIRMED', 'AUTH', 'RATE_LIMIT', 'TIMEOUT', 'CANCELLED', 'NETWORK', 'INVALID_MODEL_SETTINGS', 'INVALID_URL', 'INVALID_INPUT', 'MODEL_HTTP', 'MODEL_RESPONSE', 'MODEL_ENDPOINT_PAGE', 'MODEL_FORMAT', 'MODEL_LENGTH', 'MODEL_INCOMPLETE', 'MODEL_THINKING_ONLY', 'MODEL_EMPTY', 'OUTPUT_LIMIT', 'LIMIT_EXCEEDED', 'CONTEXT_CONFLICT', 'SKILL_MISSING', 'SKILL_INVALID', 'TOOL_SIZE_LIMIT', 'TOOL_PROTOCOL', 'TOOL_FAILED', 'TOOLS_DISABLED', 'NATIVE_SESSION_INVALID', 'NATIVE_SESSION_BUSY', 'NATIVE_TOOL_UNKNOWN', 'INVALID_MODEL_LIMITS', 'PI_RUNTIME'].includes(code) ? code : 'PI_RUNTIME';
+  const safe = ['PLAN_USAGE_UNCONFIRMED', 'AUTH', 'RATE_LIMIT', 'TIMEOUT', 'CANCELLED', 'NETWORK', 'INVALID_MODEL_SETTINGS', 'INVALID_URL', 'INVALID_INPUT', 'MODEL_HTTP', 'MODEL_RESPONSE', 'MODEL_ENDPOINT_PAGE', 'MODEL_FORMAT', 'MODEL_LENGTH', 'MODEL_INCOMPLETE', 'MODEL_THINKING_ONLY', 'MODEL_EMPTY', 'OUTPUT_LIMIT', 'IMAGE_LIMIT', 'LIMIT_EXCEEDED', 'CONTEXT_CONFLICT', 'SKILL_MISSING', 'SKILL_INVALID', 'TOOL_SIZE_LIMIT', 'TOOL_PROTOCOL', 'TOOL_FAILED', 'TOOLS_DISABLED', 'NATIVE_SESSION_INVALID', 'NATIVE_SESSION_BUSY', 'NATIVE_TOOL_UNKNOWN', 'INVALID_MODEL_LIMITS', 'PI_RUNTIME'].includes(code) ? code : 'PI_RUNTIME';
   await emit({ type: 'error', code: safe, ...(diagnostic ? { diagnostic: safeResponseDiagnostic(diagnostic) } : {}) }).catch(() => {});
   process.exit(1);
 }
@@ -48,11 +48,13 @@ function line(value) {
     try { if (!toolBridge) throw new Error(); toolBridge.accept(message); } catch { void exitError('TOOL_PROTOCOL'); }
     return;
   }
+  // Image bytes only enlarge the initial request; later tool replies retain 4 MiB.
+  bytes = Buffer.byteLength(pending);
   void start(message);
 }
 process.stdin.on('data', (chunk) => {
   bytes += chunk.length;
-  if (bytes > 4 * 1024 * 1024) { void exitError('INVALID_INPUT'); return; }
+  if (bytes > (running ? 4 : 32) * 1024 * 1024) { void exitError('INVALID_INPUT'); return; }
   pending += decoder.write(chunk);
   for (;;) {
     const index = pending.indexOf('\n');
