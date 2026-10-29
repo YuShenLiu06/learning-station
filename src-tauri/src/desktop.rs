@@ -1024,7 +1024,7 @@ pub fn run() {
             #[cfg(not(debug_assertions))]
             crate::model::set_sidecar_dir(app.path().resource_dir()?.join("pi-sidecar"))?;
             #[cfg(not(debug_assertions))]
-            crate::model::set_node_path(app.path().resource_dir()?.join("runtime/node"))?;
+            crate::model::set_node_path(app.path().resource_dir()?.join("runtime").join(crate::model::NODE_FILENAME))?;
             #[cfg(not(debug_assertions))]
             crate::feishu_bot::set_resource_dir(app.path().resource_dir()?.join("feishu-bot"))?;
             #[cfg(not(debug_assertions))]

@@ -21,9 +21,11 @@ function read(file, limit=MAX_FILE) {
 function atomic(file,value){
   const tmp=`${file}.${randomUUID()}.tmp`;const fd=fs.openSync(tmp,'wx',0o600);
   try{fs.writeFileSync(fd,JSON.stringify(value));if(!process.permission)fs.fsyncSync(fd);}finally{fs.closeSync(fd);}
-  fs.renameSync(tmp,file);const dir=fs.openSync(path.dirname(file),'r');try{if(!process.permission)fs.fsyncSync(dir);}finally{fs.closeSync(dir);}
+  fs.renameSync(tmp,file);
+  // Production checkpoints are acknowledged by Rust, including Windows directory flushes.
+  if(!process.permission&&process.platform!=='win32'){const dir=fs.openSync(path.dirname(file),'r');try{fs.fsyncSync(dir);}finally{fs.closeSync(dir);}}
 }
-function sync(file){const fd=fs.openSync(file,'r');try{if(!process.permission)fs.fsyncSync(fd);}finally{fs.closeSync(fd);}}
+function sync(file){if(process.permission)return;const fd=fs.openSync(file,process.platform==='win32'?'r+':'r');try{fs.fsyncSync(fd);}finally{fs.closeSync(fd);}}
 function text(message){return typeof message.content==='string'?message.content:(message.content??[]).filter(p=>p.type==='text').map(p=>p.text).join('');}
 function safeStream(original,secret,checkpoint,beforeRequest){return (model,context,options)=>{
   const stream=createAssistantMessageEventStream();

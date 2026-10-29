@@ -1,5 +1,7 @@
 # Pi 原生会话 v1
 
+Windows 的 Rust 检查点用可写文件句柄和带 `FILE_FLAG_BACKUP_SEMANTICS` 的目录句柄同步；Node 在权限模式下委托 `session_sync`，不自行打开目录，确认语义不降级。
+
 原生会话部分仅使用应用内部私有管道，不新增模型权限或任意路径接口。锁定 `@earendil-works/pi-coding-agent`、agent-core、pi-ai 均为1.3.0。
 
 ## 持有关系

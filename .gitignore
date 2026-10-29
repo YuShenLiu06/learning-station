@@ -15,8 +15,11 @@ src-tauri/gen/
 *.app/
 
 runtime/node
+runtime/node.exe
 tests/bridge-harness/target/
 evidence/
 docs/*build*.json
 docs/acceptance.md
 tools/local/
+.cache/
+.npm-cache/

@@ -32,7 +32,7 @@ rusqlite = { version = "0.39", features = ["bundled"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "fs", "process", "io-util"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 futures-util = "0.3"
-keyring = { version = "3", features = ["apple-native"] }
+keyring = { version = "3", features = ["apple-native", "windows-native"] }
 tauri = { version = "2", features = [], optional = true }
 
 tempfile = "3"

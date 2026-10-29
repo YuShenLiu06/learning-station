@@ -196,7 +196,7 @@ test('CLI permission sandbox ignores cwd Pi config and emits only safe NDJSON', 
   try {
     await withServer(async (req, res) => { const payload = await readPayload(req); assert(!JSON.stringify(payload).includes('unrelated-fixture-secret')); sendSse(res, `safe ${SECRET} text`); }, async (endpoint) => {
       const result = await cli(request(endpoint), { cwd });
-      assert.equal(result.code, 0); assert.equal(result.events.at(-1).type, 'done');
+      assert.equal(result.code, 0, result.stderr); assert.equal(result.events.at(-1).type, 'done');
       assert(!result.stdout.includes(SECRET)); assert(!result.stderr.includes(SECRET));
       assert.equal(result.events.filter((event) => event.type === 'delta').map((event) => event.delta).join(''), 'safe [REDACTED] text');
     });

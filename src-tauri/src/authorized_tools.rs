@@ -2461,6 +2461,7 @@ mod tests {
         assert_eq!(current["content"], "first version");
     }
 
+    #[cfg(unix)]
     #[test]
     fn workspace_symlinks_cannot_escape_confinement() {
         let (directory, engine, scope) = fixture("write");
@@ -2683,6 +2684,7 @@ mod tests {
         std::fs::write(receipts.join("pi_tool_oversize.json"), "x".repeat(1024 * 1024 + 1)).unwrap();
         let outside = directory.path().join("outside-secret.txt");
         std::fs::write(&outside, "PRIVATE").unwrap();
+        #[cfg(unix)]
         std::os::unix::fs::symlink(&outside, receipts.join("pi_tool_link.json")).unwrap();
         let summary = crate::authorized_tools::list_receipt_summaries(&engine, &scope.session_id).unwrap();
         let list = summary["receipts"].as_array().unwrap();

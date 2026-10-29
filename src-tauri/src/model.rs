@@ -86,19 +86,33 @@ const PROTOCOL: &str = "openai-completions";
 const ANTHROPIC: &str = "anthropic-messages";
 const USAGE_GATE: &str = "PLAN_USAGE_UNCONFIRMED";
 const KEYCHAIN_SERVICE: &str = "com.yushen.learning-station.pi-api-key";
-const NODE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../runtime/node");
+pub const NODE_FILENAME: &str = if cfg!(windows) { "node.exe" } else { "node" };
 static NODE_RESOURCE: OnceLock<PathBuf> = OnceLock::new();
 pub fn node_path() -> PathBuf {
     NODE_RESOURCE
         .get()
         .cloned()
-        .unwrap_or_else(|| PathBuf::from(NODE_PATH))
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../runtime").join(NODE_FILENAME))
 }
 pub fn set_node_path(path: PathBuf) -> Result<()> {
     if !path.is_absolute() || !path.is_file() {
         return Err(runtime_error());
     }
     NODE_RESOURCE.set(path).map_err(|_| runtime_error())
+}
+// Rust canonicalizes Windows paths to extended form; Node's permission matcher
+// and Pi's realpath checks need the equivalent ordinary drive/UNC spelling.
+fn node_filesystem_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    if let Some(value) = path.to_str() {
+        if let Some(unc) = value.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{unc}"));
+        }
+        if let Some(drive) = value.strip_prefix(r"\\?\") {
+            return PathBuf::from(drive);
+        }
+    }
+    path.to_path_buf()
 }
 const DOMESTIC: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
 const INTERNATIONAL: &str = "https://api.z.ai/api/coding/paas/v4";
@@ -858,10 +872,14 @@ pub async fn generate_scoped(
     )
     .await
 }
-fn configured_agent_dir(sidecar_dir: &Path) -> PathBuf {
-    let home = std::env::var_os("HOME")
+fn resource_home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| if cfg!(windows) { std::env::var_os("USERPROFILE") } else { None })
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"));
+        .filter(|path| path.is_absolute())
+}
+fn configured_agent_dir(sidecar_dir: &Path) -> PathBuf {
+    let home = resource_home().unwrap_or_else(|| sidecar_dir.to_path_buf());
     if let Some(path) = std::env::var_os("PI_CODING_AGENT_DIR") {
         let path = PathBuf::from(path);
         if path == Path::new("~") {
@@ -930,20 +948,60 @@ fn native_project_read_allowlist(
 #[cfg(test)]
 mod native_project_scope_tests {
     use super::native_project_read_allowlist;
+    #[cfg(windows)]
     use std::path::Path;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_model_credentials_use_persistent_native_backend() {
+        let entry = keyring::Entry::new("learning-station-test-backend", "synthetic-no-key").unwrap();
+        assert!(entry.get_credential().is::<keyring::windows::WinCredential>());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_node_paths_keep_drive_unc_and_unicode_identity() {
+        use super::node_filesystem_path;
+        assert_eq!(node_filesystem_path(Path::new(r"\\?\C:\课程 空格\session")), Path::new(r"C:\课程 空格\session"));
+        assert_eq!(node_filesystem_path(Path::new(r"\\?\UNC\server\share\课程 空格")), Path::new(r"\\server\share\课程 空格"));
+        assert_eq!(node_filesystem_path(Path::new(r"C:\课程 空格")), Path::new(r"C:\课程 空格"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_node_permission_handles_canonical_unicode_paths_without_scope_expansion() {
+        use super::{node_filesystem_path, node_path};
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("课程 空格");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("材料.txt"), "synthetic fixture").unwrap();
+        let outside = temp.path().join("outside.txt");
+        std::fs::write(&outside, "must remain unread").unwrap();
+        let canonical = std::fs::canonicalize(&directory).unwrap();
+        let directory = node_filesystem_path(&canonical);
+        let output = std::process::Command::new(node_path())
+            .arg("--permission")
+            .arg(format!("--allow-fs-read={}", directory.display()))
+            .args(["-e", "const fs=require('fs');if(fs.readFileSync(process.argv[1],'utf8')!=='synthetic fixture')process.exit(2);try{fs.readFileSync(process.argv[2]);process.exit(3)}catch(e){if(e.code!=='ERR_ACCESS_DENIED')throw e;}"])
+            .arg(directory.join("材料.txt"))
+            .arg(outside)
+            .output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
 
     #[test]
     fn project_scope_does_not_grant_sibling_course_or_user_auth_file() {
-        let root = Path::new("/fixture/library/courses/course-a");
-        let agent = Path::new("/fixture/home/.pi/agent");
-        let home = Path::new("/fixture/home");
-        let paths = native_project_read_allowlist(root, agent, Some(home));
+        let fixture = std::env::current_dir().unwrap().join("fixture");
+        let root = fixture.join("library/courses/course-a");
+        let agent = fixture.join("home/.pi/agent");
+        let home = fixture.join("home");
+        let paths = native_project_read_allowlist(&root, &agent, Some(&home));
 
         assert!(paths.contains(&root.to_path_buf()));
         assert!(paths.contains(&agent.join("skills")));
         assert!(paths.contains(&home.join(".agents/skills")));
         assert!(
-            !paths.contains(&Path::new("/fixture/library/courses/course-b/notes.md").to_path_buf())
+            !paths.contains(&fixture.join("library/courses/course-b/notes.md"))
         );
         assert!(!paths.contains(&agent.join("auth.json")));
     }
@@ -984,7 +1042,7 @@ async fn run_sidecar(
         .get()
         .cloned()
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../pi-sidecar"));
-    let directory = std::fs::canonicalize(directory).map_err(|_| runtime_error())?;
+    let directory = node_filesystem_path(&std::fs::canonicalize(directory).map_err(|_| runtime_error())?);
     if let Some(native) = request_context.native_session.as_mut() {
         if native.project_root.is_some() {
             native.agent_dir.get_or_insert_with(|| configured_agent_dir(&directory));
@@ -1020,6 +1078,12 @@ async fn run_sidecar(
         output_validation: bool,
         material_changes: bool,
     }
+    let native_for_node = request_context.native_session.clone().map(|mut native| {
+        native.directory = node_filesystem_path(&native.directory);
+        native.project_root = native.project_root.map(|path| node_filesystem_path(&path));
+        native.agent_dir = native.agent_dir.map(|path| node_filesystem_path(&path));
+        native
+    });
     let mut sidecar_input = Input {
         protocol: 1,
         debug_protocol: true,
@@ -1035,7 +1099,7 @@ async fn run_sidecar(
         learning_skills: &skills,
         time_context: &request_context.time,
         exploration_context: request_context.exploration.as_ref(),
-        native_session: request_context.native_session.as_ref(),
+        native_session: native_for_node.as_ref(),
         output_validation: request_context.output_validator.is_some(),
         material_changes: request_context.material_changes.is_some(),
     };
@@ -1056,8 +1120,8 @@ async fn run_sidecar(
         .arg(format!("--allow-fs-read={}", directory.display()));
     if let Some(native) = &request_context.native_session {
         command
-            .arg(format!("--allow-fs-read={}", native.directory.display()))
-            .arg(format!("--allow-fs-write={}", native.directory.display()));
+            .arg(format!("--allow-fs-read={}", node_filesystem_path(&native.directory).display()))
+            .arg(format!("--allow-fs-write={}", node_filesystem_path(&native.directory).display()));
         if let Some(project_root) = &native.project_root {
             let canonical_root =
                 std::fs::canonicalize(project_root).map_err(|_| runtime_error())?;
@@ -1073,16 +1137,22 @@ async fn run_sidecar(
             if !agent_dir.is_absolute() {
                 return Err(runtime_error());
             }
-            let home = std::env::var_os("HOME").map(PathBuf::from);
+            let home = resource_home();
             for path in native_project_read_allowlist(&canonical_root, agent_dir, home.as_deref()) {
-                command.arg(format!("--allow-fs-read={}", path.display()));
+                command.arg(format!("--allow-fs-read={}", node_filesystem_path(&path).display()));
             }
         }
+    }
+    command.env_clear();
+    #[cfg(windows)]
+    {
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        // Node/OpenSSL requires Windows' system directory to initialize its CSPRNG.
+        command.env("SystemRoot", std::env::var_os("SystemRoot").ok_or_else(runtime_error)?);
     }
     let mut child = command
         .arg(directory.join("sidecar.mjs"))
         .current_dir(&directory)
-        .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("LANG", "en_US.UTF-8")
         .env(

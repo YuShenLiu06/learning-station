@@ -318,7 +318,7 @@ fn backup(core: &Core, owner: &str, legacy: &[String]) -> Result<()> {
         &json!({"version":1,"courseId":owner,"legacySessionIds":legacy}),
     )?;
     fs::rename(temp.path(), &destination)?;
-    fs::File::open(&parent)?.sync_all()?;
+    crate::native_session::sync_path(&parent)?;
     Ok(())
 }
 
@@ -338,7 +338,7 @@ fn copy(from: &Path, to: &Path, depth: usize) -> Result<()> {
             let entry = entry?;
             copy(&entry.path(), &to.join(entry.file_name()), depth + 1)?;
         }
-        fs::File::open(to)?.sync_all()?;
+        crate::native_session::sync_path(to)?;
     } else if meta.is_file() && meta.len() <= 32 * 1024 * 1024 {
         fs::copy(from, to)?;
         #[cfg(unix)]
@@ -346,7 +346,7 @@ fn copy(from: &Path, to: &Path, depth: usize) -> Result<()> {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(to, fs::Permissions::from_mode(0o600))?;
         }
-        fs::File::open(to)?.sync_all()?;
+        crate::native_session::sync_path(to)?;
     } else {
         return Err(scope());
     }
